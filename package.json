@@ -1,0 +1,18 @@
+{
+  "name": "byond-retail-os",
+  "version": "0.0.0",
+  "private": true,
+  "description": "BYOND Retail OS — edge-first, cloud-managed, multitenant retail operating system.",
+  "packageManager": "pnpm@10.12.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "lint": "echo \"[placeholder] lint: no linter configured yet\" && exit 0",
+    "typecheck": "echo \"[placeholder] typecheck: no TypeScript projects configured yet\" && exit 0",
+    "test": "echo \"[placeholder] test: no test suites configured yet\" && exit 0",
+    "build": "echo \"[placeholder] build: no build targets configured yet\" && exit 0",
+    "security:secrets": "echo \"[placeholder] security:secrets: run gitleaks detect --source . locally or rely on CI\" && exit 0",
+    "security:scan": "echo \"[placeholder] security:scan: semgrep/trivy scanning not configured yet\" && exit 0"
+  }
+}

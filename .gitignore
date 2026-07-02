@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+.next/
+out/
+
+# Env and secrets — never commit these
+.env
+.env.*
+!.env.example
+
+# Logs and caches
+*.log
+.cache/
+.turbo/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
