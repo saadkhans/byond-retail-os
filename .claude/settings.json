@@ -6,7 +6,12 @@
       "PowerShell(pnpm run lint)",
       "PowerShell(pnpm run lint; \"LINT=$?\"; pnpm run typecheck | Out-Null; \"TYPECHECK=$?\"; Test-Path \"services\\\\api\\\\dist\\\\main.js\")",
       "PowerShell(git status --short | Where-Object { $_ -notmatch '\\\\.claude' })",
-      "PowerShell(pnpm run build | Select-Object -Last 2; \"EXIT=$?\"; git status --short | Where-Object { $_ -notmatch '\\\\.claude' })"
+      "PowerShell(pnpm run build | Select-Object -Last 2; \"EXIT=$?\"; git status --short | Where-Object { $_ -notmatch '\\\\.claude' })",
+      "PowerShell(git log --oneline -3; git status --short | Where-Object { $_ -notmatch '\\\\.claude|\\\\.vscode' })",
+      "PowerShell(cd \"c:\\\\Users\\\\walee\\\\Downloads\\\\BYOND AI\\\\byond-retail-os\"; pnpm run lint; \"LINT_OK=$?\")",
+      "PowerShell(pnpm run typecheck | Select-Object -Last 3; \"TYPECHECK_OK=$?\")",
+      "PowerShell(pnpm run test 2>$null | Select-Object -Last 8; \"TEST_OK=$?\")",
+      "PowerShell(cd services\\\\api; pnpm exec jest --silent 2>&1 | Select-String 'Tests:|Test Suites:'; cd ..\\\\..; pnpm run build | Out-Null; \"BUILD_OK=$?\"; Test-Path \"services\\\\api\\\\dist\\\\main.js\")"
     ]
   }
 }
