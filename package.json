@@ -8,10 +8,10 @@
     "node": ">=22"
   },
   "scripts": {
-    "lint": "echo \"[placeholder] lint: no linter configured yet\" && exit 0",
-    "typecheck": "echo \"[placeholder] typecheck: no TypeScript projects configured yet\" && exit 0",
-    "test": "echo \"[placeholder] test: no test suites configured yet\" && exit 0",
-    "build": "echo \"[placeholder] build: no build targets configured yet\" && exit 0",
+    "lint": "pnpm -r --if-present run lint",
+    "typecheck": "pnpm -r --if-present run typecheck",
+    "test": "pnpm -r --if-present run test",
+    "build": "pnpm -r --if-present run build",
     "security:secrets": "echo \"[placeholder] security:secrets: run gitleaks detect --source . locally or rely on CI\" && exit 0",
     "security:scan": "echo \"[placeholder] security:scan: semgrep/trivy scanning not configured yet\" && exit 0"
   }

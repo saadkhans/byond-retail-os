@@ -1,0 +1,254 @@
+// BYOND core platform schema — Phase 1.
+//
+// Scope rules:
+// - Global (platform-owned, no tenantId): Permission, PlatformModule.
+// - Tenant-owned (tenantId required): Location, TenantModule.
+// - Hybrid (tenantId nullable, guarded by CHECK constraints in migration SQL):
+//   User  — NULL tenantId ⇔ userType = PLATFORM (BYOND staff)
+//   Role  — NULL tenantId ⇔ isSystem = true (seeded system role)
+//   AuditLog — NULL tenantId only for pure platform-level actions
+// A NULL tenantId is NEVER a wildcard: the repository layer treats platform
+// scope as an explicit, separate code path.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TenantStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+}
+
+enum UserStatus {
+  INVITED
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+enum UserType {
+  PLATFORM
+  TENANT
+}
+
+enum LocationType {
+  STORE
+  WAREHOUSE
+  DARK_STORE
+  POPUP
+  OFFICE
+}
+
+enum LocationStatus {
+  ACTIVE
+  INACTIVE
+  CLOSED
+}
+
+enum ModuleStatus {
+  ENABLED
+  DISABLED
+  TRIAL
+  SUSPENDED
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  ENABLE
+  DISABLE
+  INVITE
+  ROLE_ASSIGN
+  ROLE_REVOKE
+  SUSPEND
+  REACTIVATE
+  CONFIG_CHANGE
+  ACCESS_DENIED
+}
+
+model Tenant {
+  id        String       @id @default(cuid())
+  name      String
+  slug      String       @unique
+  status    TenantStatus @default(PENDING)
+  settings  Json?
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  users     User[]
+  roles     Role[]
+  locations Location[]
+  modules   TenantModule[]
+  auditLogs AuditLog[]
+}
+
+model User {
+  id          String     @id @default(cuid())
+  tenantId    String?
+  userType    UserType
+  email       String     @unique
+  firstName   String
+  lastName    String
+  status      UserStatus @default(INVITED)
+  lastLoginAt DateTime?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  tenant    Tenant?    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  userRoles UserRole[]
+  auditLogs AuditLog[] @relation("AuditActor")
+
+  @@index([tenantId, status])
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  tenantId    String?
+  name        String
+  description String?
+  isSystem    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant          Tenant?          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  userRoles       UserRole[]
+  rolePermissions RolePermission[]
+
+  // System roles (tenantId NULL) get a partial unique index in migration SQL,
+  // because Postgres treats NULLs as distinct in this composite unique.
+  @@unique([tenantId, name])
+  @@index([tenantId])
+}
+
+model Permission {
+  id          String   @id @default(cuid())
+  code        String   @unique
+  description String?
+  module      String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  rolePermissions RolePermission[]
+}
+
+model UserRole {
+  id String @id @default(cuid())
+  userId String
+  roleId String
+  // Denormalized from Role for join-free tenant isolation filtering.
+  // Invariant (service layer): tenantId === role.tenantId.
+  tenantId     String?
+  assignedById String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, roleId])
+  @@index([roleId])
+  @@index([tenantId])
+}
+
+model RolePermission {
+  id           String   @id @default(cuid())
+  roleId       String
+  permissionId String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Restrict)
+
+  @@unique([roleId, permissionId])
+  @@index([permissionId])
+}
+
+model Location {
+  id        String         @id @default(cuid())
+  tenantId  String
+  name      String
+  code      String
+  type      LocationType
+  status    LocationStatus @default(ACTIVE)
+  timezone  String         @default("UTC")
+  address   Json?
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  @@unique([tenantId, code])
+  @@index([tenantId, type])
+}
+
+model PlatformModule {
+  id            String   @id @default(cuid())
+  code          String   @unique
+  name          String
+  description   String?
+  isActive      Boolean  @default(true)
+  defaultConfig Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  tenantModules TenantModule[]
+}
+
+model TenantModule {
+  id         String       @id @default(cuid())
+  tenantId   String
+  moduleId   String
+  status     ModuleStatus @default(ENABLED)
+  config     Json?
+  enabledAt  DateTime?
+  disabledAt DateTime?
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  tenant Tenant         @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  module PlatformModule @relation(fields: [moduleId], references: [id], onDelete: Restrict)
+
+  @@unique([tenantId, moduleId])
+  @@index([moduleId])
+}
+
+// Append-only: no updatedAt, no update/delete repository methods, and
+// migration-SQL triggers reject UPDATE/DELETE/TRUNCATE at the database level.
+// Because rows are immutable, FKs must never require mutating them: both
+// relations are Restrict/NoAction (a SetNull or cascading update would be
+// rejected by the append-only trigger and break the referencing operation).
+// Users are never hard-deleted while audit rows reference them — lifecycle is
+// status-driven (DEACTIVATED), per the platform's audit retention model.
+model AuditLog {
+  id       String  @id @default(cuid())
+  tenantId String?
+  actorId  String?
+  // Point-in-time snapshot of the actor's email at write time.
+  actorEmail String
+  action     AuditAction
+  entityType String
+  entityId   String?
+  before     Json?
+  after      Json?
+  reason     String?
+  ipAddress  String?
+  userAgent  String?
+  requestId  String?
+  createdAt  DateTime    @default(now())
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  actor  User?   @relation("AuditActor", fields: [actorId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@index([tenantId, createdAt(sort: Desc)])
+  @@index([tenantId, entityType, entityId])
+  @@index([actorId, createdAt])
+}

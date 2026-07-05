@@ -24,7 +24,10 @@ jobs:
         run: corepack enable
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile=false
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm --filter @byond/api run prisma:generate
 
       - name: Lint
         run: pnpm run lint

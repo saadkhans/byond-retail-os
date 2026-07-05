@@ -2,3 +2,10 @@ packages:
   - "apps/*"
   - "services/*"
   - "packages/*"
+
+# pnpm 10 blocks dependency build scripts by default; Prisma needs its
+# engines to run postinstall. @scarf/scarf (telemetry) stays blocked.
+onlyBuiltDependencies:
+  - "@prisma/client"
+  - "@prisma/engines"
+  - "prisma"
