@@ -5,10 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { AuditAction, Tenant } from '@prisma/client';
-import {
-  AuditLogService,
-  SYSTEM_ACTOR_EMAIL,
-} from '../common/audit/audit-log.service';
+import { SYSTEM_ACTOR_EMAIL } from '../common/audit/audit-log.service';
 import { DEFAULT_ENABLED_MODULE_CODES } from '../platform-modules/platform-module.catalog';
 import { CreateTenantDto } from './dto/create-tenant.dto';
 import { TenantsRepository } from './tenants.repository';
@@ -32,10 +29,7 @@ function isUniqueConstraintViolation(error: unknown): boolean {
 
 @Injectable()
 export class TenantsService {
-  constructor(
-    private readonly tenantsRepository: TenantsRepository,
-    private readonly auditLog: AuditLogService,
-  ) {}
+  constructor(private readonly tenantsRepository: TenantsRepository) {}
 
   async create(dto: CreateTenantDto): Promise<Tenant> {
     const name = dto.name?.trim();
@@ -49,11 +43,21 @@ export class TenantsService {
       );
     }
 
-    let tenant: Tenant;
     try {
-      tenant = await this.tenantsRepository.createWithDefaultModules(
+      // The audit entry is written inside the repository transaction —
+      // tenant, default modules, and audit row commit or roll back together.
+      return await this.tenantsRepository.createWithDefaultModules(
         { name, slug },
         DEFAULT_ENABLED_MODULE_CODES,
+        (tenant) => ({
+          tenantId: tenant.id,
+          actorEmail: SYSTEM_ACTOR_EMAIL,
+          action: AuditAction.CREATE,
+          entityType: 'Tenant',
+          entityId: tenant.id,
+          after: tenant,
+          reason: 'Tenant created',
+        }),
       );
     } catch (error) {
       if (isUniqueConstraintViolation(error)) {
@@ -61,18 +65,6 @@ export class TenantsService {
       }
       throw error;
     }
-
-    await this.auditLog.record({
-      tenantId: tenant.id,
-      actorEmail: SYSTEM_ACTOR_EMAIL,
-      action: AuditAction.CREATE,
-      entityType: 'Tenant',
-      entityId: tenant.id,
-      after: tenant,
-      reason: 'Tenant created',
-    });
-
-    return tenant;
   }
 
   async findById(id: string): Promise<Tenant> {

@@ -5,10 +5,7 @@ import {
   PlatformModule,
   TenantModule,
 } from '@prisma/client';
-import {
-  AuditLogService,
-  SYSTEM_ACTOR_EMAIL,
-} from '../common/audit/audit-log.service';
+import { SYSTEM_ACTOR_EMAIL } from '../common/audit/audit-log.service';
 import { PlatformModulesRepository } from './platform-modules.repository';
 import { TenantModulesRepository } from './tenant-modules.repository';
 
@@ -17,7 +14,6 @@ export class PlatformModulesService {
   constructor(
     private readonly platformModulesRepository: PlatformModulesRepository,
     private readonly tenantModulesRepository: TenantModulesRepository,
-    private readonly auditLog: AuditLogService,
   ) {}
 
   listCatalog(): Promise<PlatformModule[]> {
@@ -42,29 +38,28 @@ export class PlatformModulesService {
     status: ModuleStatus,
   ): Promise<TenantModule> {
     const module = await this.platformModulesRepository.findByCode(moduleCode);
+    // Inactive modules (unimplemented later-phase catalog entries) can never
+    // be enabled for a tenant — same failure as a module that doesn't exist.
     if (!module || !module.isActive) {
       throw new NotFoundException(`Platform module "${moduleCode}" not found`);
     }
 
-    const tenantModule = await this.tenantModulesRepository.setStatus(
+    return this.tenantModulesRepository.setStatus(
       tenantId,
       module.id,
       status,
+      (tenantModule) => ({
+        tenantId,
+        actorEmail: SYSTEM_ACTOR_EMAIL,
+        action:
+          status === ModuleStatus.ENABLED
+            ? AuditAction.ENABLE
+            : AuditAction.DISABLE,
+        entityType: 'TenantModule',
+        entityId: tenantModule.id,
+        after: tenantModule,
+        reason: `Module "${moduleCode}" ${status.toLowerCase()} for tenant`,
+      }),
     );
-
-    await this.auditLog.record({
-      tenantId,
-      actorEmail: SYSTEM_ACTOR_EMAIL,
-      action:
-        status === ModuleStatus.ENABLED
-          ? AuditAction.ENABLE
-          : AuditAction.DISABLE,
-      entityType: 'TenantModule',
-      entityId: tenantModule.id,
-      after: tenantModule,
-      reason: `Module "${moduleCode}" ${status.toLowerCase()} for tenant`,
-    });
-
-    return tenantModule;
   }
 }

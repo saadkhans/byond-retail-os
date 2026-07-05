@@ -56,26 +56,44 @@ describe('UsersRepository (cross-tenant isolation)', () => {
       findFirst: jest.Mock;
       findMany: jest.Mock;
     };
+    $transaction: jest.Mock;
   };
+  let auditLog: { record: jest.Mock };
   let repo: UsersRepository;
 
   beforeEach(() => {
     prisma = {
       user: {
-        create: jest.fn().mockResolvedValue({}),
+        create: jest.fn().mockResolvedValue({ id: 'user-1' }),
         findFirst: jest.fn().mockResolvedValue(null),
         findMany: jest.fn().mockResolvedValue([]),
       },
+      $transaction: jest.fn(async (callback: (tx: unknown) => unknown) =>
+        callback(prisma),
+      ),
     };
-    repo = new UsersRepository(prisma as unknown as PrismaService);
+    auditLog = { record: jest.fn().mockResolvedValue(undefined) };
+    repo = new UsersRepository(
+      prisma as unknown as PrismaService,
+      auditLog as never,
+    );
   });
 
-  it('always injects tenantId and TENANT userType on create', async () => {
-    await repo.create('tenant-a', {
-      email: 'a@example.com',
-      firstName: 'A',
-      lastName: 'B',
-    });
+  it('always injects tenantId and TENANT userType on create, and audits in-transaction', async () => {
+    await repo.create(
+      'tenant-a',
+      {
+        email: 'a@example.com',
+        firstName: 'A',
+        lastName: 'B',
+      },
+      () => ({
+        tenantId: 'tenant-a',
+        actorEmail: 'system@byond.internal',
+        action: 'CREATE' as never,
+        entityType: 'User',
+      }),
+    );
 
     expect(prisma.user.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
@@ -83,6 +101,10 @@ describe('UsersRepository (cross-tenant isolation)', () => {
         userType: 'TENANT',
       }),
     });
+    expect(auditLog.record).toHaveBeenCalledWith(
+      expect.objectContaining({ tenantId: 'tenant-a' }),
+      prisma,
+    );
   });
 
   it("tenant A's lookup of tenant B's record id is scoped to tenant A", async () => {
@@ -105,5 +127,21 @@ describe('UsersRepository (cross-tenant isolation)', () => {
     // The guard throws synchronously — before any query is even constructed.
     expect(() => repo.findMany('')).toThrow(TenantIdRequiredError);
     expect(prisma.user.findMany).not.toHaveBeenCalled();
+  });
+
+  it('refuses to create without a tenantId, before opening a transaction', () => {
+    expect(() =>
+      repo.create(
+        '',
+        { email: 'a@example.com', firstName: 'A', lastName: 'B' },
+        () => ({
+          tenantId: null,
+          actorEmail: 'system@byond.internal',
+          action: 'CREATE' as never,
+          entityType: 'User',
+        }),
+      ),
+    ).toThrow(TenantIdRequiredError);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 });

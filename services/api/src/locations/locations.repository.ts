@@ -1,11 +1,18 @@
 import { Injectable } from '@nestjs/common';
 import { Location, LocationType, Prisma } from '@prisma/client';
+import {
+  AuditEntry,
+  AuditLogService,
+} from '../common/audit/audit-log.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { TenantScopedRepository } from '../prisma/tenant-scoped.repository';
 
 @Injectable()
 export class LocationsRepository extends TenantScopedRepository {
-  constructor(prisma: PrismaService) {
+  constructor(
+    prisma: PrismaService,
+    private readonly auditLog: AuditLogService,
+  ) {
     super(prisma);
   }
 
@@ -18,9 +25,15 @@ export class LocationsRepository extends TenantScopedRepository {
       timezone?: string;
       address?: Prisma.InputJsonValue;
     },
+    buildAuditEntry: (location: Location) => AuditEntry,
   ): Promise<Location> {
-    return this.prisma.location.create({
-      data: { ...data, tenantId: this.requireTenantId(tenantId) },
+    const scopedTenantId = this.requireTenantId(tenantId);
+    return this.prisma.$transaction(async (tx) => {
+      const location = await tx.location.create({
+        data: { ...data, tenantId: scopedTenantId },
+      });
+      await this.auditLog.record(buildAuditEntry(location), tx);
+      return location;
     });
   }
 

@@ -277,7 +277,9 @@ ALTER TABLE "Role" ADD CONSTRAINT "Role_isSystem_tenantId_check"
 CREATE UNIQUE INDEX "Role_system_name_key" ON "Role"("name") WHERE "tenantId" IS NULL;
 
 -- 4. AuditLog is append-only at the database level, not just by convention.
---    Role-agnostic (works for any app DB user, unlike REVOKE).
+--    Role-agnostic (works for any app DB user, unlike REVOKE). Row-level
+--    trigger covers UPDATE/DELETE; TRUNCATE is not a row-level event, so a
+--    separate statement-level trigger blocks it too.
 CREATE FUNCTION prevent_audit_log_mutation() RETURNS trigger AS $$
 BEGIN
   RAISE EXCEPTION 'AuditLog is append-only: % is not allowed', TG_OP;
@@ -287,3 +289,7 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER audit_log_append_only
   BEFORE UPDATE OR DELETE ON "AuditLog"
   FOR EACH ROW EXECUTE FUNCTION prevent_audit_log_mutation();
+
+CREATE TRIGGER audit_log_no_truncate
+  BEFORE TRUNCATE ON "AuditLog"
+  FOR EACH STATEMENT EXECUTE FUNCTION prevent_audit_log_mutation();

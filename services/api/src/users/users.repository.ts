@@ -1,24 +1,37 @@
 import { Injectable } from '@nestjs/common';
 import { User, UserType } from '@prisma/client';
+import {
+  AuditEntry,
+  AuditLogService,
+} from '../common/audit/audit-log.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { TenantScopedRepository } from '../prisma/tenant-scoped.repository';
 
 @Injectable()
 export class UsersRepository extends TenantScopedRepository {
-  constructor(prisma: PrismaService) {
+  constructor(
+    prisma: PrismaService,
+    private readonly auditLog: AuditLogService,
+  ) {
     super(prisma);
   }
 
   create(
     tenantId: string,
     data: { email: string; firstName: string; lastName: string },
+    buildAuditEntry: (user: User) => AuditEntry,
   ): Promise<User> {
-    return this.prisma.user.create({
-      data: {
-        ...data,
-        tenantId: this.requireTenantId(tenantId),
-        userType: UserType.TENANT,
-      },
+    const scopedTenantId = this.requireTenantId(tenantId);
+    return this.prisma.$transaction(async (tx) => {
+      const user = await tx.user.create({
+        data: {
+          ...data,
+          tenantId: scopedTenantId,
+          userType: UserType.TENANT,
+        },
+      });
+      await this.auditLog.record(buildAuditEntry(user), tx);
+      return user;
     });
   }
 

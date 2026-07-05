@@ -19,7 +19,7 @@ export interface PlatformModuleSeedClient {
   platformModule: {
     upsert(args: {
       where: { code: string };
-      update: { name: string; description: string };
+      update: { name: string; description: string; isActive: boolean };
       create: {
         code: string;
         name: string;
@@ -57,18 +57,22 @@ export async function seedPermissions(
 export async function seedPlatformModules(
   db: PlatformModuleSeedClient,
 ): Promise<number> {
+  // isActive is owned by the code catalog on both create AND update, so
+  // re-seeding activates a module exactly when the phase that implements it
+  // ships — unimplemented modules stay inactive no matter how often seeds run.
   for (const platformModule of PLATFORM_MODULE_CATALOG) {
     await db.platformModule.upsert({
       where: { code: platformModule.code },
       update: {
         name: platformModule.name,
         description: platformModule.description,
+        isActive: platformModule.isActive,
       },
       create: {
         code: platformModule.code,
         name: platformModule.name,
         description: platformModule.description,
-        isActive: true,
+        isActive: platformModule.isActive,
       },
     });
   }

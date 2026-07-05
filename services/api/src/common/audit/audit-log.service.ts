@@ -6,13 +6,20 @@ export const SYSTEM_ACTOR_EMAIL = 'system@byond.internal';
 
 // Denylist applied recursively to before/after snapshots. Audit rows outlive
 // normal data-retention paths, so sensitive material must never enter them.
+// Keys are compared after normalization (lowercase, separators stripped), so
+// api_key, access-token, "secret.key", "Card Number" etc. all match.
 const REDACTED_FIELDS = new Set([
   'password',
   'passwordhash',
   'secret',
+  'secretkey',
+  'clientsecret',
+  'privatekey',
   'token',
   'accesstoken',
   'refreshtoken',
+  'sessiontoken',
+  'idtoken',
   'apikey',
   'authorization',
   'cardnumber',
@@ -20,6 +27,10 @@ const REDACTED_FIELDS = new Set([
   'cvv',
   'pan',
 ]);
+
+function normalizeKey(key: string): string {
+  return key.toLowerCase().replace(/[\s._-]/g, '');
+}
 
 export interface AuditEntry {
   tenantId: string | null;
@@ -43,10 +54,19 @@ export class AuditLogService {
   /**
    * Append an audit record. Intentionally NOT fire-and-forget: if the audit
    * write fails, the calling state change must fail with it (fail closed).
+   *
+   * Pass the surrounding Prisma transaction client as `tx` so the audit row
+   * commits or rolls back atomically with the mutation it describes —
+   * repositories performing audited mutations must always do this.
+   *
    * There are no update/delete methods on this service by design.
    */
-  async record(entry: AuditEntry): Promise<void> {
-    await this.prisma.auditLog.create({
+  async record(
+    entry: AuditEntry,
+    tx?: Prisma.TransactionClient,
+  ): Promise<void> {
+    const client = tx ?? this.prisma;
+    await client.auditLog.create({
       data: {
         tenantId: entry.tenantId,
         actorId: entry.actorId ?? null,
@@ -86,7 +106,7 @@ export class AuditLogService {
     if (value !== null && typeof value === 'object') {
       const result: Record<string, unknown> = {};
       for (const [key, val] of Object.entries(value)) {
-        if (REDACTED_FIELDS.has(key.toLowerCase())) {
+        if (REDACTED_FIELDS.has(normalizeKey(key))) {
           result[key] = '[REDACTED]';
         } else {
           result[key] = this.redact(val);

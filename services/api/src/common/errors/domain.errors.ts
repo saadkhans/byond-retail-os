@@ -7,3 +7,13 @@ export class TenantIdRequiredError extends Error {
     this.name = 'TenantIdRequiredError';
   }
 }
+
+export class DefaultModulesMissingError extends Error {
+  constructor(missingCodes: readonly string[]) {
+    super(
+      `Cannot create tenant: required default platform modules are missing or inactive: ` +
+        `${missingCodes.join(', ')}. Has the platform-module seed run?`,
+    );
+    this.name = 'DefaultModulesMissingError';
+  }
+}

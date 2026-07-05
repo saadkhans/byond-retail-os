@@ -4,7 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { AuditAction, Tenant, TenantStatus } from '@prisma/client';
-import { AuditLogService } from '../common/audit/audit-log.service';
+import { AuditEntry } from '../common/audit/audit-log.service';
 import { DEFAULT_ENABLED_MODULE_CODES } from '../platform-modules/platform-module.catalog';
 import { TenantsRepository } from './tenants.repository';
 import { TenantsService, toSlug } from './tenants.service';
@@ -33,7 +33,6 @@ describe('TenantsService', () => {
   };
 
   let repository: { createWithDefaultModules: jest.Mock; findById: jest.Mock };
-  let auditLog: { record: jest.Mock };
   let service: TenantsService;
 
   beforeEach(() => {
@@ -41,11 +40,7 @@ describe('TenantsService', () => {
       createWithDefaultModules: jest.fn().mockResolvedValue(tenant),
       findById: jest.fn().mockResolvedValue(tenant),
     };
-    auditLog = { record: jest.fn().mockResolvedValue(undefined) };
-    service = new TenantsService(
-      repository as unknown as TenantsRepository,
-      auditLog as unknown as AuditLogService,
-    );
+    service = new TenantsService(repository as unknown as TenantsRepository);
   });
 
   describe('create', () => {
@@ -55,6 +50,7 @@ describe('TenantsService', () => {
       expect(repository.createWithDefaultModules).toHaveBeenCalledWith(
         { name: 'Acme Stores!', slug: 'acme-stores' },
         DEFAULT_ENABLED_MODULE_CODES,
+        expect.any(Function),
       );
       expect(result).toBe(tenant);
     });
@@ -65,19 +61,24 @@ describe('TenantsService', () => {
       expect(repository.createWithDefaultModules).toHaveBeenCalledWith(
         { name: 'Acme Stores', slug: 'acme-eu' },
         DEFAULT_ENABLED_MODULE_CODES,
+        expect.any(Function),
       );
     });
 
-    it('writes an audit log entry scoped to the new tenant', async () => {
+    it('passes an audit entry builder that scopes the entry to the new tenant', async () => {
       await service.create({ name: 'Acme Stores' });
 
-      expect(auditLog.record).toHaveBeenCalledTimes(1);
-      expect(auditLog.record).toHaveBeenCalledWith(
+      const buildAuditEntry = repository.createWithDefaultModules.mock
+        .calls[0][2] as (created: Tenant) => AuditEntry;
+      const entry = buildAuditEntry(tenant);
+
+      expect(entry).toEqual(
         expect.objectContaining({
           tenantId: tenant.id,
           action: AuditAction.CREATE,
           entityType: 'Tenant',
           entityId: tenant.id,
+          after: tenant,
         }),
       );
     });
@@ -87,7 +88,6 @@ describe('TenantsService', () => {
         BadRequestException,
       );
       expect(repository.createWithDefaultModules).not.toHaveBeenCalled();
-      expect(auditLog.record).not.toHaveBeenCalled();
     });
 
     it('rejects a name that cannot produce a slug', async () => {
@@ -105,7 +105,6 @@ describe('TenantsService', () => {
       await expect(
         service.create({ name: 'Acme Stores' }),
       ).rejects.toBeInstanceOf(ConflictException);
-      expect(auditLog.record).not.toHaveBeenCalled();
     });
 
     it('rethrows unknown repository errors untouched', async () => {

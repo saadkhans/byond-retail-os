@@ -38,6 +38,21 @@ describe('platform module catalog', () => {
       expect(codes).toContain(expected);
     }
   });
+
+  it('keeps unimplemented modules inactive: only core is active', () => {
+    const active = PLATFORM_MODULE_CATALOG.filter((m) => m.isActive).map(
+      (m) => m.code,
+    );
+    expect(active).toEqual(['core']);
+  });
+
+  it('never marks an inactive module as default-enabled', () => {
+    for (const platformModule of PLATFORM_MODULE_CATALOG) {
+      if (platformModule.defaultEnabled) {
+        expect(platformModule.isActive).toBe(true);
+      }
+    }
+  });
 });
 
 describe('seedPermissions', () => {
@@ -87,6 +102,25 @@ describe('seedPlatformModules', () => {
     for (const platformModule of PLATFORM_MODULE_CATALOG) {
       expect(upsert).toHaveBeenCalledWith(
         expect.objectContaining({ where: { code: platformModule.code } }),
+      );
+    }
+  });
+
+  it('seeds isActive from the catalog on both create and update paths', async () => {
+    const upsert = jest.fn().mockResolvedValue({});
+    await seedPlatformModules({ platformModule: { upsert } });
+
+    for (const platformModule of PLATFORM_MODULE_CATALOG) {
+      expect(upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { code: platformModule.code },
+          create: expect.objectContaining({
+            isActive: platformModule.isActive,
+          }),
+          update: expect.objectContaining({
+            isActive: platformModule.isActive,
+          }),
+        }),
       );
     }
   });
