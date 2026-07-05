@@ -250,10 +250,15 @@ ALTER TABLE "TenantModule" ADD CONSTRAINT "TenantModule_tenantId_fkey" FOREIGN K
 ALTER TABLE "TenantModule" ADD CONSTRAINT "TenantModule_moduleId_fkey" FOREIGN KEY ("moduleId") REFERENCES "PlatformModule"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "AuditLog" ADD CONSTRAINT "AuditLog_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+-- AuditLog rows are immutable (append-only triggers below reject UPDATE), so
+-- these FKs must never require mutating audit rows: no SET NULL, no cascading
+-- updates. RESTRICT/NO ACTION means referenced users/tenants cannot be
+-- hard-deleted or re-keyed while audit history points at them — lifecycle is
+-- status-driven (DEACTIVATED/ARCHIVED) instead.
+ALTER TABLE "AuditLog" ADD CONSTRAINT "AuditLog_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE RESTRICT ON UPDATE NO ACTION;
 
 -- AddForeignKey
-ALTER TABLE "AuditLog" ADD CONSTRAINT "AuditLog_actorId_fkey" FOREIGN KEY ("actorId") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE "AuditLog" ADD CONSTRAINT "AuditLog_actorId_fkey" FOREIGN KEY ("actorId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE NO ACTION;
 
 ------------------------------------------------------------------------------
 -- BYOND hardening (hand-written — Prisma schema cannot express these).

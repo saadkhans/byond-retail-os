@@ -4,6 +4,7 @@ import {
   AuditEntry,
   AuditLogService,
 } from '../common/audit/audit-log.service';
+import { TenantIsolationViolationError } from '../common/errors/domain.errors';
 import { PrismaService } from '../prisma/prisma.service';
 import { TenantScopedRepository } from '../prisma/tenant-scoped.repository';
 
@@ -40,9 +41,14 @@ export class RolesRepository extends TenantScopedRepository {
   }
 
   /**
-   * Assign a tenant role to a user. tenantId is denormalized onto UserRole
-   * (invariant: it must equal the role's AND the user's tenantId — the
-   * service verifies both through tenant-scoped lookups before calling this).
+   * Assign a tenant role to a user. tenantId is denormalized onto UserRole.
+   *
+   * The tenancy invariant is enforced HERE, inside the transaction — not just
+   * by service-level prechecks. Every referenced row (target user, role, and
+   * the assigning actor when supplied) must carry the scoped tenantId, or the
+   * whole transaction fails closed. Platform users (tenantId NULL) and rows
+   * from other tenants can therefore never be committed into a tenant's
+   * UserRole, no matter which internal caller reaches this method.
    */
   assignToUser(
     tenantId: string,
@@ -51,6 +57,38 @@ export class RolesRepository extends TenantScopedRepository {
   ): Promise<UserRole> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
+      const [user, role] = await Promise.all([
+        tx.user.findFirst({
+          where: { id: data.userId, tenantId: scopedTenantId },
+          select: { id: true },
+        }),
+        tx.role.findFirst({
+          where: { id: data.roleId, tenantId: scopedTenantId },
+          select: { id: true },
+        }),
+      ]);
+      if (!user) {
+        throw new TenantIsolationViolationError(
+          `user "${data.userId}" does not belong to tenant "${scopedTenantId}"`,
+        );
+      }
+      if (!role) {
+        throw new TenantIsolationViolationError(
+          `role "${data.roleId}" does not belong to tenant "${scopedTenantId}"`,
+        );
+      }
+      if (data.assignedById !== undefined) {
+        const actor = await tx.user.findFirst({
+          where: { id: data.assignedById, tenantId: scopedTenantId },
+          select: { id: true },
+        });
+        if (!actor) {
+          throw new TenantIsolationViolationError(
+            `assigning user "${data.assignedById}" does not belong to tenant "${scopedTenantId}"`,
+          );
+        }
+      }
+
       const userRole = await tx.userRole.create({
         data: { ...data, tenantId: scopedTenantId },
       });

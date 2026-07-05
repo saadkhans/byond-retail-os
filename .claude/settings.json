@@ -5,7 +5,8 @@
       "PowerShell(pnpm --filter @byond/api run prisma:generate)",
       "PowerShell(pnpm run lint)",
       "PowerShell(pnpm run lint; \"LINT=$?\"; pnpm run typecheck | Out-Null; \"TYPECHECK=$?\"; Test-Path \"services\\\\api\\\\dist\\\\main.js\")",
-      "PowerShell(git status --short | Where-Object { $_ -notmatch '\\\\.claude' })"
+      "PowerShell(git status --short | Where-Object { $_ -notmatch '\\\\.claude' })",
+      "PowerShell(pnpm run build | Select-Object -Last 2; \"EXIT=$?\"; git status --short | Where-Object { $_ -notmatch '\\\\.claude' })"
     ]
   }
 }

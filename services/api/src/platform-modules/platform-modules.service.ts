@@ -38,9 +38,14 @@ export class PlatformModulesService {
     status: ModuleStatus,
   ): Promise<TenantModule> {
     const module = await this.platformModulesRepository.findByCode(moduleCode);
+    if (!module) {
+      throw new NotFoundException(`Platform module "${moduleCode}" not found`);
+    }
     // Inactive modules (unimplemented later-phase catalog entries) can never
-    // be enabled for a tenant — same failure as a module that doesn't exist.
-    if (!module || !module.isActive) {
+    // be ENABLED for a tenant. Disabling stays allowed for any existing
+    // catalog module — if a module is retired to inactive while tenants still
+    // have it enabled, cleanup must not be blocked.
+    if (status === ModuleStatus.ENABLED && !module.isActive) {
       throw new NotFoundException(`Platform module "${moduleCode}" not found`);
     }
 

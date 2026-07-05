@@ -8,6 +8,13 @@ export class TenantIdRequiredError extends Error {
   }
 }
 
+export class TenantIsolationViolationError extends Error {
+  constructor(detail: string) {
+    super(`Tenant isolation violation: ${detail}`);
+    this.name = 'TenantIsolationViolationError';
+  }
+}
+
 export class DefaultModulesMissingError extends Error {
   constructor(missingCodes: readonly string[]) {
     super(

@@ -6,8 +6,9 @@ export const SYSTEM_ACTOR_EMAIL = 'system@byond.internal';
 
 // Denylist applied recursively to before/after snapshots. Audit rows outlive
 // normal data-retention paths, so sensitive material must never enter them.
-// Keys are compared after normalization (lowercase, separators stripped), so
-// api_key, access-token, "secret.key", "Card Number" etc. all match.
+// Keys are reduced to lowercase alphanumerics before comparison, so every
+// separator style matches: api_key, access-token, access:token,
+// refresh/token, credit_card_number, "Card Number", secret.key, ...
 const REDACTED_FIELDS = new Set([
   'password',
   'passwordhash',
@@ -20,16 +21,22 @@ const REDACTED_FIELDS = new Set([
   'refreshtoken',
   'sessiontoken',
   'idtoken',
+  'bearer',
+  'bearertoken',
   'apikey',
   'authorization',
   'cardnumber',
   'creditcard',
+  'creditcardnumber',
   'cvv',
+  'cvc',
   'pan',
+  'pin',
+  'iban',
 ]);
 
 function normalizeKey(key: string): string {
-  return key.toLowerCase().replace(/[\s._-]/g, '');
+  return key.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
 export interface AuditEntry {

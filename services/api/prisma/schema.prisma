@@ -221,13 +221,18 @@ model TenantModule {
   @@index([moduleId])
 }
 
-// Append-only: no updatedAt, no update/delete repository methods, and a
-// migration-SQL trigger rejects UPDATE/DELETE at the database level.
+// Append-only: no updatedAt, no update/delete repository methods, and
+// migration-SQL triggers reject UPDATE/DELETE/TRUNCATE at the database level.
+// Because rows are immutable, FKs must never require mutating them: both
+// relations are Restrict/NoAction (a SetNull or cascading update would be
+// rejected by the append-only trigger and break the referencing operation).
+// Users are never hard-deleted while audit rows reference them — lifecycle is
+// status-driven (DEACTIVATED), per the platform's audit retention model.
 model AuditLog {
   id       String  @id @default(cuid())
   tenantId String?
   actorId  String?
-  // Snapshot — survives actor deletion (actorId is SetNull).
+  // Point-in-time snapshot of the actor's email at write time.
   actorEmail String
   action     AuditAction
   entityType String
@@ -240,8 +245,8 @@ model AuditLog {
   requestId  String?
   createdAt  DateTime    @default(now())
 
-  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  actor  User?   @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  actor  User?   @relation("AuditActor", fields: [actorId], references: [id], onDelete: Restrict, onUpdate: NoAction)
 
   @@index([tenantId, createdAt(sort: Desc)])
   @@index([tenantId, entityType, entityId])

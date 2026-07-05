@@ -78,6 +78,30 @@ describe('PlatformModulesService', () => {
     expect(tenantModulesRepository.setStatus).not.toHaveBeenCalled();
   });
 
+  it('allows disabling an existing module even when it is inactive (cleanup path)', async () => {
+    // A module retired to inactive while tenants still have it enabled must
+    // remain disable-able.
+    platformModulesRepository.findByCode.mockResolvedValue(inactiveModule);
+
+    await service.disable('tenant-a', 'inventory');
+
+    expect(tenantModulesRepository.setStatus).toHaveBeenCalledWith(
+      'tenant-a',
+      inactiveModule.id,
+      'DISABLED',
+      expect.any(Function),
+    );
+  });
+
+  it('refuses to disable a module that does not exist in the catalog', async () => {
+    platformModulesRepository.findByCode.mockResolvedValue(null);
+
+    await expect(service.disable('tenant-a', 'nope')).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
+    expect(tenantModulesRepository.setStatus).not.toHaveBeenCalled();
+  });
+
   it('disables with a DISABLE audit action', async () => {
     await service.disable('tenant-a', 'core');
 
