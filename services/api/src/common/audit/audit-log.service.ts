@@ -4,12 +4,19 @@ import { PrismaService } from '../../prisma/prisma.service';
 
 export const SYSTEM_ACTOR_EMAIL = 'system@byond.internal';
 
-// Denylist applied recursively to before/after snapshots. Audit rows outlive
-// normal data-retention paths, so sensitive material must never enter them.
-// Keys are reduced to lowercase alphanumerics before comparison, so every
-// separator style matches: api_key, access-token, access:token,
+// Redaction rules applied recursively to before/after snapshots. Audit rows
+// outlive normal data-retention paths, so sensitive material must never enter
+// them. Keys are reduced to lowercase alphanumerics before comparison, so
+// every separator style matches: api_key, access-token, access:token,
 // refresh/token, credit_card_number, "Card Number", secret.key, ...
-const REDACTED_FIELDS = new Set([
+//
+// Detection is exact-match PLUS suffix-match, so qualified aliases like
+// apiToken, paymentToken, cardToken, clientSecret, creditCardNumber, and
+// primary_account_number are caught without enumerating every prefix.
+// For audit snapshots, conservative over-redaction of credential-shaped
+// fields is acceptable; suffixes are chosen so common harmless fields
+// (timespan, tokenized, description, ...) never match.
+const REDACTED_EXACT = new Set([
   'password',
   'passwordhash',
   'secret',
@@ -30,13 +37,36 @@ const REDACTED_FIELDS = new Set([
   'creditcardnumber',
   'cvv',
   'cvc',
+  // PAN variants stay exact-match: a generic "pan" suffix would catch
+  // harmless fields like timespan.
   'pan',
+  'cardpan',
+  'primaryaccountnumber',
   'pin',
   'iban',
 ]);
 
+// A normalized key ENDING in any of these is redacted: apitoken,
+// paymenttoken, cardtoken, appsecret, webhooksecret, bankaccountnumber, ...
+const REDACTED_SUFFIXES = [
+  'token',
+  'secret',
+  'password',
+  'apikey',
+  'cardnumber',
+  'accountnumber',
+];
+
 function normalizeKey(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function isSensitiveKey(key: string): boolean {
+  const normalized = normalizeKey(key);
+  return (
+    REDACTED_EXACT.has(normalized) ||
+    REDACTED_SUFFIXES.some((suffix) => normalized.endsWith(suffix))
+  );
 }
 
 export interface AuditEntry {
@@ -113,7 +143,7 @@ export class AuditLogService {
     if (value !== null && typeof value === 'object') {
       const result: Record<string, unknown> = {};
       for (const [key, val] of Object.entries(value)) {
-        if (REDACTED_FIELDS.has(normalizeKey(key))) {
+        if (isSensitiveKey(key)) {
           result[key] = '[REDACTED]';
         } else {
           result[key] = this.redact(val);

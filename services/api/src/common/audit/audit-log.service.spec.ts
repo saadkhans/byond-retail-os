@@ -69,7 +69,17 @@ describe('AuditLogService', () => {
     'cvc',
     'pin',
     'iban',
-  ])('redacts %j regardless of separator style', async (key) => {
+    'apiToken',
+    'paymentToken',
+    'cardToken',
+    'cardPan',
+    'payment_token',
+    'card_token',
+    'card_pan',
+    'primary_account_number',
+    'webhookSecret',
+    'bank_account_number',
+  ])('redacts %j regardless of separator style or qualifier', async (key) => {
     await service.record({
       ...baseEntry,
       after: { [key]: 'sensitive-value', keepMe: 'visible' },
@@ -78,6 +88,47 @@ describe('AuditLogService', () => {
     const after = recordedData().after as Record<string, unknown>;
     expect(after[key]).toBe('[REDACTED]');
     expect(after.keepMe).toBe('visible');
+  });
+
+  it.each(['timespan', 'tokenized', 'description', 'company', 'firstName'])(
+    'does not over-redact harmless field %j',
+    async (key) => {
+      await service.record({
+        ...baseEntry,
+        after: { [key]: 'plain-value' },
+      });
+
+      const after = recordedData().after as Record<string, unknown>;
+      expect(after[key]).toBe('plain-value');
+    },
+  );
+
+  it('redacts qualified aliases nested in objects', async () => {
+    await service.record({
+      ...baseEntry,
+      after: {
+        payment: { paymentToken: 'tok_123', amount: 42 },
+      },
+    });
+
+    const after = recordedData().after as {
+      payment: Record<string, unknown>;
+    };
+    expect(after.payment.paymentToken).toBe('[REDACTED]');
+    expect(after.payment.amount).toBe(42);
+  });
+
+  it('redacts qualified aliases inside array items', async () => {
+    await service.record({
+      ...baseEntry,
+      after: { cards: [{ cardPan: '4111111111111111', brand: 'visa' }] },
+    });
+
+    const after = recordedData().after as {
+      cards: Record<string, unknown>[];
+    };
+    expect(after.cards[0].cardPan).toBe('[REDACTED]');
+    expect(after.cards[0].brand).toBe('visa');
   });
 
   it('redacts nested objects and arrays recursively', async () => {

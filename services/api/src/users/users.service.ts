@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
@@ -13,13 +14,24 @@ export class UsersService {
   constructor(private readonly usersRepository: UsersRepository) {}
 
   async create(tenantId: string, dto: CreateUserDto): Promise<User> {
+    // DTO @MinLength(1) passes for whitespace-only input; trim first and
+    // fail closed so empty names can never be persisted.
+    const firstName = dto.firstName.trim();
+    const lastName = dto.lastName.trim();
+    if (!firstName) {
+      throw new BadRequestException('firstName is required');
+    }
+    if (!lastName) {
+      throw new BadRequestException('lastName is required');
+    }
+
     try {
       return await this.usersRepository.create(
         tenantId,
         {
           email: dto.email.toLowerCase().trim(),
-          firstName: dto.firstName.trim(),
-          lastName: dto.lastName.trim(),
+          firstName,
+          lastName,
         },
         (user) => ({
           tenantId,

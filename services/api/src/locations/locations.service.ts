@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
@@ -13,15 +14,23 @@ export class LocationsService {
   constructor(private readonly locationsRepository: LocationsRepository) {}
 
   async create(tenantId: string, dto: CreateLocationDto): Promise<Location> {
+    // Same whitespace-only guard as users/tenants/roles: DTO @MinLength(1)
+    // passes for '   ', so trim and reject here. The code field needs no
+    // guard — its DTO pattern already forbids whitespace entirely.
+    const name = dto.name.trim();
+    if (!name) {
+      throw new BadRequestException('Location name is required');
+    }
     const code = dto.code.trim().toUpperCase();
     try {
       return await this.locationsRepository.create(
         tenantId,
         {
-          name: dto.name.trim(),
+          name,
           code,
           type: dto.type,
-          timezone: dto.timezone,
+          // Blank timezone falls back to the schema default (UTC).
+          timezone: dto.timezone?.trim() || undefined,
           address: dto.address as Prisma.InputJsonValue | undefined,
         },
         (location) => ({

@@ -11,7 +11,10 @@
       "PowerShell(cd \"c:\\\\Users\\\\walee\\\\Downloads\\\\BYOND AI\\\\byond-retail-os\"; pnpm run lint; \"LINT_OK=$?\")",
       "PowerShell(pnpm run typecheck | Select-Object -Last 3; \"TYPECHECK_OK=$?\")",
       "PowerShell(pnpm run test 2>$null | Select-Object -Last 8; \"TEST_OK=$?\")",
-      "PowerShell(cd services\\\\api; pnpm exec jest --silent 2>&1 | Select-String 'Tests:|Test Suites:'; cd ..\\\\..; pnpm run build | Out-Null; \"BUILD_OK=$?\"; Test-Path \"services\\\\api\\\\dist\\\\main.js\")"
+      "PowerShell(cd services\\\\api; pnpm exec jest --silent 2>&1 | Select-String 'Tests:|Test Suites:'; cd ..\\\\..; pnpm run build | Out-Null; \"BUILD_OK=$?\"; Test-Path \"services\\\\api\\\\dist\\\\main.js\")",
+      "PowerShell(pnpm run lint; \"LINT=$?\"; pnpm run typecheck | Out-Null; \"TYPECHECK=$?\")",
+      "PowerShell(cd services\\\\api; pnpm exec jest --silent 2>&1 | Select-String 'Tests:|Test Suites:|FAIL'; cd ..\\\\..; pnpm run build | Out-Null; \"BUILD=$?\"; Test-Path \"services\\\\api\\\\dist\\\\main.js\")",
+      "PowerShell(pnpm run lint | Out-Null; \"LINT=$?\"; pnpm run typecheck | Out-Null; \"TYPECHECK=$?\"; cd services\\\\api; pnpm exec jest --silent 2>&1 | Select-String 'Tests:|Test Suites:|FAIL'; cd ..\\\\..; pnpm run build | Out-Null; \"BUILD=$?\"; git status --short | Where-Object { $_ -notmatch '\\\\.claude|\\\\.vscode' })"
     ]
   }
 }
