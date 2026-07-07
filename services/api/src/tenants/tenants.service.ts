@@ -5,7 +5,10 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { AuditAction, Tenant } from '@prisma/client';
-import { SYSTEM_ACTOR_EMAIL } from '../common/audit/audit-log.service';
+import {
+  AuditActor,
+  SYSTEM_ACTOR_EMAIL,
+} from '../common/audit/audit-log.service';
 import { DEFAULT_ENABLED_MODULE_CODES } from '../platform-modules/platform-module.catalog';
 import { CreateTenantDto } from './dto/create-tenant.dto';
 import { TenantsRepository } from './tenants.repository';
@@ -31,7 +34,7 @@ function isUniqueConstraintViolation(error: unknown): boolean {
 export class TenantsService {
   constructor(private readonly tenantsRepository: TenantsRepository) {}
 
-  async create(dto: CreateTenantDto): Promise<Tenant> {
+  async create(dto: CreateTenantDto, actor?: AuditActor): Promise<Tenant> {
     const name = dto.name?.trim();
     if (!name) {
       throw new BadRequestException('Tenant name is required');
@@ -51,7 +54,8 @@ export class TenantsService {
         DEFAULT_ENABLED_MODULE_CODES,
         (tenant) => ({
           tenantId: tenant.id,
-          actorEmail: SYSTEM_ACTOR_EMAIL,
+          actorId: actor?.id ?? null,
+          actorEmail: actor?.email ?? SYSTEM_ACTOR_EMAIL,
           action: AuditAction.CREATE,
           entityType: 'Tenant',
           entityId: tenant.id,

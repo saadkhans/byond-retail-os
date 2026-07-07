@@ -5,7 +5,10 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { AuditAction, Location, Prisma } from '@prisma/client';
-import { SYSTEM_ACTOR_EMAIL } from '../common/audit/audit-log.service';
+import {
+  AuditActor,
+  SYSTEM_ACTOR_EMAIL,
+} from '../common/audit/audit-log.service';
 import { CreateLocationDto } from './dto/create-location.dto';
 import { LocationsRepository } from './locations.repository';
 
@@ -13,7 +16,11 @@ import { LocationsRepository } from './locations.repository';
 export class LocationsService {
   constructor(private readonly locationsRepository: LocationsRepository) {}
 
-  async create(tenantId: string, dto: CreateLocationDto): Promise<Location> {
+  async create(
+    tenantId: string,
+    dto: CreateLocationDto,
+    actor?: AuditActor,
+  ): Promise<Location> {
     // Same whitespace-only guard as users/tenants/roles: DTO @MinLength(1)
     // passes for '   ', so trim and reject here. The code field needs no
     // guard — its DTO pattern already forbids whitespace entirely.
@@ -35,7 +42,8 @@ export class LocationsService {
         },
         (location) => ({
           tenantId,
-          actorEmail: SYSTEM_ACTOR_EMAIL,
+          actorId: actor?.id ?? null,
+          actorEmail: actor?.email ?? SYSTEM_ACTOR_EMAIL,
           action: AuditAction.CREATE,
           entityType: 'Location',
           entityId: location.id,

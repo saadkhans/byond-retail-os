@@ -5,7 +5,10 @@ import {
   PlatformModule,
   TenantModule,
 } from '@prisma/client';
-import { SYSTEM_ACTOR_EMAIL } from '../common/audit/audit-log.service';
+import {
+  AuditActor,
+  SYSTEM_ACTOR_EMAIL,
+} from '../common/audit/audit-log.service';
 import { PlatformModulesRepository } from './platform-modules.repository';
 import { TenantModulesRepository } from './tenant-modules.repository';
 
@@ -24,18 +27,27 @@ export class PlatformModulesService {
     return this.tenantModulesRepository.findMany(tenantId);
   }
 
-  async enable(tenantId: string, moduleCode: string): Promise<TenantModule> {
-    return this.setStatus(tenantId, moduleCode, ModuleStatus.ENABLED);
+  async enable(
+    tenantId: string,
+    moduleCode: string,
+    actor?: AuditActor,
+  ): Promise<TenantModule> {
+    return this.setStatus(tenantId, moduleCode, ModuleStatus.ENABLED, actor);
   }
 
-  async disable(tenantId: string, moduleCode: string): Promise<TenantModule> {
-    return this.setStatus(tenantId, moduleCode, ModuleStatus.DISABLED);
+  async disable(
+    tenantId: string,
+    moduleCode: string,
+    actor?: AuditActor,
+  ): Promise<TenantModule> {
+    return this.setStatus(tenantId, moduleCode, ModuleStatus.DISABLED, actor);
   }
 
   private async setStatus(
     tenantId: string,
     moduleCode: string,
     status: ModuleStatus,
+    actor?: AuditActor,
   ): Promise<TenantModule> {
     const module = await this.platformModulesRepository.findByCode(moduleCode);
     if (!module) {
@@ -55,7 +67,8 @@ export class PlatformModulesService {
       status,
       (tenantModule) => ({
         tenantId,
-        actorEmail: SYSTEM_ACTOR_EMAIL,
+        actorId: actor?.id ?? null,
+        actorEmail: actor?.email ?? SYSTEM_ACTOR_EMAIL,
         action:
           status === ModuleStatus.ENABLED
             ? AuditAction.ENABLE
