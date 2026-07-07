@@ -4,16 +4,23 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { AuditAction, User } from '@prisma/client';
-import { SYSTEM_ACTOR_EMAIL } from '../common/audit/audit-log.service';
+import { AuditAction } from '@prisma/client';
+import {
+  AuditActor,
+  SYSTEM_ACTOR_EMAIL,
+} from '../common/audit/audit-log.service';
 import { CreateUserDto } from './dto/create-user.dto';
-import { UsersRepository } from './users.repository';
+import { SafeDbUser, UsersRepository } from './users.repository';
 
 @Injectable()
 export class UsersService {
   constructor(private readonly usersRepository: UsersRepository) {}
 
-  async create(tenantId: string, dto: CreateUserDto): Promise<User> {
+  async create(
+    tenantId: string,
+    dto: CreateUserDto,
+    actor?: AuditActor,
+  ): Promise<SafeDbUser> {
     // DTO @MinLength(1) passes for whitespace-only input; trim first and
     // fail closed so empty names can never be persisted.
     const firstName = dto.firstName.trim();
@@ -35,7 +42,8 @@ export class UsersService {
         },
         (user) => ({
           tenantId,
-          actorEmail: SYSTEM_ACTOR_EMAIL,
+          actorId: actor?.id ?? null,
+          actorEmail: actor?.email ?? SYSTEM_ACTOR_EMAIL,
           action: AuditAction.CREATE,
           entityType: 'User',
           entityId: user.id,
@@ -51,7 +59,7 @@ export class UsersService {
     }
   }
 
-  async findById(tenantId: string, id: string): Promise<User> {
+  async findById(tenantId: string, id: string): Promise<SafeDbUser> {
     const user = await this.usersRepository.findById(tenantId, id);
     if (!user) {
       throw new NotFoundException(`User "${id}" not found`);
@@ -59,7 +67,7 @@ export class UsersService {
     return user;
   }
 
-  findMany(tenantId: string): Promise<User[]> {
+  findMany(tenantId: string): Promise<SafeDbUser[]> {
     return this.usersRepository.findMany(tenantId);
   }
 }

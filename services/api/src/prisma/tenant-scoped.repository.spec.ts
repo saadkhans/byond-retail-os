@@ -1,5 +1,5 @@
 import { TenantIdRequiredError } from '../common/errors/domain.errors';
-import { UsersRepository } from '../users/users.repository';
+import { SAFE_USER_SELECT, UsersRepository } from '../users/users.repository';
 import { PrismaService } from './prisma.service';
 import { TenantScopedRepository } from './tenant-scoped.repository';
 
@@ -100,6 +100,7 @@ describe('UsersRepository (cross-tenant isolation)', () => {
         tenantId: 'tenant-a',
         userType: 'TENANT',
       }),
+      select: SAFE_USER_SELECT,
     });
     expect(auditLog.record).toHaveBeenCalledWith(
       expect.objectContaining({ tenantId: 'tenant-a' }),
@@ -107,11 +108,16 @@ describe('UsersRepository (cross-tenant isolation)', () => {
     );
   });
 
+  it('never selects the credential hash in non-auth queries', () => {
+    expect(SAFE_USER_SELECT).not.toHaveProperty('passwordHash');
+  });
+
   it("tenant A's lookup of tenant B's record id is scoped to tenant A", async () => {
     await repo.findById('tenant-a', 'user-belonging-to-tenant-b');
 
     expect(prisma.user.findFirst).toHaveBeenCalledWith({
       where: { id: 'user-belonging-to-tenant-b', tenantId: 'tenant-a' },
+      select: SAFE_USER_SELECT,
     });
   });
 
@@ -120,6 +126,7 @@ describe('UsersRepository (cross-tenant isolation)', () => {
 
     expect(prisma.user.findMany).toHaveBeenCalledWith({
       where: { tenantId: 'tenant-a' },
+      select: SAFE_USER_SELECT,
     });
   });
 

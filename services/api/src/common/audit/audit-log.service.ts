@@ -69,6 +69,12 @@ function isSensitiveKey(key: string): boolean {
   );
 }
 
+/** Authenticated actor attribution for audited mutations. */
+export interface AuditActor {
+  id: string;
+  email: string;
+}
+
 export interface AuditEntry {
   tenantId: string | null;
   actorId?: string | null;

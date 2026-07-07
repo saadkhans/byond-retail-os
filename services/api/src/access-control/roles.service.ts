@@ -5,7 +5,10 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { AuditAction, Role, UserRole } from '@prisma/client';
-import { SYSTEM_ACTOR_EMAIL } from '../common/audit/audit-log.service';
+import {
+  AuditActor,
+  SYSTEM_ACTOR_EMAIL,
+} from '../common/audit/audit-log.service';
 import { UsersRepository } from '../users/users.repository';
 import { CreateRoleDto } from './dto/create-role.dto';
 import { RolesRepository } from './roles.repository';
@@ -17,7 +20,11 @@ export class RolesService {
     private readonly usersRepository: UsersRepository,
   ) {}
 
-  async create(tenantId: string, dto: CreateRoleDto): Promise<Role> {
+  async create(
+    tenantId: string,
+    dto: CreateRoleDto,
+    actor?: AuditActor,
+  ): Promise<Role> {
     const name = dto.name.trim();
     if (!name) {
       throw new BadRequestException('Role name is required');
@@ -29,7 +36,8 @@ export class RolesService {
         { name, description: dto.description?.trim() },
         (role) => ({
           tenantId,
-          actorEmail: SYSTEM_ACTOR_EMAIL,
+          actorId: actor?.id ?? null,
+          actorEmail: actor?.email ?? SYSTEM_ACTOR_EMAIL,
           action: AuditAction.CREATE,
           entityType: 'Role',
           entityId: role.id,

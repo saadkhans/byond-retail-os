@@ -111,4 +111,31 @@ describe('PlatformModulesService', () => {
       expect.objectContaining({ action: AuditAction.DISABLE }),
     );
   });
+
+  it('audits the authenticated actor, not the system placeholder, when provided', async () => {
+    const actor = { id: 'user-9', email: 'ops@tenant-a.example' };
+    await service.enable('tenant-a', 'core', actor);
+
+    const buildAuditEntry = tenantModulesRepository.setStatus.mock
+      .calls[0][3] as (created: TenantModule) => AuditEntry;
+    expect(buildAuditEntry(tenantModule)).toEqual(
+      expect.objectContaining({
+        actorId: 'user-9',
+        actorEmail: 'ops@tenant-a.example',
+      }),
+    );
+  });
+
+  it('falls back to the system actor only when no actor is supplied', async () => {
+    await service.disable('tenant-a', 'core');
+
+    const buildAuditEntry = tenantModulesRepository.setStatus.mock
+      .calls[0][3] as (created: TenantModule) => AuditEntry;
+    expect(buildAuditEntry(tenantModule)).toEqual(
+      expect.objectContaining({
+        actorId: null,
+        actorEmail: 'system@byond.internal',
+      }),
+    );
+  });
 });

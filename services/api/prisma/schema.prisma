@@ -72,6 +72,9 @@ enum AuditAction {
   REACTIVATE
   CONFIG_CHANGE
   ACCESS_DENIED
+  LOGIN
+  LOGOUT
+  PASSWORD_CHANGE
 }
 
 model Tenant {
@@ -91,14 +94,20 @@ model Tenant {
 }
 
 model User {
-  id          String     @id @default(cuid())
-  tenantId    String?
-  userType    UserType
-  email       String     @unique
-  firstName   String
-  lastName    String
-  status      UserStatus @default(INVITED)
-  lastLoginAt DateTime?
+  id       String   @id @default(cuid())
+  tenantId String?
+  userType UserType
+  email    String   @unique
+  firstName String
+  lastName  String
+  status    UserStatus @default(INVITED)
+  // Nullable: users may authenticate via future providers (SSO/OIDC/OTP)
+  // and never hold a local credential. Never plaintext. Only AuthRepository
+  // may load this column — every non-auth user query goes through
+  // SAFE_USER_SELECT (users.repository.ts), which omits it; audit snapshot
+  // redaction and toSafeUser() are additional layers, not the only ones.
+  passwordHash String?
+  lastLoginAt  DateTime?
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
 
