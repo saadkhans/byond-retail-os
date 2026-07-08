@@ -189,6 +189,12 @@ export class ProductsService {
           'Referenced category or brand no longer exists',
         );
       }
+      // A plain (non-stock-locked) update reads `before`, then the product can
+      // be deleted concurrently before tx.product.update() runs (P2025). The
+      // product is gone — surface the same 404 as a missing target.
+      if (prismaErrorCode(error) === 'P2025') {
+        throw new NotFoundException(`Product "${id}" not found`);
+      }
       throw error;
     }
     if (updated === 'uom-change-blocked') {

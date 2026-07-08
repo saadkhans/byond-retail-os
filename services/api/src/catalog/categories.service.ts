@@ -71,6 +71,12 @@ export class CategoriesService {
           `A category named "${name}" already exists for this tenant`,
         );
       }
+      // The parent was validated above, but a concurrent delete can remove it
+      // before the insert lands (Restrict FK → P2003). Map to a controlled
+      // 400 instead of a 500.
+      if (prismaErrorCode(error) === 'P2003') {
+        throw new BadRequestException('Parent category no longer exists');
+      }
       throw error;
     }
   }
@@ -138,6 +144,12 @@ export class CategoriesService {
         throw new ConflictException(
           `A category named "${data.name}" already exists for this tenant`,
         );
+      }
+      // assertValidParent ran before the transaction, so the chosen parent can
+      // be deleted before the update writes the new FK (Restrict FK → P2003).
+      // Map to a controlled 400 instead of a 500.
+      if (prismaErrorCode(error) === 'P2003') {
+        throw new BadRequestException('Parent category no longer exists');
       }
       throw error;
     }

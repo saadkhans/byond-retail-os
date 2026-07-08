@@ -86,6 +86,21 @@ describe('CategoriesService', () => {
     ).rejects.toBeInstanceOf(ConflictException);
   });
 
+  it('maps a stale parent FK on create to a 400', async () => {
+    // Parent validated, then deleted before the insert lands.
+    repository.create.mockRejectedValue({ code: 'P2003' });
+    await expect(
+      service.create('tenant-a', { name: 'Sodas', parentId: 'cat-1' }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('maps a stale parent FK on update to a 400', async () => {
+    repository.update.mockRejectedValue({ code: 'P2003' });
+    await expect(
+      service.update('tenant-a', 'cat-1', { parentId: 'cat-parent' }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
   it('rejects an empty update', async () => {
     await expect(service.update('tenant-a', 'cat-1', {})).rejects.toBeInstanceOf(
       BadRequestException,

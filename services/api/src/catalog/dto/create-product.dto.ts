@@ -25,8 +25,11 @@ export class ProductBarcodeInputDto {
   @Matches(/^\S+$/, { message: 'barcode value must not contain whitespace' })
   value!: string;
 
+  // Non-nullable enum column: reject an explicit null (which @IsOptional would
+  // wave through normalizeBarcodes into a Prisma/DB error) while still letting
+  // the field be omitted so the schema default (OTHER) applies.
   @ApiPropertyOptional({ enum: BarcodeFormat, default: BarcodeFormat.OTHER })
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   @IsEnum(BarcodeFormat)
   format?: BarcodeFormat;
 }

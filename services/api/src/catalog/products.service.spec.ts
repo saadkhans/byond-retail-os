@@ -179,6 +179,15 @@ describe('ProductsService', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 
+  it('maps a concurrent product delete (P2025) on update to a 404', async () => {
+    // A plain field update read `before`, then the product was deleted before
+    // the write landed.
+    products.update.mockRejectedValue({ code: 'P2025' });
+    await expect(
+      service.update('tenant-a', 'prod-1', { name: 'Renamed' }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
   it('maps delete FK violations to "archive instead" conflict', async () => {
     products.delete.mockRejectedValue({ code: 'P2003' });
     await expect(service.delete('tenant-a', 'prod-1')).rejects.toThrow(

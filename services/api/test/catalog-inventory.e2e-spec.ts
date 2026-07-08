@@ -942,6 +942,14 @@ describe('Catalog & Inventory (e2e, no live database)', () => {
         .send({ value: '5000112637922' })
         .expect(409);
 
+      // An explicit null format is rejected at validation (400), not written
+      // to the non-nullable BarcodeFormat column as a raw DB error.
+      await request(app.getHttpServer())
+        .post(`/catalog/products/${productId}/barcodes`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ value: '9999999999999', format: null })
+        .expect(400);
+
       await request(app.getHttpServer())
         .delete(`/catalog/products/${productId}/barcodes/${barcodeId}`)
         .set('Authorization', `Bearer ${managerToken}`)
