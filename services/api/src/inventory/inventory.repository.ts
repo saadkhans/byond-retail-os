@@ -184,8 +184,15 @@ export class InventoryRepository extends TenantScopedRepository {
         // decrease going negative; the upper bound (added only for increases)
         // stops the sum overflowing the INTEGER column. Zero rows updated ⇒
         // the adjustment would breach a bound.
+        const requiredMinimum = Math.max(0, -data.quantityDelta);
+        // A decrease of PG_INT_MIN needs a minimum of PG_INT_MAX+1 on hand,
+        // which no INTEGER column can hold. Short-circuit before that bound
+        // reaches Prisma as an out-of-range filter literal.
+        if (requiredMinimum > PG_INT_MAX) {
+          throw new AdjustmentRejected('insufficient-stock');
+        }
         const quantityBound: Prisma.IntFilter = {
-          gte: Math.max(0, -data.quantityDelta),
+          gte: requiredMinimum,
         };
         if (data.quantityDelta > 0) {
           quantityBound.lte = PG_INT_MAX - data.quantityDelta;

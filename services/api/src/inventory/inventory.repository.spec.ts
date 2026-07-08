@@ -163,6 +163,22 @@ describe('InventoryRepository.adjust', () => {
     ).toEqual({ gte: 0, lte: 2147483647 - 10 });
   });
 
+  it('short-circuits an INT_MIN decrement to insufficient-stock without an out-of-range filter', async () => {
+    const tx = buildTx();
+    const repository = buildRepository(tx);
+    // -(-2147483648) = 2147483648 > PG_INT_MAX: no level can satisfy it, so
+    // this is resolved before any filter reaches Prisma.
+    await expect(
+      repository.adjust(
+        'tenant-a',
+        { ...input, quantityDelta: -2147483648 },
+        buildAuditEntry,
+      ),
+    ).resolves.toBe('insufficient-stock');
+    expect(tx.inventoryLevel.updateMany).not.toHaveBeenCalled();
+    expect(tx.inventoryMovement.create).not.toHaveBeenCalled();
+  });
+
   it('reports quantity-overflow (not insufficient-stock) when an increase would exceed the INT max', async () => {
     const tx = buildTx({
       inventoryLevel: {

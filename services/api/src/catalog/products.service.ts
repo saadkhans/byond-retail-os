@@ -156,20 +156,33 @@ export class ProductsService {
       dto.brandId ?? undefined,
     );
 
-    const updated = await this.productsRepository.update(
-      tenantId,
-      id,
-      data,
-      (before, after) =>
-        this.auditEntry(tenantId, actor, {
-          action: AuditAction.UPDATE,
-          entityType: 'Product',
-          entityId: after.id,
-          before,
-          after,
-          reason: 'Product updated',
-        }),
-    );
+    let updated: Awaited<ReturnType<ProductsRepository['update']>>;
+    try {
+      updated = await this.productsRepository.update(
+        tenantId,
+        id,
+        data,
+        (before, after) =>
+          this.auditEntry(tenantId, actor, {
+            action: AuditAction.UPDATE,
+            entityType: 'Product',
+            entityId: after.id,
+            before,
+            after,
+            reason: 'Product updated',
+          }),
+      );
+    } catch (error) {
+      // The category/brand were validated above, but a concurrent delete can
+      // remove them before this update lands, surfacing a Restrict FK
+      // violation. Map it to a controlled 400 instead of a 500.
+      if (prismaErrorCode(error) === 'P2003') {
+        throw new BadRequestException(
+          'Referenced category or brand no longer exists',
+        );
+      }
+      throw error;
+    }
     if (updated === 'uom-change-blocked') {
       throw new ConflictException(
         'Unit of measure cannot be changed once the product has inventory ' +

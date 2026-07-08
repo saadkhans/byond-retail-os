@@ -209,6 +209,8 @@ describe('ProductsRepository.delete (barcode audit)', () => {
       ],
     };
     const tx = {
+      // Per-product advisory lock shared with inventory adjust().
+      $queryRaw: jest.fn().mockResolvedValue([1]),
       product: {
         findFirst: jest.fn().mockResolvedValue(existing),
         delete: jest.fn().mockResolvedValue(existing),
@@ -244,5 +246,8 @@ describe('ProductsRepository.delete (barcode audit)', () => {
     expect(tx.productBarcode.deleteMany).toHaveBeenCalled();
     expect(tx.product.delete).toHaveBeenCalled();
     expect(auditLog.record).toHaveBeenCalledWith(expect.any(Object), tx);
+    // Serializes against adjust() so a concurrent adjustment can't race the
+    // delete into a raw FK error.
+    expect(tx.$queryRaw).toHaveBeenCalled();
   });
 });

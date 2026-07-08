@@ -242,6 +242,15 @@ export class ProductsRepository extends TenantScopedRepository {
   ): Promise<ProductWithBarcodes | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
+      // Serialize against inventory adjustments for this product (same lock
+      // adjust() takes). Otherwise a concurrent adjustment can pass its
+      // existence/status check, then this delete commits first, and the
+      // adjustment fails with a raw FK error instead of a controlled 404/409.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
+        scopedTenantId,
+        id,
+      )}))`;
+
       // Load the product WITH its barcodes so the delete audit captures the
       // scan identifiers being removed. Without this the barcodes would
       // disappear via the bulk deleteMany with no auditable trace.

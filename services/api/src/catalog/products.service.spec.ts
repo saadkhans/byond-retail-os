@@ -157,6 +157,15 @@ describe('ProductsService', () => {
     ).rejects.toBeInstanceOf(ConflictException);
   });
 
+  it('maps a stale category/brand FK violation on update to a 400', async () => {
+    // A concurrent delete removed the referenced category/brand between the
+    // service's validation and the update landing.
+    products.update.mockRejectedValue({ code: 'P2003' });
+    await expect(
+      service.update('tenant-a', 'prod-1', { categoryId: 'cat-x' }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
   it('maps delete FK violations to "archive instead" conflict', async () => {
     products.delete.mockRejectedValue({ code: 'P2003' });
     await expect(service.delete('tenant-a', 'prod-1')).rejects.toThrow(
