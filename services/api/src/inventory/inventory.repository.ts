@@ -43,6 +43,20 @@ export interface AdjustmentResult {
   movement: InventoryMovement;
 }
 
+/**
+ * Thrown INSIDE the adjustment transaction to abort it. Rejecting by throwing
+ * (rather than returning a sentinel) guarantees the whole transaction rolls
+ * back — including any InventoryLevel row the upsert created — so a rejected
+ * adjustment never leaves an orphan projection behind. Caught at the boundary
+ * and mapped back to the AdjustmentFailure sentinel.
+ */
+class AdjustmentRejected extends Error {
+  constructor(readonly reason: AdjustmentFailure) {
+    super(reason);
+    this.name = 'AdjustmentRejected';
+  }
+}
+
 @Injectable()
 export class InventoryRepository extends TenantScopedRepository {
   constructor(
@@ -77,86 +91,128 @@ export class InventoryRepository extends TenantScopedRepository {
       level: InventoryLevel,
     ) => AuditEntry,
   ): Promise<AdjustmentResult | AdjustmentFailure> {
+    // Synchronous (never a wildcard query) — must run before the promise.
     const scopedTenantId = this.requireTenantId(tenantId);
-    return this.prisma.$transaction(async (tx) => {
-      // Scoped existence checks: ids from other tenants are simply not found.
-      const location = await tx.location.findFirst({
-        where: { id: data.locationId, tenantId: scopedTenantId },
-        select: { id: true },
-      });
-      if (!location) {
-        return 'location-not-found' as const;
-      }
-      const product = await tx.product.findFirst({
-        where: { id: data.productId, tenantId: scopedTenantId },
-        select: { id: true, status: true },
-      });
-      if (!product) {
-        return 'product-not-found' as const;
-      }
-      if (product.status === ProductStatus.ARCHIVED) {
-        return 'product-archived' as const;
-      }
+    return this.runAdjustment(scopedTenantId, data, buildAuditEntry);
+  }
 
-      // Ensure the projection row exists (starts at zero stock).
-      await tx.inventoryLevel.upsert({
-        where: {
-          tenantId_locationId_productId: {
+  private async runAdjustment(
+    scopedTenantId: string,
+    data: {
+      locationId: string;
+      productId: string;
+      quantityDelta: number;
+      reason: string;
+      createdById?: string;
+    },
+    buildAuditEntry: (
+      movement: InventoryMovement,
+      level: InventoryLevel,
+    ) => AuditEntry,
+  ): Promise<AdjustmentResult | AdjustmentFailure> {
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        // Scoped existence checks: ids from other tenants are simply not
+        // found. Every rejection THROWS so the transaction rolls back —
+        // see AdjustmentRejected.
+        const location = await tx.location.findFirst({
+          where: { id: data.locationId, tenantId: scopedTenantId },
+          select: { id: true },
+        });
+        if (!location) {
+          throw new AdjustmentRejected('location-not-found');
+        }
+        const product = await tx.product.findFirst({
+          where: { id: data.productId, tenantId: scopedTenantId },
+          select: { id: true, status: true },
+        });
+        if (!product) {
+          throw new AdjustmentRejected('product-not-found');
+        }
+        if (product.status === ProductStatus.ARCHIVED) {
+          throw new AdjustmentRejected('product-archived');
+        }
+
+        // Attribute the movement only to an actor IN THIS TENANT. A
+        // createdById from another tenant (or a stale/deleted user) resolves
+        // to null rather than corrupting tenant-scoped ledger attribution —
+        // the single-column FK alone would accept any global user id.
+        const actorId = data.createdById
+          ? ((
+              await tx.user.findFirst({
+                where: { id: data.createdById, tenantId: scopedTenantId },
+                select: { id: true },
+              })
+            )?.id ?? null)
+          : null;
+
+        // Ensure the projection row exists (starts at zero stock). If the
+        // adjustment is later rejected, this insert is rolled back with the
+        // rest of the transaction, so no orphan level survives.
+        await tx.inventoryLevel.upsert({
+          where: {
+            tenantId_locationId_productId: {
+              tenantId: scopedTenantId,
+              locationId: data.locationId,
+              productId: data.productId,
+            },
+          },
+          update: {},
+          create: {
             tenantId: scopedTenantId,
             locationId: data.locationId,
             productId: data.productId,
+            quantity: 0,
           },
-        },
-        update: {},
-        create: {
-          tenantId: scopedTenantId,
-          locationId: data.locationId,
-          productId: data.productId,
-          quantity: 0,
-        },
-      });
+        });
 
-      // Conditional atomic increment: matches only when the resulting
-      // quantity stays >= 0. Zero rows updated ⇒ insufficient stock.
-      const updated = await tx.inventoryLevel.updateMany({
-        where: {
-          tenantId: scopedTenantId,
-          locationId: data.locationId,
-          productId: data.productId,
-          quantity: { gte: Math.max(0, -data.quantityDelta) },
-        },
-        data: { quantity: { increment: data.quantityDelta } },
-      });
-      if (updated.count === 0) {
-        return 'insufficient-stock' as const;
-      }
-
-      const level = await tx.inventoryLevel.findUniqueOrThrow({
-        where: {
-          tenantId_locationId_productId: {
+        // Conditional atomic increment: matches only when the resulting
+        // quantity stays >= 0. Zero rows updated ⇒ insufficient stock.
+        const updated = await tx.inventoryLevel.updateMany({
+          where: {
             tenantId: scopedTenantId,
             locationId: data.locationId,
             productId: data.productId,
+            quantity: { gte: Math.max(0, -data.quantityDelta) },
           },
-        },
-      });
+          data: { quantity: { increment: data.quantityDelta } },
+        });
+        if (updated.count === 0) {
+          throw new AdjustmentRejected('insufficient-stock');
+        }
 
-      const movement = await tx.inventoryMovement.create({
-        data: {
-          tenantId: scopedTenantId,
-          locationId: data.locationId,
-          productId: data.productId,
-          movementType: InventoryMovementType.ADJUSTMENT,
-          quantityDelta: data.quantityDelta,
-          quantityAfter: level.quantity,
-          reason: data.reason,
-          createdById: data.createdById ?? null,
-        },
-      });
+        const level = await tx.inventoryLevel.findUniqueOrThrow({
+          where: {
+            tenantId_locationId_productId: {
+              tenantId: scopedTenantId,
+              locationId: data.locationId,
+              productId: data.productId,
+            },
+          },
+        });
 
-      await this.auditLog.record(buildAuditEntry(movement, level), tx);
-      return { level, movement };
-    });
+        const movement = await tx.inventoryMovement.create({
+          data: {
+            tenantId: scopedTenantId,
+            locationId: data.locationId,
+            productId: data.productId,
+            movementType: InventoryMovementType.ADJUSTMENT,
+            quantityDelta: data.quantityDelta,
+            quantityAfter: level.quantity,
+            reason: data.reason,
+            createdById: actorId,
+          },
+        });
+
+        await this.auditLog.record(buildAuditEntry(movement, level), tx);
+        return { level, movement };
+      });
+    } catch (error) {
+      if (error instanceof AdjustmentRejected) {
+        return error.reason;
+      }
+      throw error;
+    }
   }
 
   findLevels(
