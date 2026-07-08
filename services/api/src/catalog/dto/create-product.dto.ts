@@ -8,12 +8,14 @@ import {
   IsOptional,
   IsString,
   Matches,
+  Max,
   MaxLength,
   Min,
   MinLength,
   ValidateIf,
   ValidateNested,
 } from 'class-validator';
+import { PG_INT_MAX } from '../../common/integer-bounds';
 
 export class ProductBarcodeInputDto {
   @ApiProperty({ example: '4006381333931', maxLength: 64 })
@@ -93,6 +95,7 @@ export class CreateProductDto {
   @IsOptional()
   @IsInt()
   @Min(0)
+  @Max(PG_INT_MAX)
   lowStockThreshold?: number;
 
   @ApiPropertyOptional({

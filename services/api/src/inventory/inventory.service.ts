@@ -84,6 +84,11 @@ export class InventoryService {
         throw new ConflictException(
           'Adjustment rejected: it would take on-hand stock below zero',
         );
+      case 'quantity-overflow':
+        throw new ConflictException(
+          'Adjustment rejected: it would take on-hand stock above the ' +
+            'maximum supported quantity',
+        );
       default:
         return result;
     }

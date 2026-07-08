@@ -148,7 +148,7 @@ describe('InventoryRepository.adjust', () => {
     expect(updateData.quantity).toEqual({ increment: -4 });
   });
 
-  it('positive deltas require no minimum stock', async () => {
+  it('positive deltas need no minimum stock but are capped at the INT max', async () => {
     const tx = buildTx();
     const repository = buildRepository(tx);
     await repository.adjust(
@@ -156,9 +156,30 @@ describe('InventoryRepository.adjust', () => {
       { ...input, quantityDelta: 10 },
       buildAuditEntry,
     );
+    // gte 0 (any current stock is fine for an increase) AND an upper bound so
+    // quantity + delta cannot overflow the Postgres INTEGER column.
     expect(
       tx.inventoryLevel.updateMany.mock.calls[0][0].where.quantity,
-    ).toEqual({ gte: 0 });
+    ).toEqual({ gte: 0, lte: 2147483647 - 10 });
+  });
+
+  it('reports quantity-overflow (not insufficient-stock) when an increase would exceed the INT max', async () => {
+    const tx = buildTx({
+      inventoryLevel: {
+        upsert: jest.fn().mockResolvedValue({}),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+        findUniqueOrThrow: jest.fn(),
+      },
+    });
+    const repository = buildRepository(tx);
+    await expect(
+      repository.adjust(
+        'tenant-a',
+        { ...input, quantityDelta: 5 },
+        buildAuditEntry,
+      ),
+    ).resolves.toBe('quantity-overflow');
+    expect(tx.inventoryMovement.create).not.toHaveBeenCalled();
   });
 
   it('reports insufficient stock without appending a movement', async () => {
@@ -316,6 +337,10 @@ describe('InventoryRepository reads', () => {
     expect(
       (prisma.inventoryMovement.findMany as jest.Mock).mock.calls[0][0].where,
     ).toEqual(expect.objectContaining({ tenantId: 'tenant-a' }));
+    // Deterministic pagination: id breaks createdAt ties so pages are stable.
+    expect(
+      (prisma.inventoryMovement.findMany as jest.Mock).mock.calls[0][0].orderBy,
+    ).toEqual([{ createdAt: 'desc' }, { id: 'desc' }]);
 
     expect(() => repository.findLevels('', {})).toThrow(
       TenantIdRequiredError,

@@ -915,6 +915,18 @@ describe('Catalog & Inventory (e2e, no live database)', () => {
         .expect(400);
     });
 
+    it('rejects a lowStockThreshold beyond the INT range (400)', async () => {
+      await request(app.getHttpServer())
+        .post('/catalog/products')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          sku: 'OVERFLOW-1',
+          name: 'Overflow',
+          lowStockThreshold: 2147483648,
+        })
+        .expect(400);
+    });
+
     it('adds and removes barcodes via the sub-endpoints', async () => {
       const added = await request(app.getHttpServer())
         .post(`/catalog/products/${productId}/barcodes`)
@@ -1131,6 +1143,15 @@ describe('Catalog & Inventory (e2e, no live database)', () => {
       expect(
         lowOnly.body.every((row: { isLowStock: boolean }) => row.isLowStock),
       ).toBe(true);
+    });
+
+    it('rejects an ambiguous lowStockOnly value like "1" (400)', async () => {
+      // Only 'true'/'false' are accepted, so '1' is a validation error rather
+      // than being silently treated as false and returning all levels.
+      await request(app.getHttpServer())
+        .get('/inventory/levels?lowStockOnly=1')
+        .set('Authorization', `Bearer ${viewerToken}`)
+        .expect(400);
     });
 
     it('the ledger lists this tenant’s movements newest first', async () => {

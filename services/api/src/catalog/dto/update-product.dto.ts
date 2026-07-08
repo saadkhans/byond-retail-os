@@ -5,11 +5,13 @@ import {
   IsInt,
   IsOptional,
   IsString,
+  Max,
   MaxLength,
   Min,
   MinLength,
   ValidateIf,
 } from 'class-validator';
+import { PG_INT_MAX } from '../../common/integer-bounds';
 
 // SKU is intentionally NOT updatable: it identifies the product to external
 // systems (barcode mappings, future POS/edge caches) and to the immutable
@@ -64,5 +66,6 @@ export class UpdateProductDto {
   @ValidateIf((_object, value) => value !== undefined && value !== null)
   @IsInt()
   @Min(0)
+  @Max(PG_INT_MAX)
   lowStockThreshold?: number | null;
 }

@@ -1,7 +1,7 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import {
-  IsBooleanString,
+  IsIn,
   IsInt,
   IsOptional,
   IsString,
@@ -26,9 +26,13 @@ export class QueryLevelsDto {
   @ApiPropertyOptional({
     description:
       'true → only levels at or below the product’s low-stock threshold.',
+    enum: ['true', 'false'],
   })
+  // Only the literal strings 'true'/'false' are accepted. @IsBooleanString
+  // would also admit '1'/'0', which the service's `=== 'true'` check silently
+  // treats as false — so restrict the input instead.
   @IsOptional()
-  @IsBooleanString()
+  @IsIn(['true', 'false'])
   lowStockOnly?: string;
 }
 

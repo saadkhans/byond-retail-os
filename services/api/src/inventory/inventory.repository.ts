@@ -10,6 +10,7 @@ import {
   AuditEntry,
   AuditLogService,
 } from '../common/audit/audit-log.service';
+import { PG_INT_MAX } from '../common/integer-bounds';
 import { productStockAdvisoryLockKey } from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
 import { TenantScopedRepository } from '../prisma/tenant-scoped.repository';
@@ -37,7 +38,8 @@ export type AdjustmentFailure =
   | 'location-not-found'
   | 'product-not-found'
   | 'product-archived'
-  | 'insufficient-stock';
+  | 'insufficient-stock'
+  | 'quantity-overflow';
 
 export interface AdjustmentResult {
   level: InventoryLevel;
@@ -178,18 +180,31 @@ export class InventoryRepository extends TenantScopedRepository {
         });
 
         // Conditional atomic increment: matches only when the resulting
-        // quantity stays >= 0. Zero rows updated ⇒ insufficient stock.
+        // quantity stays within [0, PG_INT_MAX]. The lower bound stops a
+        // decrease going negative; the upper bound (added only for increases)
+        // stops the sum overflowing the INTEGER column. Zero rows updated ⇒
+        // the adjustment would breach a bound.
+        const quantityBound: Prisma.IntFilter = {
+          gte: Math.max(0, -data.quantityDelta),
+        };
+        if (data.quantityDelta > 0) {
+          quantityBound.lte = PG_INT_MAX - data.quantityDelta;
+        }
         const updated = await tx.inventoryLevel.updateMany({
           where: {
             tenantId: scopedTenantId,
             locationId: data.locationId,
             productId: data.productId,
-            quantity: { gte: Math.max(0, -data.quantityDelta) },
+            quantity: quantityBound,
           },
           data: { quantity: { increment: data.quantityDelta } },
         });
         if (updated.count === 0) {
-          throw new AdjustmentRejected('insufficient-stock');
+          // A positive delta always satisfies the lower bound, so a miss there
+          // is an overflow; a negative delta can only miss the lower bound.
+          throw new AdjustmentRejected(
+            data.quantityDelta > 0 ? 'quantity-overflow' : 'insufficient-stock',
+          );
         }
 
         const level = await tx.inventoryLevel.findUniqueOrThrow({
@@ -263,7 +278,10 @@ export class InventoryRepository extends TenantScopedRepository {
     const [items, total] = await Promise.all([
       this.prisma.inventoryMovement.findMany({
         where,
-        orderBy: { createdAt: 'desc' },
+        // id is the deterministic tie-breaker: createdAt is millisecond
+        // precision, so concurrent movements can share a timestamp and would
+        // otherwise reorder across pages under skip/take.
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         skip: filters.skip ?? 0,
         take: filters.take ?? 50,
       }),
