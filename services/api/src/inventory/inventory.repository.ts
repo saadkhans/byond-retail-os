@@ -10,6 +10,7 @@ import {
   AuditEntry,
   AuditLogService,
 } from '../common/audit/audit-log.service';
+import { productStockAdvisoryLockKey } from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
 import { TenantScopedRepository } from '../prisma/tenant-scoped.repository';
 
@@ -112,6 +113,16 @@ export class InventoryRepository extends TenantScopedRepository {
   ): Promise<AdjustmentResult | AdjustmentFailure> {
     try {
       return await this.prisma.$transaction(async (tx) => {
+        // Serialize against product mutations that depend on ledger state
+        // (unit-of-measure change, archive) for THIS product: a plain row read
+        // does not stop a concurrent UOM/archive update from committing while
+        // this adjustment appends a movement. The advisory lock is held for
+        // the rest of the transaction and released on commit/rollback.
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
+          scopedTenantId,
+          data.productId,
+        )}))`;
+
         // Scoped existence checks: ids from other tenants are simply not
         // found. Every rejection THROWS so the transaction rolls back —
         // see AdjustmentRejected.

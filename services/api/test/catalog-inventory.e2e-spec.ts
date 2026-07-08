@@ -894,6 +894,27 @@ describe('Catalog & Inventory (e2e, no live database)', () => {
       );
     });
 
+    it('rejects an explicit null for non-nullable product enums (400)', async () => {
+      await request(app.getHttpServer())
+        .patch(`/catalog/products/${productId}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ unitOfMeasure: null })
+        .expect(400);
+      await request(app.getHttpServer())
+        .patch(`/catalog/products/${productId}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ status: null })
+        .expect(400);
+    });
+
+    it('rejects an explicit null brand description instead of 500ing (400)', async () => {
+      await request(app.getHttpServer())
+        .patch(`/catalog/brands/${brandId}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ description: null })
+        .expect(400);
+    });
+
     it('adds and removes barcodes via the sub-endpoints', async () => {
       const added = await request(app.getHttpServer())
         .post(`/catalog/products/${productId}/barcodes`)
@@ -980,6 +1001,20 @@ describe('Catalog & Inventory (e2e, no live database)', () => {
           reason: 'no-op',
         })
         .expect(400);
+    });
+
+    it('rejects a delta outside the persisted integer range (400)', async () => {
+      await request(app.getHttpServer())
+        .post('/inventory/adjustments')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          locationId: 'loc-a1',
+          productId,
+          quantityDelta: 2147483648,
+          reason: 'overflow attempt',
+        })
+        .expect(400);
+      expect(store.movements).toHaveLength(0);
     });
 
     it('an adjustment appends an immutable movement, updates the level, and audits', async () => {

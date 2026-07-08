@@ -13,6 +13,8 @@ describe('ProductsRepository.update (in-transaction guards)', () => {
 
   function buildTx(overrides: Record<string, unknown> = {}) {
     return {
+      // Per-product advisory lock shared with inventory adjust().
+      $queryRaw: jest.fn().mockResolvedValue([1]),
       product: {
         findFirst: jest.fn().mockResolvedValue({
           id: 'prod-1',
@@ -90,6 +92,38 @@ describe('ProductsRepository.update (in-transaction guards)', () => {
     });
     expect(tx.product.update).toHaveBeenCalled();
     expect(result).toEqual(expect.objectContaining({ unitOfMeasure: 'CASE' }));
+  });
+
+  it('takes the advisory lock on ledger-dependent updates (UOM/archive)', async () => {
+    const uomTx = buildTx();
+    await buildRepository(uomTx).update(
+      'tenant-a',
+      'prod-1',
+      { unitOfMeasure: 'CASE' },
+      buildAuditEntry,
+    );
+    expect(uomTx.$queryRaw).toHaveBeenCalled();
+
+    const archiveTx = buildTx();
+    await buildRepository(archiveTx).update(
+      'tenant-a',
+      'prod-1',
+      { status: 'ARCHIVED' },
+      buildAuditEntry,
+    );
+    expect(archiveTx.$queryRaw).toHaveBeenCalled();
+  });
+
+  it('does NOT take the advisory lock for a plain field update', async () => {
+    const tx = buildTx();
+    await buildRepository(tx).update(
+      'tenant-a',
+      'prod-1',
+      { name: 'Renamed' },
+      buildAuditEntry,
+    );
+    expect(tx.$queryRaw).not.toHaveBeenCalled();
+    expect(tx.product.update).toHaveBeenCalled();
   });
 
   it('does not re-check UOM history when the unit is unchanged', async () => {

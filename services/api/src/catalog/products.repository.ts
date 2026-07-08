@@ -11,6 +11,7 @@ import {
   AuditEntry,
   AuditLogService,
 } from '../common/audit/audit-log.service';
+import { productStockAdvisoryLockKey } from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
 import { TenantScopedRepository } from '../prisma/tenant-scoped.repository';
 
@@ -165,7 +166,21 @@ export class ProductsRepository extends TenantScopedRepository {
     ) => AuditEntry,
   ): Promise<ProductWithRelations | ProductUpdateRejection | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
+    // The UOM-immutability and archive-with-stock guards below read ledger
+    // state, so they must serialize against inventory adjustments for this
+    // product — otherwise a concurrent adjustment can commit a movement/level
+    // between the check and the write. Take the SAME per-product advisory lock
+    // that adjust() takes; other updates (name, etc.) skip it.
+    const needsStockLock =
+      data.unitOfMeasure !== undefined ||
+      data.status === ProductStatus.ARCHIVED;
     return this.prisma.$transaction(async (tx) => {
+      if (needsStockLock) {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
+          scopedTenantId,
+          id,
+        )}))`;
+      }
       const before = await tx.product.findFirst({
         where: { id, tenantId: scopedTenantId },
       });

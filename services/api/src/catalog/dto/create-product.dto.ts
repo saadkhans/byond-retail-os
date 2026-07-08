@@ -11,6 +11,7 @@ import {
   MaxLength,
   Min,
   MinLength,
+  ValidateIf,
   ValidateNested,
 } from 'class-validator';
 
@@ -65,6 +66,9 @@ export class CreateProductDto {
   @MinLength(1)
   brandId?: string;
 
+  // Non-nullable enum columns: reject an explicit null (which @IsOptional
+  // would wave through into a Prisma/DB error) while still allowing the field
+  // to be omitted so the schema default applies.
   @ApiPropertyOptional({
     enum: UnitOfMeasure,
     default: UnitOfMeasure.EACH,
@@ -72,12 +76,12 @@ export class CreateProductDto {
       'Stock quantities are integers in this unit. Weight/volume products ' +
       'use GRAM/MILLILITER so counts stay integral.',
   })
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   @IsEnum(UnitOfMeasure)
   unitOfMeasure?: UnitOfMeasure;
 
   @ApiPropertyOptional({ enum: ProductStatus, default: ProductStatus.DRAFT })
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   @IsEnum(ProductStatus)
   status?: ProductStatus;
 

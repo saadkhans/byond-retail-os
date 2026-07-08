@@ -15,8 +15,10 @@ export class UpdateCategoryDto {
   @MaxLength(120)
   name?: string;
 
+  // Non-nullable string: reject an explicit null (which @IsOptional would let
+  // through into the service's .trim(), a 500) as a 400 instead.
   @ApiPropertyOptional({ example: 'Soft drinks, juices, and water.' })
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   @IsString()
   @MaxLength(500)
   description?: string;

@@ -47,13 +47,16 @@ export class UpdateProductDto {
   @MinLength(1)
   brandId?: string | null;
 
+  // These enum columns are NOT nullable. Plain @IsOptional() would let an
+  // explicit `null` skip @IsEnum and fall through to a Prisma/DB error;
+  // @ValidateIf keeps null in scope so it is rejected as a 400 instead.
   @ApiPropertyOptional({ enum: UnitOfMeasure })
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   @IsEnum(UnitOfMeasure)
   unitOfMeasure?: UnitOfMeasure;
 
   @ApiPropertyOptional({ enum: ProductStatus })
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   @IsEnum(ProductStatus)
   status?: ProductStatus;
 

@@ -4,6 +4,7 @@ import {
   IsString,
   MaxLength,
   MinLength,
+  ValidateIf,
 } from 'class-validator';
 
 export class UpdateBrandDto {
@@ -14,8 +15,12 @@ export class UpdateBrandDto {
   @MaxLength(120)
   name?: string;
 
+  // description is a non-nullable string here (it is not documented as
+  // clearable). @ValidateIf keeps an explicit null in scope so @IsString
+  // rejects it as a 400, instead of it reaching the service's .trim() as a
+  // TypeError/500.
   @ApiPropertyOptional({ example: 'House brand for dry goods.' })
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   @IsString()
   @MaxLength(500)
   description?: string;

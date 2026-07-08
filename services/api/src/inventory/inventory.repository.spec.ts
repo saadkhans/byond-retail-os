@@ -8,6 +8,9 @@ describe('InventoryRepository.adjust', () => {
 
   function buildTx(overrides: Record<string, unknown> = {}) {
     return {
+      // Per-product advisory lock that serializes adjust() against UOM/archive
+      // product updates.
+      $queryRaw: jest.fn().mockResolvedValue([1]),
       location: {
         findFirst: jest.fn().mockResolvedValue({ id: 'loc-1' }),
       },
@@ -70,6 +73,13 @@ describe('InventoryRepository.adjust', () => {
     expect(() => repository.adjust('', input, buildAuditEntry)).toThrow(
       TenantIdRequiredError,
     );
+  });
+
+  it('takes the per-product advisory lock so UOM/archive updates serialize', async () => {
+    const tx = buildTx();
+    const repository = buildRepository(tx);
+    await repository.adjust('tenant-a', input, buildAuditEntry);
+    expect(tx.$queryRaw).toHaveBeenCalled();
   });
 
   it('resolves location and product with TENANT-SCOPED lookups', async () => {
