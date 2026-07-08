@@ -28,9 +28,13 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
   {
     code: 'inventory',
     name: 'Inventory',
-    description: 'Inventory ledger and stock projections (later phase).',
+    description:
+      'Product catalog (categories, brands, products, barcodes) plus the ' +
+      'append-only inventory ledger and stock level projections.',
+    // Shipped in Phase 3. Not default-enabled: a platform admin enables it
+    // per tenant via the existing module:manage endpoint.
     defaultEnabled: false,
-    isActive: false,
+    isActive: true,
   },
   {
     code: 'pricing',

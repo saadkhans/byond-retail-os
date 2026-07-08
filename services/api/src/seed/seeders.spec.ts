@@ -45,11 +45,12 @@ describe('platform module catalog', () => {
     }
   });
 
-  it('keeps unimplemented modules inactive: only core is active', () => {
+  it('keeps unimplemented modules inactive: only shipped modules are active', () => {
     const active = PLATFORM_MODULE_CATALOG.filter((m) => m.isActive).map(
       (m) => m.code,
     );
-    expect(active).toEqual(['core']);
+    // core: Phase 1; inventory (catalog + ledger): Phase 3.
+    expect(active).toEqual(['core', 'inventory']);
   });
 
   it('never marks an inactive module as default-enabled', () => {
