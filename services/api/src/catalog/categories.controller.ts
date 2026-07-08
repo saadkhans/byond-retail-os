@@ -19,6 +19,7 @@ import {
 } from '@nestjs/swagger';
 import { ProductCategory } from '@prisma/client';
 import {
+  RequireModule,
   RequirePermissions,
   TenantOnly,
 } from '../auth/decorators/access-policy.decorators';
@@ -37,6 +38,7 @@ import { UpdateCategoryDto } from './dto/update-category.dto';
 @ApiTags('catalog')
 @ApiBearerAuth()
 @TenantOnly()
+@RequireModule('inventory')
 @Controller('catalog/categories')
 export class CategoriesController {
   constructor(private readonly categoriesService: CategoriesService) {}

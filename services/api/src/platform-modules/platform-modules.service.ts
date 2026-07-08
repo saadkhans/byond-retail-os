@@ -27,6 +27,27 @@ export class PlatformModulesService {
     return this.tenantModulesRepository.findMany(tenantId);
   }
 
+  /**
+   * Whether a module is currently usable by a tenant: it must be an active
+   * catalog module AND explicitly ENABLED for the tenant. An inactive module,
+   * a missing enablement row, or any non-ENABLED status (DISABLED/SUSPENDED/
+   * TRIAL) all resolve to false — the gate fails closed.
+   */
+  async isEnabledForTenant(
+    tenantId: string,
+    moduleCode: string,
+  ): Promise<boolean> {
+    const module = await this.platformModulesRepository.findByCode(moduleCode);
+    if (!module || !module.isActive) {
+      return false;
+    }
+    const tenantModule = await this.tenantModulesRepository.findForModule(
+      tenantId,
+      module.id,
+    );
+    return tenantModule?.status === ModuleStatus.ENABLED;
+  }
+
   async enable(
     tenantId: string,
     moduleCode: string,

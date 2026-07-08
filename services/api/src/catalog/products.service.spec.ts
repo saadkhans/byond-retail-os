@@ -143,6 +143,20 @@ describe('ProductsService', () => {
     ).rejects.toBeInstanceOf(NotFoundException);
   });
 
+  it('maps a blocked unit-of-measure change to a conflict', async () => {
+    products.update.mockResolvedValue('uom-change-blocked');
+    await expect(
+      service.update('tenant-a', 'prod-1', { unitOfMeasure: 'CASE' }),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('maps a blocked archive (on-hand stock) to a conflict', async () => {
+    products.update.mockResolvedValue('archive-blocked');
+    await expect(
+      service.update('tenant-a', 'prod-1', { status: 'ARCHIVED' }),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
   it('maps delete FK violations to "archive instead" conflict', async () => {
     products.delete.mockRejectedValue({ code: 'P2003' });
     await expect(service.delete('tenant-a', 'prod-1')).rejects.toThrow(

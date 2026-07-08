@@ -170,6 +170,18 @@ export class ProductsService {
           reason: 'Product updated',
         }),
     );
+    if (updated === 'uom-change-blocked') {
+      throw new ConflictException(
+        'Unit of measure cannot be changed once the product has inventory ' +
+          'history; it would reinterpret every recorded stock quantity',
+      );
+    }
+    if (updated === 'archive-blocked') {
+      throw new ConflictException(
+        'Cannot archive a product that still has on-hand stock; reduce its ' +
+          'stock to zero first',
+      );
+    }
     if (!updated) {
       throw new NotFoundException(`Product "${id}" not found`);
     }

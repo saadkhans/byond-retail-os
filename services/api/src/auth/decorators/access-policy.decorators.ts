@@ -16,3 +16,13 @@ export const PlatformOnly = () => SetMetadata(PLATFORM_ONLY_KEY, true);
 /** Route is restricted to tenant users with a resolved tenant context. */
 export const TENANT_ONLY_KEY = 'byond:tenantOnly';
 export const TenantOnly = () => SetMetadata(TENANT_ONLY_KEY, true);
+
+/**
+ * Route requires the named platform module to be ENABLED for the caller's
+ * tenant. A tenant that has not enabled (or has disabled) the module is denied
+ * even if it holds the relevant RBAC permissions — enforced by
+ * ModuleEnabledGuard.
+ */
+export const REQUIRED_MODULE_KEY = 'byond:requiredModule';
+export const RequireModule = (moduleCode: string) =>
+  SetMetadata(REQUIRED_MODULE_KEY, moduleCode);

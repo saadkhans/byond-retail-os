@@ -118,7 +118,7 @@ export class CategoriesService {
       throw new BadRequestException('No fields to update');
     }
 
-    let updated: ProductCategory | null;
+    let updated: ProductCategory | 'cycle-detected' | null;
     try {
       updated = await this.categoriesRepository.update(
         tenantId,
@@ -140,6 +140,15 @@ export class CategoriesService {
         );
       }
       throw error;
+    }
+    // The service pre-check (assertValidParent) rejects cycles it can see, but
+    // a concurrent move can only be caught inside the transaction — this maps
+    // that authoritative rejection.
+    if (updated === 'cycle-detected') {
+      throw new ConflictException(
+        'Category move rejected: it would place the category under one of ' +
+          'its own descendants (possibly due to a concurrent change)',
+      );
     }
     if (!updated) {
       throw new NotFoundException(`Category "${id}" not found`);

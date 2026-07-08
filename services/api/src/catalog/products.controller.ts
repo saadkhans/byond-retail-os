@@ -20,6 +20,7 @@ import {
 } from '@nestjs/swagger';
 import { ProductBarcode } from '@prisma/client';
 import {
+  RequireModule,
   RequirePermissions,
   TenantOnly,
 } from '../auth/decorators/access-policy.decorators';
@@ -40,6 +41,7 @@ import { ProductWithRelations } from './products.repository';
 @ApiTags('catalog')
 @ApiBearerAuth()
 @TenantOnly()
+@RequireModule('inventory')
 @Controller('catalog/products')
 export class ProductsController {
   constructor(private readonly productsService: ProductsService) {}

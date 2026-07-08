@@ -9,6 +9,7 @@ import {
 } from '@nestjs/swagger';
 import { InventoryMovement } from '@prisma/client';
 import {
+  RequireModule,
   RequirePermissions,
   TenantOnly,
 } from '../auth/decorators/access-policy.decorators';
@@ -28,6 +29,7 @@ import { InventoryService, StockLevelView } from './inventory.service';
 @ApiTags('inventory')
 @ApiBearerAuth()
 @TenantOnly()
+@RequireModule('inventory')
 @Controller('inventory')
 export class InventoryController {
   constructor(private readonly inventoryService: InventoryService) {}

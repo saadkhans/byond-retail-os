@@ -25,6 +25,21 @@ export type ProductWithRelations = Prisma.ProductGetPayload<{
   include: typeof PRODUCT_INCLUDE;
 }>;
 
+export type ProductWithBarcodes = Prisma.ProductGetPayload<{
+  include: { barcodes: true };
+}>;
+
+/**
+ * Rejections surfaced by update() as sentinels (mapped to HTTP errors in the
+ * service), so the whole check-and-write stays inside one transaction:
+ * - 'uom-change-blocked': the product already has ledger history, so its unit
+ *   of measure can no longer change.
+ * - 'archive-blocked': the product still has on-hand stock, so it cannot be
+ *   archived (an archived product rejects the very adjustments that would
+ *   draw its stock down).
+ */
+export type ProductUpdateRejection = 'uom-change-blocked' | 'archive-blocked';
+
 export interface ProductSearchFilters {
   search?: string;
   barcode?: string;
@@ -148,7 +163,7 @@ export class ProductsRepository extends TenantScopedRepository {
       before: Product,
       after: ProductWithRelations,
     ) => AuditEntry,
-  ): Promise<ProductWithRelations | null> {
+  ): Promise<ProductWithRelations | ProductUpdateRejection | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
       const before = await tx.product.findFirst({
@@ -157,6 +172,44 @@ export class ProductsRepository extends TenantScopedRepository {
       if (!before) {
         return null;
       }
+
+      // The unit of measure is immutable once any ledger history exists:
+      // changing it would silently reinterpret every recorded quantityDelta,
+      // quantityAfter, and projected level from the old unit into the new one.
+      // Checked inside the transaction against the ledger (the source of
+      // truth), so a concurrent adjustment cannot slip a movement in between.
+      if (
+        data.unitOfMeasure !== undefined &&
+        data.unitOfMeasure !== before.unitOfMeasure
+      ) {
+        const movementCount = await tx.inventoryMovement.count({
+          where: { tenantId: scopedTenantId, productId: before.id },
+        });
+        if (movementCount > 0) {
+          return 'uom-change-blocked' as const;
+        }
+      }
+
+      // Archiving is blocked while on-hand stock remains: an ARCHIVED product
+      // rejects all stock adjustments, so its stock could never be reduced or
+      // disposed through the inventory APIs and would stay stranded.
+      if (
+        data.status === ProductStatus.ARCHIVED &&
+        before.status !== ProductStatus.ARCHIVED
+      ) {
+        const onHand = await tx.inventoryLevel.findFirst({
+          where: {
+            tenantId: scopedTenantId,
+            productId: before.id,
+            quantity: { gt: 0 },
+          },
+          select: { id: true },
+        });
+        if (onHand) {
+          return 'archive-blocked' as const;
+        }
+      }
+
       const after = await tx.product.update({
         where: { id: before.id },
         data,
@@ -170,12 +223,16 @@ export class ProductsRepository extends TenantScopedRepository {
   delete(
     tenantId: string,
     id: string,
-    buildAuditEntry: (deleted: Product) => AuditEntry,
-  ): Promise<Product | null> {
+    buildAuditEntry: (deleted: ProductWithBarcodes) => AuditEntry,
+  ): Promise<ProductWithBarcodes | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
+      // Load the product WITH its barcodes so the delete audit captures the
+      // scan identifiers being removed. Without this the barcodes would
+      // disappear via the bulk deleteMany with no auditable trace.
       const existing = await tx.product.findFirst({
         where: { id, tenantId: scopedTenantId },
+        include: { barcodes: true },
       });
       if (!existing) {
         return null;
@@ -186,6 +243,7 @@ export class ProductsRepository extends TenantScopedRepository {
         where: { productId: existing.id, tenantId: scopedTenantId },
       });
       await tx.product.delete({ where: { id: existing.id } });
+      // `existing` carries the removed barcodes into the audit before-snapshot.
       await this.auditLog.record(buildAuditEntry(existing), tx);
       return existing;
     });

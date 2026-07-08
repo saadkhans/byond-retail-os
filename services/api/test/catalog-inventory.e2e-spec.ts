@@ -89,6 +89,27 @@ describe('Catalog & Inventory (e2e, no live database)', () => {
     { id: 'loc-b1', tenantId: 'tenant-b', name: 'Store B1', code: 'B1' },
   ];
 
+  // Module catalog + per-tenant enablement backing the ModuleEnabledGuard.
+  // Tenant A has the inventory module ENABLED for the whole suite; the
+  // dedicated gate test toggles this row and restores it.
+  const platformModules = [
+    { id: 'module-core', code: 'core', name: 'Core', isActive: true },
+    {
+      id: 'module-inventory',
+      code: 'inventory',
+      name: 'Inventory',
+      isActive: true,
+    },
+  ];
+  const tenantModules = [
+    {
+      id: 'tm-a-inventory',
+      tenantId: 'tenant-a',
+      moduleId: 'module-inventory',
+      status: 'ENABLED',
+    },
+  ];
+
   // Stateful in-memory tables. Tenant B rows exist purely as cross-tenant
   // "bait" — every test asserts they stay invisible to tenant A callers.
   const store = {
@@ -275,6 +296,18 @@ describe('Catalog & Inventory (e2e, no live database)', () => {
       },
     },
     auditLog: { create: auditCreateSpy },
+    platformModule: {
+      findUnique: async ({ where }: { where: Where }) =>
+        platformModules.find((module) => module.code === where.code) ?? null,
+    },
+    tenantModule: {
+      findFirst: async ({ where }: { where: Where }) =>
+        tenantModules.find(
+          (tenantModule) =>
+            tenantModule.tenantId === where.tenantId &&
+            tenantModule.moduleId === where.moduleId,
+        ) ?? null,
+    },
     location: {
       findFirst: async ({ where }: { where: Where }) =>
         locations.find(
@@ -1114,6 +1147,71 @@ describe('Catalog & Inventory (e2e, no live database)', () => {
         .get('/inventory/levels')
         .set('Authorization', `Bearer ${adminToken}`)
         .expect(403);
+    });
+  });
+
+  describe('module enablement gate', () => {
+    // Temporarily flip tenant A's inventory module to DISABLED and prove that
+    // catalog AND inventory routes are blocked (403) even for a manager who
+    // holds catalog:*/inventory:* — RBAC alone is not enough. Restored after.
+    async function withInventoryDisabled(run: () => Promise<void>) {
+      const previous = tenantModules[0].status;
+      tenantModules[0].status = 'DISABLED';
+      try {
+        await run();
+      } finally {
+        tenantModules[0].status = previous;
+      }
+    }
+
+    it('blocks catalog routes when the inventory module is not enabled', async () => {
+      await withInventoryDisabled(async () => {
+        await request(app.getHttpServer())
+          .get('/catalog/products')
+          .set('Authorization', `Bearer ${managerToken}`)
+          .expect(403);
+      });
+    });
+
+    it('blocks inventory routes when the inventory module is not enabled', async () => {
+      await withInventoryDisabled(async () => {
+        await request(app.getHttpServer())
+          .get('/inventory/levels')
+          .set('Authorization', `Bearer ${managerToken}`)
+          .expect(403);
+        await request(app.getHttpServer())
+          .post('/inventory/adjustments')
+          .set('Authorization', `Bearer ${managerToken}`)
+          .send({
+            locationId: 'loc-a1',
+            productId: 'prod-x',
+            quantityDelta: 1,
+            reason: 'blocked by module gate',
+          })
+          .expect(403);
+      });
+    });
+
+    it('the denial is audited as ACCESS_DENIED', async () => {
+      await withInventoryDisabled(async () => {
+        auditCreateSpy.mockClear();
+        await request(app.getHttpServer())
+          .get('/catalog/products')
+          .set('Authorization', `Bearer ${managerToken}`)
+          .expect(403);
+        expect(auditCreateSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ action: 'ACCESS_DENIED' }),
+          }),
+        );
+      });
+    });
+
+    it('admits the routes again once the module is enabled', async () => {
+      await request(app.getHttpServer())
+        .get('/catalog/products')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .expect(200);
     });
   });
 });

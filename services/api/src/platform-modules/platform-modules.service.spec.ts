@@ -20,7 +20,11 @@ describe('PlatformModulesService', () => {
   } as TenantModule;
 
   let platformModulesRepository: { findAll: jest.Mock; findByCode: jest.Mock };
-  let tenantModulesRepository: { findMany: jest.Mock; setStatus: jest.Mock };
+  let tenantModulesRepository: {
+    findMany: jest.Mock;
+    setStatus: jest.Mock;
+    findForModule: jest.Mock;
+  };
   let service: PlatformModulesService;
 
   beforeEach(() => {
@@ -31,6 +35,7 @@ describe('PlatformModulesService', () => {
     tenantModulesRepository = {
       findMany: jest.fn().mockResolvedValue([]),
       setStatus: jest.fn().mockResolvedValue(tenantModule),
+      findForModule: jest.fn().mockResolvedValue(tenantModule),
     };
     service = new PlatformModulesService(
       platformModulesRepository as unknown as PlatformModulesRepository,
@@ -137,5 +142,54 @@ describe('PlatformModulesService', () => {
         actorEmail: 'system@byond.internal',
       }),
     );
+  });
+
+  describe('isEnabledForTenant', () => {
+    it('is true only for an active module ENABLED for the tenant', async () => {
+      platformModulesRepository.findByCode.mockResolvedValue(activeModule);
+      tenantModulesRepository.findForModule.mockResolvedValue({
+        ...tenantModule,
+        status: 'ENABLED',
+      });
+      await expect(
+        service.isEnabledForTenant('tenant-a', 'core'),
+      ).resolves.toBe(true);
+      expect(tenantModulesRepository.findForModule).toHaveBeenCalledWith(
+        'tenant-a',
+        activeModule.id,
+      );
+    });
+
+    it('is false for an inactive catalog module (never checks the tenant)', async () => {
+      platformModulesRepository.findByCode.mockResolvedValue(inactiveModule);
+      await expect(
+        service.isEnabledForTenant('tenant-a', 'inventory'),
+      ).resolves.toBe(false);
+      expect(tenantModulesRepository.findForModule).not.toHaveBeenCalled();
+    });
+
+    it('is false for an unknown module', async () => {
+      platformModulesRepository.findByCode.mockResolvedValue(null);
+      await expect(
+        service.isEnabledForTenant('tenant-a', 'nope'),
+      ).resolves.toBe(false);
+    });
+
+    it('is false when the tenant has no enablement row', async () => {
+      tenantModulesRepository.findForModule.mockResolvedValue(null);
+      await expect(
+        service.isEnabledForTenant('tenant-a', 'core'),
+      ).resolves.toBe(false);
+    });
+
+    it('is false when the module is present but not ENABLED (e.g. DISABLED)', async () => {
+      tenantModulesRepository.findForModule.mockResolvedValue({
+        ...tenantModule,
+        status: 'DISABLED',
+      });
+      await expect(
+        service.isEnabledForTenant('tenant-a', 'core'),
+      ).resolves.toBe(false);
+    });
   });
 });

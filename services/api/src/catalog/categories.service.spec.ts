@@ -111,6 +111,16 @@ describe('CategoriesService', () => {
     expect(repository.update).not.toHaveBeenCalled();
   });
 
+  it('maps an in-transaction cycle rejection to a conflict', async () => {
+    // The optimistic pre-check passes (parent is not a known descendant), but
+    // the repository detects a cycle under its per-tenant lock — e.g. a
+    // concurrent move committed first. That authoritative rejection is a 409.
+    repository.update.mockResolvedValue('cycle-detected');
+    await expect(
+      service.update('tenant-a', 'cat-1', { parentId: 'cat-parent' }),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
   it('404s when the update target is not in this tenant', async () => {
     repository.update.mockResolvedValue(null);
     await expect(

@@ -7,6 +7,18 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { TenantScopedRepository } from '../prisma/tenant-scoped.repository';
 
+// Defensive cap when walking the parent chain inside the transaction; a
+// legitimate retail category tree never approaches this depth.
+const MAX_TREE_DEPTH = 64;
+
+/**
+ * update() returns this sentinel (mapped to a 409 in the service) when the
+ * requested parent would put the category on its own ancestor chain. The
+ * check runs inside the move transaction under a per-tenant advisory lock, so
+ * it also catches cycles that only two CONCURRENT moves could form.
+ */
+export type CategoryMoveRejection = 'cycle-detected';
+
 @Injectable()
 export class CategoriesRepository extends TenantScopedRepository {
   constructor(
@@ -61,15 +73,46 @@ export class CategoriesRepository extends TenantScopedRepository {
       before: ProductCategory,
       after: ProductCategory,
     ) => AuditEntry,
-  ): Promise<ProductCategory | null> {
+  ): Promise<ProductCategory | CategoryMoveRejection | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
+      // Serialize every category-tree MOVE within a tenant. Without this, two
+      // concurrent reparents can each validate against the old tree and commit
+      // a cycle between them (A under B while B under A). The advisory lock is
+      // held for the rest of this transaction and released automatically on
+      // commit/rollback, so the second move waits and then re-validates
+      // against the first's committed change. Only taken when a parent is
+      // actually being set (parentId is a non-null string).
+      if (typeof data.parentId === 'string') {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`category-tree:${scopedTenantId}`}))`;
+      }
+
       const before = await tx.productCategory.findFirst({
         where: { id, tenantId: scopedTenantId },
       });
       if (!before) {
         return null;
       }
+
+      // Authoritative acyclicity check, now holding the tenant tree lock and
+      // therefore seeing every previously-committed move: walk up from the new
+      // parent; reaching this category (including the new parent BEING this
+      // category) means the move would create a cycle.
+      if (typeof data.parentId === 'string') {
+        let ancestorId: string | null = data.parentId;
+        for (let depth = 0; ancestorId; depth += 1) {
+          if (depth >= MAX_TREE_DEPTH || ancestorId === before.id) {
+            return 'cycle-detected' as const;
+          }
+          const ancestor: { parentId: string | null } | null =
+            await tx.productCategory.findFirst({
+              where: { id: ancestorId, tenantId: scopedTenantId },
+              select: { parentId: true },
+            });
+          ancestorId = ancestor?.parentId ?? null;
+        }
+      }
+
       const after = await tx.productCategory.update({
         where: { id: before.id },
         data,
