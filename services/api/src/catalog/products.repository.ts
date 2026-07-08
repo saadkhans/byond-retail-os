@@ -139,7 +139,9 @@ export class ProductsRepository extends TenantScopedRepository {
       this.prisma.product.findMany({
         where,
         include: PRODUCT_INCLUDE,
-        orderBy: { name: 'asc' },
+        // id is the deterministic tie-breaker: name is not unique within a
+        // tenant, so ties would otherwise reorder across skip/take pages.
+        orderBy: [{ name: 'asc' }, { id: 'asc' }],
         skip: filters.skip ?? 0,
         take: filters.take ?? 25,
       }),
@@ -281,6 +283,14 @@ export class ProductsRepository extends TenantScopedRepository {
   ): Promise<ProductBarcode | 'product-not-found'> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
+      // Serialize barcode mutations against a concurrent product delete (same
+      // per-product lock delete() takes). Otherwise this add could land after
+      // delete() snapshotted the product's barcodes, and delete's deleteMany
+      // would then remove it with no record in the product DELETE audit.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
+        scopedTenantId,
+        productId,
+      )}))`;
       const product = await tx.product.findFirst({
         where: { id: productId, tenantId: scopedTenantId },
       });
@@ -303,6 +313,12 @@ export class ProductsRepository extends TenantScopedRepository {
   ): Promise<ProductBarcode | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
+      // Serialize with a concurrent product delete on the same product, so a
+      // barcode removal and the product delete cannot interleave.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
+        scopedTenantId,
+        productId,
+      )}))`;
       const existing = await tx.productBarcode.findFirst({
         where: { id: barcodeId, productId, tenantId: scopedTenantId },
       });

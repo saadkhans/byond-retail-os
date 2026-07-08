@@ -251,3 +251,75 @@ describe('ProductsRepository.delete (barcode audit)', () => {
     expect(tx.$queryRaw).toHaveBeenCalled();
   });
 });
+
+describe('ProductsRepository barcode mutations (delete serialization)', () => {
+  const auditLog = { record: jest.fn().mockResolvedValue(undefined) };
+  const buildAuditEntry = jest.fn().mockReturnValue({ action: 'CREATE' });
+
+  function build(tx: Record<string, unknown>) {
+    const prisma = {
+      $transaction: (callback: (client: unknown) => unknown) => callback(tx),
+    } as unknown as PrismaService;
+    return new ProductsRepository(
+      prisma,
+      auditLog as unknown as AuditLogService,
+    );
+  }
+
+  it('addBarcode takes the product advisory lock before creating', async () => {
+    const tx = {
+      $queryRaw: jest.fn().mockResolvedValue([1]),
+      product: { findFirst: jest.fn().mockResolvedValue({ id: 'prod-1' }) },
+      productBarcode: {
+        create: jest.fn().mockResolvedValue({ id: 'bc-1', value: '123' }),
+      },
+    };
+    await build(tx).addBarcode(
+      'tenant-a',
+      'prod-1',
+      { value: '123' },
+      buildAuditEntry,
+    );
+    expect(tx.$queryRaw).toHaveBeenCalled();
+    expect(tx.productBarcode.create).toHaveBeenCalled();
+  });
+
+  it('removeBarcode takes the product advisory lock before deleting', async () => {
+    const tx = {
+      $queryRaw: jest.fn().mockResolvedValue([1]),
+      productBarcode: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'bc-1' }),
+        delete: jest.fn().mockResolvedValue({ id: 'bc-1' }),
+      },
+    };
+    await build(tx).removeBarcode(
+      'tenant-a',
+      'prod-1',
+      'bc-1',
+      buildAuditEntry,
+    );
+    expect(tx.$queryRaw).toHaveBeenCalled();
+    expect(tx.productBarcode.delete).toHaveBeenCalled();
+  });
+});
+
+describe('ProductsRepository.search (deterministic pagination)', () => {
+  const auditLog = { record: jest.fn() };
+
+  it('orders by name then id so paged results are stable', async () => {
+    const prisma = {
+      product: {
+        findMany: jest.fn().mockResolvedValue([]),
+        count: jest.fn().mockResolvedValue(0),
+      },
+    } as unknown as PrismaService;
+    const repository = new ProductsRepository(
+      prisma,
+      auditLog as unknown as AuditLogService,
+    );
+    await repository.search('tenant-a', {});
+    expect(
+      (prisma.product.findMany as jest.Mock).mock.calls[0][0].orderBy,
+    ).toEqual([{ name: 'asc' }, { id: 'asc' }]);
+  });
+});

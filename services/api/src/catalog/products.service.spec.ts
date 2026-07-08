@@ -133,6 +133,19 @@ describe('ProductsService', () => {
     ).rejects.toBeInstanceOf(ConflictException);
   });
 
+  it('maps a stale category/brand FK violation on create to a 400', async () => {
+    // A concurrent delete removed the referenced category/brand between
+    // validation and the insert landing.
+    products.create.mockRejectedValue({ code: 'P2003' });
+    await expect(
+      service.create('tenant-a', {
+        sku: 'BEV-COLA-330',
+        name: 'Cola',
+        categoryId: 'cat-x',
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
   it('rejects an empty update and 404s on a foreign target', async () => {
     await expect(
       service.update('tenant-a', 'prod-1', {}),

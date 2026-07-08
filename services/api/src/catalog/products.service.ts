@@ -77,6 +77,14 @@ export class ProductsService {
           `SKU "${sku}" or one of the barcodes already exists for this tenant`,
         );
       }
+      // The category/brand were validated above, but a concurrent delete can
+      // remove them before the insert lands, surfacing a Restrict FK
+      // violation. Map it to a controlled 400 instead of a 500.
+      if (prismaErrorCode(error) === 'P2003') {
+        throw new BadRequestException(
+          'Referenced category or brand no longer exists',
+        );
+      }
       throw error;
     }
   }
