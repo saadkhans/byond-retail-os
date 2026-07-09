@@ -4,6 +4,7 @@ import {
   AuditEntry,
   AuditLogService,
 } from '../common/audit/audit-log.service';
+import { categoryAdvisoryLockKey } from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
 import { TenantScopedRepository } from '../prisma/tenant-scoped.repository';
 
@@ -76,6 +77,17 @@ export class CategoriesRepository extends TenantScopedRepository {
   ): Promise<ProductCategory | CategoryMoveRejection | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
+      // Serialize this update against a concurrent delete of the SAME category
+      // (delete() takes the identical per-category lock), so a delete cannot
+      // snapshot the category for its audit and then have this update commit
+      // first, leaving that DELETE snapshot stale. Taken FIRST — before the
+      // per-tenant tree lock below — so update and delete always acquire the
+      // per-category lock in the same order (no lock-ordering deadlock).
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${categoryAdvisoryLockKey(
+        scopedTenantId,
+        id,
+      )}))`;
+
       // Serialize every category-tree MOVE within a tenant. Without this, two
       // concurrent reparents can each validate against the old tree and commit
       // a cycle between them (A under B while B under A). The advisory lock is
@@ -130,6 +142,13 @@ export class CategoriesRepository extends TenantScopedRepository {
   ): Promise<ProductCategory | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
+      // Serialize against a concurrent update of the same category (update()
+      // takes the identical per-category lock), so the DELETE audit `before`
+      // snapshot below can never become stale relative to the row removed.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${categoryAdvisoryLockKey(
+        scopedTenantId,
+        id,
+      )}))`;
       const existing = await tx.productCategory.findFirst({
         where: { id, tenantId: scopedTenantId },
       });

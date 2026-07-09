@@ -21,3 +21,33 @@ export function productStockAdvisoryLockKey(
 ): string {
   return `product-stock:${tenantId}:${productId}`;
 }
+
+/**
+ * Serializes a brand's UPDATE and DELETE against each other within a tenant.
+ * Both `BrandsRepository.update()` and `.delete()` take
+ * `pg_advisory_xact_lock(hashtext(key))` before reading the row, so a
+ * concurrent PATCH can no longer commit between DELETE's snapshot read and the
+ * row removal — the DELETE audit `before` snapshot always matches the row
+ * actually deleted. Both call sites MUST derive the key identically.
+ */
+export function brandAdvisoryLockKey(
+  tenantId: string,
+  brandId: string,
+): string {
+  return `brand:${tenantId}:${brandId}`;
+}
+
+/**
+ * Serializes a category's UPDATE and DELETE against each other within a
+ * tenant, for the same reason as brands above. This is distinct from the
+ * per-tenant `category-tree:` lock (which serializes reparent MOVES to prevent
+ * cycles): this one is per-category and guards the update/delete audit race.
+ * Both `CategoriesRepository.update()` and `.delete()` MUST derive it
+ * identically.
+ */
+export function categoryAdvisoryLockKey(
+  tenantId: string,
+  categoryId: string,
+): string {
+  return `category:${tenantId}:${categoryId}`;
+}

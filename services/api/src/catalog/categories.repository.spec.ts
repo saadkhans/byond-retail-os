@@ -104,7 +104,7 @@ describe('CategoriesRepository.update (in-transaction move validation)', () => {
     expect(result).toEqual(expect.objectContaining({ parentId: 'cat-1' }));
   });
 
-  it('does not lock or walk when the parent is not changing', async () => {
+  it('takes the per-category lock but skips the tree walk when the parent is not changing', async () => {
     const tx = buildTx();
     const repository = buildRepository(tx);
     await repository.update(
@@ -113,7 +113,11 @@ describe('CategoriesRepository.update (in-transaction move validation)', () => {
       { name: 'Renamed' },
       buildAuditEntry,
     );
-    expect(tx.$queryRaw).not.toHaveBeenCalled();
+    // The per-category lock is taken for EVERY update (serializes with
+    // delete()), but with no parent change there is no tree lock and no
+    // ancestor walk — only the single `before` lookup.
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(tx.productCategory.findFirst).toHaveBeenCalledTimes(1);
     expect(tx.productCategory.update).toHaveBeenCalled();
   });
 
@@ -129,5 +133,68 @@ describe('CategoriesRepository.update (in-transaction move validation)', () => {
       ),
     ).resolves.toBeNull();
     expect(tx.productCategory.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('CategoriesRepository.delete (update/delete serialization)', () => {
+  const auditLog = { record: jest.fn().mockResolvedValue(undefined) };
+
+  function buildRepository(tx: Record<string, unknown>) {
+    const prisma = {
+      $transaction: (callback: (client: unknown) => unknown) => callback(tx),
+    } as unknown as PrismaService;
+    return new CategoriesRepository(
+      prisma,
+      auditLog as unknown as AuditLogService,
+    );
+  }
+
+  beforeEach(() => {
+    auditLog.record.mockClear();
+  });
+
+  it('takes the per-category advisory lock BEFORE snapshotting the row', async () => {
+    const existing = { id: 'cat-1', tenantId: 'tenant-a', name: 'Beverages' };
+    const order: string[] = [];
+    const tx = {
+      $queryRaw: jest.fn(() => {
+        order.push('lock');
+        return Promise.resolve([1]);
+      }),
+      productCategory: {
+        findFirst: jest.fn(() => {
+          order.push('read');
+          return Promise.resolve(existing);
+        }),
+        delete: jest.fn().mockResolvedValue(existing),
+      },
+    };
+    const buildAuditEntry = jest.fn().mockReturnValue({ action: 'DELETE' });
+    await buildRepository(tx).delete('tenant-a', 'cat-1', buildAuditEntry);
+
+    // The lock is the SAME per-category lock update() takes, so a concurrent
+    // PATCH cannot commit between this snapshot read and the delete, keeping
+    // the audit `before` snapshot authoritative.
+    expect(order).toEqual(['lock', 'read']);
+    expect(buildAuditEntry).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'cat-1', name: 'Beverages' }),
+    );
+    expect(tx.productCategory.delete).toHaveBeenCalled();
+    expect(auditLog.record).toHaveBeenCalledWith(expect.any(Object), tx);
+  });
+
+  it('404-signals (null) without deleting when not in this tenant', async () => {
+    const tx = {
+      $queryRaw: jest.fn().mockResolvedValue([1]),
+      productCategory: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        delete: jest.fn(),
+      },
+    };
+    const buildAuditEntry = jest.fn();
+    await expect(
+      buildRepository(tx).delete('tenant-a', 'cat-x', buildAuditEntry),
+    ).resolves.toBeNull();
+    expect(tx.productCategory.delete).not.toHaveBeenCalled();
   });
 });
