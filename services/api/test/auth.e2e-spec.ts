@@ -176,7 +176,19 @@ describe('Auth & RBAC (e2e, no live database)', () => {
       findUnique: async () => null,
     },
     platformModule: {
-      findMany: async () => [{ id: 'module-core', code: 'core', isActive: true }],
+      // Honors the tenant-creation lookup's `{ code: { in }, isActive: true }`
+      // filter so every default-enabled module (core + the shipped inventory
+      // module) is provisioned for a new tenant.
+      findMany: async ({ where }: { where?: Where } = {}) => {
+        const active = [
+          { id: 'module-core', code: 'core', isActive: true },
+          { id: 'module-inventory', code: 'inventory', isActive: true },
+        ];
+        const requested = (where?.code as { in?: string[] } | undefined)?.in;
+        return requested
+          ? active.filter((module) => requested.includes(module.code))
+          : active;
+      },
     },
     tenantModule: { createMany: async () => ({ count: 1 }) },
   };

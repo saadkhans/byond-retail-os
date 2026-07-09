@@ -114,7 +114,10 @@ describe('ProductsRepository.update (in-transaction guards)', () => {
     expect(archiveTx.$queryRaw).toHaveBeenCalled();
   });
 
-  it('does NOT take the advisory lock for a plain field update', async () => {
+  it('takes the advisory lock even for a plain field update', async () => {
+    // Every update path serializes with delete()'s snapshot under the same
+    // per-product lock, so a concurrent plain update cannot make the DELETE
+    // audit before-snapshot stale.
     const tx = buildTx();
     await buildRepository(tx).update(
       'tenant-a',
@@ -122,7 +125,7 @@ describe('ProductsRepository.update (in-transaction guards)', () => {
       { name: 'Renamed' },
       buildAuditEntry,
     );
-    expect(tx.$queryRaw).not.toHaveBeenCalled();
+    expect(tx.$queryRaw).toHaveBeenCalled();
     expect(tx.product.update).toHaveBeenCalled();
   });
 

@@ -168,21 +168,21 @@ export class ProductsRepository extends TenantScopedRepository {
     ) => AuditEntry,
   ): Promise<ProductWithRelations | ProductUpdateRejection | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
-    // The UOM-immutability and archive-with-stock guards below read ledger
-    // state, so they must serialize against inventory adjustments for this
-    // product — otherwise a concurrent adjustment can commit a movement/level
-    // between the check and the write. Take the SAME per-product advisory lock
-    // that adjust() takes; other updates (name, etc.) skip it.
-    const needsStockLock =
-      data.unitOfMeasure !== undefined ||
-      data.status === ProductStatus.ARCHIVED;
     return this.prisma.$transaction(async (tx) => {
-      if (needsStockLock) {
-        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
-          scopedTenantId,
-          id,
-        )}))`;
-      }
+      // Take the SAME per-product advisory lock that adjust() and delete() take,
+      // for EVERY update path — not only UOM/archive changes. Two reasons:
+      //  1. The UOM-immutability and archive-with-stock guards below read ledger
+      //     state, so they must serialize against inventory adjustments.
+      //  2. delete() snapshots the product for its DELETE audit under this lock;
+      //     if a plain name/description/threshold update could commit between
+      //     delete()'s read and its delete, the audited `before` row would no
+      //     longer match the row actually removed. Locking all updates keeps the
+      //     DELETE audit snapshot authoritative for the concurrent update/delete
+      //     case.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
+        scopedTenantId,
+        id,
+      )}))`;
       const before = await tx.product.findFirst({
         where: { id, tenantId: scopedTenantId },
       });

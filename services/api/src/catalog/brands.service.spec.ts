@@ -88,4 +88,20 @@ describe('BrandsService', () => {
       ConflictException,
     );
   });
+
+  it('maps a concurrent delete during update (P2025) to a 404', async () => {
+    // The row was read inside the transaction, then deleted by another request
+    // before the unique update executed — Prisma raises P2025.
+    repository.update.mockRejectedValue({ code: 'P2025' });
+    await expect(
+      service.update('tenant-a', 'brand-1', { name: 'X' }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('maps a double-delete race (P2025) to a 404', async () => {
+    repository.delete.mockRejectedValue({ code: 'P2025' });
+    await expect(service.delete('tenant-a', 'brand-1')).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
+  });
 });

@@ -31,9 +31,13 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
     description:
       'Product catalog (categories, brands, products, barcodes) plus the ' +
       'append-only inventory ledger and stock level projections.',
-    // Shipped in Phase 3. Not default-enabled: a platform admin enables it
-    // per tenant via the existing module:manage endpoint.
-    defaultEnabled: false,
+    // Shipped in Phase 3 and DEFAULT-ENABLED so the catalog/inventory routes
+    // are reachable for every new tenant. The only enable endpoint
+    // (PlatformModulesController.enable) is @TenantOnly() and needs a tenant
+    // user who already holds module:manage, so leaving this false stranded new
+    // tenants behind 403s on the shipped feature. RBAC still gates every route
+    // independently; a tenant can disable the module later via module:manage.
+    defaultEnabled: true,
     isActive: true,
   },
   {

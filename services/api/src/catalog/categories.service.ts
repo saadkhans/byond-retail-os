@@ -151,6 +151,12 @@ export class CategoriesService {
       if (prismaErrorCode(error) === 'P2003') {
         throw new BadRequestException('Parent category no longer exists');
       }
+      // A concurrent DELETE can remove this category between the scoped
+      // findFirst and the unique update, so Prisma raises P2025. The target is
+      // gone — surface the same 404 as a missing category rather than a 500.
+      if (prismaErrorCode(error) === 'P2025') {
+        throw new NotFoundException(`Category "${id}" not found`);
+      }
       throw error;
     }
     // The service pre-check (assertValidParent) rejects cycles it can see, but
@@ -188,6 +194,12 @@ export class CategoriesService {
         throw new ConflictException(
           'Category is still referenced by products or child categories; reassign them first',
         );
+      }
+      // Two DELETEs can both read the scoped row before either commits; after
+      // the first succeeds, the second's unique delete raises P2025. The row is
+      // already gone — surface the normal 404 instead of a 500.
+      if (prismaErrorCode(error) === 'P2025') {
+        throw new NotFoundException(`Category "${id}" not found`);
       }
       throw error;
     }

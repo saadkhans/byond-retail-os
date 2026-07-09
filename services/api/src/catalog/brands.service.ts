@@ -109,6 +109,13 @@ export class BrandsService {
           `A brand named "${data.name}" already exists for this tenant`,
         );
       }
+      // The transaction reads the brand with the tenant filter, but a
+      // concurrent DELETE can remove it between that read and the unique
+      // update, so Prisma raises P2025. The target is gone — surface the same
+      // 404 as a missing brand rather than a raw 500.
+      if (prismaErrorCode(error) === 'P2025') {
+        throw new NotFoundException(`Brand "${id}" not found`);
+      }
       throw error;
     }
     if (!updated) {
@@ -137,6 +144,12 @@ export class BrandsService {
         throw new ConflictException(
           'Brand is still referenced by products; reassign them first',
         );
+      }
+      // A double-delete race: both requests pass the scoped findFirst, the
+      // first commits, and the second reaches the unique delete which Prisma
+      // reports as P2025. The row is already gone — surface the normal 404.
+      if (prismaErrorCode(error) === 'P2025') {
+        throw new NotFoundException(`Brand "${id}" not found`);
       }
       throw error;
     }

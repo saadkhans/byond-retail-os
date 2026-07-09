@@ -237,6 +237,12 @@ export class ProductsService {
           'Product has inventory history and cannot be deleted; set its status to ARCHIVED instead',
         );
       }
+      // A double-delete race: both requests pass the scoped findFirst, the
+      // first commits, and the second's product/barcode delete raises P2025.
+      // The row is already gone — surface the normal 404 instead of a 500.
+      if (prismaErrorCode(error) === 'P2025') {
+        throw new NotFoundException(`Product "${id}" not found`);
+      }
       throw error;
     }
     if (!deleted) {
@@ -286,19 +292,32 @@ export class ProductsService {
     barcodeId: string,
     actor?: AuditActor,
   ): Promise<void> {
-    const removed = await this.productsRepository.removeBarcode(
-      tenantId,
-      productId,
-      barcodeId,
-      (barcode) =>
-        this.auditEntry(tenantId, actor, {
-          action: AuditAction.DELETE,
-          entityType: 'ProductBarcode',
-          entityId: barcode.id,
-          before: barcode,
-          reason: 'Barcode removed from product',
-        }),
-    );
+    let removed: ProductBarcode | null;
+    try {
+      removed = await this.productsRepository.removeBarcode(
+        tenantId,
+        productId,
+        barcodeId,
+        (barcode) =>
+          this.auditEntry(tenantId, actor, {
+            action: AuditAction.DELETE,
+            entityType: 'ProductBarcode',
+            entityId: barcode.id,
+            before: barcode,
+            reason: 'Barcode removed from product',
+          }),
+      );
+    } catch (error) {
+      // A double-delete race: both requests pass the scoped findFirst, the
+      // first commits, and the second's unique delete raises P2025. The barcode
+      // is already gone — surface the normal 404 instead of a 500.
+      if (prismaErrorCode(error) === 'P2025') {
+        throw new NotFoundException(
+          `Barcode "${barcodeId}" not found on product "${productId}"`,
+        );
+      }
+      throw error;
+    }
     if (!removed) {
       throw new NotFoundException(
         `Barcode "${barcodeId}" not found on product "${productId}"`,

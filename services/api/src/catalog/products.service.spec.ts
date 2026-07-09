@@ -195,6 +195,13 @@ describe('ProductsService', () => {
     );
   });
 
+  it('maps a double-delete race (P2025) on delete to a 404', async () => {
+    products.delete.mockRejectedValue({ code: 'P2025' });
+    await expect(service.delete('tenant-a', 'prod-1')).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
+  });
+
   it('passes pagination defaults and trimmed filters to search', async () => {
     const result = await service.search('tenant-a', { search: ' cola ' });
     expect(products.search).toHaveBeenCalledWith(
@@ -224,6 +231,13 @@ describe('ProductsService', () => {
     products.removeBarcode.mockResolvedValue(null);
     await expect(
       service.removeBarcode('tenant-a', 'prod-1', 'bc-x'),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('maps a double-delete race (P2025) on barcode removal to a 404', async () => {
+    products.removeBarcode.mockRejectedValue({ code: 'P2025' });
+    await expect(
+      service.removeBarcode('tenant-a', 'prod-1', 'bc-1'),
     ).rejects.toBeInstanceOf(NotFoundException);
   });
 });

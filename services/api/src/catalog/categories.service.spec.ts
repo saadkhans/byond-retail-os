@@ -143,6 +143,15 @@ describe('CategoriesService', () => {
     ).rejects.toBeInstanceOf(NotFoundException);
   });
 
+  it('maps a concurrent delete during update (P2025) to a 404', async () => {
+    // Row read inside the transaction, then deleted by another request before
+    // the unique update executed — Prisma raises P2025.
+    repository.update.mockRejectedValue({ code: 'P2025' });
+    await expect(
+      service.update('tenant-a', 'cat-1', { name: 'X' }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
   it('maps delete FK violations to a conflict (children/products exist)', async () => {
     repository.delete.mockRejectedValue({ code: 'P2003' });
     await expect(service.delete('tenant-a', 'cat-1')).rejects.toBeInstanceOf(
@@ -155,5 +164,12 @@ describe('CategoriesService', () => {
     await expect(
       service.delete('tenant-a', 'cat-foreign'),
     ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('maps a double-delete race (P2025) to a 404', async () => {
+    repository.delete.mockRejectedValue({ code: 'P2025' });
+    await expect(service.delete('tenant-a', 'cat-1')).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
   });
 });
