@@ -75,6 +75,46 @@ enum AuditAction {
   LOGIN
   LOGOUT
   PASSWORD_CHANGE
+  STOCK_ADJUSTMENT
+}
+
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  DISCONTINUED
+  ARCHIVED
+}
+
+// Quantities are INTEGERS in the product's unit of measure. Products sold by
+// weight/volume declare a base unit that keeps integer counts expressive
+// (GRAM, MILLILITER) — there are no fractional stock quantities anywhere in
+// the ledger, which keeps stock math exact (no float/decimal drift).
+enum UnitOfMeasure {
+  EACH
+  PACK
+  BOX
+  CASE
+  PAIR
+  GRAM
+  MILLILITER
+}
+
+enum BarcodeFormat {
+  EAN13
+  EAN8
+  UPC_A
+  UPC_E
+  CODE128
+  CODE39
+  QR
+  OTHER
+}
+
+// Ledger event types. Phase 3 ships manual adjustments only; later phases
+// append values (SALE, RECEIPT, TRANSFER, ...) — the ledger shape (signed
+// delta + snapshot + reference fields) is already sized for them.
+enum InventoryMovementType {
+  ADJUSTMENT
 }
 
 model Tenant {
@@ -91,6 +131,13 @@ model Tenant {
   locations Location[]
   modules   TenantModule[]
   auditLogs AuditLog[]
+
+  productCategories  ProductCategory[]
+  brands             Brand[]
+  products           Product[]
+  productBarcodes    ProductBarcode[]
+  inventoryLevels    InventoryLevel[]
+  inventoryMovements InventoryMovement[]
 }
 
 model User {
@@ -114,6 +161,7 @@ model User {
   tenant    Tenant?    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   userRoles UserRole[]
   auditLogs AuditLog[] @relation("AuditActor")
+  inventoryMovements InventoryMovement[] @relation("InventoryMovementActor")
 
   @@index([tenantId, status])
 }
@@ -195,7 +243,13 @@ model Location {
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
 
+  inventoryLevels    InventoryLevel[]
+  inventoryMovements InventoryMovement[]
+
   @@unique([tenantId, code])
+  // Enables the composite tenant-integrity FKs added in migration SQL
+  // (inventory rows must reference a location of the SAME tenant).
+  @@unique([id, tenantId])
   @@index([tenantId, type])
 }
 
@@ -260,4 +314,157 @@ model AuditLog {
   @@index([tenantId, createdAt(sort: Desc)])
   @@index([tenantId, entityType, entityId])
   @@index([actorId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — product catalog & inventory foundation.
+//
+// Every model below is tenant-owned (tenantId required, accessed only through
+// TenantScopedRepository subclasses). Migration SQL additionally adds
+// composite foreign keys — e.g. (productId, tenantId) → Product(id, tenantId)
+// — so a row can never reference another tenant's product/location/category
+// even if a repository bug slipped an unscoped id through.
+// ---------------------------------------------------------------------------
+
+model ProductCategory {
+  id          String  @id @default(cuid())
+  tenantId    String
+  name        String
+  description String?
+  // Optional single-parent hierarchy within the same tenant.
+  parentId  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant   Tenant            @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  parent   ProductCategory?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children ProductCategory[] @relation("CategoryTree")
+  products Product[]
+
+  @@unique([tenantId, name])
+  @@unique([id, tenantId])
+  @@index([tenantId, parentId])
+}
+
+model Brand {
+  id          String  @id @default(cuid())
+  tenantId    String
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  products Product[]
+
+  @@unique([tenantId, name])
+  @@unique([id, tenantId])
+}
+
+model Product {
+  id          String  @id @default(cuid())
+  tenantId    String
+  // Stock-keeping unit code, unique per tenant, normalized to uppercase.
+  sku         String
+  name        String
+  description String?
+  categoryId  String?
+  brandId     String?
+  unitOfMeasure UnitOfMeasure @default(EACH)
+  status        ProductStatus @default(DRAFT)
+  // When set, inventory reads flag levels with quantity <= threshold as low
+  // stock. Product-wide (per-location overrides are a later phase).
+  lowStockThreshold Int?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  category ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  brand    Brand?           @relation(fields: [brandId], references: [id], onDelete: Restrict)
+
+  barcodes           ProductBarcode[]
+  inventoryLevels    InventoryLevel[]
+  inventoryMovements InventoryMovement[]
+
+  @@unique([tenantId, sku])
+  @@unique([id, tenantId])
+  @@index([tenantId, status])
+  @@index([tenantId, categoryId])
+  @@index([tenantId, brandId])
+  @@index([tenantId, name])
+}
+
+model ProductBarcode {
+  id        String        @id @default(cuid())
+  tenantId  String
+  productId String
+  // Scanned value; a barcode resolves to exactly one product per tenant.
+  value     String
+  format    BarcodeFormat @default(OTHER)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@unique([tenantId, value])
+  @@index([productId])
+}
+
+// DERIVED stock projection — never written directly from user input. The
+// quantity changes exclusively via atomic increments inside the same
+// transaction that appends the InventoryMovement ledger row (the ledger is
+// the source of truth, per AGENTS.md). CHECK (quantity >= 0) in migration
+// SQL backstops the application-level guard against races.
+model InventoryLevel {
+  id        String @id @default(cuid())
+  tenantId  String
+  locationId String
+  productId  String
+  quantity   Int    @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@unique([tenantId, locationId, productId])
+  @@index([tenantId, productId])
+  @@index([tenantId, locationId])
+}
+
+// Append-only inventory ledger: no updatedAt, no update/delete repository
+// methods, and migration-SQL triggers reject UPDATE/DELETE/TRUNCATE at the
+// database level (same hardening as AuditLog). All relations are Restrict/
+// NoAction so no FK action can ever need to mutate a ledger row.
+model InventoryMovement {
+  id         String @id @default(cuid())
+  tenantId   String
+  locationId String
+  productId  String
+  movementType  InventoryMovementType
+  // Signed change, never zero (CHECK in migration SQL).
+  quantityDelta Int
+  // Resulting on-hand quantity, snapshotted inside the adjustment
+  // transaction — lets auditors verify the ledger replays to the level.
+  quantityAfter Int
+  reason        String
+  // Future phases link movements to their cause (order, transfer, receipt)
+  // without schema changes.
+  referenceType String?
+  referenceId   String?
+  createdById   String?
+  createdAt     DateTime @default(now())
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  location  Location @relation(fields: [locationId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  createdBy User?    @relation("InventoryMovementActor", fields: [createdById], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@index([tenantId, locationId, productId, createdAt(sort: Desc)])
+  @@index([tenantId, createdAt(sort: Desc)])
+  @@index([productId])
+  @@index([locationId])
+  @@index([createdById])
 }

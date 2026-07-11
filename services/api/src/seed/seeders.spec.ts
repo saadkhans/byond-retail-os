@@ -34,8 +34,12 @@ describe('platform module catalog', () => {
     expect(new Set(codes).size).toBe(codes.length);
   });
 
-  it('enables only the core module by default', () => {
-    expect(DEFAULT_ENABLED_MODULE_CODES).toEqual(['core']);
+  it('default-enables core plus the shipped inventory module', () => {
+    // inventory is default-enabled from Phase 3 so the catalog/inventory
+    // routes are reachable for every new tenant (the only enable endpoint is
+    // tenant-scoped and needs a module:manage tenant user, which a brand-new
+    // tenant does not yet have).
+    expect(DEFAULT_ENABLED_MODULE_CODES).toEqual(['core', 'inventory']);
   });
 
   it('lists later-phase modules as catalog names only', () => {
@@ -45,11 +49,12 @@ describe('platform module catalog', () => {
     }
   });
 
-  it('keeps unimplemented modules inactive: only core is active', () => {
+  it('keeps unimplemented modules inactive: only shipped modules are active', () => {
     const active = PLATFORM_MODULE_CATALOG.filter((m) => m.isActive).map(
       (m) => m.code,
     );
-    expect(active).toEqual(['core']);
+    // core: Phase 1; inventory (catalog + ledger): Phase 3.
+    expect(active).toEqual(['core', 'inventory']);
   });
 
   it('never marks an inactive module as default-enabled', () => {

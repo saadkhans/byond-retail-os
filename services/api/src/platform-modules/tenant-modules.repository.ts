@@ -22,6 +22,16 @@ export class TenantModulesRepository extends TenantScopedRepository {
     });
   }
 
+  /** Tenant-scoped lookup of a single module's enablement row (or null). */
+  findForModule(
+    tenantId: string,
+    moduleId: string,
+  ): Promise<TenantModule | null> {
+    return this.prisma.tenantModule.findFirst({
+      where: this.scope(tenantId, { moduleId }),
+    });
+  }
+
   setStatus(
     tenantId: string,
     moduleId: string,

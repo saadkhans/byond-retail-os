@@ -28,12 +28,22 @@ async function bootstrap(): Promise<void> {
     const swaggerConfig = new DocumentBuilder()
       .setTitle('BYOND Core Platform API')
       .setDescription(
-        'Core platform — auth, tenants, users, RBAC, locations, modules. ' +
+        'Core platform — auth, tenants, users, RBAC, locations, modules, ' +
+          'product catalog, and inventory. ' +
           'All endpoints except /health and /auth/login require an ' +
           'Authorization: Bearer <access token> header (POST /auth/login). ' +
           'Errors use the standard Nest shape: { statusCode, message, error }.',
       )
-      .setVersion('0.2.0')
+      .setVersion('0.3.0')
+      .addTag(
+        'catalog',
+        'Tenant product catalog: categories, brands, products/SKUs, barcodes.',
+      )
+      .addTag(
+        'inventory',
+        'Stock levels per tenant/location/product, the append-only ' +
+          'movement ledger, and manual stock adjustments.',
+      )
       .addBearerAuth()
       .build();
     const document = SwaggerModule.createDocument(app, swaggerConfig);

@@ -22,4 +22,8 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   { code: 'module:read', module: 'core', description: 'View platform modules and tenant enablement' },
   { code: 'module:manage', module: 'core', description: 'Enable or disable modules for a tenant' },
   { code: 'audit:read', module: 'core', description: 'View audit logs' },
+  { code: 'catalog:read', module: 'inventory', description: 'View product categories, brands, products, and barcodes' },
+  { code: 'catalog:manage', module: 'inventory', description: 'Create, update, delete catalog entities' },
+  { code: 'inventory:read', module: 'inventory', description: 'View stock levels and the inventory movement ledger' },
+  { code: 'inventory:adjust', module: 'inventory', description: 'Perform manual stock adjustments' },
 ];
