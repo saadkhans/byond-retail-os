@@ -178,11 +178,12 @@ describe('Auth & RBAC (e2e, no live database)', () => {
     platformModule: {
       // Honors the tenant-creation lookup's `{ code: { in }, isActive: true }`
       // filter so every default-enabled module (core + the shipped inventory
-      // module) is provisioned for a new tenant.
+      // and devices modules) is provisioned for a new tenant.
       findMany: async ({ where }: { where?: Where } = {}) => {
         const active = [
           { id: 'module-core', code: 'core', isActive: true },
           { id: 'module-inventory', code: 'inventory', isActive: true },
+          { id: 'module-devices', code: 'devices', isActive: true },
         ];
         const requested = (where?.code as { in?: string[] } | undefined)?.in;
         return requested

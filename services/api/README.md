@@ -1,6 +1,6 @@
 # @byond/api — Core Platform API
 
-Phase 1 of the BYOND cloud control plane: tenants, users, RBAC, locations, platform modules, and the append-only audit log. NestJS 11 + TypeScript strict + Prisma + PostgreSQL.
+The BYOND cloud control plane: tenants, users, auth + RBAC (Phase 2), stores/locations, platform modules, the append-only audit log, product catalog + inventory ledger (Phase 3), and retail units, devices, and the edge-registration foundation (Phase 4). NestJS 11 + TypeScript strict + Prisma + PostgreSQL.
 
 ## Prerequisites
 
@@ -45,8 +45,10 @@ All four also run from the repo root via `pnpm run lint|typecheck|test|build`.
 - **Platform vs tenant users** — single `User` table with a `userType` discriminator; a DB CHECK constraint enforces `PLATFORM ⇔ tenantId IS NULL`.
 - **Audit log** — append-only: no update/delete service methods, a DB trigger rejects `UPDATE`/`DELETE`, and before/after snapshots pass a redaction filter.
 - **Catalogs as code** — permissions ([permission.catalog.ts](src/access-control/permission.catalog.ts)) and platform modules ([platform-module.catalog.ts](src/platform-modules/platform-module.catalog.ts)) are typed constants; the seed upserts from them, so codes never drift.
-- **No auth yet** — credentials, JWT, and the permissions guard land in Phase 2; only `health` and `tenants` expose controllers.
+- **Auth** — Phase 2: bcrypt credentials, short-lived HS256 JWTs, a global auth guard, and a permissions guard that audits every denial. Tenant context comes exclusively from the authenticated user — a `tenantId` in any request body is rejected by the global whitelist `ValidationPipe`.
+- **Stores / units / devices (Phase 4)** — the `Location` entity is the store/branch/site concept, served under both `/locations` and `/stores`. `RetailUnit` (smart fridge/shelf/kiosk/... with a DRAFT→ACTIVE→MAINTENANCE/DISABLED→RETIRED lifecycle) belongs to a store; `Device` (camera/lock/sensor/... with per-tenant-unique serials, heartbeats, and `lastSeenAt`) belongs to a unit. Composite same-tenant FKs in migration SQL make cross-tenant references impossible even if an unscoped id slipped through code. Deletion is Restrict-guarded: stores with units/inventory and units with devices return controlled 409s.
+- **Edge registration (Phase 4)** — `POST /devices/:id/registration-token` (permission `device:register`) issues a one-time token whose **SHA-256 hash alone** is stored; the plaintext is returned once and never logged or audited. The unauthenticated `POST /edge/register` redeems it (serial-bound, single-use, 60-minute expiry; every failure is the same generic 401). Phase 7 will exchange this registration for long-lived edge credentials — none are minted today.
 
 ## Environment variables
 
-See [.env.example](.env.example). `DATABASE_URL` is required; `PORT` (default 3000) and `NODE_ENV` are optional. Never commit a real `.env`.
+See [.env.example](.env.example). `DATABASE_URL` and `JWT_SECRET` are required; `PORT` (default 3000), `CORS_ORIGINS` (default `http://localhost:5173`, the admin web dev server), and `NODE_ENV` are optional. Never commit a real `.env`.

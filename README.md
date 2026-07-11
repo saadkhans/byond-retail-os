@@ -42,4 +42,31 @@ pnpm run test
 pnpm run build
 ```
 
-All scripts are placeholders until the first packages land; they exist so CI runs green from day one.
+## Running locally
+
+### Backend API (http://localhost:3000)
+
+```bash
+cd services/api
+cp .env.example .env        # set DATABASE_URL and a real JWT_SECRET
+pnpm run prisma:migrate     # apply migrations to your local Postgres
+pnpm run db:seed            # seed permissions/modules (see .env.example for
+                            # the local platform-admin opt-in)
+pnpm run start:dev
+```
+
+- API: http://localhost:3000
+- Swagger UI: http://localhost:3000/docs (non-production only)
+
+### Admin web (http://localhost:5173)
+
+```bash
+cd apps/admin-web
+cp .env.example .env        # VITE_API_BASE_URL, defaults to localhost:3000
+pnpm run dev
+```
+
+The admin web signs in via `POST /auth/login` (or a pasted access token) and
+provides read-only visibility over stores, units, devices, catalog, and
+inventory. The API's CORS allowlist defaults to `http://localhost:5173`
+(override with `CORS_ORIGINS`).

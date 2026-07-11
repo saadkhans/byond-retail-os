@@ -41,6 +41,20 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
     isActive: true,
   },
   {
+    code: 'devices',
+    name: 'Units & Devices',
+    description:
+      'Autonomous retail units (smart fridges, shelves, kiosks, ...) and ' +
+      'their devices, including heartbeats and the edge-registration ' +
+      'foundation.',
+    // Shipped in Phase 4 and DEFAULT-ENABLED for the same reason as
+    // inventory (see above): the only enable endpoint is @TenantOnly(), so
+    // leaving this false would strand new tenants behind 403s. RBAC still
+    // gates every route independently.
+    defaultEnabled: true,
+    isActive: true,
+  },
+  {
     code: 'pricing',
     name: 'Pricing',
     description: 'Versioned, auditable pricing (later phase).',

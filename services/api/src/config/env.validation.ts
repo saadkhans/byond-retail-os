@@ -72,6 +72,13 @@ class EnvironmentVariables {
   @Min(1000)
   LOGIN_THROTTLE_WINDOW_MS?: number;
 
+  // Comma-separated list of browser origins allowed by CORS (the admin
+  // web app). Default: the local Vite dev server. Never a wildcard.
+  @IsOptional()
+  @IsString()
+  @MinLength(1)
+  CORS_ORIGINS?: string;
+
   @IsOptional()
   @IsInt()
   @Min(0)
@@ -121,6 +128,20 @@ export function parseTrustProxy(
   }
   // loopback | linklocal | uniquelocal (validated upstream).
   return normalized;
+}
+
+/**
+ * Parses CORS_ORIGINS (comma-separated) into the explicit origin allowlist
+ * handed to Express CORS. Fail-safe default: only the local admin-web dev
+ * server. A wildcard is never produced — an empty/blank value falls back to
+ * the default rather than allowing everything.
+ */
+export function parseCorsOrigins(value: string | undefined): string[] {
+  const origins = (value ?? '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0 && origin !== '*');
+  return origins.length > 0 ? origins : ['http://localhost:5173'];
 }
 
 export function assertJwtSecretUsable(secret: string): void {
