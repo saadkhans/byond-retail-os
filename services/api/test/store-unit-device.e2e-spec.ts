@@ -949,6 +949,30 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
         .expect(200);
     });
 
+    it('rejects illegal lifecycle jumps (409) without persisting them', async () => {
+      // The unit is ACTIVE here: an operational unit can never go back to DRAFT.
+      await request(app.getHttpServer())
+        .patch(`/units/${unitId}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ status: 'DRAFT' })
+        .expect(409);
+      expect(store.units.find((u) => u.id === unitId)?.status).toBe('ACTIVE');
+    });
+
+    it('rejects creating a unit in a mid-lifecycle status (400)', async () => {
+      await request(app.getHttpServer())
+        .post('/units')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          locationId: storeId,
+          code: 'SKIP-1',
+          name: 'Lifecycle Skipper',
+          type: 'KIOSK',
+          status: 'MAINTENANCE',
+        })
+        .expect(400);
+    });
+
     it('reassigning a unit to another tenant’s store is rejected (400)', async () => {
       await request(app.getHttpServer())
         .patch(`/units/${unitId}`)
@@ -957,7 +981,7 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
         .expect(400);
     });
 
-    it('RETIRED is terminal (409 on any status change)', async () => {
+    it('DRAFT cannot be retired directly, and RETIRED is terminal (409)', async () => {
       const retired = await request(app.getHttpServer())
         .post('/units')
         .set('Authorization', `Bearer ${managerToken}`)
@@ -968,6 +992,17 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
           type: 'KIOSK',
         })
         .expect(201);
+      // A never-operational DRAFT unit is deleted, not retired.
+      await request(app.getHttpServer())
+        .patch(`/units/${retired.body.id}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ status: 'RETIRED' })
+        .expect(409);
+      await request(app.getHttpServer())
+        .patch(`/units/${retired.body.id}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ status: 'ACTIVE' })
+        .expect(200);
       await request(app.getHttpServer())
         .patch(`/units/${retired.body.id}`)
         .set('Authorization', `Bearer ${managerToken}`)
@@ -1096,6 +1131,39 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
           tenantId: 'tenant-b',
         })
         .expect(400);
+    });
+
+    it('credential/payment-shaped metadata is rejected outright (400)', async () => {
+      await request(app.getHttpServer())
+        .post('/devices')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          unitId,
+          name: 'Leaky terminal',
+          type: 'PAYMENT_TERMINAL',
+          serialNumber: 'SN-LEAK-1',
+          metadata: { processor: { config: { apiKey: 'sk_live_secret' } } },
+        })
+        .expect(400);
+      expect(
+        store.devices.some((d) => d.serialNumber === 'SN-LEAK-1'),
+      ).toBe(false);
+
+      const before = store.devices.find((d) => d.id === deviceId)!.metadata;
+      await request(app.getHttpServer())
+        .patch(`/devices/${deviceId}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ metadata: { payment: { cardNumber: '4111111111111111' } } })
+        .expect(400);
+      await request(app.getHttpServer())
+        .patch(`/devices/${deviceId}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ metadata: { reader: { track2: 'raw-stripe' } } })
+        .expect(400);
+      // Nothing was persisted — the stored metadata is untouched.
+      expect(store.devices.find((d) => d.id === deviceId)!.metadata).toEqual(
+        before,
+      );
     });
 
     it('lastSeenAt is not client-writable (400)', async () => {
@@ -1258,7 +1326,7 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
         expect(response.body).not.toHaveProperty('registrationTokenHash');
       });
 
-      it('rejects a wrong token and a serial mismatch with the same generic 401', async () => {
+      it('rejects an unknown token with the generic 401 (nothing consumed)', async () => {
         await request(app.getHttpServer())
           .post('/edge/register')
           .send({
@@ -1266,13 +1334,10 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
             registrationToken: 'totally-wrong-token-value',
           })
           .expect(401);
-        await request(app.getHttpServer())
-          .post('/edge/register')
-          .send({
-            serialNumber: 'SN-WRONG-SERIAL',
-            registrationToken,
-          })
-          .expect(401);
+        // The real, still-unredeemed token was not touched.
+        expect(
+          store.devices.find((d) => d.id === deviceId)!.registrationTokenHash,
+        ).toBeTruthy();
       });
 
       it('redeems the token unauthenticated, marks the device ONLINE + registered, audits', async () => {
@@ -1317,6 +1382,81 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
           .expect(201);
         const row = store.devices.find((d) => d.id === deviceId)!;
         row.registrationTokenExpiresAt = new Date(Date.now() - 1000);
+        await request(app.getHttpServer())
+          .post('/edge/register')
+          .send({
+            serialNumber: 'SN-LOCK-1',
+            registrationToken: issued.body.registrationToken,
+          })
+          .expect(401);
+      });
+
+      it('a devices-module-disabled tenant cannot redeem — same 401, nothing mutated', async () => {
+        const issued = await request(app.getHttpServer())
+          .post(`/devices/${deviceId}/registration-token`)
+          .set('Authorization', `Bearer ${managerToken}`)
+          .expect(201);
+        const row = store.devices.find((d) => d.id === deviceId)!;
+        const snapshot = {
+          status: row.status,
+          lastSeenAt: row.lastSeenAt,
+          registeredAt: row.registeredAt,
+          registrationTokenHash: row.registrationTokenHash,
+          registrationTokenExpiresAt: row.registrationTokenExpiresAt,
+        };
+
+        const enabled = tenantModules.pop()!;
+        try {
+          await request(app.getHttpServer())
+            .post('/edge/register')
+            .send({
+              serialNumber: 'SN-LOCK-1',
+              registrationToken: issued.body.registrationToken,
+            })
+            .expect(401);
+          // No mutation at all: status, lastSeenAt, registeredAt, and the
+          // token fields are untouched while the module is disabled.
+          expect({
+            status: row.status,
+            lastSeenAt: row.lastSeenAt,
+            registeredAt: row.registeredAt,
+            registrationTokenHash: row.registrationTokenHash,
+            registrationTokenExpiresAt: row.registrationTokenExpiresAt,
+          }).toEqual(snapshot);
+        } finally {
+          tenantModules.push(enabled);
+        }
+
+        // Re-enabling the module lets the untouched token redeem normally.
+        await request(app.getHttpServer())
+          .post('/edge/register')
+          .send({
+            serialNumber: 'SN-LOCK-1',
+            registrationToken: issued.body.registrationToken,
+          })
+          .expect(200);
+      });
+
+      it('a serial mismatch CONSUMES the token — the correct serial then fails too', async () => {
+        const issued = await request(app.getHttpServer())
+          .post(`/devices/${deviceId}/registration-token`)
+          .set('Authorization', `Bearer ${managerToken}`)
+          .expect(201);
+        const row = store.devices.find((d) => d.id === deviceId)!;
+        expect(row.registrationTokenHash).toBeTruthy();
+
+        await request(app.getHttpServer())
+          .post('/edge/register')
+          .send({
+            serialNumber: 'SN-GUESSED-WRONG',
+            registrationToken: issued.body.registrationToken,
+          })
+          .expect(401);
+        // The token was invalidated by the mismatch (no serial-guessing
+        // window), but nothing else about the device changed.
+        expect(row.registrationTokenHash).toBeNull();
+        expect(row.registrationTokenExpiresAt).toBeNull();
+
         await request(app.getHttpServer())
           .post('/edge/register')
           .send({

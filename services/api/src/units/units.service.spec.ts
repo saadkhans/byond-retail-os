@@ -159,11 +159,52 @@ describe('UnitsService', () => {
     expect(repository.update).not.toHaveBeenCalled();
   });
 
+  it('rejects creating a unit in a mid-lifecycle status (400)', async () => {
+    for (const status of [
+      RetailUnitStatus.MAINTENANCE,
+      RetailUnitStatus.DISABLED,
+      RetailUnitStatus.RETIRED,
+    ]) {
+      await expect(
+        service.create('tenant-a', {
+          locationId: 'loc-a1',
+          code: 'FRIDGE-001',
+          name: 'Fridge',
+          type: RetailUnitType.SMART_FRIDGE,
+          status,
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
+    expect(repository.create).not.toHaveBeenCalled();
+  });
+
+  it('allows creating a unit as DRAFT or ACTIVE', async () => {
+    for (const status of [RetailUnitStatus.DRAFT, RetailUnitStatus.ACTIVE]) {
+      await service.create('tenant-a', {
+        locationId: 'loc-a1',
+        code: 'FRIDGE-001',
+        name: 'Fridge',
+        type: RetailUnitType.SMART_FRIDGE,
+        status,
+      });
+    }
+    expect(repository.create).toHaveBeenCalledTimes(2);
+  });
+
   it('maps the retired-blocked sentinel to a conflict', async () => {
     repository.update.mockResolvedValue('retired-blocked');
     await expect(
       service.update('tenant-a', 'unit-1', {
         status: RetailUnitStatus.ACTIVE,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('maps the transition-blocked sentinel to a conflict', async () => {
+    repository.update.mockResolvedValue('transition-blocked');
+    await expect(
+      service.update('tenant-a', 'unit-1', {
+        status: RetailUnitStatus.DRAFT,
       }),
     ).rejects.toBeInstanceOf(ConflictException);
   });

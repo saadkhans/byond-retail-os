@@ -50,7 +50,9 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
     // Shipped in Phase 4 and DEFAULT-ENABLED for the same reason as
     // inventory (see above): the only enable endpoint is @TenantOnly(), so
     // leaving this false would strand new tenants behind 403s. RBAC still
-    // gates every route independently.
+    // gates every route independently. Tenants that existed BEFORE Phase 4
+    // are covered by the 20260711000001_devices_module_backfill migration —
+    // defaultEnabled only applies at tenant creation time.
     defaultEnabled: true,
     isActive: true,
   },

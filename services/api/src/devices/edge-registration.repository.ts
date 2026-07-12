@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { DeviceStatus } from '@prisma/client';
+import { DeviceStatus, ModuleStatus } from '@prisma/client';
 import {
   AuditEntry,
   AuditLogService,
@@ -7,6 +7,9 @@ import {
 import { deviceAdvisoryLockKey } from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
 import { DEVICE_INCLUDE, DEVICE_OMIT, DeviceWithUnit } from './devices.repository';
+
+/** Module code gating all unit/device functionality (same as @RequireModule). */
+const DEVICES_MODULE_CODE = 'devices';
 
 /**
  * EXPLICITLY NOT a TenantScopedRepository: the caller of the redemption flow
@@ -25,17 +28,32 @@ export class EdgeRegistrationRepository {
 
   /**
    * Redeems a one-time registration token. Returns the registered device, or
-   * null on ANY mismatch (unknown hash, wrong serial, expired token,
-   * disabled/retired device) — callers surface a single generic error so the
-   * endpoint cannot be used to probe which part failed.
+   * null on ANY mismatch (unknown hash, disabled devices module, wrong
+   * serial, expired token, disabled/retired device) — callers surface a
+   * single generic error so the endpoint cannot be used to probe which part
+   * failed.
    *
-   * Single-use: the stored hash is cleared in the same transaction.
+   * Single-use, and hostile-input hardened:
+   * - A valid token presented with the WRONG serial is CONSUMED (hash and
+   *   expiry cleared, nothing else mutated) before returning the generic
+   *   failure — a leaked token grants exactly one serial guess, not a
+   *   guessing window until expiry.
+   * - When the tenant has the devices module disabled, the redemption fails
+   *   with NO mutation at all: the module gate on /units and /devices cannot
+   *   be bypassed through the public registration endpoint, and the token
+   *   resumes working if the module is re-enabled within its lifetime.
+   * - On success the stored hash is cleared in the same transaction.
    */
   redeem(
     tokenHash: string,
     serialNumber: string,
     buildAuditEntry: (
-      before: { id: string; tenantId: string; status: DeviceStatus },
+      before: {
+        id: string;
+        tenantId: string;
+        status: DeviceStatus;
+        registeredAt: Date | null;
+      },
       after: DeviceWithUnit,
     ) => AuditEntry,
   ): Promise<DeviceWithUnit | null> {
@@ -57,9 +75,43 @@ export class EdgeRegistrationRepository {
       const device = await tx.device.findFirst({
         where: { id: candidate.id, registrationTokenHash: tokenHash },
       });
+      if (!device) {
+        return null;
+      }
+
+      // Mirror ModuleEnabledGuard/PlatformModulesService.isEnabledForTenant
+      // inside the transaction: registration is part of the devices module,
+      // so a tenant that disabled it cannot complete the handshake. Checked
+      // FIRST and with no mutation — the outcome must stay indistinguishable
+      // from a bad token, and nothing about the device may change.
+      const platformModule = await tx.platformModule.findUnique({
+        where: { code: DEVICES_MODULE_CODE },
+      });
+      if (!platformModule || !platformModule.isActive) {
+        return null;
+      }
+      const tenantModule = await tx.tenantModule.findFirst({
+        where: { tenantId: device.tenantId, moduleId: platformModule.id },
+      });
+      if (tenantModule?.status !== ModuleStatus.ENABLED) {
+        return null;
+      }
+
+      // Wrong serial for a REAL token: consume the token so a leaked token
+      // cannot be replayed with different serial guesses, then fail with the
+      // same generic response as every other branch.
+      if (device.serialNumber !== serialNumber) {
+        await tx.device.update({
+          where: { id: device.id },
+          data: {
+            registrationTokenHash: null,
+            registrationTokenExpiresAt: null,
+          },
+        });
+        return null;
+      }
+
       if (
-        !device ||
-        device.serialNumber !== serialNumber ||
         !device.registrationTokenExpiresAt ||
         device.registrationTokenExpiresAt.getTime() < Date.now() ||
         device.status === DeviceStatus.DISABLED ||
@@ -89,6 +141,9 @@ export class EdgeRegistrationRepository {
             id: device.id,
             tenantId: device.tenantId,
             status: device.status,
+            // Real prior registration state: re-registration of a device
+            // that was registered before must not be audited as first-time.
+            registeredAt: device.registeredAt,
           },
           after,
         ),

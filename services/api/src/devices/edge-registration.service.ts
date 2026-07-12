@@ -26,9 +26,10 @@ export class EdgeRegistrationService {
    * Completes the edge registration handshake. The one-time token (issued by
    * a tenant admin holding device:register) is the credential: it is matched
    * by SHA-256 hash, bound to the device's serial number, single-use, and
-   * expiring. Every failure mode surfaces the SAME generic 401 so the
-   * endpoint cannot be used to probe serials or token validity, and neither
-   * the token nor its hash is ever logged.
+   * expiring. Every failure mode — including a tenant whose devices module
+   * is disabled — surfaces the SAME generic 401 so the endpoint cannot be
+   * used to probe serials, token validity, tenant existence, or module
+   * state; neither the token nor its hash is ever logged.
    *
    * Phase 7 (edge runtime) will exchange this registration for long-lived
    * device credentials; this phase deliberately mints none.
@@ -46,13 +47,23 @@ export class EdgeRegistrationService {
         action: AuditAction.REGISTER,
         entityType: 'Device',
         entityId: before.id,
-        before: { status: before.status, registered: false },
+        // Reissued tokens allow deliberate re-registration (edge reset /
+        // re-pair); the before snapshot reflects the REAL prior state so a
+        // re-registration is never audited as first-time.
+        before: {
+          status: before.status,
+          registered: before.registeredAt !== null,
+          registeredAt: before.registeredAt,
+        },
         after: {
           status: after.status,
           registered: true,
           registeredAt: after.registeredAt,
         },
-        reason: 'Edge device registered with one-time token',
+        reason:
+          before.registeredAt !== null
+            ? 'Edge device re-registered with one-time token'
+            : 'Edge device registered with one-time token',
       }),
     );
     if (!device) {

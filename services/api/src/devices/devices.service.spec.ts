@@ -109,6 +109,68 @@ describe('DevicesService', () => {
     );
   });
 
+  describe('metadata sensitive-key blocking', () => {
+    it('rejects credential-shaped keys nested in metadata on create (400)', async () => {
+      await expect(
+        service.create('tenant-a', {
+          unitId: 'unit-1',
+          name: 'Cam',
+          type: DeviceType.CAMERA,
+          serialNumber: 'SN-1',
+          metadata: { config: { auth: { apiKey: 'super-secret' } } },
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(repository.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects payment-shaped keys (card number, CVV, track data) on create', async () => {
+      for (const metadata of [
+        { cardNumber: '4111111111111111' },
+        { payment: { cvv: '123' } },
+        { readerDump: [{ track2: 'raw-stripe-data' }] },
+      ]) {
+        await expect(
+          service.create('tenant-a', {
+            unitId: 'unit-1',
+            name: 'Terminal',
+            type: DeviceType.PAYMENT_TERMINAL,
+            serialNumber: 'SN-PAY-1',
+            metadata,
+          }),
+        ).rejects.toBeInstanceOf(BadRequestException);
+      }
+      expect(repository.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects sensitive keys on update — persistence is blocked, not redacted', async () => {
+      await expect(
+        service.update('tenant-a', 'device-1', {
+          metadata: { integration: { clientSecret: 'x' } },
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(repository.update).not.toHaveBeenCalled();
+    });
+
+    it('accepts safe non-secret metadata', async () => {
+      await service.create('tenant-a', {
+        unitId: 'unit-1',
+        name: 'Cam',
+        type: DeviceType.CAMERA,
+        serialNumber: 'SN-1',
+        metadata: {
+          mountPosition: 'front',
+          stream: { url: 'rtsp://cam.local', fps: 25 },
+          zones: [{ name: 'entry', threshold: 0.4 }],
+        },
+      });
+      expect(repository.create).toHaveBeenCalled();
+      await service.update('tenant-a', 'device-1', {
+        metadata: { mountPosition: 'rear' },
+      });
+      expect(repository.update).toHaveBeenCalled();
+    });
+  });
+
   it('maps duplicate serial numbers to a conflict error', async () => {
     repository.create.mockRejectedValue({ code: 'P2002' });
     await expect(

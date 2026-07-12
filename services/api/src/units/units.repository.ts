@@ -27,11 +27,44 @@ export type RetailUnitWithLocation = Prisma.RetailUnitGetPayload<{
  * so the whole check-and-write stays inside one transaction:
  * - 'retired-blocked': RETIRED is a terminal status — a retired unit's
  *   status can never change again.
+ * - 'transition-blocked': the requested status change is not a legal
+ *   lifecycle transition (see UNIT_STATUS_TRANSITIONS).
  * - 'has-devices': the unit still has devices assigned; deleting it would
  *   orphan them (and future phases will add inventory references).
  */
-export type UnitUpdateRejection = 'retired-blocked';
+export type UnitUpdateRejection = 'retired-blocked' | 'transition-blocked';
 export type UnitDeleteRejection = 'has-devices';
+
+/**
+ * The unit lifecycle state machine: DRAFT → ACTIVE ↔ MAINTENANCE/DISABLED →
+ * RETIRED. A DRAFT unit has never been operational, so it cannot be retired
+ * directly (delete it instead) and an operational unit cannot go back to
+ * DRAFT. RETIRED is terminal.
+ */
+export const UNIT_STATUS_TRANSITIONS: Readonly<
+  Record<RetailUnitStatus, readonly RetailUnitStatus[]>
+> = {
+  [RetailUnitStatus.DRAFT]: [
+    RetailUnitStatus.ACTIVE,
+    RetailUnitStatus.DISABLED,
+  ],
+  [RetailUnitStatus.ACTIVE]: [
+    RetailUnitStatus.MAINTENANCE,
+    RetailUnitStatus.DISABLED,
+    RetailUnitStatus.RETIRED,
+  ],
+  [RetailUnitStatus.MAINTENANCE]: [
+    RetailUnitStatus.ACTIVE,
+    RetailUnitStatus.DISABLED,
+    RetailUnitStatus.RETIRED,
+  ],
+  [RetailUnitStatus.DISABLED]: [
+    RetailUnitStatus.ACTIVE,
+    RetailUnitStatus.MAINTENANCE,
+    RetailUnitStatus.RETIRED,
+  ],
+  [RetailUnitStatus.RETIRED]: [],
+};
 
 export interface UnitSearchFilters {
   search?: string;
@@ -149,14 +182,19 @@ export class UnitsRepository extends TenantScopedRepository {
       if (!before) {
         return null;
       }
-      // RETIRED is terminal: once retired, a unit's status never changes
-      // again (re-provision hardware as a new unit instead).
-      if (
-        before.status === RetailUnitStatus.RETIRED &&
-        data.status !== undefined &&
-        data.status !== RetailUnitStatus.RETIRED
-      ) {
-        return 'retired-blocked' as const;
+      // Lifecycle enforcement, checked inside the transaction so a
+      // concurrent status change cannot slip an illegal jump through.
+      if (data.status !== undefined && data.status !== before.status) {
+        // RETIRED is terminal: once retired, a unit's status never changes
+        // again (re-provision hardware as a new unit instead).
+        if (before.status === RetailUnitStatus.RETIRED) {
+          return 'retired-blocked' as const;
+        }
+        if (
+          !UNIT_STATUS_TRANSITIONS[before.status].includes(data.status)
+        ) {
+          return 'transition-blocked' as const;
+        }
       }
       const after = await tx.retailUnit.update({
         where: { id: before.id },

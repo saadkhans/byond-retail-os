@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { api, Paginated, Store, Unit } from '../api';
+import { api, ApiError, Paginated, Store, Unit } from '../api';
 import { formatDate, Page, StatusBadge, useLoad } from '../components';
 
 export function StoresPage() {
@@ -76,14 +76,29 @@ export function StoreDetailPage() {
   const { id } = useParams<{ id: string }>();
   const { data, error, loading } = useLoad<{
     store: Store;
-    units: Paginated<Unit>;
+    units: Paginated<Unit> | null;
+    unitsError: string | null;
   }>(
-    async () => ({
-      store: await api<Store>(`/stores/${id}`),
-      units: await api<Paginated<Unit>>(`/units?locationId=${id}&take=100`).catch(
-        () => ({ items: [], total: 0, skip: 0, take: 0 }),
-      ),
-    }),
+    async () => {
+      const store = await api<Store>(`/stores/${id}`);
+      // An authorization/module failure on the related list must surface as
+      // "unavailable", never masquerade as an empty store.
+      try {
+        const units = await api<Paginated<Unit>>(
+          `/units?locationId=${id}&take=100`,
+        );
+        return { store, units, unitsError: null };
+      } catch (err) {
+        return {
+          store,
+          units: null,
+          unitsError:
+            err instanceof ApiError
+              ? `Units unavailable (${err.status || 'network'}): ${err.message}`
+              : 'Units unavailable',
+        };
+      }
+    },
     [id],
   );
 
@@ -118,34 +133,39 @@ export function StoreDetailPage() {
             <dd>{formatDate(data.store.updatedAt)}</dd>
           </dl>
           <h1 style={{ marginTop: '1.5rem' }}>
-            Units in this store ({data.units.total})
+            Units in this store
+            {data.units ? ` (${data.units.total})` : ''}
           </h1>
-          <table>
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Code</th>
-                <th>Type</th>
-                <th>Status</th>
-                <th>Placement</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.units.items.map((unit) => (
-                <tr key={unit.id}>
-                  <td>
-                    <Link to={`/units/${unit.id}`}>{unit.name}</Link>
-                  </td>
-                  <td>{unit.code}</td>
-                  <td>{unit.type}</td>
-                  <td>
-                    <StatusBadge status={unit.status} />
-                  </td>
-                  <td>{unit.placement ?? '—'}</td>
+          {data.unitsError ? (
+            <div className="error">{data.unitsError}</div>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Code</th>
+                  <th>Type</th>
+                  <th>Status</th>
+                  <th>Placement</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {data.units?.items.map((unit) => (
+                  <tr key={unit.id}>
+                    <td>
+                      <Link to={`/units/${unit.id}`}>{unit.name}</Link>
+                    </td>
+                    <td>{unit.code}</td>
+                    <td>{unit.type}</td>
+                    <td>
+                      <StatusBadge status={unit.status} />
+                    </td>
+                    <td>{unit.placement ?? '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
       ) : null}
     </Page>

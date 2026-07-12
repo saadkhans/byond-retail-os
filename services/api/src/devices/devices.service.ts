@@ -11,6 +11,7 @@ import {
   AuditEntry,
   SYSTEM_ACTOR_EMAIL,
 } from '../common/audit/audit-log.service';
+import { findSensitiveKeyPath } from '../common/sensitive-keys';
 import { UnitsRepository } from '../units/units.repository';
 import {
   DevicesRepository,
@@ -61,6 +62,7 @@ export class DevicesService {
     if (!serialNumber) {
       throw new BadRequestException('Device serial number is required');
     }
+    this.assertSafeMetadata(dto.metadata);
     // The unit must exist IN THIS TENANT (scoped lookup).
     await this.assertUnit(tenantId, dto.unitId);
 
@@ -155,6 +157,7 @@ export class DevicesService {
       data.status = dto.status;
     }
     if (dto.metadata !== undefined) {
+      this.assertSafeMetadata(dto.metadata);
       data.metadata = dto.metadata as Prisma.InputJsonValue;
     }
     if (dto.firmwareVersion !== undefined) {
@@ -316,6 +319,30 @@ export class DevicesService {
       throw new NotFoundException(`Device "${id}" not found`);
     }
     return { registrationToken, expiresAt };
+  }
+
+  /**
+   * Device metadata is for SAFE, NON-SECRET configuration only. This BLOCKS
+   * persistence (controlled 400) when any credential- or payment-shaped key
+   * (passwords, tokens, secrets, API keys, card numbers, CVV/PIN, track
+   * data, PAN, ...) appears anywhere in the object — recursively, through
+   * nested objects and arrays. Audit-snapshot redaction is only a backstop;
+   * such values must never reach storage in the first place (AGENTS.md
+   * payments invariant).
+   */
+  private assertSafeMetadata(metadata?: Record<string, unknown>): void {
+    if (metadata === undefined) {
+      return;
+    }
+    const offendingPath = findSensitiveKeyPath(metadata);
+    if (offendingPath) {
+      throw new BadRequestException(
+        `Device metadata must not contain credential- or payment-shaped ` +
+          `keys ("${offendingPath}"). Metadata is for safe, non-secret ` +
+          `configuration only — secrets belong in a dedicated secret store, ` +
+          `and payment data must never be stored.`,
+      );
+    }
   }
 
   /** The unit must exist IN THIS TENANT (scoped lookup). */

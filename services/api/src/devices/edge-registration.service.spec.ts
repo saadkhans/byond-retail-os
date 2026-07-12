@@ -64,7 +64,12 @@ describe('EdgeRegistrationService', () => {
       registrationToken: 'the-plaintext-token-value',
     });
     const buildAuditEntry = repository.redeem.mock.calls[0][2] as (
-      before: { id: string; tenantId: string; status: DeviceStatus },
+      before: {
+        id: string;
+        tenantId: string;
+        status: DeviceStatus;
+        registeredAt: Date | null;
+      },
       after: DeviceWithUnit,
     ) => AuditEntry;
     const entry = buildAuditEntry(
@@ -72,6 +77,7 @@ describe('EdgeRegistrationService', () => {
         id: 'device-1',
         tenantId: 'tenant-a',
         status: DeviceStatus.PROVISIONED,
+        registeredAt: null,
       },
       registered,
     );
@@ -82,9 +88,50 @@ describe('EdgeRegistrationService', () => {
         action: AuditAction.REGISTER,
         entityType: 'Device',
         entityId: 'device-1',
+        before: {
+          status: DeviceStatus.PROVISIONED,
+          registered: false,
+          registeredAt: null,
+        },
+        reason: 'Edge device registered with one-time token',
       }),
     );
     expect(JSON.stringify(entry)).not.toContain('the-plaintext-token-value');
+  });
+
+  it('audits a RE-registration with the real prior registered state', async () => {
+    await service.register({
+      serialNumber: 'SN-0001',
+      registrationToken: 'the-plaintext-token-value',
+    });
+    const buildAuditEntry = repository.redeem.mock.calls[0][2] as (
+      before: {
+        id: string;
+        tenantId: string;
+        status: DeviceStatus;
+        registeredAt: Date | null;
+      },
+      after: DeviceWithUnit,
+    ) => AuditEntry;
+    const previouslyRegisteredAt = new Date('2026-07-01T00:00:00Z');
+    const entry = buildAuditEntry(
+      {
+        id: 'device-1',
+        tenantId: 'tenant-a',
+        status: DeviceStatus.ONLINE,
+        registeredAt: previouslyRegisteredAt,
+      },
+      registered,
+    );
+    // The before snapshot must NOT claim the device was unregistered.
+    expect(entry.before).toEqual({
+      status: DeviceStatus.ONLINE,
+      registered: true,
+      registeredAt: previouslyRegisteredAt,
+    });
+    expect(entry.reason).toBe(
+      'Edge device re-registered with one-time token',
+    );
   });
 
   it('surfaces every failure as the same generic 401', async () => {

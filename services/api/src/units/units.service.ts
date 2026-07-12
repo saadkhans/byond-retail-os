@@ -4,7 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { AuditAction, RetailUnit } from '@prisma/client';
+import { AuditAction, RetailUnit, RetailUnitStatus } from '@prisma/client';
 import {
   AuditActor,
   AuditEntry,
@@ -40,6 +40,18 @@ export class UnitsService {
     const name = dto.name.trim();
     if (!name) {
       throw new BadRequestException('Unit name is required');
+    }
+    // The lifecycle state machine starts at DRAFT (or directly ACTIVE for
+    // pre-commissioned hardware); creating a unit in a later state would
+    // bypass the transition rules enforced on update.
+    if (
+      dto.status !== undefined &&
+      dto.status !== RetailUnitStatus.DRAFT &&
+      dto.status !== RetailUnitStatus.ACTIVE
+    ) {
+      throw new BadRequestException(
+        'A unit is created as DRAFT or ACTIVE; other statuses are reached through lifecycle transitions',
+      );
     }
     const code = dto.code.trim().toUpperCase();
     // The store must exist IN THIS TENANT (scoped lookup).
@@ -184,6 +196,13 @@ export class UnitsService {
     if (updated === 'retired-blocked') {
       throw new ConflictException(
         'A RETIRED unit is terminal and cannot change status; provision a new unit instead',
+      );
+    }
+    if (updated === 'transition-blocked') {
+      throw new ConflictException(
+        'Invalid unit lifecycle transition. Allowed: DRAFT -> ACTIVE/DISABLED; ' +
+          'ACTIVE/MAINTENANCE/DISABLED may move between each other or to RETIRED; ' +
+          'RETIRED is terminal. Delete a DRAFT unit instead of retiring it.',
       );
     }
     if (!updated) {

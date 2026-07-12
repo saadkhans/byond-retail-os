@@ -40,8 +40,11 @@ export class CreateUnitDto {
   type!: RetailUnitType;
 
   @ApiPropertyOptional({
-    enum: RetailUnitStatus,
+    enum: [RetailUnitStatus.DRAFT, RetailUnitStatus.ACTIVE],
     default: RetailUnitStatus.DRAFT,
+    description:
+      'Initial status: DRAFT or ACTIVE only. Later states are reached ' +
+      'through lifecycle transitions on update.',
   })
   @IsOptional()
   @IsEnum(RetailUnitStatus)

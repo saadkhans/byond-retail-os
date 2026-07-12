@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { api, Device, Paginated, Unit } from '../api';
+import { api, ApiError, Device, Paginated, Unit } from '../api';
 import { formatDate, Page, StatusBadge, useLoad } from '../components';
 
 const UNIT_STATUSES = ['', 'DRAFT', 'ACTIVE', 'MAINTENANCE', 'DISABLED', 'RETIRED'];
@@ -100,14 +100,29 @@ export function UnitDetailPage() {
   const { id } = useParams<{ id: string }>();
   const { data, error, loading } = useLoad<{
     unit: Unit;
-    devices: Paginated<Device>;
+    devices: Paginated<Device> | null;
+    devicesError: string | null;
   }>(
-    async () => ({
-      unit: await api<Unit>(`/units/${id}`),
-      devices: await api<Paginated<Device>>(
-        `/devices?unitId=${id}&take=100`,
-      ).catch(() => ({ items: [], total: 0, skip: 0, take: 0 })),
-    }),
+    async () => {
+      const unit = await api<Unit>(`/units/${id}`);
+      // An authorization/module failure on the related list must surface as
+      // "unavailable", never masquerade as a unit with no devices.
+      try {
+        const devices = await api<Paginated<Device>>(
+          `/devices?unitId=${id}&take=100`,
+        );
+        return { unit, devices, devicesError: null };
+      } catch (err) {
+        return {
+          unit,
+          devices: null,
+          devicesError:
+            err instanceof ApiError
+              ? `Devices unavailable (${err.status || 'network'}): ${err.message}`
+              : 'Devices unavailable',
+        };
+      }
+    },
     [id],
   );
 
@@ -146,34 +161,39 @@ export function UnitDetailPage() {
             <dd>{formatDate(data.unit.updatedAt)}</dd>
           </dl>
           <h1 style={{ marginTop: '1.5rem' }}>
-            Devices on this unit ({data.devices.total})
+            Devices on this unit
+            {data.devices ? ` (${data.devices.total})` : ''}
           </h1>
-          <table>
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Type</th>
-                <th>Status</th>
-                <th>Serial</th>
-                <th>Last seen</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.devices.items.map((device) => (
-                <tr key={device.id}>
-                  <td>
-                    <Link to={`/devices/${device.id}`}>{device.name}</Link>
-                  </td>
-                  <td>{device.type}</td>
-                  <td>
-                    <StatusBadge status={device.status} />
-                  </td>
-                  <td>{device.serialNumber}</td>
-                  <td>{formatDate(device.lastSeenAt)}</td>
+          {data.devicesError ? (
+            <div className="error">{data.devicesError}</div>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Type</th>
+                  <th>Status</th>
+                  <th>Serial</th>
+                  <th>Last seen</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {data.devices?.items.map((device) => (
+                  <tr key={device.id}>
+                    <td>
+                      <Link to={`/devices/${device.id}`}>{device.name}</Link>
+                    </td>
+                    <td>{device.type}</td>
+                    <td>
+                      <StatusBadge status={device.status} />
+                    </td>
+                    <td>{device.serialNumber}</td>
+                    <td>{formatDate(device.lastSeenAt)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
       ) : null}
     </Page>
