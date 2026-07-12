@@ -1,5 +1,7 @@
 import {
   containsCredentialValue,
+  containsPaymentCardValue,
+  containsSensitiveValue,
   findSensitiveKeyPath,
   isSensitiveKey,
 } from './sensitive-keys';
@@ -63,6 +65,35 @@ describe('sensitive key detection', () => {
   });
 
   it.each([
+    // Qualified card-verification aliases in every separator style.
+    'terminalCvv2',
+    'terminal_cvv',
+    'terminal-cvv2',
+    'payment_cvv2',
+    'paymentCvc',
+    'readerCvc2',
+    'card_verification_value',
+    'cardVerificationValue',
+    'card_verification_code',
+    'cardSecurityCode',
+    'cid',
+    // Qualified magstripe/track-data aliases.
+    'track1',
+    'track2',
+    'readerTrack2',
+    'reader_track_1',
+    'magstripeTrack2',
+    'readerTrackData',
+    'pos_track_data',
+    'magneticStripeData',
+    'magnetic_stripe_data',
+    'readerMagstripeData',
+    'deviceMagneticStripe',
+  ])('flags qualified CVV/track-data alias %s', (key) => {
+    expect(isSensitiveKey(key)).toBe(true);
+  });
+
+  it.each([
     'name',
     'mountPosition',
     'streamUrl',
@@ -81,6 +112,15 @@ describe('sensitive key detection', () => {
     'expansion',
     'spinning',
     'companyName',
+    // Near-misses of the CVV/track aliases must stay harmless: bare
+    // 'track' is not a token, Stripe-the-vendor keys are not stripe data,
+    // and correlation-id 'cid' qualifiers are only exact-match sensitive.
+    'trackingNumber',
+    'audioTrack',
+    'audio_track',
+    'stripeCustomerId',
+    'requestCid',
+    'lucidMode',
   ])('accepts harmless key %s', (key) => {
     expect(isSensitiveKey(key)).toBe(false);
   });
@@ -107,20 +147,70 @@ describe('containsCredentialValue', () => {
     // Key-value connection strings.
     'Server=db.local;Database=app;User Id=sa;Password=hunter2;',
     'host=db.local pwd=hunter2',
+    // URLs carrying credential query parameters (no userinfo needed).
+    'https://camera.local/feed?access_token=abc',
+    'https://camera.local/feed?api_key=abc',
+    'rtsp://camera.local/feed?token=abc',
+    'mqtt://broker.local?password=abc',
+    'https://example.com?signature=abc',
+    'https://example.com?client_secret=abc',
+    'https://example.com/path?token=none#frag',
+    'https://cdn.example.com/asset.jpg?sig=xyz&expires=12',
+    'https://api.example.com/v1?key=abc123',
+    // Bare key=value credential fragments outside a parseable URL.
+    'token=abc123',
+    'endpoint at broker.local, auth=basic secret=hunter2',
   ])('flags credential-bearing value %s', (value) => {
     expect(containsCredentialValue(value)).toBe(true);
   });
 
   it.each([
     'rtsp://camera.local/feed',
-    'https://example.com/path?token=none#frag',
+    'rtsp://camera.local/feed?channel=1&fps=25',
+    'https://example.com/path?page=2&sort=asc#frag',
+    'https://example.com/docs?version=1.4.2',
     'mqtt://broker.local:1883',
     'postgres://db.local:5432/app',
     'plain text mentioning admin@store.example without a scheme',
     'front entrance, aisle 3',
     '1.4.2',
+    // Innocent substrings never trip the key=value backstop.
+    'monkey=banana',
+    'oauth flow disabled',
   ])('accepts safe value %s', (value) => {
     expect(containsCredentialValue(value)).toBe(false);
+  });
+});
+
+describe('containsPaymentCardValue', () => {
+  it.each([
+    // Common test PANs are Luhn-valid and rejected like live ones.
+    '4111111111111111',
+    '4111 1111 1111 1111',
+    '4111-1111-1111-1111',
+    '4242424242424242',
+    '378282246310005', // Amex, 15 digits
+    '6011111111111117', // Discover
+    '4222222222222', // 13-digit Visa test PAN
+    'card on file: 4111 1111 1111 1111 (do not share)',
+  ])('flags PAN-shaped value %s', (value) => {
+    expect(containsPaymentCardValue(value)).toBe(true);
+    expect(containsSensitiveValue(value)).toBe(true);
+  });
+
+  it.each([
+    // Luhn-invalid digit runs: serials, order numbers, phone-ish strings.
+    '4111111111111112',
+    '1234567890123',
+    'order 1234567890123 confirmed',
+    'SN-4111-1111-1111-1112',
+    // Too short / too long to be a PAN.
+    '411111111111', // 12 digits
+    '12345678901234567890', // 20 digits
+    '1234 5678',
+    'firmware 1.4.2 build 20260712',
+  ])('accepts non-PAN value %s', (value) => {
+    expect(containsPaymentCardValue(value)).toBe(false);
   });
 });
 
@@ -174,5 +264,43 @@ describe('findSensitiveKeyPath', () => {
         endpoints: ['rtsp://cam.local/ok', 'http://admin:secret@dev.local'],
       }),
     ).toBe('endpoints[1]');
+  });
+
+  it('finds URL query secrets under harmless keys', () => {
+    expect(
+      findSensitiveKeyPath({
+        streamUrl: 'https://camera.local/feed?access_token=abc',
+      }),
+    ).toBe('streamUrl');
+    expect(
+      findSensitiveKeyPath({
+        feeds: ['rtsp://cam.local/ok', 'rtsp://cam.local/feed?token=abc'],
+      }),
+    ).toBe('feeds[1]');
+  });
+
+  it('finds raw PAN values under harmless keys, nested and separated', () => {
+    expect(findSensitiveKeyPath({ notes: '4111111111111111' })).toBe('notes');
+    expect(findSensitiveKeyPath({ notes: '4111 1111 1111 1111' })).toBe(
+      'notes',
+    );
+    expect(findSensitiveKeyPath({ notes: '4111-1111-1111-1111' })).toBe(
+      'notes',
+    );
+    expect(
+      findSensitiveKeyPath({
+        device: { diagnostics: ['ok', { lastError: 'card 4242424242424242' }] },
+      }),
+    ).toBe('device.diagnostics[1].lastError');
+  });
+
+  it('accepts harmless serial/order numbers that are not Luhn-valid', () => {
+    expect(
+      findSensitiveKeyPath({
+        serialNumber: 'SN-4111-1111-1111-1112',
+        orderRef: 'order 1234567890123 confirmed',
+        assetTag: '12345678901234567890',
+      }),
+    ).toBeNull();
   });
 });

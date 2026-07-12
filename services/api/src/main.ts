@@ -50,7 +50,8 @@ async function bootstrap(): Promise<void> {
         'stores',
         'Tenant stores/branches/sites (the Location entity): name, code, ' +
           'type, status, timezone, address. Served under both /stores and ' +
-          '/locations.',
+          '/locations; the GET list differs — /locations returns the ' +
+          'legacy plain array, /stores a filtered/paginated envelope.',
       )
       .addTag(
         'catalog',

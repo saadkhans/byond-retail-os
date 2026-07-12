@@ -76,6 +76,12 @@ export class LocationsService {
     return location;
   }
 
+  // Legacy GET /locations contract: the full unpaginated list, as shipped
+  // in Phase 1. New list features belong on search() (/stores) instead.
+  findMany(tenantId: string): Promise<Location[]> {
+    return this.locationsRepository.findMany(tenantId);
+  }
+
   async search(
     tenantId: string,
     query: QueryLocationsDto,

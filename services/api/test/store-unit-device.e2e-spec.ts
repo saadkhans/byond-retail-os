@@ -790,6 +790,33 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
       expect(response.body.id).toBe(storeId);
     });
 
+    it('GET /locations keeps the legacy plain-array shape', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/locations')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .expect(200);
+      // Phase 1 clients iterate the response directly — no envelope.
+      expect(Array.isArray(response.body)).toBe(true);
+      expect(
+        response.body.some((l: { id: string }) => l.id === storeId),
+      ).toBe(true);
+      expect(
+        response.body.every(
+          (l: { tenantId: string }) => l.tenantId === 'tenant-a',
+        ),
+      ).toBe(true);
+
+      // The Phase 4 /stores list keeps the paginated envelope.
+      const stores = await request(app.getHttpServer())
+        .get('/stores')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .expect(200);
+      expect(Array.isArray(stores.body.items)).toBe(true);
+      expect(typeof stores.body.total).toBe('number');
+      expect(stores.body).toHaveProperty('skip');
+      expect(stores.body).toHaveProperty('take');
+    });
+
     it('cross-tenant reads and writes miss with 404', async () => {
       await request(app.getHttpServer())
         .get('/stores/loc-b1')
@@ -1187,15 +1214,53 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
           metadata: { streamUrl: 'rtsp://user:password@camera.local/feed' },
         })
         .expect(400);
+      // Raw PAN values hide under harmless keys too — Luhn-validated
+      // detection rejects them in any grouping style.
+      for (const pan of [
+        '4111111111111111',
+        '4111 1111 1111 1111',
+        '4111-1111-1111-1111',
+      ]) {
+        await request(app.getHttpServer())
+          .patch(`/devices/${deviceId}`)
+          .set('Authorization', `Bearer ${managerToken}`)
+          .send({ metadata: { notes: pan } })
+          .expect(400);
+      }
+      // Credential query parameters are as fatal as URL userinfo.
+      await request(app.getHttpServer())
+        .patch(`/devices/${deviceId}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          metadata: { streamUrl: 'https://camera.local/feed?access_token=x' },
+        })
+        .expect(400);
+      // Qualified CVV/track-data key aliases are rejected like the bare ones.
+      await request(app.getHttpServer())
+        .patch(`/devices/${deviceId}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ metadata: { terminalCvv2: '123' } })
+        .expect(400);
+      await request(app.getHttpServer())
+        .patch(`/devices/${deviceId}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ metadata: { readerTrack2: 'raw' } })
+        .expect(400);
       // Nothing was persisted — the stored metadata is untouched.
       expect(store.devices.find((d) => d.id === deviceId)!.metadata).toEqual(
         before,
       );
-      // A credential-free stream URL remains perfectly fine.
+      // A credential-free stream URL and a non-Luhn serial number remain
+      // perfectly fine.
       await request(app.getHttpServer())
         .patch(`/devices/${deviceId}`)
         .set('Authorization', `Bearer ${managerToken}`)
-        .send({ metadata: { streamUrl: 'rtsp://camera.local/feed' } })
+        .send({
+          metadata: {
+            streamUrl: 'rtsp://camera.local/feed',
+            vendorSerial: 'SN-4111-1111-1111-1112',
+          },
+        })
         .expect(200);
     });
 

@@ -185,6 +185,22 @@ describe('AuditLogService', () => {
     expect((after.feeds as string[])[1]).toBe('mqtt://broker.local');
   });
 
+  it('redacts raw PAN values and URL query secrets under harmless keys', async () => {
+    await service.record({
+      ...baseEntry,
+      after: {
+        notes: 'card 4111 1111 1111 1111 on file',
+        streamUrl: 'https://camera.local/feed?access_token=abc',
+        serialNumber: 'SN-4111-1111-1111-1112',
+      },
+    });
+
+    const after = recordedData().after as Record<string, unknown>;
+    expect(after.notes).toBe('[REDACTED]');
+    expect(after.streamUrl).toBe('[REDACTED]');
+    expect(after.serialNumber).toBe('SN-4111-1111-1111-1112');
+  });
+
   it('serializes dates and preserves non-sensitive scalars', async () => {
     await service.record({
       ...baseEntry,

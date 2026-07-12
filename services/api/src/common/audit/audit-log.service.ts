@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { AuditAction, Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import {
-  containsCredentialValue,
+  containsSensitiveValue,
   isSensitiveKey,
 } from '../sensitive-keys';
 
@@ -102,10 +102,11 @@ export class AuditLogService {
       }
       return result;
     }
-    // Credential-bearing string VALUES (rtsp://user:pass@host, password=x
-    // connection strings) are redacted even under a harmless key — same
-    // shared detection that blocks device-metadata persistence.
-    if (typeof value === 'string' && containsCredentialValue(value)) {
+    // Credential- or PAN-bearing string VALUES (rtsp://user:pass@host,
+    // ?access_token=... URLs, password=x connection strings, raw card
+    // numbers) are redacted even under a harmless key — same shared
+    // detection that blocks device-metadata persistence.
+    if (typeof value === 'string' && containsSensitiveValue(value)) {
       return '[REDACTED]';
     }
     return value;

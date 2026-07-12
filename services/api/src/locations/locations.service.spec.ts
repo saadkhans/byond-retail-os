@@ -108,6 +108,11 @@ describe('LocationsService', () => {
     expect(result).toEqual({ items: [location], total: 1, skip: 0, take: 25 });
   });
 
+  it('findMany returns the legacy plain array for GET /locations', async () => {
+    await expect(service.findMany('tenant-a')).resolves.toEqual([location]);
+    expect(repository.findMany).toHaveBeenCalledWith('tenant-a');
+  });
+
   it('rejects an empty update and 404s on a foreign target', async () => {
     await expect(
       service.update('tenant-a', 'location-1', {}),

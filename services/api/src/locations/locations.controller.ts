@@ -35,7 +35,10 @@ import { LocationsService } from './locations.service';
 
 // The Location entity IS the store/branch/site concept — one controller
 // serves both route prefixes (`/locations` is the original Phase 1 path,
-// `/stores` the Phase 4 store-management alias).
+// `/stores` the Phase 4 store-management alias). The GET list route is the
+// one exception: it lives in the two dedicated controllers below, because
+// legacy `/locations` clients receive a plain Location[] while the Phase 4
+// `/stores` list returns a filtered/paginated envelope.
 // Tenant context comes exclusively from the authenticated user via
 // @CurrentTenantId(). A tenantId in the request body is rejected by the
 // global whitelist ValidationPipe (forbidNonWhitelisted).
@@ -63,22 +66,6 @@ export class LocationsController {
       id: actor.userId,
       email: actor.email,
     });
-  }
-
-  @Get()
-  @RequirePermissions('location:read')
-  @ApiOperation({
-    summary: 'Search stores in the caller’s tenant',
-    description:
-      'Filters: free-text search (name/code, case-insensitive), type, ' +
-      'status. Paginated via skip/take with a deterministic order ' +
-      '(name, then id).',
-  })
-  search(
-    @CurrentTenantId() tenantId: string,
-    @Query() query: QueryLocationsDto,
-  ): Promise<{ items: Location[]; total: number; skip: number; take: number }> {
-    return this.locationsService.search(tenantId, query);
   }
 
   @Get(':id')
@@ -132,5 +119,53 @@ export class LocationsController {
       id: actor.userId,
       email: actor.email,
     });
+  }
+}
+
+// Legacy Phase 1 list contract: GET /locations returns a plain Location[].
+// Deployed clients iterate the response directly, so this shape is frozen —
+// new list features (filtering, pagination) live on GET /stores only.
+@ApiTags('stores')
+@ApiBearerAuth()
+@TenantOnly()
+@Controller('locations')
+export class LocationsListController {
+  constructor(private readonly locationsService: LocationsService) {}
+
+  @Get()
+  @RequirePermissions('location:read')
+  @ApiOperation({
+    summary: 'List locations in the caller’s tenant (legacy shape)',
+    description:
+      'Returns a plain array for Phase 1 compatibility. Use GET /stores ' +
+      'for filtering and pagination.',
+  })
+  findMany(@CurrentTenantId() tenantId: string): Promise<Location[]> {
+    return this.locationsService.findMany(tenantId);
+  }
+}
+
+// Phase 4 store list: filtered/paginated envelope, /stores prefix only.
+@ApiTags('stores')
+@ApiBearerAuth()
+@TenantOnly()
+@Controller('stores')
+export class StoresListController {
+  constructor(private readonly locationsService: LocationsService) {}
+
+  @Get()
+  @RequirePermissions('location:read')
+  @ApiOperation({
+    summary: 'Search stores in the caller’s tenant',
+    description:
+      'Filters: free-text search (name/code, case-insensitive), type, ' +
+      'status. Paginated via skip/take with a deterministic order ' +
+      '(name, then id).',
+  })
+  search(
+    @CurrentTenantId() tenantId: string,
+    @Query() query: QueryLocationsDto,
+  ): Promise<{ items: Location[]; total: number; skip: number; take: number }> {
+    return this.locationsService.search(tenantId, query);
   }
 }
