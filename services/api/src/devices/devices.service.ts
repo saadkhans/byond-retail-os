@@ -323,9 +323,11 @@ export class DevicesService {
 
   /**
    * Device metadata is for SAFE, NON-SECRET configuration only. This BLOCKS
-   * persistence (controlled 400) when any credential- or payment-shaped key
-   * (passwords, tokens, secrets, API keys, card numbers, CVV/PIN, track
-   * data, PAN, ...) appears anywhere in the object — recursively, through
+   * persistence (controlled 400) when any credential- or payment-shaped KEY
+   * (passwords, tokens, secrets, API keys, card numbers, CVV/PIN/PAN in any
+   * prefixed or camelCased alias, track data, ...) OR credential-bearing
+   * string VALUE (rtsp://user:pass@camera.local, password= connection
+   * strings, ...) appears anywhere in the object — recursively, through
    * nested objects and arrays. Audit-snapshot redaction is only a backstop;
    * such values must never reach storage in the first place (AGENTS.md
    * payments invariant).
@@ -338,8 +340,9 @@ export class DevicesService {
     if (offendingPath) {
       throw new BadRequestException(
         `Device metadata must not contain credential- or payment-shaped ` +
-          `keys ("${offendingPath}"). Metadata is for safe, non-secret ` +
-          `configuration only — secrets belong in a dedicated secret store, ` +
+          `keys or credential-bearing values ("${offendingPath}"). ` +
+          `Metadata is for safe, non-secret configuration only — secrets ` +
+          `belong in a dedicated secret store (reference them by name), ` +
           `and payment data must never be stored.`,
       );
     }

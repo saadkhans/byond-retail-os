@@ -1173,10 +1173,30 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
         .set('Authorization', `Bearer ${managerToken}`)
         .send({ metadata: { reader: { track2: 'raw-stripe' } } })
         .expect(400);
+      // Prefixed PAN/PIN aliases and credential-bearing URL values are
+      // rejected too.
+      await request(app.getHttpServer())
+        .patch(`/devices/${deviceId}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ metadata: { terminal: { payment_pan_number: '4111' } } })
+        .expect(400);
+      await request(app.getHttpServer())
+        .patch(`/devices/${deviceId}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          metadata: { streamUrl: 'rtsp://user:password@camera.local/feed' },
+        })
+        .expect(400);
       // Nothing was persisted — the stored metadata is untouched.
       expect(store.devices.find((d) => d.id === deviceId)!.metadata).toEqual(
         before,
       );
+      // A credential-free stream URL remains perfectly fine.
+      await request(app.getHttpServer())
+        .patch(`/devices/${deviceId}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ metadata: { streamUrl: 'rtsp://camera.local/feed' } })
+        .expect(200);
     });
 
     it('lastSeenAt is not client-writable (400)', async () => {

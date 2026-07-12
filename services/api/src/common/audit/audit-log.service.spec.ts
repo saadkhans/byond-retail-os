@@ -150,6 +150,41 @@ describe('AuditLogService', () => {
     expect(after.cards[0].label).toBe('main');
   });
 
+  it('redacts prefixed PAN/PIN aliases via the shared key detection', async () => {
+    await service.record({
+      ...baseEntry,
+      after: {
+        payment_pan_number: '4111111111111111',
+        encryptedPinBlock: 'A1B2',
+        customer_pan: '4111',
+        panelCount: 4,
+      },
+    });
+
+    const after = recordedData().after as Record<string, unknown>;
+    expect(after.payment_pan_number).toBe('[REDACTED]');
+    expect(after.encryptedPinBlock).toBe('[REDACTED]');
+    expect(after.customer_pan).toBe('[REDACTED]');
+    expect(after.panelCount).toBe(4);
+  });
+
+  it('redacts credential-bearing string VALUES under harmless keys', async () => {
+    await service.record({
+      ...baseEntry,
+      after: {
+        streamUrl: 'rtsp://user:password@camera.local/feed',
+        safeUrl: 'rtsp://camera.local/feed',
+        feeds: ['http://admin:secret@device.local', 'mqtt://broker.local'],
+      },
+    });
+
+    const after = recordedData().after as Record<string, unknown>;
+    expect(after.streamUrl).toBe('[REDACTED]');
+    expect(after.safeUrl).toBe('rtsp://camera.local/feed');
+    expect((after.feeds as string[])[0]).toBe('[REDACTED]');
+    expect((after.feeds as string[])[1]).toBe('mqtt://broker.local');
+  });
+
   it('serializes dates and preserves non-sensitive scalars', async () => {
     await service.record({
       ...baseEntry,

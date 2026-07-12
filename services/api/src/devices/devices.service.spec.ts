@@ -151,6 +151,69 @@ describe('DevicesService', () => {
       expect(repository.update).not.toHaveBeenCalled();
     });
 
+    it('rejects prefixed PAN/PIN alias keys on create and update', async () => {
+      await expect(
+        service.create('tenant-a', {
+          unitId: 'unit-1',
+          name: 'Terminal',
+          type: DeviceType.PAYMENT_TERMINAL,
+          serialNumber: 'SN-PAY-2',
+          metadata: { payment_pan_number: '4111111111111111' },
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      await expect(
+        service.update('tenant-a', 'device-1', {
+          metadata: { reader: { encryptedPinBlock: 'A1B2' } },
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(repository.create).not.toHaveBeenCalled();
+      expect(repository.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects credential-bearing URL VALUES on create (userinfo in stream URLs)', async () => {
+      await expect(
+        service.create('tenant-a', {
+          unitId: 'unit-1',
+          name: 'Cam',
+          type: DeviceType.CAMERA,
+          serialNumber: 'SN-1',
+          metadata: { streamUrl: 'rtsp://user:password@camera.local/feed' },
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(repository.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects credential-bearing values on update, even deeply nested in arrays', async () => {
+      await expect(
+        service.update('tenant-a', 'device-1', {
+          metadata: {
+            feeds: [
+              { url: 'rtsp://cam.local/ok' },
+              { fallback: ['http://admin:secret@device.local'] },
+            ],
+          },
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      await expect(
+        service.update('tenant-a', 'device-1', {
+          metadata: {
+            db: 'Server=db.local;User Id=sa;Password=hunter2;',
+          },
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(repository.update).not.toHaveBeenCalled();
+    });
+
+    it('accepts credential-free stream URLs and hosts', async () => {
+      await service.update('tenant-a', 'device-1', {
+        metadata: {
+          streamUrl: 'rtsp://camera.local/feed',
+          broker: 'mqtt://broker.local:1883',
+        },
+      });
+      expect(repository.update).toHaveBeenCalled();
+    });
+
     it('accepts safe non-secret metadata', async () => {
       await service.create('tenant-a', {
         unitId: 'unit-1',
