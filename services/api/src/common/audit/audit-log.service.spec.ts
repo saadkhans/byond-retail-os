@@ -201,6 +201,22 @@ describe('AuditLogService', () => {
     expect(after.serialNumber).toBe('SN-4111-1111-1111-1112');
   });
 
+  it('redacts PANs submitted as JSON numbers, keeping harmless numbers', async () => {
+    await service.record({
+      ...baseEntry,
+      after: {
+        notes: 4111111111111111,
+        port: 8080,
+        serial: 1234567890123, // 13 digits, fails Luhn
+      },
+    });
+
+    const after = recordedData().after as Record<string, unknown>;
+    expect(after.notes).toBe('[REDACTED]');
+    expect(after.port).toBe(8080);
+    expect(after.serial).toBe(1234567890123);
+  });
+
   it('serializes dates and preserves non-sensitive scalars', async () => {
     await service.record({
       ...baseEntry,

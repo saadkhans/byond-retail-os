@@ -3,6 +3,7 @@ import { AuditAction, Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import {
   containsSensitiveValue,
+  isPaymentCardNumber,
   isSensitiveKey,
 } from '../sensitive-keys';
 
@@ -107,6 +108,10 @@ export class AuditLogService {
     // numbers) are redacted even under a harmless key — same shared
     // detection that blocks device-metadata persistence.
     if (typeof value === 'string' && containsSensitiveValue(value)) {
+      return '[REDACTED]';
+    }
+    // PANs submitted as JSON numbers are redacted just like strings.
+    if (typeof value === 'number' && isPaymentCardNumber(value)) {
       return '[REDACTED]';
     }
     return value;

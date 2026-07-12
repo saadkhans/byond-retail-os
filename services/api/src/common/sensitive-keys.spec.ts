@@ -89,6 +89,25 @@ describe('sensitive key detection', () => {
     'magnetic_stripe_data',
     'readerMagstripeData',
     'deviceMagneticStripe',
+    // CVN/CSC synonyms and spelled-out verification numbers.
+    'cvn',
+    'csc',
+    'cardCvn',
+    'terminalCsc',
+    'payment_cvn',
+    'cardVerificationNumber',
+    'card_verification_number',
+    // EMV Track 2 Equivalent Data in every separator style.
+    'track_2_equivalent_data',
+    'track2EquivalentData',
+    'track2equivalentdata',
+    'track 1 equivalent data',
+    // Cloud/API access-key identifiers.
+    'accessKeyId',
+    'access_key_id',
+    'secretAccessKey',
+    'sharedAccessKey',
+    'storageAccountKey',
   ])('flags qualified CVV/track-data alias %s', (key) => {
     expect(isSensitiveKey(key)).toBe(true);
   });
@@ -116,11 +135,22 @@ describe('sensitive key detection', () => {
     // 'track' is not a token, Stripe-the-vendor keys are not stripe data,
     // and correlation-id 'cid' qualifiers are only exact-match sensitive.
     'trackingNumber',
+    'trackingData',
     'audioTrack',
     'audio_track',
     'stripeCustomerId',
     'requestCid',
     'lucidMode',
+    // Near-misses of the new CVN/CSC/access-key aliases stay harmless:
+    // bare 'key' is never sensitive, and cvn/csc match only as whole
+    // words/suffixes.
+    'monkey',
+    'turkey',
+    'key',
+    'keyboardLayout',
+    'sortKey',
+    'cascade',
+    'canvasColor',
   ])('accepts harmless key %s', (key) => {
     expect(isSensitiveKey(key)).toBe(false);
   });
@@ -160,6 +190,18 @@ describe('containsCredentialValue', () => {
     // Bare key=value credential fragments outside a parseable URL.
     'token=abc123',
     'endpoint at broker.local, auth=basic secret=hunter2',
+    // Provider-namespaced signed-URL credentials.
+    'https://bucket.s3.amazonaws.com/backup.tar?X-Amz-Signature=abc123',
+    'https://bucket.s3.amazonaws.com/f?X-Amz-Credential=AKIA%2F20260712',
+    'https://storage.googleapis.com/f.jpg?X-Goog-Signature=abc123',
+    // Payment-shaped key=value fragments.
+    'cvv=123',
+    'CVC=999',
+    'cvn=12',
+    'csc=321',
+    'pin=1234',
+    'pan=4111111111111111',
+    'terminal config: cvv2=456',
   ])('flags credential-bearing value %s', (value) => {
     expect(containsCredentialValue(value)).toBe(true);
   });
@@ -177,6 +219,10 @@ describe('containsCredentialValue', () => {
     // Innocent substrings never trip the key=value backstop.
     'monkey=banana',
     'oauth flow disabled',
+    'spin=fast',
+    'timespan=90',
+    'expand=all',
+    'https://example.com/f?x-request-id=5&region=eu',
   ])('accepts safe value %s', (value) => {
     expect(containsCredentialValue(value)).toBe(false);
   });
@@ -300,6 +346,25 @@ describe('findSensitiveKeyPath', () => {
         serialNumber: 'SN-4111-1111-1111-1112',
         orderRef: 'order 1234567890123 confirmed',
         assetTag: '12345678901234567890',
+      }),
+    ).toBeNull();
+  });
+
+  it('finds PANs submitted as JSON numbers', () => {
+    expect(findSensitiveKeyPath({ notes: 4111111111111111 })).toBe('notes');
+    expect(
+      findSensitiveKeyPath({ device: { cards: [4242424242424242] } }),
+    ).toBe('device.cards[0]');
+  });
+
+  it('accepts harmless numbers (non-Luhn, short, or fractional)', () => {
+    expect(
+      findSensitiveKeyPath({
+        port: 8080,
+        threshold: 0.4,
+        serial: 1234567890123, // 13 digits, fails Luhn
+        epochMs: 1752307200000,
+        negativeOffset: -42,
       }),
     ).toBeNull();
   });

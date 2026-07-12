@@ -74,9 +74,10 @@ class EnvironmentVariables {
 
   // Comma-separated list of browser origins allowed by CORS (the admin
   // web app). Default: the local Vite dev server. Never a wildcard.
+  // No MinLength: deployments that materialize unset vars as CORS_ORIGINS=
+  // must still boot — parseCorsOrigins maps blank to the safe default.
   @IsOptional()
   @IsString()
-  @MinLength(1)
   CORS_ORIGINS?: string;
 
   @IsOptional()

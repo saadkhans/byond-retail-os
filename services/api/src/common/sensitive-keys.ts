@@ -25,7 +25,8 @@
  *    key=value credential fragments outside parseable URLs.
  * 3. Payment-card numbers (PANs): 13–19 digit runs, optionally space/dash
  *    separated, that pass the Luhn check — which includes all common test
- *    PANs (4111 1111 1111 1111, 4242..., 3782 822463 10005, ...).
+ *    PANs (4111 1111 1111 1111, 4242..., 3782 822463 10005, ...). PANs
+ *    submitted as JSON numbers are checked the same way.
  *
  * Conservative over-matching of credential-shaped names is acceptable for
  * both call sites.
@@ -53,14 +54,19 @@ const SENSITIVE_EXACT = new Set([
   'cvv2',
   'cvc',
   'cvc2',
+  'cvn',
+  'csc',
   // Amex card identification number; exact-only — as a suffix or token it
   // would swallow correlation-id style "cid" qualifiers.
   'cid',
   'cardverificationvalue',
   'cardverificationcode',
+  'cardverificationnumber',
   'cardsecuritycode',
   'primaryaccountnumber',
   'iban',
+  // Cloud/API access-key identifiers travel with their secrets.
+  'accesskeyid',
   // Magnetic stripe track data (AGENTS.md payments invariant).
   'track1',
   'track2',
@@ -97,14 +103,23 @@ const SENSITIVE_SUFFIXES = [
   'paymentpin',
   'debitpin',
   'encryptedpin',
-  // Card verification values/codes: terminalCvv2, payment_cvv, cardCvc, ...
+  // Card verification values/codes/numbers: terminalCvv2, payment_cvv,
+  // cardCvc, cardCvn, terminalCsc, cardVerificationNumber, ...
   'cvv',
   'cvv2',
   'cvc',
   'cvc2',
+  'cvn',
+  'csc',
   'verificationvalue',
   'verificationcode',
+  'verificationnumber',
   'securitycode',
+  // Cloud/API access keys: accessKeyId, secretAccessKey, sharedAccessKey,
+  // storageAccountKey, ... (bare 'key' stays harmless).
+  'accesskey',
+  'accesskeyid',
+  'accountkey',
   // Magnetic stripe track data: readerTrack2, magstripeTrack1,
   // readerTrackData, magneticStripeData, posMagstripeData, ...
   'track1',
@@ -128,12 +143,19 @@ const SENSITIVE_TOKENS = new Set([
   'cvv2',
   'cvc',
   'cvc2',
+  'cvn',
+  'csc',
   'iban',
   'track1',
   'track2',
   'track3',
   'magstripe',
 ]);
+
+// EMV "Track 2 Equivalent Data" in single-word lowercase form
+// (track2equivalentdata) — separator/camelCase forms are caught by the
+// track-digit token rules below.
+const TRACK_EQUIVALENT = /track[123]equivalent/;
 
 function normalizeKey(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -149,12 +171,27 @@ function tokenizeKey(key: string): string[] {
     .map((token) => token.toLowerCase());
 }
 
+/** Adjacent 'track' + '1'/'2'/'3' tokens: track_2_equivalent_data, reader track 1, ... */
+function hasTrackDigitPair(tokens: string[]): boolean {
+  return tokens.some(
+    (token, index) =>
+      token === 'track' && /^[123]$/.test(tokens[index + 1] ?? ''),
+  );
+}
+
 export function isSensitiveKey(key: string): boolean {
   const normalized = normalizeKey(key);
-  return (
+  if (
     SENSITIVE_EXACT.has(normalized) ||
     SENSITIVE_SUFFIXES.some((suffix) => normalized.endsWith(suffix)) ||
-    tokenizeKey(key).some((token) => SENSITIVE_TOKENS.has(token))
+    TRACK_EQUIVALENT.test(normalized)
+  ) {
+    return true;
+  }
+  const tokens = tokenizeKey(key);
+  return (
+    tokens.some((token) => SENSITIVE_TOKENS.has(token)) ||
+    hasTrackDigitPair(tokens)
   );
 }
 
@@ -175,7 +212,7 @@ const USERINFO_BACKSTOP = /[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s@]+:[^/\s@]*@/;
 // keeps innocent substrings out: "monkey=1" and "oauth=..." never match
 // because 'key'/'auth' are preceded by a word character.
 const KEY_VALUE_CREDENTIAL =
-  /(?:^|[?&;#,\s])(?:access[-_ ]?token|refresh[-_ ]?token|session[-_ ]?token|id[-_ ]?token|api[-_ ]?key|client[-_ ]?secret|token|secret|password|passwd|pwd|signature|sig|auth|authorization|bearer|key)\s*=\s*[^;&\s]/i;
+  /(?:^|[?&;#,\s])(?:access[-_ ]?token|refresh[-_ ]?token|session[-_ ]?token|id[-_ ]?token|api[-_ ]?key|client[-_ ]?secret|token|secret|password|passwd|pwd|signature|sig|auth|authorization|bearer|key|cvv2|cvv|cvc2|cvc|cvn|csc|pin|pan)\s*=\s*[^;&\s]/i;
 
 // Credential query-parameter names checked on parsed URLs, on top of the
 // shared key detection (which already flags *token, *secret, *apikey,
@@ -191,7 +228,16 @@ const SENSITIVE_PARAM_EXTRA = new Set([
 ]);
 
 function isSensitiveParamName(name: string): boolean {
-  return SENSITIVE_PARAM_EXTRA.has(normalizeKey(name)) || isSensitiveKey(name);
+  const normalized = normalizeKey(name);
+  return (
+    SENSITIVE_PARAM_EXTRA.has(normalized) ||
+    // Provider-namespaced signed-URL params: X-Amz-Signature,
+    // X-Goog-Signature, X-Amz-Credential, ... (X-Amz-Security-Token
+    // already ends in 'token' via isSensitiveKey).
+    normalized.endsWith('signature') ||
+    normalized.endsWith('credential') ||
+    isSensitiveKey(name)
+  );
 }
 
 export function containsCredentialValue(text: string): boolean {
@@ -253,6 +299,15 @@ export function containsSensitiveValue(text: string): boolean {
 }
 
 /**
+ * PANs submitted as JSON NUMBERS ({ "notes": 4111111111111111 }) get the
+ * same Luhn treatment as strings — integers up to 2^53 (all 13–16 digit
+ * PANs) round-trip exactly through Number.
+ */
+export function isPaymentCardNumber(value: number): boolean {
+  return Number.isFinite(value) && containsPaymentCardValue(String(value));
+}
+
+/**
  * Recursively searches an arbitrary JSON-shaped value for a credential/
  * payment-shaped KEY or a credential/PAN-bearing string VALUE. Returns the
  * dotted path of the FIRST offense ("config.auth.apiKey",
@@ -266,6 +321,9 @@ export function findSensitiveKeyPath(
 ): string | null {
   if (typeof value === 'string') {
     return containsSensitiveValue(value) ? path || '(value)' : null;
+  }
+  if (typeof value === 'number') {
+    return isPaymentCardNumber(value) ? path || '(value)' : null;
   }
   if (Array.isArray(value)) {
     for (let index = 0; index < value.length; index += 1) {
