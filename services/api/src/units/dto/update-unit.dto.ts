@@ -8,35 +8,37 @@ import {
   MinLength,
   ValidateIf,
 } from 'class-validator';
+import { IsOptionalNonNull } from '../../common/validation';
 
 /**
  * `code` is immutable (tenant-unique identifier); tenantId never appears in
  * any DTO — it comes from the authenticated user. RETIRED is terminal: a
- * retired unit's status can never change again.
+ * retired unit's status can never change again. Fields may be omitted but
+ * never null — except `placement`, where null explicitly clears the value.
  */
 export class UpdateUnitDto {
   @ApiPropertyOptional({
     description: 'Reassign the unit to another store in the same tenant.',
   })
-  @IsOptional()
+  @IsOptionalNonNull()
   @IsString()
   @MinLength(1)
   locationId?: string;
 
   @ApiPropertyOptional({ maxLength: 120 })
-  @IsOptional()
+  @IsOptionalNonNull()
   @IsString()
   @MinLength(1)
   @MaxLength(120)
   name?: string;
 
   @ApiPropertyOptional({ enum: RetailUnitType })
-  @IsOptional()
+  @IsOptionalNonNull()
   @IsEnum(RetailUnitType)
   type?: RetailUnitType;
 
   @ApiPropertyOptional({ enum: RetailUnitStatus })
-  @IsOptional()
+  @IsOptionalNonNull()
   @IsEnum(RetailUnitStatus)
   status?: RetailUnitStatus;
 

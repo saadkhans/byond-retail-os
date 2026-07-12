@@ -13,6 +13,14 @@ describe('sensitive key detection', () => {
     'cvv2',
     'pin',
     'pan',
+    'pan_number',
+    'panNumber',
+    'panNo',
+    'card_pin',
+    'cardPin',
+    'pinBlock',
+    'pin_number',
+    'encryptedPin',
     'primary_account_number',
     'track2',
     'trackData',
@@ -35,6 +43,9 @@ describe('sensitive key detection', () => {
     'description',
     'panelCount',
     'firmwareChannel',
+    'pinnedVersion',
+    'pushpin',
+    'spanWidth',
   ])('accepts harmless key %s', (key) => {
     expect(isSensitiveKey(key)).toBe(false);
   });

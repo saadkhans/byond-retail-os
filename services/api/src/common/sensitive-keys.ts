@@ -35,12 +35,23 @@ const SENSITIVE_EXACT = new Set([
   'cvv2',
   'cvc',
   'cvc2',
-  // PAN variants stay exact-match: a generic "pan" suffix would catch
-  // harmless fields like timespan.
+  // PAN/PIN variants stay exact-match: generic "pan"/"pin" suffixes would
+  // catch harmless fields like timespan or pushpin. Common qualified
+  // aliases (pan_number, panNumber, card_pin, pin_block, ...) are
+  // enumerated explicitly instead.
   'pan',
+  'panno',
+  'pannumber',
   'cardpan',
   'primaryaccountnumber',
+  'accountpan',
   'pin',
+  'pinno',
+  'pinnumber',
+  'cardpin',
+  'debitpin',
+  'pinblock',
+  'encryptedpin',
   'iban',
   // Magnetic stripe track data (AGENTS.md payments invariant).
   'track1',

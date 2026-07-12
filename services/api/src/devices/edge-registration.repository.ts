@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { DeviceStatus, ModuleStatus } from '@prisma/client';
+import { DeviceStatus, ModuleStatus, TenantStatus } from '@prisma/client';
 import {
   AuditEntry,
   AuditLogService,
@@ -38,10 +38,11 @@ export class EdgeRegistrationRepository {
    *   expiry cleared, nothing else mutated) before returning the generic
    *   failure — a leaked token grants exactly one serial guess, not a
    *   guessing window until expiry.
-   * - When the tenant has the devices module disabled, the redemption fails
-   *   with NO mutation at all: the module gate on /units and /devices cannot
-   *   be bypassed through the public registration endpoint, and the token
-   *   resumes working if the module is re-enabled within its lifetime.
+   * - When the tenant is not ACTIVE or has the devices module disabled, the
+   *   redemption fails with NO mutation at all: authenticated routes fail
+   *   closed on suspended tenants via AuthRepository, and this public
+   *   endpoint must not be the exception. The token resumes working if the
+   *   tenant/module is reactivated within its lifetime.
    * - On success the stored hash is cleared in the same transaction.
    */
   redeem(
@@ -79,11 +80,25 @@ export class EdgeRegistrationRepository {
         return null;
       }
 
+      // Authenticated requests fail closed on non-ACTIVE tenants (login and
+      // AuthGuard both check tenant status); this public route must apply
+      // the same rule before ANY mutation — a token issued while the tenant
+      // was ACTIVE must not register devices for a tenant that has since
+      // been suspended/archived. Same generic failure, nothing consumed.
+      const tenant = await tx.tenant.findUnique({
+        where: { id: device.tenantId },
+        select: { status: true },
+      });
+      if (tenant?.status !== TenantStatus.ACTIVE) {
+        return null;
+      }
+
       // Mirror ModuleEnabledGuard/PlatformModulesService.isEnabledForTenant
       // inside the transaction: registration is part of the devices module,
       // so a tenant that disabled it cannot complete the handshake. Checked
-      // FIRST and with no mutation — the outcome must stay indistinguishable
-      // from a bad token, and nothing about the device may change.
+      // BEFORE the serial-mismatch consumption and with no mutation — the
+      // outcome must stay indistinguishable from a bad token, and nothing
+      // about the device may change.
       const platformModule = await tx.platformModule.findUnique({
         where: { code: DEVICES_MODULE_CODE },
       });

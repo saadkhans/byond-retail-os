@@ -107,6 +107,13 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
     },
   ];
 
+  // Mutable per-tenant status backing tenant.findUnique — the suspended-
+  // tenant edge-registration test flips this and restores it.
+  const tenantStatuses: Record<string, string> = {
+    'tenant-a': 'ACTIVE',
+    'tenant-b': 'ACTIVE',
+  };
+
   // Stateful in-memory tables. Tenant B rows exist purely as cross-tenant
   // "bait" — every test asserts they stay invisible to tenant A callers.
   const store = {
@@ -301,6 +308,12 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
       },
     },
     auditLog: { create: auditCreateSpy },
+    tenant: {
+      findUnique: async ({ where }: { where: Where }) =>
+        tenantStatuses[String(where.id)]
+          ? { status: tenantStatuses[String(where.id)] }
+          : null,
+    },
     platformModule: {
       findUnique: async ({ where }: { where: Where }) =>
         platformModules.find((module) => module.code === where.code) ?? null,
@@ -1174,6 +1187,33 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
         .expect(400);
     });
 
+    it('explicit nulls in optional fields are a controlled 400, never a 500', async () => {
+      for (const body of [
+        { name: null },
+        { firmwareVersion: null },
+        { metadata: null },
+        { unitId: null },
+        { status: null },
+      ]) {
+        await request(app.getHttpServer())
+          .patch(`/devices/${deviceId}`)
+          .set('Authorization', `Bearer ${managerToken}`)
+          .send(body)
+          .expect(400);
+      }
+      // Same DTO hardening on units and stores.
+      await request(app.getHttpServer())
+        .patch(`/units/${unitId}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ name: null })
+        .expect(400);
+      await request(app.getHttpServer())
+        .patch(`/stores/${storeId}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ timezone: null })
+        .expect(400);
+    });
+
     it('search NEVER leaks tenant B devices', async () => {
       const response = await request(app.getHttpServer())
         .get('/devices?search=SN-')
@@ -1428,6 +1468,50 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
         }
 
         // Re-enabling the module lets the untouched token redeem normally.
+        await request(app.getHttpServer())
+          .post('/edge/register')
+          .send({
+            serialNumber: 'SN-LOCK-1',
+            registrationToken: issued.body.registrationToken,
+          })
+          .expect(200);
+      });
+
+      it('a suspended tenant cannot redeem — same 401, nothing mutated', async () => {
+        const issued = await request(app.getHttpServer())
+          .post(`/devices/${deviceId}/registration-token`)
+          .set('Authorization', `Bearer ${managerToken}`)
+          .expect(201);
+        const row = store.devices.find((d) => d.id === deviceId)!;
+        const snapshot = {
+          status: row.status,
+          lastSeenAt: row.lastSeenAt,
+          registeredAt: row.registeredAt,
+          registrationTokenHash: row.registrationTokenHash,
+          registrationTokenExpiresAt: row.registrationTokenExpiresAt,
+        };
+
+        tenantStatuses['tenant-a'] = 'SUSPENDED';
+        try {
+          await request(app.getHttpServer())
+            .post('/edge/register')
+            .send({
+              serialNumber: 'SN-LOCK-1',
+              registrationToken: issued.body.registrationToken,
+            })
+            .expect(401);
+          expect({
+            status: row.status,
+            lastSeenAt: row.lastSeenAt,
+            registeredAt: row.registeredAt,
+            registrationTokenHash: row.registrationTokenHash,
+            registrationTokenExpiresAt: row.registrationTokenExpiresAt,
+          }).toEqual(snapshot);
+        } finally {
+          tenantStatuses['tenant-a'] = 'ACTIVE';
+        }
+
+        // Reactivating the tenant lets the untouched token redeem normally.
         await request(app.getHttpServer())
           .post('/edge/register')
           .send({

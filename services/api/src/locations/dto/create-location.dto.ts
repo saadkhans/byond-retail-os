@@ -3,12 +3,12 @@ import { LocationType } from '@prisma/client';
 import {
   IsEnum,
   IsObject,
-  IsOptional,
   IsString,
   Matches,
   MaxLength,
   MinLength,
 } from 'class-validator';
+import { IsOptionalNonNull } from '../../common/validation';
 
 export class CreateLocationDto {
   @ApiProperty({ example: 'Downtown Flagship', maxLength: 120 })
@@ -34,13 +34,13 @@ export class CreateLocationDto {
   type!: LocationType;
 
   @ApiPropertyOptional({ example: 'Europe/Berlin', default: 'UTC' })
-  @IsOptional()
+  @IsOptionalNonNull()
   @IsString()
   @MaxLength(60)
   timezone?: string;
 
   @ApiPropertyOptional({ description: 'Free-form address object.' })
-  @IsOptional()
+  @IsOptionalNonNull()
   @IsObject()
   address?: Record<string, unknown>;
 }

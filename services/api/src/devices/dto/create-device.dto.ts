@@ -3,11 +3,11 @@ import { DeviceStatus, DeviceType } from '@prisma/client';
 import {
   IsEnum,
   IsObject,
-  IsOptional,
   IsString,
   MaxLength,
   MinLength,
 } from 'class-validator';
+import { IsOptionalNonNull } from '../../common/validation';
 
 export class CreateDeviceDto {
   @ApiProperty({ description: 'The retail unit this device is attached to.' })
@@ -29,7 +29,7 @@ export class CreateDeviceDto {
     enum: DeviceStatus,
     default: DeviceStatus.PROVISIONED,
   })
-  @IsOptional()
+  @IsOptionalNonNull()
   @IsEnum(DeviceStatus)
   status?: DeviceStatus;
 
@@ -48,18 +48,18 @@ export class CreateDeviceDto {
       'SAFE, NON-SECRET configuration only (mount position, stream ' +
       'settings, ...). Never put credentials or tokens here.',
   })
-  @IsOptional()
+  @IsOptionalNonNull()
   @IsObject()
   metadata?: Record<string, unknown>;
 
   @ApiPropertyOptional({ example: '1.4.2', maxLength: 60 })
-  @IsOptional()
+  @IsOptionalNonNull()
   @IsString()
   @MaxLength(60)
   firmwareVersion?: string;
 
   @ApiPropertyOptional({ example: '2026.07.1', maxLength: 60 })
-  @IsOptional()
+  @IsOptionalNonNull()
   @IsString()
   @MaxLength(60)
   softwareVersion?: string;

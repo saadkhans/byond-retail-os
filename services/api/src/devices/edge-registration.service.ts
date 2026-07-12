@@ -26,10 +26,11 @@ export class EdgeRegistrationService {
    * Completes the edge registration handshake. The one-time token (issued by
    * a tenant admin holding device:register) is the credential: it is matched
    * by SHA-256 hash, bound to the device's serial number, single-use, and
-   * expiring. Every failure mode — including a tenant whose devices module
-   * is disabled — surfaces the SAME generic 401 so the endpoint cannot be
-   * used to probe serials, token validity, tenant existence, or module
-   * state; neither the token nor its hash is ever logged.
+   * expiring. Every failure mode — including a non-ACTIVE tenant or a
+   * tenant whose devices module is disabled — surfaces the SAME generic 401
+   * so the endpoint cannot be used to probe serials, token validity, tenant
+   * existence/status, or module state; neither the token nor its hash is
+   * ever logged.
    *
    * Phase 7 (edge runtime) will exchange this registration for long-lived
    * device credentials; this phase deliberately mints none.

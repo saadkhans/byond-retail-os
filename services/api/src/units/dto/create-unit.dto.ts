@@ -2,12 +2,12 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { RetailUnitStatus, RetailUnitType } from '@prisma/client';
 import {
   IsEnum,
-  IsOptional,
   IsString,
   Matches,
   MaxLength,
   MinLength,
 } from 'class-validator';
+import { IsOptionalNonNull } from '../../common/validation';
 
 export class CreateUnitDto {
   @ApiProperty({
@@ -46,7 +46,7 @@ export class CreateUnitDto {
       'Initial status: DRAFT or ACTIVE only. Later states are reached ' +
       'through lifecycle transitions on update.',
   })
-  @IsOptional()
+  @IsOptionalNonNull()
   @IsEnum(RetailUnitStatus)
   status?: RetailUnitStatus;
 
@@ -55,7 +55,7 @@ export class CreateUnitDto {
     description: 'Physical placement within the store.',
     maxLength: 240,
   })
-  @IsOptional()
+  @IsOptionalNonNull()
   @IsString()
   @MaxLength(240)
   placement?: string;
