@@ -51,3 +51,44 @@ export function categoryAdvisoryLockKey(
 ): string {
   return `category:${tenantId}:${categoryId}`;
 }
+
+/**
+ * Serializes a location's (store's) UPDATE and DELETE against each other
+ * within a tenant — same audit-snapshot rationale as brands above. Both
+ * `LocationsRepository.update()` and `.delete()` MUST derive it identically.
+ */
+export function locationAdvisoryLockKey(
+  tenantId: string,
+  locationId: string,
+): string {
+  return `location:${tenantId}:${locationId}`;
+}
+
+/**
+ * Serializes a retail unit's UPDATE and DELETE against each other AND
+ * against device creation under that unit: delete() counts the unit's
+ * devices before removing it, so a concurrent device create must not land
+ * between the count and the delete. All three call sites
+ * (`UnitsRepository.update()`, `.delete()`, `DevicesRepository.create()`)
+ * MUST derive it identically.
+ */
+export function unitAdvisoryLockKey(
+  tenantId: string,
+  unitId: string,
+): string {
+  return `retail-unit:${tenantId}:${unitId}`;
+}
+
+/**
+ * Serializes a device's mutations (update, delete, heartbeat, registration
+ * token issuance/redemption) against each other within a tenant. Heartbeats
+ * and registration decide status transitions from a read-then-write, so they
+ * must not interleave with update/delete. All DevicesRepository mutation
+ * methods MUST derive it identically.
+ */
+export function deviceAdvisoryLockKey(
+  tenantId: string,
+  deviceId: string,
+): string {
+  return `device:${tenantId}:${deviceId}`;
+}

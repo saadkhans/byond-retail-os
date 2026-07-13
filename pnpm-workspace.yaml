@@ -4,8 +4,10 @@ packages:
   - "packages/*"
 
 # pnpm 10 blocks dependency build scripts by default; Prisma needs its
-# engines to run postinstall. @scarf/scarf (telemetry) stays blocked.
+# engines to run postinstall, and esbuild (Vite's bundler) installs its
+# platform binary the same way. @scarf/scarf (telemetry) stays blocked.
 onlyBuiltDependencies:
   - "@prisma/client"
   - "@prisma/engines"
   - "prisma"
+  - "esbuild"

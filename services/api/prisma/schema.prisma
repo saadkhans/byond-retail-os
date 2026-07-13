@@ -76,6 +76,8 @@ enum AuditAction {
   LOGOUT
   PASSWORD_CHANGE
   STOCK_ADJUSTMENT
+  REGISTER
+  HEARTBEAT
 }
 
 enum ProductStatus {
@@ -117,6 +119,48 @@ enum InventoryMovementType {
   ADJUSTMENT
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4 — stores (Location), autonomous retail units, devices.
+// ---------------------------------------------------------------------------
+
+enum RetailUnitType {
+  SMART_FRIDGE
+  SMART_SHELF
+  KIOSK
+  VENDING_MACHINE
+  MICRO_MARKET
+  SMART_GATE
+  OTHER
+}
+
+enum RetailUnitStatus {
+  DRAFT
+  ACTIVE
+  MAINTENANCE
+  DISABLED
+  RETIRED
+}
+
+enum DeviceType {
+  CAMERA
+  DOOR_LOCK
+  SHELF_SENSOR
+  WEIGHT_SENSOR
+  PAYMENT_TERMINAL
+  EDGE_GATEWAY
+  TEMPERATURE_SENSOR
+  OTHER
+}
+
+enum DeviceStatus {
+  PROVISIONED
+  ONLINE
+  OFFLINE
+  MAINTENANCE
+  DISABLED
+  RETIRED
+}
+
 model Tenant {
   id        String       @id @default(cuid())
   name      String
@@ -138,6 +182,8 @@ model Tenant {
   productBarcodes    ProductBarcode[]
   inventoryLevels    InventoryLevel[]
   inventoryMovements InventoryMovement[]
+  retailUnits        RetailUnit[]
+  devices            Device[]
 }
 
 model User {
@@ -245,6 +291,7 @@ model Location {
 
   inventoryLevels    InventoryLevel[]
   inventoryMovements InventoryMovement[]
+  retailUnits        RetailUnit[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -432,6 +479,78 @@ model InventoryLevel {
   @@unique([tenantId, locationId, productId])
   @@index([tenantId, productId])
   @@index([tenantId, locationId])
+}
+
+// Phase 4 — autonomous retail unit inside a store (smart fridge, smart
+// shelf, kiosk, ...). Tenant-owned; always assigned to a Location of the
+// SAME tenant (composite FK in migration SQL). Deletion is Restrict-guarded:
+// a unit with devices (or future inventory references) cannot be removed.
+model RetailUnit {
+  id       String @id @default(cuid())
+  tenantId String
+  // The store (Location) this unit lives in.
+  locationId String
+  // Short human-readable identifier, unique per tenant, uppercase.
+  code   String
+  name   String
+  type   RetailUnitType
+  status RetailUnitStatus @default(DRAFT)
+  // Physical placement within the store, e.g. "Aisle 3, next to entrance".
+  placement String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  devices  Device[]
+
+  @@unique([tenantId, code])
+  // Enables composite same-tenant FKs (devices must reference a unit of the
+  // SAME tenant) — mirrors the Phase 3 hardening pattern.
+  @@unique([id, tenantId])
+  @@index([tenantId, locationId])
+  @@index([tenantId, status])
+  @@index([tenantId, type])
+}
+
+// Phase 4 — physical device attached to a retail unit (camera, lock,
+// sensor, gateway, ...). `metadata` holds SAFE, NON-SECRET configuration
+// only — credentials/secrets must never be stored here (audit snapshots
+// additionally redact credential-shaped keys as a backstop).
+//
+// Edge registration stores ONLY the SHA-256 hash of a one-time registration
+// token; the plaintext is returned once at issuance and never persisted or
+// logged. Redeeming the token (POST /edge/register) clears the hash.
+model Device {
+  id       String @id @default(cuid())
+  tenantId String
+  unitId   String
+  name     String
+  type     DeviceType
+  status   DeviceStatus @default(PROVISIONED)
+  // Hardware serial number / ID, unique per tenant. Stored as entered
+  // (trimmed) — serials can be case-sensitive.
+  serialNumber String
+  metadata     Json?
+  firmwareVersion String?
+  softwareVersion String?
+  // Updated by the heartbeat endpoint; never client-supplied.
+  lastSeenAt DateTime?
+  registrationTokenHash      String?   @unique
+  registrationTokenExpiresAt DateTime?
+  registeredAt               DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  unit   RetailUnit @relation(fields: [unitId], references: [id], onDelete: Restrict)
+
+  @@unique([tenantId, serialNumber])
+  @@unique([id, tenantId])
+  @@index([tenantId, unitId])
+  @@index([tenantId, status])
+  @@index([tenantId, type])
+  @@index([tenantId, lastSeenAt])
 }
 
 // Append-only inventory ledger: no updatedAt, no update/delete repository

@@ -1,73 +1,19 @@
 import { Injectable } from '@nestjs/common';
 import { AuditAction, Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import {
+  containsSensitiveValue,
+  isPaymentCardNumber,
+  isSensitiveKey,
+} from '../sensitive-keys';
 
 export const SYSTEM_ACTOR_EMAIL = 'system@byond.internal';
 
 // Redaction rules applied recursively to before/after snapshots. Audit rows
 // outlive normal data-retention paths, so sensitive material must never enter
-// them. Keys are reduced to lowercase alphanumerics before comparison, so
-// every separator style matches: api_key, access-token, access:token,
-// refresh/token, credit_card_number, "Card Number", secret.key, ...
-//
-// Detection is exact-match PLUS suffix-match, so qualified aliases like
-// apiToken, paymentToken, cardToken, clientSecret, creditCardNumber, and
-// primary_account_number are caught without enumerating every prefix.
-// For audit snapshots, conservative over-redaction of credential-shaped
-// fields is acceptable; suffixes are chosen so common harmless fields
-// (timespan, tokenized, description, ...) never match.
-const REDACTED_EXACT = new Set([
-  'password',
-  'passwordhash',
-  'secret',
-  'secretkey',
-  'clientsecret',
-  'privatekey',
-  'token',
-  'accesstoken',
-  'refreshtoken',
-  'sessiontoken',
-  'idtoken',
-  'bearer',
-  'bearertoken',
-  'apikey',
-  'authorization',
-  'cardnumber',
-  'creditcard',
-  'creditcardnumber',
-  'cvv',
-  'cvc',
-  // PAN variants stay exact-match: a generic "pan" suffix would catch
-  // harmless fields like timespan.
-  'pan',
-  'cardpan',
-  'primaryaccountnumber',
-  'pin',
-  'iban',
-]);
-
-// A normalized key ENDING in any of these is redacted: apitoken,
-// paymenttoken, cardtoken, appsecret, webhooksecret, bankaccountnumber, ...
-const REDACTED_SUFFIXES = [
-  'token',
-  'secret',
-  'password',
-  'apikey',
-  'cardnumber',
-  'accountnumber',
-];
-
-function normalizeKey(key: string): string {
-  return key.toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
-function isSensitiveKey(key: string): boolean {
-  const normalized = normalizeKey(key);
-  return (
-    REDACTED_EXACT.has(normalized) ||
-    REDACTED_SUFFIXES.some((suffix) => normalized.endsWith(suffix))
-  );
-}
+// them. The credential/payment-shaped key heuristics live in
+// common/sensitive-keys.ts, SHARED with device-metadata validation so the
+// two policies cannot drift.
 
 /** Authenticated actor attribution for audited mutations. */
 export interface AuditActor {
@@ -156,6 +102,17 @@ export class AuditLogService {
         }
       }
       return result;
+    }
+    // Credential- or PAN-bearing string VALUES (rtsp://user:pass@host,
+    // ?access_token=... URLs, password=x connection strings, raw card
+    // numbers) are redacted even under a harmless key — same shared
+    // detection that blocks device-metadata persistence.
+    if (typeof value === 'string' && containsSensitiveValue(value)) {
+      return '[REDACTED]';
+    }
+    // PANs submitted as JSON numbers are redacted just like strings.
+    if (typeof value === 'number' && isPaymentCardNumber(value)) {
+      return '[REDACTED]';
     }
     return value;
   }

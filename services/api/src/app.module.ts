@@ -5,12 +5,14 @@ import { AuthModule } from './auth/auth.module';
 import { CatalogModule } from './catalog/catalog.module';
 import { RequestIdMiddleware } from './common/request-id.middleware';
 import { validateEnv } from './config/env.validation';
+import { DevicesModule } from './devices/devices.module';
 import { HealthModule } from './health/health.module';
 import { InventoryModule } from './inventory/inventory.module';
 import { LocationsModule } from './locations/locations.module';
 import { PlatformModulesModule } from './platform-modules/platform-modules.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { TenantsModule } from './tenants/tenants.module';
+import { UnitsModule } from './units/units.module';
 import { UsersModule } from './users/users.module';
 
 @Module({
@@ -26,6 +28,8 @@ import { UsersModule } from './users/users.module';
     PlatformModulesModule,
     CatalogModule,
     InventoryModule,
+    UnitsModule,
+    DevicesModule,
   ],
 })
 export class AppModule implements NestModule {

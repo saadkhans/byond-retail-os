@@ -26,4 +26,10 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   { code: 'catalog:manage', module: 'inventory', description: 'Create, update, delete catalog entities' },
   { code: 'inventory:read', module: 'inventory', description: 'View stock levels and the inventory movement ledger' },
   { code: 'inventory:adjust', module: 'inventory', description: 'Perform manual stock adjustments' },
+  { code: 'unit:read', module: 'devices', description: 'View autonomous retail units' },
+  { code: 'unit:manage', module: 'devices', description: 'Create, update, delete retail units' },
+  { code: 'device:read', module: 'devices', description: 'View devices' },
+  { code: 'device:manage', module: 'devices', description: 'Create, update, delete devices' },
+  { code: 'device:register', module: 'devices', description: 'Issue one-time edge registration tokens for devices' },
+  { code: 'device:heartbeat', module: 'devices', description: 'Record device heartbeats' },
 ];

@@ -164,6 +164,17 @@ describe('validateEnv', () => {
     });
   });
 
+  it('accepts a blank CORS_ORIGINS (parseCorsOrigins applies the fallback)', () => {
+    // Deployments that materialize unset optional vars as CORS_ORIGINS=
+    // must still boot with the safe default allowlist.
+    expect(() =>
+      validateEnv({ ...validConfig, CORS_ORIGINS: '' }),
+    ).not.toThrow();
+    expect(() =>
+      validateEnv({ ...validConfig, CORS_ORIGINS: 'https://admin.example.com' }),
+    ).not.toThrow();
+  });
+
   it('validates throttle overrides as positive integers', () => {
     expect(() =>
       validateEnv({ ...validConfig, LOGIN_THROTTLE_LIMIT: '5' }),
