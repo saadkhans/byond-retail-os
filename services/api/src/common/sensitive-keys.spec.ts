@@ -202,6 +202,22 @@ describe('containsCredentialValue', () => {
     'pin=1234',
     'pan=4111111111111111',
     'terminal config: cvv2=456',
+    // key: value credential fragments in free-form text.
+    'password: hunter2',
+    'api_key: abc',
+    'apiKey: abc',
+    'access_token: abc',
+    'client_secret: xyz',
+    'token: abc123',
+    'secret: hunter2',
+    'cvv: 123',
+    'cvc: 123',
+    'cvn: 123',
+    'csc: 123',
+    'pin: 1234',
+    'pan: 4111111111111111',
+    'Authorization: Bearer eyJhbGciOi',
+    'reader notes — password: hunter2, rotate monthly',
   ])('flags credential-bearing value %s', (value) => {
     expect(containsCredentialValue(value)).toBe(true);
   });
@@ -223,6 +239,18 @@ describe('containsCredentialValue', () => {
     'timespan=90',
     'expand=all',
     'https://example.com/f?x-request-id=5&region=eu',
+    // Colon-bearing text that is NOT a credential fragment: URL schemes,
+    // harmless labels, ambiguous label words, timestamps/ratios.
+    'title: camera',
+    'label: front entrance',
+    'key: primary',
+    'auth: enabled',
+    'sig: pending',
+    'note: rotate weekly',
+    'spin: fast',
+    'aspect ratio 16:9',
+    'maintenance window 12:30:45',
+    'see https://docs.example.com/setup for details',
   ])('accepts safe value %s', (value) => {
     expect(containsCredentialValue(value)).toBe(false);
   });
@@ -365,7 +393,23 @@ describe('findSensitiveKeyPath', () => {
         serial: 1234567890123, // 13 digits, fails Luhn
         epochMs: 1752307200000,
         negativeOffset: -42,
+        fractional: 1234567890123.5,
       }),
     ).toBeNull();
+  });
+
+  it('rejects PAN-length numbers above the JS safe-integer range', () => {
+    // 17–19 digit integers exceed 2^53, so JS may have rounded them before
+    // this code runs — a rounded PAN can fail Luhn, so they fail closed.
+    // Number('...') keeps the (intentionally) imprecise literals lint-clean.
+    const rounded17 = Number('12345678901234567'); // → ...568 after rounding
+    const rounded18 = Number('123456789012345678');
+    const roundedPan19 = Number('4111111111111111111'); // 19-digit Visa shape
+    expect(Number.isSafeInteger(rounded17)).toBe(false);
+    expect(findSensitiveKeyPath({ notes: rounded17 })).toBe('notes');
+    expect(findSensitiveKeyPath({ notes: rounded18 })).toBe('notes');
+    expect(findSensitiveKeyPath({ device: { cards: [roundedPan19] } })).toBe(
+      'device.cards[0]',
+    );
   });
 });

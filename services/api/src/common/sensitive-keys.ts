@@ -22,11 +22,13 @@
  * 1. URLs/connection strings with userinfo (rtsp://user:pass@cam.local).
  * 2. URLs whose query string carries a credential parameter
  *    (?access_token=..., ?api_key=..., ?signature=...), plus bare
- *    key=value credential fragments outside parseable URLs.
+ *    key=value and key: value credential fragments outside parseable URLs.
  * 3. Payment-card numbers (PANs): 13–19 digit runs, optionally space/dash
  *    separated, that pass the Luhn check — which includes all common test
  *    PANs (4111 1111 1111 1111, 4242..., 3782 822463 10005, ...). PANs
- *    submitted as JSON numbers are checked the same way.
+ *    submitted as JSON numbers are checked the same way, and PAN-length
+ *    integers above 2^53 are rejected outright (JS rounding would defeat
+ *    the Luhn check).
  *
  * Conservative over-matching of credential-shaped names is acceptable for
  * both call sites.
@@ -214,6 +216,16 @@ const USERINFO_BACKSTOP = /[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s@]+:[^/\s@]*@/;
 const KEY_VALUE_CREDENTIAL =
   /(?:^|[?&;#,\s])(?:access[-_ ]?token|refresh[-_ ]?token|session[-_ ]?token|id[-_ ]?token|api[-_ ]?key|client[-_ ]?secret|token|secret|password|passwd|pwd|signature|sig|auth|authorization|bearer|key|cvv2|cvv|cvc2|cvc|cvn|csc|pin|pan)\s*=\s*[^;&\s]/i;
 
+// key: value credential fragments in free-form text (password: hunter2,
+// api_key: abc, cvv: 123). Two differences from the '=' variant keep
+// colon-heavy prose safe: the value must not start with '/' or ':' (so URL
+// schemes like "https://..." never match), and ambiguous label words —
+// bare 'key', 'sig', 'auth' — are omitted, so "key: primary" and
+// "auth: enabled" stay harmless while unambiguous credential words
+// (password, token, secret, pin, pan, cvv, ...) still flag.
+const KEY_COLON_CREDENTIAL =
+  /(?:^|[?&;#,\s])(?:access[-_ ]?token|refresh[-_ ]?token|session[-_ ]?token|id[-_ ]?token|api[-_ ]?key|client[-_ ]?secret|token|secret|password|passwd|pwd|authorization|bearer|cvv2|cvv|cvc2|cvc|cvn|csc|pin|pan)\s*:\s*[^/\s:]/i;
+
 // Credential query-parameter names checked on parsed URLs, on top of the
 // shared key detection (which already flags *token, *secret, *apikey,
 // password, authorization, bearer, ...). Bare 'key'/'sig'/'auth' are only
@@ -256,7 +268,11 @@ export function containsCredentialValue(text: string): boolean {
       // Not WHATWG-parseable — the backstops below still apply.
     }
   }
-  return USERINFO_BACKSTOP.test(text) || KEY_VALUE_CREDENTIAL.test(text);
+  return (
+    USERINFO_BACKSTOP.test(text) ||
+    KEY_VALUE_CREDENTIAL.test(text) ||
+    KEY_COLON_CREDENTIAL.test(text)
+  );
 }
 
 /**
@@ -301,10 +317,22 @@ export function containsSensitiveValue(text: string): boolean {
 /**
  * PANs submitted as JSON NUMBERS ({ "notes": 4111111111111111 }) get the
  * same Luhn treatment as strings — integers up to 2^53 (all 13–16 digit
- * PANs) round-trip exactly through Number.
+ * PANs) round-trip exactly through Number. PAN-length integers ABOVE 2^53
+ * (17–19 digit card numbers) are rejected outright: JS has already rounded
+ * them by the time we see the value, so a rounded PAN could fail Luhn and
+ * slip through — fail closed instead.
  */
 export function isPaymentCardNumber(value: number): boolean {
-  return Number.isFinite(value) && containsPaymentCardValue(String(value));
+  if (!Number.isFinite(value)) {
+    return false;
+  }
+  if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+    const digits = String(Math.abs(value));
+    if (digits.length >= 13 && digits.length <= 19) {
+      return true;
+    }
+  }
+  return containsPaymentCardValue(String(value));
 }
 
 /**
