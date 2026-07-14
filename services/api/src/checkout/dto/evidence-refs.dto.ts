@@ -20,6 +20,14 @@ import { IsOptionalNonNull } from '../../common/validation';
  * identifiers a future CV/VLM adapter layer will resolve. Phase 5 stores and
  * returns them verbatim; it never interprets them, and nothing in the core
  * depends on any specific vision provider, model, or camera SDK.
+ *
+ * Because they are persisted verbatim, every string field here (and every
+ * reasonCodes entry) is additionally screened for credential- or
+ * payment-bearing content (raw PANs, tokens, credential URLs, CVV/PIN
+ * fragments) by `assertSafeEvidenceRefs` in CheckoutSessionsService before
+ * any write — same shared detection (common/sensitive-keys) and same
+ * controlled-400 pattern as device metadata. Payment data and secrets must
+ * never reach storage (AGENTS.md payments invariant).
  */
 export class EvidenceRefsDto {
   @ApiPropertyOptional({

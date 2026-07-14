@@ -141,13 +141,74 @@ describe('checkout module backfill migration', () => {
     'utf8',
   );
 
+  it('activates a pre-existing checkout module row instead of leaving it inactive', () => {
+    // Databases seeded BEFORE Phase 5 can already carry the `checkout` row
+    // with isActive=false; DO NOTHING would leave every tenant 403ing even
+    // with enablement rows. The upsert must refresh the catalog fields and
+    // force activation while PRESERVING the existing row's id.
+    expect(sql).toContain('ON CONFLICT ("code") DO UPDATE SET');
+    expect(sql).toContain('"name" = EXCLUDED."name"');
+    expect(sql).toContain('"description" = EXCLUDED."description"');
+    expect(sql).toContain('"isActive" = true');
+    // The conflict target is the unique `code` — the update path never
+    // inserts a second row or touches the conflicting row's "id".
+    expect(sql).not.toMatch(/DO UPDATE SET[^;]*"id"\s*=/);
+  });
+
   it('is idempotent and never overwrites a tenant admin choice', () => {
-    expect(sql).toContain('ON CONFLICT ("code") DO NOTHING');
+    // Tenant enablement stays DO NOTHING: re-running must not overwrite a
+    // row a tenant admin already created or disabled; the module upsert
+    // converges on the same catalog values on every run.
     expect(sql).toContain('ON CONFLICT ("tenantId", "moduleId") DO NOTHING');
+    expect(sql).not.toMatch(/ON CONFLICT \("tenantId", "moduleId"\) DO UPDATE/);
   });
 
   it('enables checkout for every pre-existing tenant with deterministic ids', () => {
     expect(sql).toContain(`'tm-' || md5(t."id" || ':checkout')`);
     expect(sql).toContain(`WHERE pm."code" = 'checkout'`);
+  });
+});
+
+describe('checkout line soft-delete migration hardening', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260714000000_checkout_line_soft_delete',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('replaces the per-product unique with a PARTIAL unique over ACTIVE lines', () => {
+    // Tombstones must be exempt from "one line per product per session", or
+    // a product could never be re-added after a removal — while ACTIVE lines
+    // keep the aggregate-into-updates guarantee.
+    expect(sql).toContain(
+      'DROP INDEX "CheckoutSessionLine_tenantId_sessionId_productId_key"',
+    );
+    expect(sql).toContain('CheckoutSessionLine_active_product_key');
+    expect(sql).toMatch(
+      /CREATE UNIQUE INDEX "CheckoutSessionLine_active_product_key"[\s\S]*WHERE "status" = 'ACTIVE'/,
+    );
+  });
+
+  it('keeps removed-line tombstones honest with a CHECK constraint', () => {
+    expect(sql).toContain('CheckoutSessionLine_removed_has_timestamp_check');
+    expect(sql).toContain(
+      `CHECK (("status" = 'REMOVED') = ("removedAt" IS NOT NULL))`,
+    );
+  });
+
+  it('never drops or cascades over line rows (idempotency keys stay reserved)', () => {
+    // The (tenantId, idempotencyKey) unique from the Phase 5 migration is
+    // untouched, and nothing here deletes rows — the tombstone IS the
+    // reservation.
+    expect(sql).not.toMatch(/DROP INDEX "CheckoutSessionLine_tenantId_idempotencyKey_key"/);
+    expect(sql).not.toMatch(/DELETE FROM/);
+    expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
   });
 });

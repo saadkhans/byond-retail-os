@@ -5,6 +5,7 @@ import {
   InventoryMovementType,
   Prisma,
   ProductStatus,
+  UnitOfMeasure,
 } from '@prisma/client';
 import {
   AuditEntry,
@@ -38,6 +39,8 @@ export type AdjustmentFailure =
   | 'location-not-found'
   | 'product-not-found'
   | 'product-archived'
+  | 'product-not-saleable'
+  | 'unit-of-measure-changed'
   | 'insufficient-stock'
   | 'quantity-overflow';
 
@@ -73,6 +76,15 @@ export interface ApplyMovementInput {
   productId: string;
   quantityDelta: number;
   movementType: InventoryMovementType;
+  /**
+   * When set, the product's CURRENT unit of measure is revalidated against
+   * this snapshot under the per-product advisory lock, and a mismatch rejects
+   * the movement ('unit-of-measure-changed'). Callers that consume stock
+   * against a quantity captured earlier (checkout completion consuming a
+   * basket-line snapshot) MUST pass it: a UOM change between snapshot and
+   * movement would silently reinterpret the quantity in the new unit.
+   */
+  expectedUnitOfMeasure?: UnitOfMeasure;
   reason?: string | null;
   referenceType?: string | null;
   referenceId?: string | null;
@@ -202,13 +214,33 @@ export class InventoryRepository extends TenantScopedRepository {
     }
     const product = await tx.product.findFirst({
       where: { id: input.productId, tenantId: scopedTenantId },
-      select: { id: true, status: true },
+      select: { id: true, status: true, unitOfMeasure: true },
     });
     if (!product) {
       throw new AdjustmentRejected('product-not-found');
     }
     if (product.status === ProductStatus.ARCHIVED) {
       throw new AdjustmentRejected('product-archived');
+    }
+    // A SALE consumes stock for a shopper: the product must be saleable NOW,
+    // not merely when it entered the basket. DRAFT/DISCONTINUED products can
+    // still be adjusted/received (Phase 3 behavior, unchanged for non-SALE
+    // movements) but can no longer be sold. Checked under the per-product
+    // advisory lock, so a concurrent status change cannot slip in between.
+    if (
+      input.movementType === InventoryMovementType.SALE &&
+      product.status !== ProductStatus.ACTIVE
+    ) {
+      throw new AdjustmentRejected('product-not-saleable');
+    }
+    // Revalidate the caller's UOM snapshot (see ApplyMovementInput): the
+    // quantityDelta was captured in the snapshot unit, so if the product's
+    // unit changed since, applying it would corrupt ledger semantics.
+    if (
+      input.expectedUnitOfMeasure !== undefined &&
+      product.unitOfMeasure !== input.expectedUnitOfMeasure
+    ) {
+      throw new AdjustmentRejected('unit-of-measure-changed');
     }
 
     // Attribute the movement only to an actor IN THIS TENANT. A

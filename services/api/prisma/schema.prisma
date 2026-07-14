@@ -657,6 +657,16 @@ enum EvidenceQuality {
   HIGH
 }
 
+// Basket line lifecycle. Removing a line is a SOFT delete (status → REMOVED):
+// the row survives as a tombstone so its tenant-scoped idempotencyKey stays
+// reserved forever — a lost-response retry of the original add can never
+// resurrect an intentionally removed item. REMOVED lines are excluded from
+// the active basket and from completion.
+enum CheckoutSessionLineStatus {
+  ACTIVE
+  REMOVED
+}
+
 // A shopping visit at one retail unit in one store. Lifecycle:
 // OPEN -> ACTIVE -> PENDING_REVIEW -> COMPLETED, with CANCELLED/EXPIRED as
 // the other terminal states. Terminal sessions are immutable except through
@@ -719,6 +729,10 @@ model CheckoutSessionLine {
   productName   String
   unitOfMeasure UnitOfMeasure
   quantity      Int
+  // Soft-delete lifecycle: REMOVED lines are tombstones that keep the
+  // idempotencyKey reserved (see CheckoutSessionLineStatus above).
+  status    CheckoutSessionLineStatus @default(ACTIVE)
+  removedAt DateTime?
   // Pricing placeholders — ALWAYS NULL in Phase 5; future pricing/payment
   // phases populate them (minor currency units, integer-exact).
   unitPriceMinor Int?
@@ -746,10 +760,14 @@ model CheckoutSessionLine {
   orderLines OrderLine[]
 
   @@unique([id, tenantId])
-  // One line per product per session — adds aggregate into updates.
-  @@unique([tenantId, sessionId, productId])
+  // One ACTIVE line per product per session ("adds aggregate into updates")
+  // is enforced by a PARTIAL unique index in migration SQL
+  // (CheckoutSessionLine_active_product_key, WHERE status = 'ACTIVE') —
+  // Prisma cannot express partial indexes. REMOVED tombstones are exempt so
+  // a product can be legitimately re-added after removal.
   @@unique([tenantId, idempotencyKey])
   @@index([tenantId, sessionId, createdAt, id])
+  @@index([tenantId, sessionId, productId])
 }
 
 // Order foundation generated from a completed checkout session. CONFIRMED

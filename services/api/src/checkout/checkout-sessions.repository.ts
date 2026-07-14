@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import {
   CheckoutSession,
   CheckoutSessionLine,
+  CheckoutSessionLineStatus,
   CheckoutSessionStatus,
   EvidenceQuality,
   EvidenceSourceType,
@@ -35,12 +36,16 @@ export const SESSION_INCLUDE = {
 } satisfies Prisma.CheckoutSessionInclude;
 
 /**
- * Read shape for session detail: basket lines in deterministic order plus a
- * minimal order reference so a completed session links to its order.
+ * Read shape for session detail: ACTIVE basket lines in deterministic order
+ * (REMOVED tombstones are idempotency reservations, never basket content)
+ * plus a minimal order reference so a completed session links to its order.
  */
 export const SESSION_DETAIL_INCLUDE = {
   ...SESSION_INCLUDE,
-  lines: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] },
+  lines: {
+    where: { status: CheckoutSessionLineStatus.ACTIVE },
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+  },
   order: { select: { id: true, orderNumber: true, status: true } },
 } satisfies Prisma.CheckoutSessionInclude;
 
@@ -121,7 +126,8 @@ export type CreateSessionRejection =
   | 'location-not-found'
   | 'unit-not-found'
   | 'unit-location-mismatch'
-  | 'device-not-found';
+  | 'device-not-found'
+  | 'device-unit-mismatch';
 
 export type StatusUpdateRejection = 'terminal-blocked' | 'transition-blocked';
 
@@ -130,13 +136,15 @@ export type LineMutationRejection =
   | 'session-terminal'
   | 'product-not-found'
   | 'product-not-saleable'
-  | 'line-not-found';
+  | 'line-not-found'
+  | 'idempotency-key-consumed';
 
 export type CompletionRejection =
   | 'session-not-found'
   | 'session-terminal'
   | 'already-completed'
-  | 'empty-session';
+  | 'empty-session'
+  | 'idempotency-key-conflict';
 
 /** A per-line inventory decrement failure that aborted the whole completion. */
 export interface CompletionStockFailure {
@@ -245,10 +253,16 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
       if (data.deviceId) {
         const device = await tx.device.findFirst({
           where: { id: data.deviceId, tenantId: scopedTenantId },
-          select: { id: true },
+          select: { id: true, unitId: true },
         });
         if (!device) {
           return 'device-not-found' as const;
+        }
+        // The source device must be the hardware attached to the SELECTED
+        // unit: a same-tenant device from another unit would corrupt the
+        // evidence/source lineage every future edge flow trusts.
+        if (device.unitId !== data.unitId) {
+          return 'device-unit-mismatch' as const;
         }
       }
       const session = await tx.checkoutSession.create({
@@ -283,6 +297,23 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
     return this.prisma.checkoutSession.findFirst({
       where: this.scope(tenantId, { idempotencyKey }),
       include: SESSION_DETAIL_INCLUDE,
+    });
+  }
+
+  /**
+   * Replay lookup for the completion P2002 backstop: if a completion loses
+   * the (tenantId, idempotencyKey) unique race despite the under-lock
+   * recheck, the service resolves the winning order here and maps to a
+   * replay (same session) or a controlled 409 (different session) — never
+   * an uncaught 500.
+   */
+  findOrderByIdempotencyKey(
+    tenantId: string,
+    idempotencyKey: string,
+  ): Promise<CompletedOrder | null> {
+    return this.prisma.order.findFirst({
+      where: this.scope(tenantId, { idempotencyKey }),
+      include: COMPLETION_ORDER_INCLUDE,
     });
   }
 
@@ -416,9 +447,15 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
             idempotencyKey: data.idempotencyKey,
           },
         });
-        // Only a replay against the SAME session is a replay; the same key
-        // pointed at another session is a caller bug surfaced as P2002.
         if (existing && existing.sessionId === sessionId) {
+          // The key landed on a REMOVED tombstone: the original add
+          // succeeded and the line was then intentionally removed. A retry
+          // must NOT resurrect the item — the key is consumed for good.
+          if (existing.status === CheckoutSessionLineStatus.REMOVED) {
+            return 'idempotency-key-consumed' as const;
+          }
+          // Only a replay against the SAME session is a replay; the same key
+          // pointed at another session is a caller bug surfaced as P2002.
           return { line: existing, replayed: true };
         }
       }
@@ -490,7 +527,14 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
         return 'session-terminal' as const;
       }
       const before = await tx.checkoutSessionLine.findFirst({
-        where: { id: lineId, sessionId, tenantId: scopedTenantId },
+        // A REMOVED tombstone is not part of the basket: updating it would
+        // resurrect it through the back door.
+        where: {
+          id: lineId,
+          sessionId,
+          tenantId: scopedTenantId,
+          status: CheckoutSessionLineStatus.ACTIVE,
+        },
       });
       if (!before) {
         return 'line-not-found' as const;
@@ -534,14 +578,29 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
         return 'session-terminal' as const;
       }
       const existing = await tx.checkoutSessionLine.findFirst({
-        where: { id: lineId, sessionId, tenantId: scopedTenantId },
+        where: {
+          id: lineId,
+          sessionId,
+          tenantId: scopedTenantId,
+          status: CheckoutSessionLineStatus.ACTIVE,
+        },
       });
       if (!existing) {
         return 'line-not-found' as const;
       }
-      await tx.checkoutSessionLine.delete({ where: { id: existing.id } });
+      // SOFT delete: the tombstone keeps the (tenantId, idempotencyKey)
+      // reservation alive, so a lost-response retry of the original add can
+      // never resurrect an intentionally removed item. REMOVED lines are
+      // excluded from the active basket and from completion.
+      const removed = await tx.checkoutSessionLine.update({
+        where: { id: existing.id },
+        data: {
+          status: CheckoutSessionLineStatus.REMOVED,
+          removedAt: new Date(),
+        },
+      });
       await this.auditLog.record(buildAuditEntry(existing), tx);
-      return existing;
+      return removed;
     });
   }
 
@@ -577,7 +636,14 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
         await this.lockSession(tx, scopedTenantId, sessionId);
         const session = await tx.checkoutSession.findFirst({
           where: { id: sessionId, tenantId: scopedTenantId },
-          include: { lines: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] } },
+          include: {
+            // Only ACTIVE lines complete into an order; REMOVED tombstones
+            // are idempotency reservations and must never consume stock.
+            lines: {
+              where: { status: CheckoutSessionLineStatus.ACTIVE },
+              orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+            },
+          },
         });
         if (!session) {
           return 'session-not-found' as const;
@@ -606,19 +672,32 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
         if (session.lines.length === 0) {
           return 'empty-session' as const;
         }
-        // Cross-session replay guard: the same completion key retried after
-        // the response was lost, but routed at a different session id.
-        if (input.idempotencyKey) {
-          const replay = await tx.order.findFirst({
+        // Idempotency-key guard: a key that already produced an order either
+        // replays it (same session — the retry of a completion whose
+        // response was lost) or is a controlled conflict (a DIFFERENT
+        // session reusing the key must never receive another session's
+        // order, nor blow up as an uncaught unique violation).
+        const checkIdempotencyKey = async () => {
+          if (!input.idempotencyKey) {
+            return null;
+          }
+          const existing = await tx.order.findFirst({
             where: {
               tenantId: scopedTenantId,
               idempotencyKey: input.idempotencyKey,
             },
             include: COMPLETION_ORDER_INCLUDE,
           });
-          if (replay) {
-            return { order: replay, replayed: true };
+          if (!existing) {
+            return null;
           }
+          return existing.checkoutSessionId === session.id
+            ? ({ order: existing, replayed: true } as const)
+            : ('idempotency-key-conflict' as const);
+        };
+        const preLock = await checkIdempotencyKey();
+        if (preLock) {
+          return preLock;
         }
 
         // Order numbers are per-tenant sequential; the advisory lock
@@ -629,6 +708,16 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
         await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${tenantOrderNumberAdvisoryLockKey(
           scopedTenantId,
         )}))`;
+
+        // Recheck the key now that the tenant order lock is held: two
+        // completions with the same key on DIFFERENT sessions serialize
+        // here, so the loser sees the winner's committed order and returns
+        // a controlled replay/conflict instead of racing into the
+        // (tenantId, idempotencyKey) unique as a P2002/500.
+        const underLock = await checkIdempotencyKey();
+        if (underLock) {
+          return underLock;
+        }
         const count = await tx.order.count({
           where: { tenantId: scopedTenantId },
         });
@@ -696,6 +785,11 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
                 productId: line.productId,
                 quantityDelta: -line.quantity,
                 movementType: InventoryMovementType.SALE,
+                // Revalidated against the CURRENT product under the
+                // per-product lock: the line quantity was captured in the
+                // snapshot unit, so a UOM change since add rejects the
+                // completion instead of corrupting the SALE ledger.
+                expectedUnitOfMeasure: line.unitOfMeasure,
                 reason: `Checkout completion ${orderNumber}`,
                 referenceType: 'Order',
                 referenceId: order.id,

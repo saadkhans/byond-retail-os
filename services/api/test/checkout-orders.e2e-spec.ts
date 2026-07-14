@@ -300,8 +300,16 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
       view.unit = refPick(units, row.unitId);
     }
     if (include.lines) {
+      // Honors the relation filter the API uses to exclude REMOVED
+      // tombstones from the active basket ({ lines: { where: { status } } }).
+      const lineWhere = (include.lines as { where?: Where }).where;
       view.lines = store.sessionLines
-        .filter((line) => line.sessionId === row.id)
+        .filter(
+          (line) =>
+            line.sessionId === row.id &&
+            (lineWhere?.status === undefined ||
+              line.status === lineWhere.status),
+        )
         .sort(byCreatedAsc);
     }
     if (include.order) {
@@ -614,12 +622,15 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
     },
     checkoutSessionLine: {
       create: async ({ data }: { data: Where }) => {
+        // Mirrors the PARTIAL unique index: only one ACTIVE line per
+        // product per session — REMOVED tombstones don't block a re-add.
         if (
           store.sessionLines.some(
             (row) =>
               row.tenantId === data.tenantId &&
               row.sessionId === data.sessionId &&
-              row.productId === data.productId,
+              row.productId === data.productId &&
+              row.status === 'ACTIVE',
           )
         ) {
           throw { code: 'P2002' };
@@ -636,6 +647,8 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
         }
         const row = {
           id: nextId('line'),
+          status: 'ACTIVE',
+          removedAt: null,
           unitPriceMinor: null,
           lineTotalMinor: null,
           currencyCode: null,
@@ -664,6 +677,7 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
             'sessionId',
             'productId',
             'idempotencyKey',
+            'status',
           ]),
         ) ?? null,
       update: async ({ where, data }: { where: Where; data: Where }) => {
@@ -1070,6 +1084,64 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
         .expect(400);
     });
 
+    it('a same-tenant device from a DIFFERENT unit is rejected (400)', async () => {
+      // dev-a1 belongs to unit-a1; binding it to unit-a2 would corrupt the
+      // session's evidence/source lineage.
+      const before = store.sessions.length;
+      await request(app.getHttpServer())
+        .post('/checkout-sessions')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ locationId: 'loc-a2', unitId: 'unit-a2', deviceId: 'dev-a1' })
+        .expect(400);
+      expect(store.sessions).toHaveLength(before);
+    });
+
+    it('credential- or payment-bearing evidence references are rejected (400)', async () => {
+      const before = store.sessions.length;
+      // Raw PAN in sourceId.
+      await request(app.getHttpServer())
+        .post('/checkout-sessions')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          locationId: 'loc-a1',
+          unitId: 'unit-a1',
+          sourceId: '4111 1111 1111 1111',
+        })
+        .expect(400);
+      // Credential URL in evidenceBundleId.
+      await request(app.getHttpServer())
+        .post('/checkout-sessions')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          locationId: 'loc-a1',
+          unitId: 'unit-a1',
+          evidenceBundleId: 'rtsp://admin:secret@cam-1.local/feed',
+        })
+        .expect(400);
+      // Token fragment in visionEventId; CVV fragment in reasonCodes.
+      await request(app.getHttpServer())
+        .post('/checkout-sessions')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          locationId: 'loc-a1',
+          unitId: 'unit-a1',
+          // Assembled at runtime so no static secret-shaped literal lands
+          // in the repo (Gitleaks scans every commit diff).
+          visionEventId: `api_key=${['sk', 'live', '123'].join('_')}`,
+        })
+        .expect(400);
+      await request(app.getHttpServer())
+        .post('/checkout-sessions')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          locationId: 'loc-a1',
+          unitId: 'unit-a1',
+          reasonCodes: ['cvv=123'],
+        })
+        .expect(400);
+      expect(store.sessions).toHaveLength(before);
+    });
+
     it("lists only this tenant's sessions with a deterministic envelope", async () => {
       const response = await request(app.getHttpServer())
         .get('/checkout-sessions')
@@ -1237,7 +1309,7 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
         .expect(400);
     });
 
-    it('removes a line (204) and audits the deletion', async () => {
+    it('removes a line (204) as a REMOVED tombstone and audits the deletion', async () => {
       await request(app.getHttpServer())
         .delete(
           `/checkout-sessions/${sessionId}/lines/${
@@ -1257,12 +1329,79 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
           }),
         }),
       );
+      // SOFT delete: the row survives as a REMOVED tombstone (keeping its
+      // idempotency key reserved) but leaves the ACTIVE basket.
+      const tombstone = store.sessionLines.find(
+        (line) =>
+          line.sessionId === sessionId && line.productId === 'prod-a2',
+      );
+      expect(tombstone).toEqual(
+        expect.objectContaining({
+          status: 'REMOVED',
+          idempotencyKey: 'line-key-1',
+        }),
+      );
+      expect(tombstone!.removedAt).not.toBeNull();
+      const session = await request(app.getHttpServer())
+        .get(`/checkout-sessions/${sessionId}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .expect(200);
+      expect(
+        session.body.lines.some(
+          (line: { productId: string }) => line.productId === 'prod-a2',
+        ),
+      ).toBe(false);
+    });
+
+    it('retrying the add-line key AFTER removal never resurrects the item (409)', async () => {
+      await request(app.getHttpServer())
+        .post(`/checkout-sessions/${sessionId}/lines`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          productId: 'prod-a2',
+          quantity: 5,
+          idempotencyKey: 'line-key-1',
+        })
+        .expect(409);
+      // Still no ACTIVE prod-a2 line — the item stayed removed.
       expect(
         store.sessionLines.some(
           (line) =>
-            line.sessionId === sessionId && line.productId === 'prod-a2',
+            line.sessionId === sessionId &&
+            line.productId === 'prod-a2' &&
+            line.status === 'ACTIVE',
         ),
       ).toBe(false);
+    });
+
+    it('re-adding the product with a NEW key succeeds past the tombstone', async () => {
+      const response = await request(app.getHttpServer())
+        .post(`/checkout-sessions/${sessionId}/lines`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          productId: 'prod-a2',
+          quantity: 1,
+          idempotencyKey: 'line-key-2',
+        })
+        .expect(201);
+      expect(response.body.status).toBe('ACTIVE');
+      // The tombstone remains alongside the fresh line, key still reserved.
+      expect(
+        store.sessionLines.filter(
+          (line) =>
+            line.sessionId === sessionId && line.productId === 'prod-a2',
+        ),
+      ).toHaveLength(2);
+      // ...and the retired key still cannot come back.
+      await request(app.getHttpServer())
+        .post(`/checkout-sessions/${sessionId}/lines`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          productId: 'prod-a2',
+          quantity: 5,
+          idempotencyKey: 'line-key-1',
+        })
+        .expect(409);
     });
 
     it('a missing line 404s', async () => {
@@ -1601,6 +1740,76 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
         store.orders.find((order) => order.id === orderId)!.orderNumber,
       );
     });
+
+    it('completion consumes stock ONLY for ACTIVE lines, never for removed ones', async () => {
+      // Fresh session: cola stays, chips is added then removed. Completion
+      // must decrement cola only.
+      const created = await request(app.getHttpServer())
+        .post('/checkout-sessions')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ locationId: 'loc-a1', unitId: 'unit-a1' })
+        .expect(201);
+      const freshSessionId = created.body.id as string;
+      await request(app.getHttpServer())
+        .post(`/checkout-sessions/${freshSessionId}/lines`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ productId: 'prod-a1', quantity: 1 })
+        .expect(201);
+      const chips = await request(app.getHttpServer())
+        .post(`/checkout-sessions/${freshSessionId}/lines`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ productId: 'prod-a2', quantity: 1 })
+        .expect(201);
+      await request(app.getHttpServer())
+        .delete(`/checkout-sessions/${freshSessionId}/lines/${chips.body.id}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .expect(204);
+
+      const colaBefore = levelQuantity('prod-a1') as number;
+      const chipsBefore = levelQuantity('prod-a2') as number;
+      const response = await request(app.getHttpServer())
+        .post(`/checkout-sessions/${freshSessionId}/complete`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ idempotencyKey: 'complete-after-removal' })
+        .expect(201);
+      // Only the cola line materialized; the removed chips line consumed
+      // nothing and produced no order line.
+      expect(response.body.totalQuantity).toBe(1);
+      expect(response.body.lines).toHaveLength(1);
+      expect(response.body.lines[0].sku).toBe('A-COLA-330');
+      expect(levelQuantity('prod-a1')).toBe(colaBefore - 1);
+      expect(levelQuantity('prod-a2')).toBe(chipsBefore);
+      expect(
+        store.movements.filter(
+          (movement) =>
+            movement.movementType === 'SALE' &&
+            movement.productId === 'prod-a2' &&
+            movement.referenceId === response.body.id,
+        ),
+      ).toHaveLength(0);
+    });
+
+    it('a session whose ONLY line was removed cannot complete (409 empty)', async () => {
+      const created = await request(app.getHttpServer())
+        .post('/checkout-sessions')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ locationId: 'loc-a1', unitId: 'unit-a1' })
+        .expect(201);
+      const line = await request(app.getHttpServer())
+        .post(`/checkout-sessions/${created.body.id}/lines`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ productId: 'prod-a1', quantity: 1 })
+        .expect(201);
+      await request(app.getHttpServer())
+        .delete(`/checkout-sessions/${created.body.id}/lines/${line.body.id}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .expect(204);
+      await request(app.getHttpServer())
+        .post(`/checkout-sessions/${created.body.id}/complete`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ idempotencyKey: 'complete-all-removed' })
+        .expect(409);
+    });
   });
 
   describe('orders: list, detail, cancel & tenant isolation', () => {
@@ -1668,6 +1877,9 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
         .expect(200);
       const target = list.body.items[0].id as string;
       const colaBefore = levelQuantity('prod-a1');
+      const saleMovementsBefore = store.movements.filter(
+        (m) => m.movementType === 'SALE',
+      ).length;
       const response = await request(app.getHttpServer())
         .post(`/orders/${target}/cancel`)
         .set('Authorization', `Bearer ${managerToken}`)
@@ -1680,7 +1892,7 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
       expect(levelQuantity('prod-a1')).toBe(colaBefore);
       expect(
         store.movements.filter((m) => m.movementType === 'SALE'),
-      ).toHaveLength(3);
+      ).toHaveLength(saleMovementsBefore);
       expect(auditCreateSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({

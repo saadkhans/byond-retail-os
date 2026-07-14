@@ -13,6 +13,7 @@ import {
   AuditEntry,
   SYSTEM_ACTOR_EMAIL,
 } from '../common/audit/audit-log.service';
+import { containsSensitiveValue } from '../common/sensitive-keys';
 import {
   CheckoutSessionDetail,
   CheckoutSessionsRepository,
@@ -48,6 +49,47 @@ function evidenceRefs(dto: EvidenceRefs): EvidenceRefs {
   };
 }
 
+/** The free-form evidence/source string fields persisted verbatim. */
+const EVIDENCE_STRING_FIELDS = [
+  'sourceId',
+  'evidenceBundleId',
+  'visionEventId',
+  'vlmReviewId',
+] as const;
+
+/**
+ * Evidence/source references are OPAQUE IDENTIFIERS persisted verbatim to
+ * session/line/order rows. This BLOCKS persistence (controlled 400) when any
+ * of them — or any reasonCodes entry — carries credential- or payment-bearing
+ * content: raw PANs (Luhn-checked), credential URLs
+ * (rtsp://user:pass@camera.local, ?access_token=...), or token/api_key/
+ * password/CVV/PIN fragments. Audit-snapshot redaction is only a backstop;
+ * such values must never reach storage in the first place (AGENTS.md
+ * payments invariant). Same detection and same pattern as DevicesService
+ * metadata validation.
+ */
+function assertSafeEvidenceRefs(refs: EvidenceRefs): void {
+  for (const field of EVIDENCE_STRING_FIELDS) {
+    const value = refs[field];
+    if (value !== undefined && containsSensitiveValue(value)) {
+      throw new BadRequestException(
+        `${field} must be an opaque reference and must not contain ` +
+          `credential- or payment-bearing values. Secrets belong in a ` +
+          `dedicated secret store (reference them by name), and payment ` +
+          `data must never be stored.`,
+      );
+    }
+  }
+  for (const [index, code] of (refs.reasonCodes ?? []).entries()) {
+    if (containsSensitiveValue(code)) {
+      throw new BadRequestException(
+        `reasonCodes[${index}] must be an opaque reason code and must not ` +
+          `contain credential- or payment-bearing values.`,
+      );
+    }
+  }
+}
+
 @Injectable()
 export class CheckoutSessionsService {
   constructor(
@@ -59,6 +101,7 @@ export class CheckoutSessionsService {
     dto: CreateCheckoutSessionDto,
     actor?: AuditActor,
   ): Promise<CheckoutSessionDetail> {
+    assertSafeEvidenceRefs(dto);
     let result: Awaited<
       ReturnType<CheckoutSessionsRepository['create']>
     >;
@@ -114,6 +157,11 @@ export class CheckoutSessionsService {
     }
     if (result === 'device-not-found') {
       throw new BadRequestException(`Device "${dto.deviceId}" not found`);
+    }
+    if (result === 'device-unit-mismatch') {
+      throw new BadRequestException(
+        `Device "${dto.deviceId}" is not attached to unit "${dto.unitId}"`,
+      );
     }
     return result.session;
   }
@@ -197,6 +245,7 @@ export class CheckoutSessionsService {
     dto: AddSessionLineDto,
     actor?: AuditActor,
   ): Promise<CheckoutSessionLine> {
+    assertSafeEvidenceRefs(dto);
     let result: Awaited<ReturnType<CheckoutSessionsRepository['addLine']>>;
     try {
       result = await this.sessionsRepository.addLine(
@@ -243,6 +292,7 @@ export class CheckoutSessionsService {
     dto: UpdateSessionLineDto,
     actor?: AuditActor,
   ): Promise<CheckoutSessionLine> {
+    assertSafeEvidenceRefs(dto);
     const refs = evidenceRefs(dto);
     const hasChange =
       dto.quantity !== undefined ||
@@ -297,38 +347,64 @@ export class CheckoutSessionsService {
     dto: CompleteSessionDto,
     actor?: AuditActor,
   ): Promise<CompletedOrder> {
-    const result = await this.sessionsRepository.complete(
-      tenantId,
-      sessionId,
-      { idempotencyKey: dto.idempotencyKey, createdById: actor?.id },
-      {
-        sessionCompleted: (before, after) =>
-          this.auditEntry(tenantId, actor, {
-            action: AuditAction.COMPLETE,
-            entityType: 'CheckoutSession',
-            entityId: after.id,
-            before,
-            after,
-            reason: 'Checkout session completed into an order',
-          }),
-        orderCreated: (order) =>
-          this.auditEntry(tenantId, actor, {
-            action: AuditAction.CREATE,
-            entityType: 'Order',
-            entityId: order.id,
-            after: order,
-            reason: `Order ${order.orderNumber} created from checkout session`,
-          }),
-        stockConsumed: (movement, level, line) =>
-          this.auditEntry(tenantId, actor, {
-            action: AuditAction.STOCK_ADJUSTMENT,
-            entityType: 'InventoryMovement',
-            entityId: movement.id,
-            after: { movement, quantityAfter: level.quantity },
-            reason: `Stock consumed for SKU "${line.sku}" by checkout completion`,
-          }),
-      },
-    );
+    let result: Awaited<ReturnType<CheckoutSessionsRepository['complete']>>;
+    try {
+      result = await this.sessionsRepository.complete(
+        tenantId,
+        sessionId,
+        { idempotencyKey: dto.idempotencyKey, createdById: actor?.id },
+        {
+          sessionCompleted: (before, after) =>
+            this.auditEntry(tenantId, actor, {
+              action: AuditAction.COMPLETE,
+              entityType: 'CheckoutSession',
+              entityId: after.id,
+              before,
+              after,
+              reason: 'Checkout session completed into an order',
+            }),
+          orderCreated: (order) =>
+            this.auditEntry(tenantId, actor, {
+              action: AuditAction.CREATE,
+              entityType: 'Order',
+              entityId: order.id,
+              after: order,
+              reason: `Order ${order.orderNumber} created from checkout session`,
+            }),
+          stockConsumed: (movement, level, line) =>
+            this.auditEntry(tenantId, actor, {
+              action: AuditAction.STOCK_ADJUSTMENT,
+              entityType: 'InventoryMovement',
+              entityId: movement.id,
+              after: { movement, quantityAfter: level.quantity },
+              reason: `Stock consumed for SKU "${line.sku}" by checkout completion`,
+            }),
+        },
+      );
+    } catch (error) {
+      // Unique-violation backstop for the completion idempotency-key race:
+      // if two completions with the same key slipped past the under-lock
+      // recheck, the loser's order insert hits the (tenantId,
+      // idempotencyKey) unique. Resolve the winner and replay (same
+      // session) or reject with a controlled 409 (different session) —
+      // never an uncaught 500.
+      if (prismaErrorCode(error) === 'P2002' && dto.idempotencyKey) {
+        const winner = await this.sessionsRepository.findOrderByIdempotencyKey(
+          tenantId,
+          dto.idempotencyKey,
+        );
+        if (winner) {
+          if (winner.checkoutSessionId === sessionId) {
+            return winner;
+          }
+          throw new ConflictException(
+            'This completion idempotency key was already used by a ' +
+              'different checkout session',
+          );
+        }
+      }
+      throw error;
+    }
     if (result === 'session-not-found') {
       throw new NotFoundException(
         `Checkout session "${sessionId}" not found`,
@@ -350,6 +426,12 @@ export class CheckoutSessionsService {
         'Session has no basket lines; add at least one line before completing',
       );
     }
+    if (result === 'idempotency-key-conflict') {
+      throw new ConflictException(
+        'This completion idempotency key was already used by a different ' +
+          'checkout session',
+      );
+    }
     if (typeof result === 'object' && 'stockFailure' in result) {
       if (result.stockFailure === 'insufficient-stock') {
         throw new ConflictException(
@@ -361,6 +443,19 @@ export class CheckoutSessionsService {
         throw new ConflictException(
           `Product with SKU "${result.sku}" is archived and cannot be sold; ` +
             'the completion was rolled back',
+        );
+      }
+      if (result.stockFailure === 'product-not-saleable') {
+        throw new ConflictException(
+          `Product with SKU "${result.sku}" is no longer ACTIVE and cannot ` +
+            'be sold; the completion was rolled back and no order was created',
+        );
+      }
+      if (result.stockFailure === 'unit-of-measure-changed') {
+        throw new ConflictException(
+          `Product with SKU "${result.sku}" changed its unit of measure ` +
+            'after the line was added; remove and re-add the line. The ' +
+            'completion was rolled back and no order was created',
         );
       }
       throw new ConflictException(
@@ -398,6 +493,13 @@ export class CheckoutSessionsService {
     if (result === 'line-not-found') {
       throw new NotFoundException(
         `Line "${lineId}" not found on session "${sessionId}"`,
+      );
+    }
+    if (result === 'idempotency-key-consumed') {
+      throw new ConflictException(
+        'This idempotency key was used by a basket line that has since ' +
+          'been removed; the line was not re-added. Use a new key to add ' +
+          'the product again.',
       );
     }
   }

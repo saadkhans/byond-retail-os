@@ -6,10 +6,16 @@
 -- /checkout-sessions and /orders call despite the catalog declaring the
 -- module default-enabled.
 
--- 1. Ensure the PlatformModule row exists. Migrations run before any seed on
---    an upgraded deployment, so the backfill cannot rely on `db:seed` having
---    created it. Idempotent: the seed later upserts (keyed on the unique
---    `code`) and keeps name/description/isActive in sync with the catalog.
+-- 1. Ensure the PlatformModule row exists AND is active. Migrations run
+--    before any seed on an upgraded deployment, so the backfill cannot rely
+--    on `db:seed` having created it. Databases seeded BEFORE Phase 5 may
+--    already carry a `checkout` row from an earlier catalog with
+--    `isActive = false`; DO NOTHING would leave it inactive and
+--    PlatformModulesService.isEnabledForTenant() would still 403 every
+--    checkout/orders request despite the tenant enablement rows below. The
+--    upsert therefore refreshes name/description and forces `isActive = true`
+--    while PRESERVING the existing row's id (no duplicate row, `code` stays
+--    unique). Idempotent: re-running converges on the same catalog values.
 INSERT INTO "PlatformModule" ("id", "code", "name", "description", "isActive", "createdAt", "updatedAt")
 VALUES (
   'pm-checkout-phase5',
@@ -20,7 +26,11 @@ VALUES (
   CURRENT_TIMESTAMP,
   CURRENT_TIMESTAMP
 )
-ON CONFLICT ("code") DO NOTHING;
+ON CONFLICT ("code") DO UPDATE SET
+  "name" = EXCLUDED."name",
+  "description" = EXCLUDED."description",
+  "isActive" = true,
+  "updatedAt" = CURRENT_TIMESTAMP;
 
 -- 2. Enable the module for every existing tenant that does not already have
 --    an enablement row. ON CONFLICT ("tenantId", "moduleId") DO NOTHING makes

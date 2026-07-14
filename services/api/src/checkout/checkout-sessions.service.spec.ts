@@ -25,6 +25,7 @@ describe('CheckoutSessionsService', () => {
   let repository: {
     create: jest.Mock;
     findByIdempotencyKey: jest.Mock;
+    findOrderByIdempotencyKey: jest.Mock;
     findById: jest.Mock;
     search: jest.Mock;
     updateStatus: jest.Mock;
@@ -41,6 +42,7 @@ describe('CheckoutSessionsService', () => {
         .fn()
         .mockResolvedValue({ session: sessionDetail, replayed: false }),
       findByIdempotencyKey: jest.fn().mockResolvedValue(null),
+      findOrderByIdempotencyKey: jest.fn().mockResolvedValue(null),
       findById: jest.fn().mockResolvedValue(sessionDetail),
       search: jest.fn().mockResolvedValue({ items: [], total: 0 }),
       updateStatus: jest.fn().mockResolvedValue(sessionDetail),
@@ -85,6 +87,7 @@ describe('CheckoutSessionsService', () => {
       'unit-not-found',
       'unit-location-mismatch',
       'device-not-found',
+      'device-unit-mismatch',
     ] as const)('maps %s to a 400', async (rejection) => {
       repository.create.mockResolvedValue(rejection);
       await expect(
@@ -110,6 +113,92 @@ describe('CheckoutSessionsService', () => {
         'tenant-a',
         'key-1',
       );
+    });
+  });
+
+  describe('evidence reference safety (payments invariant)', () => {
+    // Persisted verbatim → must never carry credential/payment content.
+    const rejects = async (dto: Record<string, unknown>) => {
+      await expect(
+        service.create('tenant-a', {
+          locationId: 'loc-a1',
+          unitId: 'unit-a1',
+          ...dto,
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      await expect(
+        service.addLine('tenant-a', 'sess-1', {
+          productId: 'prod-a',
+          quantity: 1,
+          ...dto,
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      await expect(
+        service.updateLine('tenant-a', 'sess-1', 'line-1', dto),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(repository.create).not.toHaveBeenCalled();
+      expect(repository.addLine).not.toHaveBeenCalled();
+      expect(repository.updateLine).not.toHaveBeenCalled();
+    };
+
+    it('rejects a raw PAN in sourceId with a controlled 400', async () => {
+      await rejects({ sourceId: '4111 1111 1111 1111' });
+    });
+
+    it('rejects token/api_key/password fragments in evidence fields', async () => {
+      // Key-shaped values are assembled at runtime so the repo never carries
+      // a static secret-shaped literal (Gitleaks scans every commit diff).
+      const keyShapedValue = ['sk', 'live', 'abc123'].join('_');
+      const tokenShapedValue = ['eyJhbGciOi', 'JIUzI1NiJ9'].join('');
+      await rejects({ visionEventId: `api_key=${keyShapedValue}` });
+      await rejects({ vlmReviewId: 'password: hunter2' });
+      await rejects({ sourceId: `access_token=${tokenShapedValue}` });
+    });
+
+    it('rejects a credential URL in evidenceBundleId', async () => {
+      await rejects({
+        evidenceBundleId: 'rtsp://admin:pass@camera-aisle-01.local/feed',
+      });
+      await rejects({
+        evidenceBundleId: 'https://cdn.example/bundle?access_token=abc',
+      });
+    });
+
+    it('rejects CVV/PIN/PAN content in reasonCodes', async () => {
+      await rejects({ reasonCodes: ['cvv=123'] });
+      await rejects({ reasonCodes: ['pin: 1234'] });
+      await rejects({ reasonCodes: ['ok', '4242424242424242'] });
+    });
+
+    it('accepts safe opaque references and reason codes', async () => {
+      await service.create('tenant-a', {
+        locationId: 'loc-a1',
+        unitId: 'unit-a1',
+        sourceId: 'camera-aisle-01',
+        evidenceBundleId: 'bundle_001',
+        visionEventId: 'vision_evt_123',
+        vlmReviewId: 'vlm_review_abc',
+        reasonCodes: ['shelf_pickup_observed'],
+      });
+      expect(repository.create).toHaveBeenCalledWith(
+        'tenant-a',
+        expect.objectContaining({
+          sourceId: 'camera-aisle-01',
+          evidenceBundleId: 'bundle_001',
+          visionEventId: 'vision_evt_123',
+          vlmReviewId: 'vlm_review_abc',
+          reasonCodes: ['shelf_pickup_observed'],
+        }),
+        expect.any(Function),
+      );
+      await service.addLine('tenant-a', 'sess-1', {
+        productId: 'prod-a',
+        quantity: 1,
+        sourceId: 'camera-aisle-01',
+        visionEventId: 'vision_evt_123',
+        reasonCodes: ['shelf_pickup_observed'],
+      });
+      expect(repository.addLine).toHaveBeenCalled();
     });
   });
 
@@ -195,6 +284,17 @@ describe('CheckoutSessionsService', () => {
       ).rejects.toBeInstanceOf(ConflictException);
     });
 
+    it('maps a consumed (removed-line) idempotency key to 409 — never a resurrect', async () => {
+      repository.addLine.mockResolvedValue('idempotency-key-consumed');
+      await expect(
+        service.addLine('tenant-a', 'sess-1', {
+          productId: 'prod-a',
+          quantity: 1,
+          idempotencyKey: 'key-K',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+    });
+
     it('rejects an empty line update before touching the repository', async () => {
       await expect(
         service.updateLine('tenant-a', 'sess-1', 'line-1', {}),
@@ -256,11 +356,66 @@ describe('CheckoutSessionsService', () => {
       ['already-completed'],
       ['session-terminal'],
       ['empty-session'],
+      ['idempotency-key-conflict'],
     ] as const)('maps %s to 409', async (rejection) => {
       repository.complete.mockResolvedValue(rejection);
       await expect(
         service.complete('tenant-a', 'sess-1', {}),
       ).rejects.toBeInstanceOf(ConflictException);
+    });
+
+    it.each([
+      ['product-not-saleable'],
+      ['unit-of-measure-changed'],
+    ] as const)('names the failing SKU on a %s rollback (409)', async (reason) => {
+      repository.complete.mockResolvedValue({
+        stockFailure: reason,
+        sku: 'SKU-B',
+      });
+      await expect(
+        service.complete('tenant-a', 'sess-1', {}),
+      ).rejects.toMatchObject({
+        message: expect.stringContaining('SKU-B') as string,
+        status: 409,
+      });
+    });
+
+    it('replays the winning order when a completion P2002 race was THIS session', async () => {
+      repository.complete.mockRejectedValue({ code: 'P2002' });
+      const winner = {
+        id: 'order-1',
+        orderNumber: 'ORD-000001',
+        checkoutSessionId: 'sess-1',
+      };
+      repository.findOrderByIdempotencyKey = jest
+        .fn()
+        .mockResolvedValue(winner);
+      await expect(
+        service.complete('tenant-a', 'sess-1', { idempotencyKey: 'key-1' }),
+      ).resolves.toBe(winner);
+      expect(repository.findOrderByIdempotencyKey).toHaveBeenCalledWith(
+        'tenant-a',
+        'key-1',
+      );
+    });
+
+    it('maps a completion P2002 race lost to ANOTHER session to 409, never 500', async () => {
+      repository.complete.mockRejectedValue({ code: 'P2002' });
+      repository.findOrderByIdempotencyKey = jest.fn().mockResolvedValue({
+        id: 'order-x',
+        orderNumber: 'ORD-000009',
+        checkoutSessionId: 'sess-OTHER',
+      });
+      await expect(
+        service.complete('tenant-a', 'sess-1', { idempotencyKey: 'key-1' }),
+      ).rejects.toBeInstanceOf(ConflictException);
+    });
+
+    it('rethrows a P2002 with no idempotency key (not a replayable race)', async () => {
+      repository.complete.mockRejectedValue({ code: 'P2002' });
+      await expect(
+        service.complete('tenant-a', 'sess-1', {}),
+      ).rejects.toMatchObject({ code: 'P2002' });
     });
 
     it('maps a missing session to 404', async () => {

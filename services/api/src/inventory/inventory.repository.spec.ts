@@ -128,6 +128,29 @@ describe('InventoryRepository.adjust', () => {
     ).resolves.toBe('product-archived');
   });
 
+  it.each(['DRAFT', 'DISCONTINUED'] as const)(
+    'still allows ADJUSTMENT movements on %s products (Phase 3 behavior unchanged)',
+    async (status) => {
+      const tx = buildTx({
+        product: {
+          findFirst: jest
+            .fn()
+            .mockResolvedValue({ id: 'prod-1', status, unitOfMeasure: 'EACH' }),
+        },
+      });
+      const repository = buildRepository(tx);
+      const result = await repository.adjust(
+        'tenant-a',
+        input,
+        buildAuditEntry,
+      );
+      expect(result).toEqual(
+        expect.objectContaining({ movement: expect.any(Object) }),
+      );
+      expect(tx.inventoryMovement.create).toHaveBeenCalled();
+    },
+  );
+
   it('changes stock ONLY via a conditional atomic increment', async () => {
     const tx = buildTx();
     const repository = buildRepository(tx);
@@ -325,6 +348,106 @@ describe('InventoryRepository.adjust', () => {
     expect(tx.inventoryMovement.create).toHaveBeenCalledWith({
       data: expect.objectContaining({ createdById: null }),
     });
+  });
+});
+
+describe('InventoryRepository.applyMovement — SALE revalidation', () => {
+  const auditLog = { record: jest.fn().mockResolvedValue(undefined) };
+
+  function buildTx(product: Record<string, unknown>) {
+    return {
+      $queryRaw: jest.fn().mockResolvedValue([1]),
+      location: { findFirst: jest.fn().mockResolvedValue({ id: 'loc-1' }) },
+      product: { findFirst: jest.fn().mockResolvedValue(product) },
+      user: { findFirst: jest.fn().mockResolvedValue({ id: 'user-1' }) },
+      inventoryLevel: {
+        upsert: jest.fn().mockResolvedValue({}),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findUniqueOrThrow: jest.fn().mockResolvedValue({ quantity: 3 }),
+      },
+      inventoryMovement: {
+        create: jest.fn().mockImplementation(({ data }) =>
+          Promise.resolve({ id: 'move-1', ...data }),
+        ),
+      },
+    };
+  }
+
+  function buildRepository() {
+    return new InventoryRepository(
+      { $transaction: jest.fn() } as unknown as PrismaService,
+      auditLog as unknown as AuditLogService,
+    );
+  }
+
+  const saleInput = {
+    tenantId: 'tenant-a',
+    locationId: 'loc-1',
+    productId: 'prod-1',
+    quantityDelta: -2,
+    movementType: 'SALE' as const,
+  };
+
+  it.each(['DRAFT', 'DISCONTINUED', 'ARCHIVED'] as const)(
+    'rejects a SALE movement when the product is %s (no longer saleable)',
+    async (status) => {
+      const tx = buildTx({ id: 'prod-1', status, unitOfMeasure: 'EACH' });
+      const repository = buildRepository();
+      await expect(
+        repository.applyMovement(tx as never, saleInput),
+      ).rejects.toMatchObject({
+        name: 'AdjustmentRejected',
+        reason: status === 'ARCHIVED' ? 'product-archived' : 'product-not-saleable',
+      });
+      // Rejected BEFORE any stock or ledger write.
+      expect(tx.inventoryLevel.updateMany).not.toHaveBeenCalled();
+      expect(tx.inventoryMovement.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it('allows a SALE movement on an ACTIVE product', async () => {
+    const tx = buildTx({ id: 'prod-1', status: 'ACTIVE', unitOfMeasure: 'EACH' });
+    const repository = buildRepository();
+    await expect(
+      repository.applyMovement(tx as never, saleInput),
+    ).resolves.toEqual(
+      expect.objectContaining({ movement: expect.any(Object) }),
+    );
+  });
+
+  it('rejects the movement when the product UOM no longer matches the snapshot', async () => {
+    // The line was captured in EACH; the product has since become GRAM,
+    // so the quantityDelta would be reinterpreted in the new unit.
+    const tx = buildTx({
+      id: 'prod-1',
+      status: 'ACTIVE',
+      unitOfMeasure: 'GRAM',
+    });
+    const repository = buildRepository();
+    await expect(
+      repository.applyMovement(tx as never, {
+        ...saleInput,
+        expectedUnitOfMeasure: 'EACH' as never,
+      }),
+    ).rejects.toMatchObject({
+      name: 'AdjustmentRejected',
+      reason: 'unit-of-measure-changed',
+    });
+    expect(tx.inventoryLevel.updateMany).not.toHaveBeenCalled();
+    expect(tx.inventoryMovement.create).not.toHaveBeenCalled();
+  });
+
+  it('passes UOM revalidation when the snapshot still matches', async () => {
+    const tx = buildTx({ id: 'prod-1', status: 'ACTIVE', unitOfMeasure: 'EACH' });
+    const repository = buildRepository();
+    await expect(
+      repository.applyMovement(tx as never, {
+        ...saleInput,
+        expectedUnitOfMeasure: 'EACH' as never,
+      }),
+    ).resolves.toEqual(
+      expect.objectContaining({ level: expect.any(Object) }),
+    );
   });
 });
 
