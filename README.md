@@ -68,5 +68,7 @@ pnpm run dev
 
 The admin web signs in via `POST /auth/login` (or a pasted access token) and
 provides read-only visibility over stores, units, devices, catalog, and
-inventory. The API's CORS allowlist defaults to `http://localhost:5173`
-(override with `CORS_ORIGINS`).
+inventory, plus a manual checkout test flow: create a checkout session, manage
+basket lines, and complete it into an order (no payment capture — pricing and
+payments arrive in a later phase). The API's CORS allowlist defaults to
+`http://localhost:5173` (override with `CORS_ORIGINS`).

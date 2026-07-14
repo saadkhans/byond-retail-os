@@ -159,3 +159,97 @@ export interface SafeUser {
   userType: string;
   tenantId: string | null;
 }
+
+export type CheckoutSessionStatus =
+  | 'OPEN'
+  | 'ACTIVE'
+  | 'PENDING_REVIEW'
+  | 'COMPLETED'
+  | 'CANCELLED'
+  | 'EXPIRED';
+
+export type OrderStatus = 'DRAFT' | 'CONFIRMED' | 'CANCELLED';
+
+/**
+ * Vendor-neutral evidence/source lineage placeholders. Future CV/VLM adapters
+ * populate these; the admin UI only displays the raw identifiers.
+ */
+export interface EvidenceRefs {
+  sourceType: string;
+  sourceId: string | null;
+  evidenceBundleId: string | null;
+  visionEventId: string | null;
+  vlmReviewId: string | null;
+  evidenceScore: number | null;
+  evidenceQuality: string | null;
+  reasonCodes: string[];
+}
+
+export interface CheckoutSessionLine extends EvidenceRefs {
+  id: string;
+  sessionId: string;
+  productId: string;
+  sku: string;
+  productName: string;
+  unitOfMeasure: string;
+  quantity: number;
+  // Pricing placeholders — always null until a later pricing/payment phase.
+  unitPriceMinor: number | null;
+  lineTotalMinor: number | null;
+  currencyCode: string | null;
+  idempotencyKey: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CheckoutSession extends EvidenceRefs {
+  id: string;
+  locationId: string;
+  unitId: string;
+  deviceId: string | null;
+  status: CheckoutSessionStatus;
+  startedAt: string;
+  endedAt: string | null;
+  idempotencyKey: string | null;
+  createdAt: string;
+  updatedAt: string;
+  lines?: CheckoutSessionLine[];
+  order?: { id: string; orderNumber: string; status: OrderStatus } | null;
+}
+
+export interface OrderLine extends EvidenceRefs {
+  id: string;
+  orderId: string;
+  productId: string;
+  sessionLineId: string | null;
+  sku: string;
+  productName: string;
+  unitOfMeasure: string;
+  quantity: number;
+  unitPriceMinor: number | null;
+  lineTotalMinor: number | null;
+  currencyCode: string | null;
+  createdAt: string;
+}
+
+export interface Order extends EvidenceRefs {
+  id: string;
+  orderNumber: string;
+  checkoutSessionId: string;
+  locationId: string;
+  unitId: string;
+  status: OrderStatus;
+  placedAt: string;
+  confirmedAt: string | null;
+  cancelledAt: string | null;
+  cancelReason: string | null;
+  totalQuantity: number;
+  // Pricing placeholders — always null in this phase; nothing here implies payment.
+  subtotalMinor: number | null;
+  totalMinor: number | null;
+  currencyCode: string | null;
+  idempotencyKey: string | null;
+  createdAt: string;
+  updatedAt: string;
+  lines?: OrderLine[];
+}

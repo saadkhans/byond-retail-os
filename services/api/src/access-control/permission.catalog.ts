@@ -32,4 +32,8 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   { code: 'device:manage', module: 'devices', description: 'Create, update, delete devices' },
   { code: 'device:register', module: 'devices', description: 'Issue one-time edge registration tokens for devices' },
   { code: 'device:heartbeat', module: 'devices', description: 'Record device heartbeats' },
+  { code: 'checkout:read', module: 'checkout', description: 'View checkout sessions and basket lines' },
+  { code: 'checkout:manage', module: 'checkout', description: 'Create checkout sessions, mutate basket lines, and complete sessions into orders' },
+  { code: 'order:read', module: 'checkout', description: 'View orders and order lines' },
+  { code: 'order:manage', module: 'checkout', description: 'Cancel orders (no payment operations in Phase 5)' },
 ];

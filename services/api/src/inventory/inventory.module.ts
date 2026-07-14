@@ -6,6 +6,8 @@ import { InventoryService } from './inventory.service';
 @Module({
   controllers: [InventoryController],
   providers: [InventoryService, InventoryRepository],
-  exports: [InventoryService],
+  // InventoryRepository is exported for checkout completion (Phase 5), which
+  // applies SALE movements inside its own transaction via applyMovement().
+  exports: [InventoryService, InventoryRepository],
 })
 export class InventoryModule {}

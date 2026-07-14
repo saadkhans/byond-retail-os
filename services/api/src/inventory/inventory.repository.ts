@@ -47,17 +47,41 @@ export interface AdjustmentResult {
 }
 
 /**
- * Thrown INSIDE the adjustment transaction to abort it. Rejecting by throwing
+ * Thrown INSIDE the movement transaction to abort it. Rejecting by throwing
  * (rather than returning a sentinel) guarantees the whole transaction rolls
  * back — including any InventoryLevel row the upsert created — so a rejected
- * adjustment never leaves an orphan projection behind. Caught at the boundary
- * and mapped back to the AdjustmentFailure sentinel.
+ * movement never leaves an orphan projection behind. `adjust()` catches it at
+ * the boundary and maps it back to the AdjustmentFailure sentinel; external
+ * callers of `applyMovement()` (checkout completion) catch it to roll back
+ * their own enclosing transaction.
  */
-class AdjustmentRejected extends Error {
+export class AdjustmentRejected extends Error {
   constructor(readonly reason: AdjustmentFailure) {
     super(reason);
     this.name = 'AdjustmentRejected';
   }
+}
+
+/**
+ * One ledger movement applied inside a caller-supplied transaction. The
+ * referenceType/referenceId pair links the movement to its business cause
+ * (e.g. 'Order' + orderId for checkout completion) without schema changes.
+ */
+export interface ApplyMovementInput {
+  tenantId: string;
+  locationId: string;
+  productId: string;
+  quantityDelta: number;
+  movementType: InventoryMovementType;
+  reason?: string | null;
+  referenceType?: string | null;
+  referenceId?: string | null;
+  createdById?: string | null;
+}
+
+export interface ApplyMovementResult {
+  movement: InventoryMovement;
+  level: InventoryLevel;
 }
 
 @Injectable()
@@ -115,126 +139,14 @@ export class InventoryRepository extends TenantScopedRepository {
   ): Promise<AdjustmentResult | AdjustmentFailure> {
     try {
       return await this.prisma.$transaction(async (tx) => {
-        // Serialize against product mutations that depend on ledger state
-        // (unit-of-measure change, archive) for THIS product: a plain row read
-        // does not stop a concurrent UOM/archive update from committing while
-        // this adjustment appends a movement. The advisory lock is held for
-        // the rest of the transaction and released on commit/rollback.
-        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
-          scopedTenantId,
-          data.productId,
-        )}))`;
-
-        // Scoped existence checks: ids from other tenants are simply not
-        // found. Every rejection THROWS so the transaction rolls back —
-        // see AdjustmentRejected.
-        const location = await tx.location.findFirst({
-          where: { id: data.locationId, tenantId: scopedTenantId },
-          select: { id: true },
-        });
-        if (!location) {
-          throw new AdjustmentRejected('location-not-found');
-        }
-        const product = await tx.product.findFirst({
-          where: { id: data.productId, tenantId: scopedTenantId },
-          select: { id: true, status: true },
-        });
-        if (!product) {
-          throw new AdjustmentRejected('product-not-found');
-        }
-        if (product.status === ProductStatus.ARCHIVED) {
-          throw new AdjustmentRejected('product-archived');
-        }
-
-        // Attribute the movement only to an actor IN THIS TENANT. A
-        // createdById from another tenant (or a stale/deleted user) resolves
-        // to null rather than corrupting tenant-scoped ledger attribution —
-        // the single-column FK alone would accept any global user id.
-        const actorId = data.createdById
-          ? ((
-              await tx.user.findFirst({
-                where: { id: data.createdById, tenantId: scopedTenantId },
-                select: { id: true },
-              })
-            )?.id ?? null)
-          : null;
-
-        // Ensure the projection row exists (starts at zero stock). If the
-        // adjustment is later rejected, this insert is rolled back with the
-        // rest of the transaction, so no orphan level survives.
-        await tx.inventoryLevel.upsert({
-          where: {
-            tenantId_locationId_productId: {
-              tenantId: scopedTenantId,
-              locationId: data.locationId,
-              productId: data.productId,
-            },
-          },
-          update: {},
-          create: {
-            tenantId: scopedTenantId,
-            locationId: data.locationId,
-            productId: data.productId,
-            quantity: 0,
-          },
-        });
-
-        // Conditional atomic increment: matches only when the resulting
-        // quantity stays within [0, PG_INT_MAX]. The lower bound stops a
-        // decrease going negative; the upper bound (added only for increases)
-        // stops the sum overflowing the INTEGER column. Zero rows updated ⇒
-        // the adjustment would breach a bound.
-        const requiredMinimum = Math.max(0, -data.quantityDelta);
-        // A decrease of PG_INT_MIN needs a minimum of PG_INT_MAX+1 on hand,
-        // which no INTEGER column can hold. Short-circuit before that bound
-        // reaches Prisma as an out-of-range filter literal.
-        if (requiredMinimum > PG_INT_MAX) {
-          throw new AdjustmentRejected('insufficient-stock');
-        }
-        const quantityBound: Prisma.IntFilter = {
-          gte: requiredMinimum,
-        };
-        if (data.quantityDelta > 0) {
-          quantityBound.lte = PG_INT_MAX - data.quantityDelta;
-        }
-        const updated = await tx.inventoryLevel.updateMany({
-          where: {
-            tenantId: scopedTenantId,
-            locationId: data.locationId,
-            productId: data.productId,
-            quantity: quantityBound,
-          },
-          data: { quantity: { increment: data.quantityDelta } },
-        });
-        if (updated.count === 0) {
-          // A positive delta always satisfies the lower bound, so a miss there
-          // is an overflow; a negative delta can only miss the lower bound.
-          throw new AdjustmentRejected(
-            data.quantityDelta > 0 ? 'quantity-overflow' : 'insufficient-stock',
-          );
-        }
-
-        const level = await tx.inventoryLevel.findUniqueOrThrow({
-          where: {
-            tenantId_locationId_productId: {
-              tenantId: scopedTenantId,
-              locationId: data.locationId,
-              productId: data.productId,
-            },
-          },
-        });
-
-        const movement = await tx.inventoryMovement.create({
-          data: {
-            tenantId: scopedTenantId,
-            locationId: data.locationId,
-            productId: data.productId,
-            movementType: InventoryMovementType.ADJUSTMENT,
-            quantityDelta: data.quantityDelta,
-            quantityAfter: level.quantity,
-            reason: data.reason,
-            createdById: actorId,
-          },
+        const { movement, level } = await this.applyMovement(tx, {
+          tenantId: scopedTenantId,
+          locationId: data.locationId,
+          productId: data.productId,
+          quantityDelta: data.quantityDelta,
+          movementType: InventoryMovementType.ADJUSTMENT,
+          reason: data.reason,
+          createdById: data.createdById,
         });
 
         await this.auditLog.record(buildAuditEntry(movement, level), tx);
@@ -246,6 +158,155 @@ export class InventoryRepository extends TenantScopedRepository {
       }
       throw error;
     }
+  }
+
+  /**
+   * Applies ONE ledger movement inside a CALLER-SUPPLIED transaction: scoped
+   * existence checks, conditional atomic level increment, and the immutable
+   * movement append — everything `adjust()` does except owning the
+   * transaction and writing the audit row (the caller audits, so the audit
+   * commits/rolls back with the caller's own transaction).
+   *
+   * Used by manual adjustments (via `adjust()`) and by checkout completion,
+   * which decrements every basket line atomically with order creation: any
+   * AdjustmentRejected thrown here aborts the caller's whole transaction, so
+   * a failed decrement can never leave a confirmed order behind.
+   */
+  async applyMovement(
+    tx: Prisma.TransactionClient,
+    input: ApplyMovementInput,
+  ): Promise<ApplyMovementResult> {
+    const scopedTenantId = this.requireTenantId(input.tenantId);
+
+    // Serialize against product mutations that depend on ledger state
+    // (unit-of-measure change, archive) for THIS product: a plain row read
+    // does not stop a concurrent UOM/archive update from committing while
+    // this movement appends. The advisory lock is held for the rest of the
+    // caller's transaction and released on commit/rollback. (Re-acquiring
+    // the same key inside one transaction is a no-op, so multi-line callers
+    // may lock the same product twice safely.)
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
+      scopedTenantId,
+      input.productId,
+    )}))`;
+
+    // Scoped existence checks: ids from other tenants are simply not
+    // found. Every rejection THROWS so the transaction rolls back —
+    // see AdjustmentRejected.
+    const location = await tx.location.findFirst({
+      where: { id: input.locationId, tenantId: scopedTenantId },
+      select: { id: true },
+    });
+    if (!location) {
+      throw new AdjustmentRejected('location-not-found');
+    }
+    const product = await tx.product.findFirst({
+      where: { id: input.productId, tenantId: scopedTenantId },
+      select: { id: true, status: true },
+    });
+    if (!product) {
+      throw new AdjustmentRejected('product-not-found');
+    }
+    if (product.status === ProductStatus.ARCHIVED) {
+      throw new AdjustmentRejected('product-archived');
+    }
+
+    // Attribute the movement only to an actor IN THIS TENANT. A
+    // createdById from another tenant (or a stale/deleted user) resolves
+    // to null rather than corrupting tenant-scoped ledger attribution —
+    // the single-column FK alone would accept any global user id.
+    const actorId = input.createdById
+      ? ((
+          await tx.user.findFirst({
+            where: { id: input.createdById, tenantId: scopedTenantId },
+            select: { id: true },
+          })
+        )?.id ?? null)
+      : null;
+
+    // Ensure the projection row exists (starts at zero stock). If the
+    // movement is later rejected, this insert is rolled back with the
+    // rest of the transaction, so no orphan level survives.
+    await tx.inventoryLevel.upsert({
+      where: {
+        tenantId_locationId_productId: {
+          tenantId: scopedTenantId,
+          locationId: input.locationId,
+          productId: input.productId,
+        },
+      },
+      update: {},
+      create: {
+        tenantId: scopedTenantId,
+        locationId: input.locationId,
+        productId: input.productId,
+        quantity: 0,
+      },
+    });
+
+    // Conditional atomic increment: matches only when the resulting
+    // quantity stays within [0, PG_INT_MAX]. The lower bound stops a
+    // decrease going negative; the upper bound (added only for increases)
+    // stops the sum overflowing the INTEGER column. Zero rows updated ⇒
+    // the movement would breach a bound.
+    const requiredMinimum = Math.max(0, -input.quantityDelta);
+    // A decrease of PG_INT_MIN needs a minimum of PG_INT_MAX+1 on hand,
+    // which no INTEGER column can hold. Short-circuit before that bound
+    // reaches Prisma as an out-of-range filter literal.
+    if (requiredMinimum > PG_INT_MAX) {
+      throw new AdjustmentRejected('insufficient-stock');
+    }
+    const quantityBound: Prisma.IntFilter = {
+      gte: requiredMinimum,
+    };
+    if (input.quantityDelta > 0) {
+      quantityBound.lte = PG_INT_MAX - input.quantityDelta;
+    }
+    const updated = await tx.inventoryLevel.updateMany({
+      where: {
+        tenantId: scopedTenantId,
+        locationId: input.locationId,
+        productId: input.productId,
+        quantity: quantityBound,
+      },
+      data: { quantity: { increment: input.quantityDelta } },
+    });
+    if (updated.count === 0) {
+      // A positive delta always satisfies the lower bound, so a miss there
+      // is an overflow; a negative delta can only miss the lower bound.
+      throw new AdjustmentRejected(
+        input.quantityDelta > 0 ? 'quantity-overflow' : 'insufficient-stock',
+      );
+    }
+
+    const level = await tx.inventoryLevel.findUniqueOrThrow({
+      where: {
+        tenantId_locationId_productId: {
+          tenantId: scopedTenantId,
+          locationId: input.locationId,
+          productId: input.productId,
+        },
+      },
+    });
+
+    const movement = await tx.inventoryMovement.create({
+      data: {
+        tenantId: scopedTenantId,
+        locationId: input.locationId,
+        productId: input.productId,
+        movementType: input.movementType,
+        quantityDelta: input.quantityDelta,
+        quantityAfter: level.quantity,
+        // The ledger requires a human-readable cause; movement type is the
+        // honest fallback when the caller supplies none.
+        reason: input.reason ?? input.movementType,
+        referenceType: input.referenceType ?? null,
+        referenceId: input.referenceId ?? null,
+        createdById: actorId,
+      },
+    });
+
+    return { movement, level };
   }
 
   findLevels(

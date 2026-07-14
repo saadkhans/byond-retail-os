@@ -65,10 +65,18 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
   },
   {
     code: 'checkout',
-    name: 'Checkout',
-    description: 'Checkout routing and payment orchestration (later phase).',
-    defaultEnabled: false,
-    isActive: false,
+    name: 'Checkout & Orders',
+    description:
+      'Checkout sessions, basket lines, and the order foundation (no ' +
+      'payment capture; payments arrive in a later phase).',
+    // Shipped in Phase 5 and DEFAULT-ENABLED for the same reason as
+    // inventory/devices (see above): the only enable endpoint is
+    // @TenantOnly(), so leaving this false would strand new tenants behind
+    // 403s. RBAC still gates every route independently. Tenants that existed
+    // BEFORE Phase 5 are covered by the 20260713000001_checkout_module_backfill
+    // migration — defaultEnabled only applies at tenant creation time.
+    defaultEnabled: true,
+    isActive: true,
   },
   {
     code: 'cv',
