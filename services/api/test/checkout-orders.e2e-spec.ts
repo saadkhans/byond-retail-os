@@ -1930,6 +1930,26 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
       expect(detail.body.lines[0].sessionLineId).toBeDefined();
     });
 
+    it('rejects a cancellation reason carrying credential/payment content (400) without cancelling', async () => {
+      const list = await request(app.getHttpServer())
+        .get('/orders')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .expect(200);
+      const target = list.body.items[0].id as string;
+      await request(app.getHttpServer())
+        .post(`/orders/${target}/cancel`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ reason: 'refund to card 4111 1111 1111 1111' })
+        .expect(400);
+      // A rejected reason never reaches persistence: the order stays live.
+      const detail = await request(app.getHttpServer())
+        .get(`/orders/${target}`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .expect(200);
+      expect(detail.body.status).not.toBe('CANCELLED');
+      expect(detail.body.cancelReason).toBeNull();
+    });
+
     it('cancels an order (status only — stock is NOT restored) and audits CANCEL', async () => {
       const list = await request(app.getHttpServer())
         .get('/orders')

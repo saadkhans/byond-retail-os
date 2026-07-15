@@ -1,5 +1,6 @@
 import {
   containsCredentialValue,
+  containsKnownSecretToken,
   containsPaymentCardValue,
   containsSensitiveValue,
   findSensitiveKeyPath,
@@ -285,6 +286,56 @@ describe('containsPaymentCardValue', () => {
     'firmware 1.4.2 build 20260712',
   ])('accepts non-PAN value %s', (value) => {
     expect(containsPaymentCardValue(value)).toBe(false);
+  });
+});
+
+describe('containsKnownSecretToken', () => {
+  // Every secret-shaped string is assembled at runtime so no static literal
+  // reaches the repo (Gitleaks scans every commit diff). Low-entropy fillers
+  // keep the assembled values from tripping Gitleaks' own generic rules while
+  // still matching our provider-format patterns.
+  const stripeKey = ['sk', 'live', '0abcdef1234567890'].join('_');
+  const jwt = ['eyJ' + 'A'.repeat(12), 'B'.repeat(16), 'C'.repeat(16)].join(
+    '.',
+  );
+  const awsKeyId = 'AKIA' + 'A'.repeat(16);
+  const githubToken = 'ghp_' + 'A'.repeat(24);
+  const googleKey = 'AIza' + 'A'.repeat(24);
+  const slackToken = 'xoxb-' + 'A'.repeat(16);
+
+  it.each([
+    ['stripe key', () => stripeKey],
+    ['jwt', () => jwt],
+    ['aws access key id', () => awsKeyId],
+    ['github token', () => githubToken],
+    ['google api key', () => googleKey],
+    ['slack token', () => slackToken],
+  ])('flags a bare %s (no key= label, no URL)', (_label, build) => {
+    const value = build();
+    expect(containsKnownSecretToken(value)).toBe(true);
+    // And it flows through the combined gate the call sites use.
+    expect(containsSensitiveValue(value)).toBe(true);
+    // Embedded mid-text is caught too (an operator pasting into a reason).
+    expect(containsSensitiveValue(`please use ${value} to authenticate`)).toBe(
+      true,
+    );
+  });
+
+  // Opaque IDs are legitimately random-looking; detection is a fixed
+  // provider-format allow-list, NOT an entropy heuristic, so these PASS.
+  it.each([
+    'chk-2026-07-14-unit-a1-0001',
+    'session-2026-07-14-0001',
+    '550e8400-e29b-41d4-a716-446655440000',
+    ['ord', '7f3a9b2c1d4e', '5a6b'].join('_'),
+    'camera-aisle-01',
+    'bundle_001',
+    'vision_evt_123',
+    'vlm_review_abc',
+    'shelf_pickup_observed',
+  ])('does not flag opaque id %s', (value) => {
+    expect(containsKnownSecretToken(value)).toBe(false);
+    expect(containsSensitiveValue(value)).toBe(false);
   });
 });
 

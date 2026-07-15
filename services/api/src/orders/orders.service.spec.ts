@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   NotFoundException,
 } from '@nestjs/common';
@@ -92,6 +93,50 @@ describe('OrdersService', () => {
       await expect(
         service.cancel('tenant-a', 'order-1', {}),
       ).rejects.toBeInstanceOf(ConflictException);
+    });
+
+    describe('cancellation reason safety (payments invariant)', () => {
+      // The reason lands verbatim in Order.cancelReason AND the audit reason,
+      // so it must never carry credential/payment content. Secret-shaped
+      // fragments are assembled at runtime so no static literal reaches the
+      // repo (Gitleaks scans every commit diff).
+      const keyShapedValue = ['sk', 'live', 'abc123'].join('_');
+      const bareSecretToken = ['sk', 'live', '0abcdef123456789'].join('_');
+      const rejects = async (reason: string) => {
+        await expect(
+          service.cancel('tenant-a', 'order-1', { reason }),
+        ).rejects.toBeInstanceOf(BadRequestException);
+        expect(repository.cancel).not.toHaveBeenCalled();
+      };
+
+      it('rejects a raw PAN in the reason (400, before any write)', async () => {
+        await rejects('refund card 4111 1111 1111 1111');
+      });
+
+      it('rejects a token/api_key/password fragment in the reason', async () => {
+        await rejects(`leaked api_key=${keyShapedValue}`);
+        await rejects('note password: hunter2');
+      });
+
+      it('rejects a bare well-known secret token in the reason', async () => {
+        await rejects(`operator pasted ${bareSecretToken}`);
+      });
+
+      it('rejects a credential URL in the reason', async () => {
+        await rejects('feed rtsp://admin:pass@cam-1.local/live went down');
+      });
+
+      it('accepts a safe operational reason', async () => {
+        await service.cancel('tenant-a', 'order-1', {
+          reason: 'Customer changed mind',
+        });
+        expect(repository.cancel).toHaveBeenCalledWith(
+          'tenant-a',
+          'order-1',
+          'Customer changed mind',
+          expect.any(Function),
+        );
+      });
     });
   });
 });

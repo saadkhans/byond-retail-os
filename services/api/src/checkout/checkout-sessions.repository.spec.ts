@@ -461,6 +461,30 @@ describe('CheckoutSessionsRepository', () => {
         }),
       );
     });
+
+    it('rejects a basket whose total quantity overflows the order INTEGER before creating the order', async () => {
+      // Two lines individually within the DTO bound but summing above the
+      // Postgres INTEGER backing Order.totalQuantity (2,147,483,647).
+      const huge = 2_000_000_000;
+      tx.checkoutSession.findFirst.mockResolvedValue({
+        ...session,
+        lines: [
+          { ...session.lines[0], quantity: huge },
+          { ...session.lines[1], quantity: huge },
+        ],
+      });
+      const result = await repository.complete(
+        'tenant-a',
+        'sess-1',
+        {},
+        builders,
+      );
+      expect(result).toBe('total-quantity-overflow');
+      // Nothing written: no order, no movement, no session flip.
+      expect(tx.order.create).not.toHaveBeenCalled();
+      expect(inventoryRepository.applyMovement).not.toHaveBeenCalled();
+      expect(tx.checkoutSession.update).not.toHaveBeenCalled();
+    });
   });
 
   describe('addLine', () => {
@@ -589,6 +613,60 @@ describe('CheckoutSessionsRepository', () => {
       ).resolves.toBe('idempotency-key-consumed');
       // No new line, no replay of the tombstone, no audit row.
       expect(lineMocks.create).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
+    });
+
+    it('takes the product stock lock BEFORE reading the product and holds it through the insert', async () => {
+      // Serializes with ProductsRepository.update() (same key): status/UOM
+      // cannot change between the read and the create, so a non-saleable or
+      // stale-UOM line can never be persisted. Lock order is session→product.
+      const productFind = (
+        tx as unknown as { product: { findFirst: jest.Mock } }
+      ).product.findFirst;
+      const createMock = (
+        tx as unknown as { checkoutSessionLine: { create: jest.Mock } }
+      ).checkoutSessionLine.create;
+      await repository.addLine(
+        'tenant-a',
+        'sess-1',
+        { productId: 'prod-a', quantity: 1 },
+        () => auditEntry('CheckoutSessionLine'),
+      );
+      expect(tx.$queryRaw.mock.calls.map((call) => call[1] as string)).toEqual([
+        'checkout-session:tenant-a:sess-1',
+        'product-stock:tenant-a:prod-a',
+      ]);
+      const productLockOrder = tx.$queryRaw.mock.invocationCallOrder[1];
+      expect(productLockOrder).toBeLessThan(
+        productFind.mock.invocationCallOrder[0],
+      );
+      expect(productLockOrder).toBeLessThan(
+        createMock.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('rejects a product that went non-ACTIVE under the lock without inserting a line', async () => {
+      (
+        tx as unknown as { product: { findFirst: jest.Mock } }
+      ).product.findFirst.mockResolvedValue({
+        id: 'prod-a',
+        sku: 'SKU-A',
+        name: 'Alpha',
+        unitOfMeasure: 'EACH',
+        status: 'DISCONTINUED',
+      });
+      const createMock = (
+        tx as unknown as { checkoutSessionLine: { create: jest.Mock } }
+      ).checkoutSessionLine.create;
+      await expect(
+        repository.addLine(
+          'tenant-a',
+          'sess-1',
+          { productId: 'prod-a', quantity: 1 },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toBe('product-not-saleable');
+      expect(createMock).not.toHaveBeenCalled();
       expect(auditLog.record).not.toHaveBeenCalled();
     });
   });

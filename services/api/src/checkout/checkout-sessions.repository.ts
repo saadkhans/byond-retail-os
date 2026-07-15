@@ -17,9 +17,11 @@ import {
   AuditEntry,
   AuditLogService,
 } from '../common/audit/audit-log.service';
+import { PG_INT_MAX } from '../common/integer-bounds';
 import {
   checkoutSessionAdvisoryLockKey,
   deviceAdvisoryLockKey,
+  productStockAdvisoryLockKey,
   tenantOrderNumberAdvisoryLockKey,
   unitAdvisoryLockKey,
 } from '../common/locks';
@@ -146,7 +148,8 @@ export type CompletionRejection =
   | 'session-terminal'
   | 'already-completed'
   | 'empty-session'
-  | 'idempotency-key-conflict';
+  | 'idempotency-key-conflict'
+  | 'total-quantity-overflow';
 
 /** A per-line inventory decrement failure that aborted the whole completion. */
 export interface CompletionStockFailure {
@@ -483,6 +486,17 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
           return { line: existing, replayed: true };
         }
       }
+      // Serialize with ProductsRepository.update() (same key) BEFORE reading
+      // the product, held through the line insert: without it, status/UOM
+      // could change between this read and the create, persisting a
+      // non-saleable or stale-UOM basket line that completion only rejects
+      // later. Lock order here is session→product; completion is
+      // session→order-number→product; no path takes product before session,
+      // so the two cannot deadlock.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
+        scopedTenantId,
+        data.productId,
+      )}))`;
       const product = await tx.product.findFirst({
         where: { id: data.productId, tenantId: scopedTenantId },
         select: {
@@ -763,6 +777,15 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
           (sum, line) => sum + line.quantity,
           0,
         );
+        // Each line quantity is individually ≤ PG_INT_MAX (DTO bound), but the
+        // SUM can exceed the INTEGER backing Order.totalQuantity. Reject BEFORE
+        // order.create so an API-valid-but-oversized basket becomes a controlled
+        // rejection instead of a raw out-of-range Prisma error (500). No order,
+        // lines, movements, session flip, or audit rows are written on this
+        // path — the transaction has only taken locks and read so far.
+        if (totalQuantity > PG_INT_MAX) {
+          return 'total-quantity-overflow' as const;
+        }
 
         // The order row is created first so SALE movements can carry its id
         // as their referenceType/referenceId cause. CONFIRMED means

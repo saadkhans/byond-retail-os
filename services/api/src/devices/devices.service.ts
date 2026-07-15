@@ -236,6 +236,15 @@ export class DevicesService {
       if (prismaErrorCode(error) === 'P2025') {
         throw new NotFoundException(`Device "${id}" not found`);
       }
+      // A RESTRICT foreign key blocks the delete: the device is still
+      // referenced (e.g. a checkout session's source device). Map to a
+      // controlled 409 instead of leaking a raw Prisma error as a 500.
+      if (prismaErrorCode(error) === 'P2003') {
+        throw new ConflictException(
+          'Device is referenced by checkout sessions or related records ' +
+            'and cannot be deleted',
+        );
+      }
       throw error;
     }
     if (!deleted) {

@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
@@ -9,6 +10,7 @@ import {
   AuditEntry,
   SYSTEM_ACTOR_EMAIL,
 } from '../common/audit/audit-log.service';
+import { containsSensitiveValue } from '../common/sensitive-keys';
 import { CancelOrderDto } from './dto/cancel-order.dto';
 import { QueryOrdersDto } from './dto/query-orders.dto';
 import {
@@ -57,10 +59,16 @@ export class OrdersService {
     dto: CancelOrderDto,
     actor?: AuditActor,
   ): Promise<OrderDetail> {
+    const reason = dto.reason?.trim() || undefined;
+    // The reason is persisted verbatim to Order.cancelReason AND used as the
+    // audit reason; audit-snapshot redaction only covers before/after, not the
+    // top-level reason field. Reject credential-/payment-bearing content before
+    // either write (AGENTS.md payments invariant), like device metadata.
+    this.assertSafeReason(reason);
     const result = await this.ordersRepository.cancel(
       tenantId,
       id,
-      dto.reason?.trim() || undefined,
+      reason,
       (before, after) =>
         this.auditEntry(tenantId, actor, {
           action: AuditAction.CANCEL,
@@ -78,6 +86,21 @@ export class OrdersService {
       throw new ConflictException('Order is already cancelled');
     }
     return result;
+  }
+
+  /**
+   * A cancellation reason is free-form operator text; it must never carry
+   * credential- or payment-bearing values (a pasted PAN, token, or credential
+   * URL) into Order.cancelReason or the audit log. Reject (controlled 400)
+   * before persistence — redaction is only a backstop.
+   */
+  private assertSafeReason(reason: string | undefined): void {
+    if (reason !== undefined && containsSensitiveValue(reason)) {
+      throw new BadRequestException(
+        'Cancellation reason must not contain credential- or ' +
+          'payment-bearing values',
+      );
+    }
   }
 
   private auditEntry(

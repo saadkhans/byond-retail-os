@@ -320,6 +320,48 @@ describe('CheckoutSessionsService', () => {
         }),
       ).rejects.toBeInstanceOf(NotFoundException);
     });
+
+    describe('status reason safety (payments invariant)', () => {
+      // dto.reason flows into AuditLog.reason, which redaction does not cover.
+      // Secret-shaped fragments are assembled at runtime so no static literal
+      // reaches the repo (Gitleaks scans every commit diff).
+      const keyShapedValue = ['sk', 'live', 'abc123'].join('_');
+      const bareSecretToken = ['sk', 'live', '0abcdef123456789'].join('_');
+      const rejects = async (reason: string) => {
+        await expect(
+          service.updateStatus('tenant-a', 'sess-1', {
+            status: CheckoutSessionStatus.CANCELLED,
+            reason,
+          }),
+        ).rejects.toBeInstanceOf(BadRequestException);
+        expect(repository.updateStatus).not.toHaveBeenCalled();
+      };
+
+      it('rejects a PAN in the reason (400, before any audit write)', async () => {
+        await rejects('void card 4111 1111 1111 1111');
+      });
+
+      it('rejects token/api_key/password fragments in the reason', async () => {
+        await rejects(`saw api_key=${keyShapedValue}`);
+        await rejects('note password: hunter2');
+      });
+
+      it('rejects a bare well-known secret token in the reason', async () => {
+        await rejects(`pasted ${bareSecretToken}`);
+      });
+
+      it('rejects a credential URL in the reason', async () => {
+        await rejects('camera rtsp://admin:pass@cam-1.local/live offline');
+      });
+
+      it('accepts a safe operational reason', async () => {
+        await service.updateStatus('tenant-a', 'sess-1', {
+          status: CheckoutSessionStatus.CANCELLED,
+          reason: 'Shopper abandoned the basket',
+        });
+        expect(repository.updateStatus).toHaveBeenCalled();
+      });
+    });
   });
 
   describe('lines', () => {
@@ -432,6 +474,7 @@ describe('CheckoutSessionsService', () => {
       ['session-terminal'],
       ['empty-session'],
       ['idempotency-key-conflict'],
+      ['total-quantity-overflow'],
     ] as const)('maps %s to 409', async (rejection) => {
       repository.complete.mockResolvedValue(rejection);
       await expect(

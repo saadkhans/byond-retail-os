@@ -284,6 +284,15 @@ describe('DevicesService', () => {
     ).rejects.toBeInstanceOf(NotFoundException);
   });
 
+  it('maps a RESTRICT FK conflict on delete (P2003) to a 409, not a 500', async () => {
+    // A device still referenced as a checkout session's source device cannot
+    // be hard-deleted; the raw Prisma P2003 must surface as a controlled 409.
+    repository.delete.mockRejectedValue({ code: 'P2003' });
+    await expect(
+      service.delete('tenant-a', 'device-1'),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
   describe('heartbeat', () => {
     it('passes a HEARTBEAT audit builder with status-only snapshots', async () => {
       await service.heartbeat(

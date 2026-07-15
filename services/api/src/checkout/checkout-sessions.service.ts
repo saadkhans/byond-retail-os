@@ -107,6 +107,21 @@ function assertSafeIdempotencyKey(key: string | undefined): void {
   }
 }
 
+/**
+ * A status-change reason is free-form operator text that flows into
+ * AuditLog.reason; audit redaction only covers before/after snapshots, not the
+ * top-level reason field. Reject credential-/payment-bearing content (controlled
+ * 400) before the audit entry is built, so raw card/secret data never reaches
+ * audit storage (AGENTS.md payments invariant).
+ */
+function assertSafeReason(reason: string | undefined): void {
+  if (reason !== undefined && containsSensitiveValue(reason)) {
+    throw new BadRequestException(
+      'reason must not contain credential- or payment-bearing values',
+    );
+  }
+}
+
 @Injectable()
 export class CheckoutSessionsService {
   constructor(
@@ -222,6 +237,7 @@ export class CheckoutSessionsService {
     dto: UpdateSessionStatusDto,
     actor?: AuditActor,
   ): Promise<CheckoutSessionDetail> {
+    assertSafeReason(dto.reason);
     const result = await this.sessionsRepository.updateStatus(
       tenantId,
       id,
@@ -450,6 +466,12 @@ export class CheckoutSessionsService {
       throw new ConflictException(
         'This completion idempotency key was already used by a different ' +
           'checkout session',
+      );
+    }
+    if (result === 'total-quantity-overflow') {
+      throw new ConflictException(
+        'The basket total quantity exceeds the maximum an order can hold; ' +
+          'reduce line quantities before completing. No order was created',
       );
     }
     if (typeof result === 'object' && 'stockFailure' in result) {
