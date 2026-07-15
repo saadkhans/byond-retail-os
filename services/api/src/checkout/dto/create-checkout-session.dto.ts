@@ -31,6 +31,8 @@ export class CreateCheckoutSessionDto extends EvidenceRefsDto {
       'Tenant-scoped idempotency key: retrying the same create returns the ' +
       'original session instead of opening a duplicate.',
   })
+  // Persisted verbatim → screened by assertSafeIdempotencyKey in the
+  // service (no credential- or payment-bearing values), like evidence refs.
   @IsOptionalNonNull()
   @IsString()
   @MinLength(1)

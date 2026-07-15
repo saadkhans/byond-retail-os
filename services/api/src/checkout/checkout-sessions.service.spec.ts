@@ -202,6 +202,81 @@ describe('CheckoutSessionsService', () => {
     });
   });
 
+  describe('idempotency key safety (payments invariant)', () => {
+    // Persisted verbatim onto session/line/order rows → same opaqueness
+    // rule as evidence refs. Key-shaped fragments are assembled at runtime
+    // so the repo never carries a static secret-shaped literal (Gitleaks
+    // scans every commit diff).
+    const keyShapedValue = ['sk', 'live', 'abc123'].join('_');
+    const sensitiveKeys = [
+      '4242424242424242',
+      `token=${keyShapedValue}`,
+      'rtsp://admin:pass@cam-1.local/feed',
+    ];
+
+    const rejectsKey = async (idempotencyKey: string) => {
+      await expect(
+        service.create('tenant-a', {
+          locationId: 'loc-a1',
+          unitId: 'unit-a1',
+          idempotencyKey,
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      await expect(
+        service.addLine('tenant-a', 'sess-1', {
+          productId: 'prod-a',
+          quantity: 1,
+          idempotencyKey,
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      await expect(
+        service.complete('tenant-a', 'sess-1', { idempotencyKey }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(repository.create).not.toHaveBeenCalled();
+      expect(repository.addLine).not.toHaveBeenCalled();
+      expect(repository.complete).not.toHaveBeenCalled();
+    };
+
+    it('rejects a raw PAN used as an idempotency key (400, before any write)', async () => {
+      await rejectsKey(sensitiveKeys[0]);
+    });
+
+    it('rejects a token fragment used as an idempotency key', async () => {
+      await rejectsKey(sensitiveKeys[1]);
+    });
+
+    it('rejects a credential URL used as an idempotency key', async () => {
+      await rejectsKey(sensitiveKeys[2]);
+    });
+
+    it('accepts safe opaque idempotency keys on create/addLine/complete', async () => {
+      const idempotencyKey = 'checkout-2026-07-14-unit-a1-0001';
+      await service.create('tenant-a', {
+        locationId: 'loc-a1',
+        unitId: 'unit-a1',
+        idempotencyKey,
+      });
+      expect(repository.create).toHaveBeenCalledWith(
+        'tenant-a',
+        expect.objectContaining({ idempotencyKey }),
+        expect.any(Function),
+      );
+      await service.addLine('tenant-a', 'sess-1', {
+        productId: 'prod-a',
+        quantity: 1,
+        idempotencyKey,
+      });
+      expect(repository.addLine).toHaveBeenCalled();
+      await service.complete('tenant-a', 'sess-1', { idempotencyKey });
+      expect(repository.complete).toHaveBeenCalledWith(
+        'tenant-a',
+        'sess-1',
+        expect.objectContaining({ idempotencyKey }),
+        expect.anything(),
+      );
+    });
+  });
+
   describe('updateStatus', () => {
     it('uses CANCEL/EXPIRE audit actions for terminal targets and UPDATE otherwise', async () => {
       for (const [status, action] of [

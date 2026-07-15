@@ -90,6 +90,23 @@ function assertSafeEvidenceRefs(refs: EvidenceRefs): void {
   }
 }
 
+/**
+ * Idempotency keys are client-supplied strings persisted verbatim to
+ * session/line/order rows (the (tenantId, idempotencyKey) uniques). Like
+ * evidence refs above, they must be OPAQUE: a client that (mis)uses a PAN,
+ * token fragment, or credential URL as its "unique key" would otherwise
+ * write it straight into storage. Same containsSensitiveValue gate, same
+ * controlled 400, checked before ANY repository write.
+ */
+function assertSafeIdempotencyKey(key: string | undefined): void {
+  if (key !== undefined && containsSensitiveValue(key)) {
+    throw new BadRequestException(
+      'idempotencyKey must be an opaque identifier and must not contain ' +
+        'credential- or payment-bearing values',
+    );
+  }
+}
+
 @Injectable()
 export class CheckoutSessionsService {
   constructor(
@@ -102,6 +119,7 @@ export class CheckoutSessionsService {
     actor?: AuditActor,
   ): Promise<CheckoutSessionDetail> {
     assertSafeEvidenceRefs(dto);
+    assertSafeIdempotencyKey(dto.idempotencyKey);
     let result: Awaited<
       ReturnType<CheckoutSessionsRepository['create']>
     >;
@@ -246,6 +264,7 @@ export class CheckoutSessionsService {
     actor?: AuditActor,
   ): Promise<CheckoutSessionLine> {
     assertSafeEvidenceRefs(dto);
+    assertSafeIdempotencyKey(dto.idempotencyKey);
     let result: Awaited<ReturnType<CheckoutSessionsRepository['addLine']>>;
     try {
       result = await this.sessionsRepository.addLine(
@@ -347,6 +366,7 @@ export class CheckoutSessionsService {
     dto: CompleteSessionDto,
     actor?: AuditActor,
   ): Promise<CompletedOrder> {
+    assertSafeIdempotencyKey(dto.idempotencyKey);
     let result: Awaited<ReturnType<CheckoutSessionsRepository['complete']>>;
     try {
       result = await this.sessionsRepository.complete(

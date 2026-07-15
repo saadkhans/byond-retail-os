@@ -19,7 +19,9 @@ import {
 } from '../common/audit/audit-log.service';
 import {
   checkoutSessionAdvisoryLockKey,
+  deviceAdvisoryLockKey,
   tenantOrderNumberAdvisoryLockKey,
+  unitAdvisoryLockKey,
 } from '../common/locks';
 import {
   AdjustmentFailure,
@@ -231,6 +233,19 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
           return { session: existing, replayed: true };
         }
       }
+      // Serialize with UnitsRepository.update()/delete() (same key), held
+      // through the insert: the unit/store validation below must not pass on
+      // a read that a concurrent unit mutation immediately invalidates,
+      // or the session would persist a stale unit→store binding. Taken
+      // BEFORE the device lock: this is the ONLY path that holds both the
+      // unit and device locks, and it always acquires them unit-then-device,
+      // so no lock-ordering cycle exists (every other path — units, device
+      // update/delete/heartbeat, device create — takes at most one of the
+      // two). Concurrent session creates therefore cannot deadlock.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${unitAdvisoryLockKey(
+        scopedTenantId,
+        data.unitId,
+      )}))`;
       const location = await tx.location.findFirst({
         where: { id: data.locationId, tenantId: scopedTenantId },
         select: { id: true },
@@ -251,6 +266,15 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
         return 'unit-location-mismatch' as const;
       }
       if (data.deviceId) {
+        // Serialize with DevicesRepository.update() (same key), held through
+        // the insert: a concurrent device reassignment to another unit must
+        // not land between the unit check below and the session row, or the
+        // session would bind a source device that was no longer attached to
+        // the selected unit at creation time.
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceAdvisoryLockKey(
+          scopedTenantId,
+          data.deviceId,
+        )}))`;
         const device = await tx.device.findFirst({
           where: { id: data.deviceId, tenantId: scopedTenantId },
           select: { id: true, unitId: true },

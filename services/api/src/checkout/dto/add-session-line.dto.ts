@@ -35,6 +35,8 @@ export class AddSessionLineDto extends EvidenceRefsDto {
       'Tenant-scoped idempotency key: retrying the same add returns the ' +
       'original line instead of failing on the one-line-per-product rule.',
   })
+  // Persisted verbatim → screened by assertSafeIdempotencyKey in the
+  // service (no credential- or payment-bearing values), like evidence refs.
   @IsOptionalNonNull()
   @IsString()
   @MinLength(1)

@@ -10,6 +10,9 @@ export class CompleteSessionDto {
       'request with the same key returns the already-created order instead ' +
       'of consuming inventory twice.',
   })
+  // Persisted verbatim (onto the Order) → screened by
+  // assertSafeIdempotencyKey in the service (no credential- or
+  // payment-bearing values), like evidence refs.
   @IsOptionalNonNull()
   @IsString()
   @MinLength(1)

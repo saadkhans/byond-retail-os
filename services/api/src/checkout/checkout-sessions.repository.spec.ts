@@ -731,5 +731,87 @@ describe('CheckoutSessionsRepository', () => {
       );
       expect(createMock).not.toHaveBeenCalled();
     });
+
+    it('takes the unit advisory lock BEFORE the unit/store validation and holds it through the insert', async () => {
+      // Serializes with UnitsRepository.update()/delete() (same key): the
+      // unit/store check must not pass on a read a concurrent unit mutation
+      // immediately invalidates.
+      const unitFind = (
+        tx as unknown as { retailUnit: { findFirst: jest.Mock } }
+      ).retailUnit.findFirst;
+      await repository.create('tenant-a', data, () =>
+        auditEntry('CheckoutSession'),
+      );
+      expect(tx.$queryRaw.mock.calls[0][1]).toBe(
+        'retail-unit:tenant-a:unit-a1',
+      );
+      expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        unitFind.mock.invocationCallOrder[0],
+      );
+      expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        createMock.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('takes the device advisory lock BEFORE the device/unit check — unit lock first (deadlock-safe order)', async () => {
+      // Serializes with DevicesRepository.update() (same key): a concurrent
+      // reassignment cannot land between the unit check and the insert.
+      await repository.create('tenant-a', data, () =>
+        auditEntry('CheckoutSession'),
+      );
+      expect(
+        tx.$queryRaw.mock.calls.map((call) => call[1] as string),
+      ).toEqual(['retail-unit:tenant-a:unit-a1', 'device:tenant-a:dev-1']);
+      expect(tx.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
+        deviceMocks.findFirst.mock.invocationCallOrder[0],
+      );
+      expect(tx.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
+        createMock.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('does not take a device lock when no source device is supplied', async () => {
+      await repository.create(
+        'tenant-a',
+        { locationId: 'loc-a1', unitId: 'unit-a1' },
+        () => auditEntry('CheckoutSession'),
+      );
+      expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+      expect(tx.$queryRaw.mock.calls[0][1]).toBe(
+        'retail-unit:tenant-a:unit-a1',
+      );
+      expect(deviceMocks.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('rejects a unit whose store changed by the time the under-lock read runs', async () => {
+      // The post-lock read IS the validation read: a unit move that
+      // committed while we waited on the lock is observed here, so the
+      // session can never persist a stale unit→store binding.
+      (
+        tx as unknown as { retailUnit: { findFirst: jest.Mock } }
+      ).retailUnit.findFirst.mockResolvedValue({
+        id: 'unit-a1',
+        locationId: 'loc-MOVED',
+      });
+      await expect(
+        repository.create('tenant-a', data, () =>
+          auditEntry('CheckoutSession'),
+        ),
+      ).resolves.toBe('unit-location-mismatch');
+      expect(createMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects a device reassigned to another unit by the time the under-lock read runs', async () => {
+      deviceMocks.findFirst.mockResolvedValue({
+        id: 'dev-1',
+        unitId: 'unit-MOVED-TO',
+      });
+      await expect(
+        repository.create('tenant-a', data, () =>
+          auditEntry('CheckoutSession'),
+        ),
+      ).resolves.toBe('device-unit-mismatch');
+      expect(createMock).not.toHaveBeenCalled();
+    });
   });
 });

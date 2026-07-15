@@ -1142,6 +1142,66 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
       expect(store.sessions).toHaveLength(before);
     });
 
+    it('credential- or payment-bearing idempotency keys are rejected (400) before any write', async () => {
+      const before = store.sessions.length;
+      const ordersBefore = store.orders.length;
+      // Raw PAN as a create key.
+      await request(app.getHttpServer())
+        .post('/checkout-sessions')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          locationId: 'loc-a1',
+          unitId: 'unit-a1',
+          idempotencyKey: '4242424242424242',
+        })
+        .expect(400);
+      // Token fragment as an add-line key (assembled at runtime so no
+      // static secret-shaped literal lands in the repo).
+      const session = await request(app.getHttpServer())
+        .post('/checkout-sessions')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ locationId: 'loc-a1', unitId: 'unit-a1' })
+        .expect(201);
+      const sessionId = (session.body as { id: string }).id;
+      await request(app.getHttpServer())
+        .post(`/checkout-sessions/${sessionId}/lines`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          productId: 'prod-a1',
+          quantity: 1,
+          idempotencyKey: `token=${['sk', 'live', 'x1'].join('_')}`,
+        })
+        .expect(400);
+      // Credential URL as a completion key — screened before ANY completion
+      // work (even the empty-basket check), so nothing is written.
+      await request(app.getHttpServer())
+        .post(`/checkout-sessions/${sessionId}/complete`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ idempotencyKey: 'rtsp://admin:pass@cam-1.local/feed' })
+        .expect(400);
+      // Nothing persisted for the rejected requests: only the probe session
+      // itself was created, its basket stayed empty, and no order exists.
+      expect(store.sessions).toHaveLength(before + 1);
+      expect(store.orders).toHaveLength(ordersBefore);
+      expect(
+        store.sessionLines.filter((line) => line.sessionId === sessionId),
+      ).toHaveLength(0);
+      const probe = store.sessions.find(
+        (candidate) => candidate.id === sessionId,
+      );
+      expect(probe?.status).not.toBe('COMPLETED');
+      // A safe opaque key passes the screen and creates normally.
+      await request(app.getHttpServer())
+        .post('/checkout-sessions')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          locationId: 'loc-a1',
+          unitId: 'unit-a1',
+          idempotencyKey: 'session-2026-07-14-0001',
+        })
+        .expect(201);
+    });
+
     it("lists only this tenant's sessions with a deterministic envelope", async () => {
       const response = await request(app.getHttpServer())
         .get('/checkout-sessions')
