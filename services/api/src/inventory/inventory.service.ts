@@ -80,6 +80,17 @@ export class InventoryService {
         throw new ConflictException(
           'Stock of an ARCHIVED product cannot be adjusted',
         );
+      // Unreachable through manual adjustments (ADJUSTMENT movements never
+      // set a UOM snapshot and are allowed on non-ACTIVE products); mapped
+      // defensively so any future caller still gets a controlled 409.
+      case 'product-not-saleable':
+        throw new ConflictException(
+          'Stock movement rejected: the product is not ACTIVE',
+        );
+      case 'unit-of-measure-changed':
+        throw new ConflictException(
+          'Stock movement rejected: the product unit of measure changed',
+        );
       case 'insufficient-stock':
         throw new ConflictException(
           'Adjustment rejected: it would take on-hand stock below zero',

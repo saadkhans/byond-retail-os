@@ -92,3 +92,28 @@ export function deviceAdvisoryLockKey(
 ): string {
   return `device:${tenantId}:${deviceId}`;
 }
+
+/**
+ * Serializes a checkout session's mutations (status transitions, basket line
+ * add/update/remove, completion) against each other within a tenant. Line
+ * mutations and completion decide from a read-then-write of the session's
+ * status, so two concurrent requests (e.g. duplicate completion attempts, or
+ * a line add racing a cancel) must not interleave. All CheckoutSessions
+ * repository mutation methods MUST derive it identically.
+ */
+export function checkoutSessionAdvisoryLockKey(
+  tenantId: string,
+  sessionId: string,
+): string {
+  return `checkout-session:${tenantId}:${sessionId}`;
+}
+
+/**
+ * Serializes order-number generation per tenant: completion computes the
+ * next ORD-… sequence from a count inside its transaction, so two
+ * simultaneous completions must not observe the same count. Any code path
+ * that assigns an orderNumber MUST take this lock first.
+ */
+export function tenantOrderNumberAdvisoryLockKey(tenantId: string): string {
+  return `order-number:${tenantId}`;
+}

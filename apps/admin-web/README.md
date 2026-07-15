@@ -1,9 +1,13 @@
 # BYOND Admin Web Shell
 
 Functional admin visibility over the BYOND API: dashboard, stores, retail
-units, devices (with heartbeat status and last-seen), plus read-only catalog
-and inventory-level views. Deliberately unpolished — Phase 4 scope is
-visibility, not UI product work.
+units, devices (with heartbeat status and last-seen), read-only catalog and
+inventory-level views, plus checkout sessions and orders (Phase 5) with a
+minimal manual test flow — create a session, add/update/remove basket lines,
+and complete it into an order. Orders show no payment state: Phase 5 is the
+order foundation only, and evidence/source IDs shown on sessions, lines, and
+orders are vendor-neutral placeholders for future CV/VLM adapters.
+Deliberately unpolished — the scope is visibility, not UI product work.
 
 ## Run locally
 

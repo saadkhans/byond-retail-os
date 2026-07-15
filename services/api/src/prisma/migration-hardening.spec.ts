@@ -53,3 +53,162 @@ describe('catalog & inventory migration hardening', () => {
     expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
   });
 });
+
+describe('checkout & orders migration hardening', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260713000000_checkout_session_orders',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('adds the SALE ledger type and lifecycle audit actions', () => {
+    expect(sql).toContain(`ALTER TYPE "InventoryMovementType" ADD VALUE 'SALE'`);
+    expect(sql).toContain(`ALTER TYPE "AuditAction" ADD VALUE 'COMPLETE'`);
+    expect(sql).toContain(`ALTER TYPE "AuditAction" ADD VALUE 'CANCEL'`);
+    expect(sql).toContain(`ALTER TYPE "AuditAction" ADD VALUE 'EXPIRE'`);
+  });
+
+  it('blocks non-positive line quantities and empty orders with CHECK constraints', () => {
+    expect(sql).toContain('CheckoutSessionLine_quantity_positive_check');
+    expect(sql).toContain('OrderLine_quantity_positive_check');
+    expect(sql).toContain('Order_totalQuantity_positive_check');
+    expect(sql).toContain('CHECK ("quantity" >= 1)');
+    expect(sql).toContain('CHECK ("totalQuantity" >= 1)');
+  });
+
+  it('constrains evidence scores to normalized [0, 1] confidences', () => {
+    for (const constraint of [
+      'CheckoutSession_evidenceScore_range_check',
+      'CheckoutSessionLine_evidenceScore_range_check',
+      'Order_evidenceScore_range_check',
+      'OrderLine_evidenceScore_range_check',
+    ]) {
+      expect(sql).toContain(constraint);
+    }
+    expect(sql).toContain(
+      '"evidenceScore" IS NULL OR ("evidenceScore" >= 0 AND "evidenceScore" <= 1)',
+    );
+  });
+
+  it('enforces same-tenant references with composite foreign keys', () => {
+    for (const constraint of [
+      'CheckoutSession_location_same_tenant_fkey',
+      'CheckoutSession_unit_same_tenant_fkey',
+      'CheckoutSession_device_same_tenant_fkey',
+      'CheckoutSessionLine_session_same_tenant_fkey',
+      'CheckoutSessionLine_product_same_tenant_fkey',
+      'Order_session_same_tenant_fkey',
+      'Order_location_same_tenant_fkey',
+      'Order_unit_same_tenant_fkey',
+      'OrderLine_order_same_tenant_fkey',
+      'OrderLine_product_same_tenant_fkey',
+      'OrderLine_sessionLine_same_tenant_fkey',
+    ]) {
+      expect(sql).toContain(constraint);
+    }
+  });
+
+  it('keeps order numbers and idempotency keys unique per tenant', () => {
+    expect(sql).toContain('Order_tenantId_orderNumber_key');
+    expect(sql).toContain('Order_tenantId_idempotencyKey_key');
+    expect(sql).toContain('CheckoutSession_tenantId_idempotencyKey_key');
+    expect(sql).toContain('CheckoutSessionLine_tenantId_idempotencyKey_key');
+  });
+
+  it('never cascades deletes into checkout or order tables', () => {
+    expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
+  });
+});
+
+describe('checkout module backfill migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260713000001_checkout_module_backfill',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('activates a pre-existing checkout module row instead of leaving it inactive', () => {
+    // Databases seeded BEFORE Phase 5 can already carry the `checkout` row
+    // with isActive=false; DO NOTHING would leave every tenant 403ing even
+    // with enablement rows. The upsert must refresh the catalog fields and
+    // force activation while PRESERVING the existing row's id.
+    expect(sql).toContain('ON CONFLICT ("code") DO UPDATE SET');
+    expect(sql).toContain('"name" = EXCLUDED."name"');
+    expect(sql).toContain('"description" = EXCLUDED."description"');
+    expect(sql).toContain('"isActive" = true');
+    // The conflict target is the unique `code` — the update path never
+    // inserts a second row or touches the conflicting row's "id".
+    expect(sql).not.toMatch(/DO UPDATE SET[^;]*"id"\s*=/);
+  });
+
+  it('is idempotent and never overwrites a tenant admin choice', () => {
+    // Tenant enablement stays DO NOTHING: re-running must not overwrite a
+    // row a tenant admin already created or disabled; the module upsert
+    // converges on the same catalog values on every run.
+    expect(sql).toContain('ON CONFLICT ("tenantId", "moduleId") DO NOTHING');
+    expect(sql).not.toMatch(/ON CONFLICT \("tenantId", "moduleId"\) DO UPDATE/);
+  });
+
+  it('enables checkout for every pre-existing tenant with deterministic ids', () => {
+    expect(sql).toContain(`'tm-' || md5(t."id" || ':checkout')`);
+    expect(sql).toContain(`WHERE pm."code" = 'checkout'`);
+  });
+});
+
+describe('checkout line soft-delete migration hardening', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260714000000_checkout_line_soft_delete',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('replaces the per-product unique with a PARTIAL unique over ACTIVE lines', () => {
+    // Tombstones must be exempt from "one line per product per session", or
+    // a product could never be re-added after a removal — while ACTIVE lines
+    // keep the aggregate-into-updates guarantee.
+    expect(sql).toContain(
+      'DROP INDEX "CheckoutSessionLine_tenantId_sessionId_productId_key"',
+    );
+    expect(sql).toContain('CheckoutSessionLine_active_product_key');
+    expect(sql).toMatch(
+      /CREATE UNIQUE INDEX "CheckoutSessionLine_active_product_key"[\s\S]*WHERE "status" = 'ACTIVE'/,
+    );
+  });
+
+  it('keeps removed-line tombstones honest with a CHECK constraint', () => {
+    expect(sql).toContain('CheckoutSessionLine_removed_has_timestamp_check');
+    expect(sql).toContain(
+      `CHECK (("status" = 'REMOVED') = ("removedAt" IS NOT NULL))`,
+    );
+  });
+
+  it('never drops or cascades over line rows (idempotency keys stay reserved)', () => {
+    // The (tenantId, idempotencyKey) unique from the Phase 5 migration is
+    // untouched, and nothing here deletes rows — the tombstone IS the
+    // reservation.
+    expect(sql).not.toMatch(/DROP INDEX "CheckoutSessionLine_tenantId_idempotencyKey_key"/);
+    expect(sql).not.toMatch(/DELETE FROM/);
+    expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
+  });
+});

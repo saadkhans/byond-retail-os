@@ -309,9 +309,52 @@ export function containsPaymentCardValue(text: string): boolean {
   return false;
 }
 
-/** Combined VALUE check: credential-bearing strings OR raw card numbers. */
+/**
+ * Bare well-known secret-TOKEN detection: standalone provider credentials
+ * that carry NO `key=`/`key:` label and are not inside a URL, so the
+ * credential-fragment backstops above miss them (a client that pastes a raw
+ * `sk_live_…`, a JWT, or an AWS access-key id as an idempotency key, evidence
+ * ref, or cancellation reason). Each pattern matches ONLY an unambiguous,
+ * provider-specific format on word boundaries.
+ *
+ * This is deliberately a fixed allow-list of KNOWN formats, NOT a generic
+ * high-entropy/length heuristic: idempotency keys, evidence bundle ids, and
+ * source ids are legitimately opaque random-looking strings, so entropy-based
+ * detection would reject valid inputs and break those features. Adding a new
+ * provider format here is safe; broadening to "looks random" is not.
+ */
+const KNOWN_SECRET_TOKENS: readonly RegExp[] = [
+  // Stripe-style keys: sk_live_/pk_live_/rk_live_/sk_test_/…
+  /\b[sprk]k_(?:live|test)_[A-Za-z0-9]{8,}\b/,
+  // JSON Web Tokens: three base64url segments, header begins `eyJ`.
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
+  // AWS access-key ids: AKIA/ASIA/AKID + uppercase-alphanumeric body.
+  /\b(?:AKIA|ASIA|AKID)[0-9A-Z]{12,}\b/,
+  // GitHub tokens: ghp_/gho_/ghs_/ghr_/ghu_ + body.
+  /\bgh[posru]_[A-Za-z0-9]{20,}\b/,
+  // GitHub fine-grained PATs: github_pat_ + body (distinct from the gh*_
+  // classic prefixes above, which never match github_pat_).
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
+  // Google API keys: AIza + body.
+  /\bAIza[0-9A-Za-z_-]{20,}\b/,
+  // Slack tokens: xoxb-/xoxa-/xoxp-/xoxr-/xoxs- + body.
+  /\bxox[baprs]-[0-9A-Za-z-]{10,}\b/,
+];
+
+export function containsKnownSecretToken(text: string): boolean {
+  return KNOWN_SECRET_TOKENS.some((pattern) => pattern.test(text));
+}
+
+/**
+ * Combined VALUE check: credential-bearing strings (URLs, key=value/key:value
+ * fragments), bare well-known secret tokens, OR raw card numbers.
+ */
 export function containsSensitiveValue(text: string): boolean {
-  return containsCredentialValue(text) || containsPaymentCardValue(text);
+  return (
+    containsCredentialValue(text) ||
+    containsKnownSecretToken(text) ||
+    containsPaymentCardValue(text)
+  );
 }
 
 /**

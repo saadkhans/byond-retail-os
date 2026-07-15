@@ -39,13 +39,17 @@ async function bootstrap(): Promise<void> {
       .setTitle('BYOND Core Platform API')
       .setDescription(
         'Core platform — auth, tenants, users, RBAC, stores, modules, ' +
-          'product catalog, inventory, retail units, and devices. ' +
+          'product catalog, inventory, retail units, devices, checkout ' +
+          'sessions, and orders. Phase 5 adds the order FOUNDATION only: ' +
+          'completing a checkout session consumes inventory atomically, ' +
+          'but no payment is captured and nothing is marked paid — ' +
+          'payments arrive in a later phase. ' +
           'All endpoints except /health, /auth/login, and /edge/register ' +
           'require an Authorization: Bearer <access token> header ' +
           '(POST /auth/login). ' +
           'Errors use the standard Nest shape: { statusCode, message, error }.',
       )
-      .setVersion('0.4.0')
+      .setVersion('0.5.0')
       .addTag(
         'stores',
         'Tenant stores/branches/sites (the Location entity): name, code, ' +
@@ -73,6 +77,24 @@ async function bootstrap(): Promise<void> {
         'Devices (cameras, locks, sensors, gateways, ...) attached to ' +
           'retail units: per-tenant unique serials, heartbeats, lastSeenAt, ' +
           'firmware/software versions, and safe non-secret metadata.',
+      )
+      .addTag(
+        'checkout-sessions',
+        'Tenant checkout sessions on a store/unit with basket lines and a ' +
+          'OPEN → ACTIVE ↔ PENDING_REVIEW → COMPLETED/CANCELLED/EXPIRED ' +
+          'lifecycle. Completion atomically creates a CONFIRMED order and ' +
+          'consumes inventory via SALE ledger movements (idempotent by ' +
+          'key). Evidence/source fields (sourceType, visionEventId, ' +
+          'vlmReviewId, ...) are vendor-neutral placeholders for future ' +
+          'CV/VLM adapters — no vision code runs in Phase 5.',
+      )
+      .addTag(
+        'orders',
+        'Orders generated from completed checkout sessions: per-tenant ' +
+          'order numbers, immutable product snapshot lines with full ' +
+          'session → line → movement lineage. CONFIRMED means inventory ' +
+          'was consumed — NOT paid/captured; payment capture is a later ' +
+          'phase, and pricing fields are null placeholders.',
       )
       .addTag(
         'edge-registration',

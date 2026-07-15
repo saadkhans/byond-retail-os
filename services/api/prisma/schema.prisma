@@ -78,6 +78,9 @@ enum AuditAction {
   STOCK_ADJUSTMENT
   REGISTER
   HEARTBEAT
+  COMPLETE
+  CANCEL
+  EXPIRE
 }
 
 enum ProductStatus {
@@ -112,11 +115,13 @@ enum BarcodeFormat {
   OTHER
 }
 
-// Ledger event types. Phase 3 ships manual adjustments only; later phases
-// append values (SALE, RECEIPT, TRANSFER, ...) — the ledger shape (signed
-// delta + snapshot + reference fields) is already sized for them.
+// Ledger event types. Phase 3 shipped manual adjustments; Phase 5 adds SALE
+// (checkout completion). Later phases append more values (RECEIPT, TRANSFER,
+// ...) — the ledger shape (signed delta + snapshot + reference fields) is
+// already sized for them.
 enum InventoryMovementType {
   ADJUSTMENT
+  SALE
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +189,10 @@ model Tenant {
   inventoryMovements InventoryMovement[]
   retailUnits        RetailUnit[]
   devices            Device[]
+  checkoutSessions     CheckoutSession[]
+  checkoutSessionLines CheckoutSessionLine[]
+  orders               Order[]
+  orderLines           OrderLine[]
 }
 
 model User {
@@ -208,6 +217,10 @@ model User {
   userRoles UserRole[]
   auditLogs AuditLog[] @relation("AuditActor")
   inventoryMovements InventoryMovement[] @relation("InventoryMovementActor")
+  checkoutSessionsCreated     CheckoutSession[]     @relation("CheckoutSessionActor")
+  checkoutSessionLinesCreated CheckoutSessionLine[] @relation("CheckoutSessionLineActor")
+  ordersCreated               Order[]               @relation("OrderActor")
+  orderLinesCreated           OrderLine[]           @relation("OrderLineActor")
 
   @@index([tenantId, status])
 }
@@ -292,6 +305,8 @@ model Location {
   inventoryLevels    InventoryLevel[]
   inventoryMovements InventoryMovement[]
   retailUnits        RetailUnit[]
+  checkoutSessions   CheckoutSession[]
+  orders             Order[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -432,6 +447,8 @@ model Product {
   barcodes           ProductBarcode[]
   inventoryLevels    InventoryLevel[]
   inventoryMovements InventoryMovement[]
+  checkoutSessionLines CheckoutSessionLine[]
+  orderLines           OrderLine[]
 
   @@unique([tenantId, sku])
   @@unique([id, tenantId])
@@ -503,6 +520,8 @@ model RetailUnit {
   tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   location Location @relation(fields: [locationId], references: [id], onDelete: Restrict)
   devices  Device[]
+  checkoutSessions CheckoutSession[]
+  orders           Order[]
 
   @@unique([tenantId, code])
   // Enables composite same-tenant FKs (devices must reference a unit of the
@@ -544,6 +563,7 @@ model Device {
 
   tenant Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   unit   RetailUnit @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  checkoutSessions CheckoutSession[]
 
   @@unique([tenantId, serialNumber])
   @@unique([id, tenantId])
@@ -586,4 +606,264 @@ model InventoryMovement {
   @@index([productId])
   @@index([locationId])
   @@index([createdById])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — checkout sessions & order foundation.
+//
+// Connects Phase 3 inventory and Phase 4 stores/units/devices into the first
+// transaction backbone: session -> basket line -> order line -> SALE ledger
+// movement. NO payment capture in this phase — pricing/total columns are
+// nullable placeholders that stay NULL until the pricing/payments phases, and
+// nothing here may imply an order was paid.
+//
+// Evidence/source fields (sourceType, sourceId, evidenceBundleId,
+// visionEventId, vlmReviewId, evidenceScore, evidenceQuality, reasonCodes)
+// are VENDOR-NEUTRAL lineage placeholders: future CV/VLM providers plug in
+// through adapter layers that populate these normalized references. No
+// camera/model/vendor-specific data is ever stored in the checkout core.
+// ---------------------------------------------------------------------------
+
+enum CheckoutSessionStatus {
+  OPEN
+  ACTIVE
+  PENDING_REVIEW
+  COMPLETED
+  CANCELLED
+  EXPIRED
+}
+
+enum OrderStatus {
+  DRAFT
+  CONFIRMED
+  CANCELLED
+}
+
+// Who/what produced a session, line, or order: staff acting manually, an
+// admin tool, a device-originated flow, a vision pipeline (future), or the
+// system itself (e.g. expiry sweeps). Deliberately generic — never a vendor
+// or model name.
+enum EvidenceSourceType {
+  MANUAL
+  ADMIN
+  DEVICE
+  VISION
+  SYSTEM
+}
+
+enum EvidenceQuality {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+// Basket line lifecycle. Removing a line is a SOFT delete (status → REMOVED):
+// the row survives as a tombstone so its tenant-scoped idempotencyKey stays
+// reserved forever — a lost-response retry of the original add can never
+// resurrect an intentionally removed item. REMOVED lines are excluded from
+// the active basket and from completion.
+enum CheckoutSessionLineStatus {
+  ACTIVE
+  REMOVED
+}
+
+// A shopping visit at one retail unit in one store. Lifecycle:
+// OPEN -> ACTIVE -> PENDING_REVIEW -> COMPLETED, with CANCELLED/EXPIRED as
+// the other terminal states. Terminal sessions are immutable except through
+// the audit trail. Completion is the ONLY path that creates an Order and
+// consumes stock, atomically with SALE ledger movements.
+model CheckoutSession {
+  id         String                @id @default(cuid())
+  tenantId   String
+  locationId String
+  unitId     String
+  // Optional source device reference (no edge runtime in Phase 5).
+  deviceId  String?
+  status    CheckoutSessionStatus @default(OPEN)
+  startedAt DateTime              @default(now())
+  endedAt   DateTime?
+  // Vendor-neutral evidence/source lineage (see Phase 5 header comment).
+  sourceType       EvidenceSourceType @default(MANUAL)
+  sourceId         String?
+  evidenceBundleId String?
+  visionEventId    String?
+  vlmReviewId      String?
+  evidenceScore    Float?
+  evidenceQuality  EvidenceQuality?
+  reasonCodes      String[]           @default([])
+  // Tenant-scoped idempotency for session creation: replays return the
+  // original session instead of opening a duplicate.
+  idempotencyKey String?
+  createdById    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location  Location   @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit      RetailUnit @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  device    Device?    @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  createdBy User?      @relation("CheckoutSessionActor", fields: [createdById], references: [id], onDelete: Restrict)
+  lines     CheckoutSessionLine[]
+  order     Order?
+
+  // Enables composite same-tenant FKs (lines/orders must reference a session
+  // of the SAME tenant) — mirrors the Phase 3/4 hardening pattern.
+  @@unique([id, tenantId])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, status, startedAt, id])
+  @@index([tenantId, locationId])
+  @@index([tenantId, unitId])
+}
+
+// Basket line: one product per session (quantity aggregates). Snapshots the
+// product's sku/name/unit so completed history never rewrites when the
+// catalog is edited later. Every mutation carries evidence/source lineage or
+// a manual/admin actor reference.
+model CheckoutSessionLine {
+  id        String @id @default(cuid())
+  tenantId  String
+  sessionId String
+  productId String
+  // Product snapshot (immutable history even if the product is later edited):
+  sku           String
+  productName   String
+  unitOfMeasure UnitOfMeasure
+  quantity      Int
+  // Soft-delete lifecycle: REMOVED lines are tombstones that keep the
+  // idempotencyKey reserved (see CheckoutSessionLineStatus above).
+  status    CheckoutSessionLineStatus @default(ACTIVE)
+  removedAt DateTime?
+  // Pricing placeholders — ALWAYS NULL in Phase 5; future pricing/payment
+  // phases populate them (minor currency units, integer-exact).
+  unitPriceMinor Int?
+  lineTotalMinor Int?
+  currencyCode   String?
+  // Vendor-neutral evidence/source lineage (same set as the session).
+  sourceType       EvidenceSourceType @default(MANUAL)
+  sourceId         String?
+  evidenceBundleId String?
+  visionEventId    String?
+  vlmReviewId      String?
+  evidenceScore    Float?
+  evidenceQuality  EvidenceQuality?
+  reasonCodes      String[]           @default([])
+  // Tenant-scoped idempotency for line creation replays.
+  idempotencyKey String?
+  createdById    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  tenant     Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  session    CheckoutSession @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  product    Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  createdBy  User?           @relation("CheckoutSessionLineActor", fields: [createdById], references: [id], onDelete: Restrict)
+  orderLines OrderLine[]
+
+  @@unique([id, tenantId])
+  // One ACTIVE line per product per session ("adds aggregate into updates")
+  // is enforced by a PARTIAL unique index in migration SQL
+  // (CheckoutSessionLine_active_product_key, WHERE status = 'ACTIVE') —
+  // Prisma cannot express partial indexes. REMOVED tombstones are exempt so
+  // a product can be legitimately re-added after removal.
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, sessionId, createdAt, id])
+  @@index([tenantId, sessionId, productId])
+}
+
+// Order foundation generated from a completed checkout session. CONFIRMED
+// means inventory was consumed atomically — it does NOT mean paid/captured;
+// payment status arrives in a later phase. Cancelling an order in Phase 5 is
+// a status change only (stock reversal ships with the returns/refunds phase).
+model Order {
+  id       String @id @default(cuid())
+  tenantId String
+  // Human-readable, unique per tenant (ORD-000001 style).
+  orderNumber String
+  // One order per session; globally unique because ids are cuids, and
+  // additionally unique per tenant below (the composite same-tenant FK in
+  // migration SQL keeps the pair tenant-consistent).
+  checkoutSessionId String      @unique
+  locationId        String
+  unitId            String
+  status            OrderStatus @default(CONFIRMED)
+  placedAt          DateTime    @default(now())
+  confirmedAt       DateTime?
+  cancelledAt       DateTime?
+  cancelReason      String?
+  totalQuantity     Int
+  // Pricing/payment placeholders — ALWAYS NULL in Phase 5 (no paid/captured
+  // semantics anywhere).
+  subtotalMinor Int?
+  totalMinor    Int?
+  currencyCode  String?
+  // Evidence lineage copied from the completed session.
+  sourceType       EvidenceSourceType @default(MANUAL)
+  sourceId         String?
+  evidenceBundleId String?
+  visionEventId    String?
+  vlmReviewId      String?
+  evidenceScore    Float?
+  evidenceQuality  EvidenceQuality?
+  reasonCodes      String[]           @default([])
+  // Tenant-scoped completion idempotency: a duplicate completion request
+  // with the same key returns this order instead of creating another.
+  idempotencyKey String?
+  createdById    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  tenant    Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  session   CheckoutSession @relation(fields: [checkoutSessionId], references: [id], onDelete: Restrict)
+  location  Location        @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit      RetailUnit      @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  createdBy User?           @relation("OrderActor", fields: [createdById], references: [id], onDelete: Restrict)
+  lines     OrderLine[]
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, orderNumber])
+  @@unique([tenantId, checkoutSessionId])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, status, placedAt, id])
+  @@index([tenantId, locationId])
+}
+
+// Order line snapshot. Copies the session line's product snapshot and
+// evidence lineage at completion time, plus a sessionLineId back-reference so
+// the full chain session -> basket line -> order line -> SALE movement stays
+// traceable. Never updated after creation (no updatedAt by design).
+model OrderLine {
+  id        String  @id @default(cuid())
+  tenantId  String
+  orderId   String
+  productId String
+  // Lineage: which basket line this order line was materialized from.
+  sessionLineId String?
+  sku           String
+  productName   String
+  unitOfMeasure UnitOfMeasure
+  quantity      Int
+  // Pricing placeholders — ALWAYS NULL in Phase 5.
+  unitPriceMinor Int?
+  lineTotalMinor Int?
+  currencyCode   String?
+  // Vendor-neutral evidence/source lineage copied from the session line.
+  sourceType       EvidenceSourceType @default(MANUAL)
+  sourceId         String?
+  evidenceBundleId String?
+  visionEventId    String?
+  vlmReviewId      String?
+  evidenceScore    Float?
+  evidenceQuality  EvidenceQuality?
+  reasonCodes      String[]           @default([])
+  createdById      String?
+  createdAt        DateTime           @default(now())
+
+  tenant      Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  order       Order                @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  product     Product              @relation(fields: [productId], references: [id], onDelete: Restrict)
+  sessionLine CheckoutSessionLine? @relation(fields: [sessionLineId], references: [id], onDelete: Restrict)
+  createdBy   User?                @relation("OrderLineActor", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@index([tenantId, orderId])
 }

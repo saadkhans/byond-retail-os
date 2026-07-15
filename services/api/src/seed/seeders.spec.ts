@@ -34,15 +34,16 @@ describe('platform module catalog', () => {
     expect(new Set(codes).size).toBe(codes.length);
   });
 
-  it('default-enables core plus the shipped inventory and devices modules', () => {
-    // inventory (Phase 3) and devices (Phase 4) are default-enabled so their
-    // routes are reachable for every new tenant (the only enable endpoint is
-    // tenant-scoped and needs a module:manage tenant user, which a brand-new
-    // tenant does not yet have).
+  it('default-enables core plus the shipped inventory, devices, and checkout modules', () => {
+    // inventory (Phase 3), devices (Phase 4), and checkout (Phase 5) are
+    // default-enabled so their routes are reachable for every new tenant (the
+    // only enable endpoint is tenant-scoped and needs a module:manage tenant
+    // user, which a brand-new tenant does not yet have).
     expect(DEFAULT_ENABLED_MODULE_CODES).toEqual([
       'core',
       'inventory',
       'devices',
+      'checkout',
     ]);
   });
 
@@ -58,8 +59,9 @@ describe('platform module catalog', () => {
       (m) => m.code,
     );
     // core: Phase 1; inventory (catalog + ledger): Phase 3;
-    // devices (units, devices, edge registration): Phase 4.
-    expect(active).toEqual(['core', 'inventory', 'devices']);
+    // devices (units, devices, edge registration): Phase 4;
+    // checkout (sessions, basket lines, order foundation): Phase 5.
+    expect(active).toEqual(['core', 'inventory', 'devices', 'checkout']);
   });
 
   it('never marks an inactive module as default-enabled', () => {

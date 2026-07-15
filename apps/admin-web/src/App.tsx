@@ -9,10 +9,15 @@ import {
 } from 'react-router-dom';
 import { AuthProvider, useAuth } from './auth';
 import { CatalogPage } from './pages/CatalogPage';
+import {
+  CheckoutSessionDetailPage,
+  CheckoutSessionsPage,
+} from './pages/CheckoutSessionsPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { DeviceDetailPage, DevicesPage } from './pages/DevicesPage';
 import { InventoryPage } from './pages/InventoryPage';
 import { LoginPage } from './pages/LoginPage';
+import { OrderDetailPage, OrdersPage } from './pages/OrdersPage';
 import { StoreDetailPage, StoresPage } from './pages/StoresPage';
 import { UnitDetailPage, UnitsPage } from './pages/UnitsPage';
 
@@ -42,6 +47,8 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/devices">Devices</NavLink>
         <NavLink to="/catalog">Catalog</NavLink>
         <NavLink to="/inventory">Inventory</NavLink>
+        <NavLink to="/checkout-sessions">Checkout sessions</NavLink>
+        <NavLink to="/orders">Orders</NavLink>
         <div className="spacer" />
         <div className="who">{user?.email}</div>
         <button onClick={() => void logout()}>Sign out</button>
@@ -72,6 +79,16 @@ export function App() {
                     <Route path="devices/:id" element={<DeviceDetailPage />} />
                     <Route path="catalog" element={<CatalogPage />} />
                     <Route path="inventory" element={<InventoryPage />} />
+                    <Route
+                      path="checkout-sessions"
+                      element={<CheckoutSessionsPage />}
+                    />
+                    <Route
+                      path="checkout-sessions/:id"
+                      element={<CheckoutSessionDetailPage />}
+                    />
+                    <Route path="orders" element={<OrdersPage />} />
+                    <Route path="orders/:id" element={<OrderDetailPage />} />
                     <Route path="*" element={<Navigate to="/" replace />} />
                   </Routes>
                 </Shell>
