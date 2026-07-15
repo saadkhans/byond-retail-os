@@ -300,6 +300,8 @@ describe('containsKnownSecretToken', () => {
   );
   const awsKeyId = 'AKIA' + 'A'.repeat(16);
   const githubToken = 'ghp_' + 'A'.repeat(24);
+  // Fine-grained PAT: distinct github_pat_ prefix, not the gh*_ classic form.
+  const githubFineGrainedPat = 'github_pat_' + 'A'.repeat(30);
   const googleKey = 'AIza' + 'A'.repeat(24);
   const slackToken = 'xoxb-' + 'A'.repeat(16);
 
@@ -308,6 +310,7 @@ describe('containsKnownSecretToken', () => {
     ['jwt', () => jwt],
     ['aws access key id', () => awsKeyId],
     ['github token', () => githubToken],
+    ['github fine-grained pat', () => githubFineGrainedPat],
     ['google api key', () => googleKey],
     ['slack token', () => slackToken],
   ])('flags a bare %s (no key= label, no URL)', (_label, build) => {

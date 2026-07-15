@@ -332,6 +332,9 @@ const KNOWN_SECRET_TOKENS: readonly RegExp[] = [
   /\b(?:AKIA|ASIA|AKID)[0-9A-Z]{12,}\b/,
   // GitHub tokens: ghp_/gho_/ghs_/ghr_/ghu_ + body.
   /\bgh[posru]_[A-Za-z0-9]{20,}\b/,
+  // GitHub fine-grained PATs: github_pat_ + body (distinct from the gh*_
+  // classic prefixes above, which never match github_pat_).
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
   // Google API keys: AIza + body.
   /\bAIza[0-9A-Za-z_-]{20,}\b/,
   // Slack tokens: xoxb-/xoxa-/xoxp-/xoxr-/xoxs- + body.
