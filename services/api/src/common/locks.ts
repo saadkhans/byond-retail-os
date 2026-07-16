@@ -117,3 +117,33 @@ export function checkoutSessionAdvisoryLockKey(
 export function tenantOrderNumberAdvisoryLockKey(tenantId: string): string {
   return `order-number:${tenantId}`;
 }
+
+/**
+ * Serializes a payment intent's mutations (authorize, capture, cancel/void,
+ * fail) against each other within a tenant. Each transition decides from a
+ * read-then-write of the intent's status, so two concurrent requests (e.g. a
+ * duplicate capture racing a cancel) must not interleave and double-capture or
+ * revive a terminal intent. All PaymentsRepository intent-mutation methods
+ * MUST derive it identically.
+ */
+export function paymentIntentAdvisoryLockKey(
+  tenantId: string,
+  intentId: string,
+): string {
+  return `payment-intent:${tenantId}:${intentId}`;
+}
+
+/**
+ * Serializes provider-event ingestion per (tenant, provider, providerEventId):
+ * the ingest path decides from a read-then-write ("have I seen this event?"),
+ * so two concurrent deliveries of the SAME provider event must not both insert
+ * before either sees the other. Any code path that ingests a provider event
+ * MUST take this lock first.
+ */
+export function paymentEventAdvisoryLockKey(
+  tenantId: string,
+  provider: string,
+  providerEventId: string,
+): string {
+  return `payment-event:${tenantId}:${provider}:${providerEventId}`;
+}

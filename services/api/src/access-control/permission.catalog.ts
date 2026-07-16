@@ -36,4 +36,9 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   { code: 'checkout:manage', module: 'checkout', description: 'Create checkout sessions, mutate basket lines, and complete sessions into orders' },
   { code: 'order:read', module: 'checkout', description: 'View orders and order lines' },
   { code: 'order:manage', module: 'checkout', description: 'Cancel orders (no payment operations in Phase 5)' },
+  { code: 'payment:read', module: 'payments', description: 'View payment intents, authorizations, captures, and events' },
+  { code: 'payment:manage', module: 'payments', description: 'Create payment intents and manage their linkage (no live gateway)' },
+  { code: 'payment:simulate', module: 'payments', description: 'Simulate provider-abstract authorization, capture, cancel/void, failure, and provider events' },
+  { code: 'reconciliation:read', module: 'payments', description: 'View payment reconciliation records' },
+  { code: 'reconciliation:manage', module: 'payments', description: 'Update reconciliation record status (mark reconciled/mismatch — no settlement accounting)' },
 ];

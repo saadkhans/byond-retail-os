@@ -169,6 +169,106 @@ describe('checkout module backfill migration', () => {
   });
 });
 
+describe('payments & reconciliation migration hardening', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260716000000_payments_reconciliation',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('adds the payment-lifecycle audit actions', () => {
+    for (const action of ['AUTHORIZE', 'CAPTURE', 'VOID', 'FAIL', 'RECONCILE']) {
+      expect(sql).toContain(`ALTER TYPE "AuditAction" ADD VALUE '${action}'`);
+    }
+  });
+
+  it('keeps money non-negative and a capture within its authorization', () => {
+    expect(sql).toContain('PaymentIntent_amountMinor_nonneg_check');
+    expect(sql).toContain('PaymentAuthorization_amountMinor_nonneg_check');
+    expect(sql).toContain('PaymentCapture_amountMinor_nonneg_check');
+    expect(sql).toContain('PaymentIntent_capturedAmount_range_check');
+    expect(sql).toContain(
+      'CHECK ("capturedAmountMinor" >= 0 AND "capturedAmountMinor" <= "amountMinor")',
+    );
+  });
+
+  it('stores only SAFE card metadata: last4 is exactly four digits', () => {
+    expect(sql).toContain('PaymentIntent_instrumentLast4_format_check');
+    expect(sql).toContain(`CHECK ("instrumentLast4" IS NULL OR "instrumentLast4" ~ '^[0-9]{4}$')`);
+    expect(sql).toContain('PaymentIntent_instrumentExpiryMonth_range_check');
+    expect(sql).toContain('PaymentIntent_instrumentExpiryYear_range_check');
+  });
+
+  it('deduplicates provider events per tenant/provider', () => {
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "PaymentEvent_tenantId_provider_providerEventId_key"',
+    );
+  });
+
+  it('keeps idempotency keys unique per tenant on every mutating table', () => {
+    expect(sql).toContain('PaymentIntent_tenantId_idempotencyKey_key');
+    expect(sql).toContain('PaymentAuthorization_tenantId_idempotencyKey_key');
+    expect(sql).toContain('PaymentCapture_tenantId_idempotencyKey_key');
+    expect(sql).toContain('PaymentEvent_tenantId_idempotencyKey_key');
+  });
+
+  it('enforces same-tenant references with composite foreign keys', () => {
+    for (const constraint of [
+      'PaymentIntent_order_same_tenant_fkey',
+      'PaymentIntent_session_same_tenant_fkey',
+      'PaymentAuthorization_intent_same_tenant_fkey',
+      'PaymentCapture_intent_same_tenant_fkey',
+      'PaymentEvent_intent_same_tenant_fkey',
+      'PaymentReconciliationRecord_intent_same_tenant_fkey',
+      'PaymentReconciliationRecord_capture_same_tenant_fkey',
+    ]) {
+      expect(sql).toContain(constraint);
+    }
+  });
+
+  it('never cascades deletes into payment tables', () => {
+    expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
+  });
+});
+
+describe('payments module backfill migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260716000001_payments_module_backfill',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('activates a pre-existing payments module row instead of leaving it inactive', () => {
+    expect(sql).toContain('ON CONFLICT ("code") DO UPDATE SET');
+    expect(sql).toContain('"isActive" = true');
+    expect(sql).not.toMatch(/DO UPDATE SET[^;]*"id"\s*=/);
+  });
+
+  it('is idempotent and never overwrites a tenant admin choice', () => {
+    expect(sql).toContain('ON CONFLICT ("tenantId", "moduleId") DO NOTHING');
+    expect(sql).not.toMatch(/ON CONFLICT \("tenantId", "moduleId"\) DO UPDATE/);
+  });
+
+  it('enables payments for every pre-existing tenant with deterministic ids', () => {
+    expect(sql).toContain(`'tm-' || md5(t."id" || ':payments')`);
+    expect(sql).toContain(`WHERE pm."code" = 'payments'`);
+  });
+});
+
 describe('checkout line soft-delete migration hardening', () => {
   const sql = readFileSync(
     join(

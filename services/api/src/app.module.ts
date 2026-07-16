@@ -11,6 +11,7 @@ import { HealthModule } from './health/health.module';
 import { InventoryModule } from './inventory/inventory.module';
 import { LocationsModule } from './locations/locations.module';
 import { OrdersModule } from './orders/orders.module';
+import { PaymentsModule } from './payments/payments.module';
 import { PlatformModulesModule } from './platform-modules/platform-modules.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { TenantsModule } from './tenants/tenants.module';
@@ -34,6 +35,7 @@ import { UsersModule } from './users/users.module';
     DevicesModule,
     CheckoutModule,
     OrdersModule,
+    PaymentsModule,
   ],
 })
 export class AppModule implements NestModule {

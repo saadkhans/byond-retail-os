@@ -170,6 +170,150 @@ export type CheckoutSessionStatus =
 
 export type OrderStatus = 'DRAFT' | 'CONFIRMED' | 'CANCELLED';
 
+export type OrderPaymentStatus =
+  | 'UNPAID'
+  | 'AUTHORIZED'
+  | 'PAID'
+  | 'PAYMENT_FAILED'
+  | 'VOIDED'
+  | 'REFUND_PENDING'
+  | 'REFUNDED';
+
+// Phase 6 — provider-neutral payment abstraction. NO live gateway: authorize
+// and capture are SIMULATED. Provider references are opaque; only SAFE card
+// metadata (brand, last4, expiry, wallet) is ever stored.
+export type PaymentProvider = 'SIMULATED' | 'MANUAL';
+
+export type PaymentStatus =
+  | 'CREATED'
+  | 'REQUIRES_AUTHORIZATION'
+  | 'AUTHORIZED'
+  | 'CAPTURE_PENDING'
+  | 'CAPTURED'
+  | 'FAILED'
+  | 'CANCELLED'
+  | 'VOIDED'
+  | 'EXPIRED';
+
+export type PaymentCaptureStatus = 'PENDING' | 'SUCCEEDED' | 'FAILED';
+
+export type PaymentEventStatus = 'RECEIVED' | 'PROCESSED' | 'IGNORED' | 'FAILED';
+
+export type PaymentEventType =
+  | 'AUTHORIZATION_SUCCEEDED'
+  | 'AUTHORIZATION_FAILED'
+  | 'CAPTURE_SUCCEEDED'
+  | 'CAPTURE_FAILED'
+  | 'PAYMENT_CANCELLED'
+  | 'PAYMENT_VOIDED'
+  | 'PAYMENT_EXPIRED'
+  | 'UNKNOWN';
+
+export type ReconciliationStatus =
+  | 'PENDING'
+  | 'MATCHED'
+  | 'MISMATCH'
+  | 'RECONCILED'
+  | 'FAILED';
+
+export interface PaymentAuthorization {
+  id: string;
+  intentId: string;
+  status: string;
+  amountMinor: number;
+  providerRef: string | null;
+  authorizedAt: string;
+  expiresAt: string | null;
+  voidedAt: string | null;
+  createdAt: string;
+}
+
+export interface PaymentCapture {
+  id: string;
+  intentId: string;
+  status: PaymentCaptureStatus;
+  amountMinor: number;
+  providerRef: string | null;
+  capturedAt: string | null;
+  idempotencyKey: string | null;
+  createdAt: string;
+  intent?: { id: string; status: PaymentStatus; orderId: string | null } | null;
+}
+
+export interface PaymentEvent {
+  id: string;
+  intentId: string | null;
+  provider: PaymentProvider;
+  providerEventId: string;
+  eventType: PaymentEventType;
+  status: PaymentEventStatus;
+  providerRef: string | null;
+  receivedAt: string;
+  processedAt: string | null;
+  createdAt: string;
+  intent?: { id: string; status: PaymentStatus } | null;
+}
+
+export interface ReconciliationRecord {
+  id: string;
+  intentId: string | null;
+  captureId: string | null;
+  provider: PaymentProvider;
+  status: ReconciliationStatus;
+  providerRef: string | null;
+  expectedAmountMinor: number | null;
+  reportedAmountMinor: number | null;
+  currencyCode: string | null;
+  notes: string | null;
+  reconciledAt: string | null;
+  createdAt: string;
+  intent?: {
+    id: string;
+    status: PaymentStatus;
+    provider: PaymentProvider;
+    orderId: string | null;
+  } | null;
+}
+
+export interface PaymentIntent {
+  id: string;
+  orderId: string | null;
+  checkoutSessionId: string | null;
+  provider: PaymentProvider;
+  status: PaymentStatus;
+  amountMinor: number;
+  currencyCode: string;
+  capturedAmountMinor: number;
+  providerRef: string | null;
+  providerCustomerRef: string | null;
+  // SAFE card metadata only — never a raw PAN/CVV/PIN/token.
+  instrumentBrand: string | null;
+  instrumentLast4: string | null;
+  instrumentExpiryMonth: number | null;
+  instrumentExpiryYear: number | null;
+  instrumentWallet: string | null;
+  description: string | null;
+  failureReason: string | null;
+  authorizedAt: string | null;
+  capturedAt: string | null;
+  cancelledAt: string | null;
+  failedAt: string | null;
+  idempotencyKey: string | null;
+  createdAt: string;
+  updatedAt: string;
+  order?: {
+    id: string;
+    orderNumber: string;
+    status: OrderStatus;
+    paymentStatus: OrderPaymentStatus;
+  } | null;
+  session?: { id: string; status: CheckoutSessionStatus } | null;
+  authorizations?: PaymentAuthorization[];
+  captures?: PaymentCapture[];
+  events?: PaymentEvent[];
+  reconciliationRecords?: ReconciliationRecord[];
+}
+
 /**
  * Vendor-neutral evidence/source lineage placeholders. Future CV/VLM adapters
  * populate these; the admin UI only displays the raw identifiers.
@@ -239,6 +383,10 @@ export interface Order extends EvidenceRefs {
   locationId: string;
   unitId: string;
   status: OrderStatus;
+  // Phase 6 — payment projection. UNPAID until a linked payment intent is
+  // CAPTURED; paidAt is set exactly when paymentStatus becomes PAID.
+  paymentStatus: OrderPaymentStatus;
+  paidAt: string | null;
   placedAt: string;
   confirmedAt: string | null;
   cancelledAt: string | null;

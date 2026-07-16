@@ -79,6 +79,22 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
     isActive: true,
   },
   {
+    code: 'payments',
+    name: 'Payments & Reconciliation',
+    description:
+      'Provider-neutral payment intents, simulated authorization/capture, ' +
+      'provider event ingestion, and the reconciliation foundation (no live ' +
+      'gateway; no raw card data).',
+    // Shipped in Phase 6 and DEFAULT-ENABLED for the same reason as
+    // inventory/devices/checkout (see above): the only enable endpoint is
+    // @TenantOnly(), so leaving this false would strand new tenants behind
+    // 403s. RBAC still gates every route independently. Tenants that existed
+    // BEFORE Phase 6 are covered by the 20260716000001_payments_module_backfill
+    // migration — defaultEnabled only applies at tenant creation time.
+    defaultEnabled: true,
+    isActive: true,
+  },
+  {
     code: 'cv',
     name: 'Computer Vision',
     description: 'CV event proposal pipeline (later phase).',

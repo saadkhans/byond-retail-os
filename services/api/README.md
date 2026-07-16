@@ -1,6 +1,18 @@
 # @byond/api — Core Platform API
 
-The BYOND cloud control plane: tenants, users, auth + RBAC (Phase 2), stores/locations, platform modules, the append-only audit log, product catalog + inventory ledger (Phase 3), retail units, devices, and the edge-registration foundation (Phase 4), and checkout sessions + orders (Phase 5). NestJS 11 + TypeScript strict + Prisma + PostgreSQL.
+The BYOND cloud control plane: tenants, users, auth + RBAC (Phase 2), stores/locations, platform modules, the append-only audit log, product catalog + inventory ledger (Phase 3), retail units, devices, and the edge-registration foundation (Phase 4), checkout sessions + orders (Phase 5), and the provider-neutral payment abstraction + reconciliation foundation (Phase 6). NestJS 11 + TypeScript strict + Prisma + PostgreSQL.
+
+### Phase 6 — payments & reconciliation (foundation only)
+
+Phase 6 introduces a **provider-neutral** payment abstraction. It deliberately does **not** integrate a live payment gateway:
+
+- **No live gateway / no provider SDK.** There is no MyFatoorah/Stripe/Tap/HyperPay/Moyasar (or any) SDK. `provider` is a generic enum (`SIMULATED`/`MANUAL`); real gateway adapters plug in through this abstraction later.
+- **Authorization and capture are SIMULATED** through an explicit payment state machine (`CREATED → REQUIRES_AUTHORIZATION → AUTHORIZED → CAPTURE_PENDING → CAPTURED`, plus `FAILED`/`CANCELLED`/`VOIDED`/`EXPIRED`). Invalid transitions are rejected, terminal states are protected, and every mutation is audited.
+- **No raw card data or secrets, ever.** Only opaque provider references and **safe** card metadata are stored — `instrumentBrand`, `instrumentLast4` (exactly four digits, DB-enforced), `instrumentExpiryMonth/Year`, `instrumentWallet`. Raw PAN, CVV, PIN, magnetic-track data, provider secret keys, bearer tokens, API keys, and raw webhook secrets/payloads are **never** accepted, stored, logged, or audited (screened by `common/sensitive-keys`).
+- **Order is not "paid" unless the payment reaches CAPTURED.** A captured intent is the only path that flips a linked order's `paymentStatus` to `PAID`; a failure/void never marks an order paid, and a `PAID` order is never downgraded. Refunds are reserved (`REFUND_PENDING`/`REFUNDED`) but **not** implemented — no money movement.
+- **Idempotency & duplicate-capture safety.** Create/authorize/capture carry tenant-scoped idempotency keys; a duplicate capture with the same key **never** moves money twice. Provider events are deduplicated per `(tenant, provider, providerEventId)`.
+- **Provider events are an ingestion FOUNDATION** — authenticated/admin-only (`POST /payment-events/simulate`), **not** a public webhook. Only normalized fields are stored (no raw payload, no signature verification yet).
+- **Reconciliation is a FOUNDATION** — a `PENDING` record is seeded on capture, with read models and a manual status update. No settlement accounting, provider import, or Zoho integration.
 
 ## Prerequisites
 

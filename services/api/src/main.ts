@@ -40,16 +40,19 @@ async function bootstrap(): Promise<void> {
       .setDescription(
         'Core platform — auth, tenants, users, RBAC, stores, modules, ' +
           'product catalog, inventory, retail units, devices, checkout ' +
-          'sessions, and orders. Phase 5 adds the order FOUNDATION only: ' +
-          'completing a checkout session consumes inventory atomically, ' +
-          'but no payment is captured and nothing is marked paid — ' +
-          'payments arrive in a later phase. ' +
+          'sessions, orders, and payments. Phase 6 adds a PROVIDER-NEUTRAL ' +
+          'payment abstraction: there is NO live payment gateway, NO provider ' +
+          'SDK, and NO raw card data — authorization and capture are ' +
+          'SIMULATED through an internal state machine, provider references ' +
+          'are opaque, and an order is marked PAID only when its payment ' +
+          'intent reaches the CAPTURED state. Real gateway adapters and ' +
+          'webhook signature verification arrive in a later phase. ' +
           'All endpoints except /health, /auth/login, and /edge/register ' +
           'require an Authorization: Bearer <access token> header ' +
           '(POST /auth/login). ' +
           'Errors use the standard Nest shape: { statusCode, message, error }.',
       )
-      .setVersion('0.5.0')
+      .setVersion('0.6.0')
       .addTag(
         'stores',
         'Tenant stores/branches/sites (the Location entity): name, code, ' +
@@ -95,6 +98,31 @@ async function bootstrap(): Promise<void> {
           'session → line → movement lineage. CONFIRMED means inventory ' +
           'was consumed — NOT paid/captured; payment capture is a later ' +
           'phase, and pricing fields are null placeholders.',
+      )
+      .addTag(
+        'payments',
+        'Provider-neutral payment intents with a CREATED → ' +
+          'REQUIRES_AUTHORIZATION → AUTHORIZED → CAPTURE_PENDING → CAPTURED ' +
+          'lifecycle (plus FAILED/CANCELLED/VOIDED/EXPIRED). NO live gateway: ' +
+          'authorization and capture are SIMULATED and provider references ' +
+          'are opaque. Only SAFE card metadata (brand, last4, expiry, wallet) ' +
+          'is stored — never raw PAN/CVV/PIN/track data, tokens, or secrets. ' +
+          'A captured intent is the ONLY thing that marks a linked order PAID; ' +
+          'duplicate captures are idempotent and never move money twice.',
+      )
+      .addTag(
+        'payment-events',
+        'Provider event / webhook INGESTION FOUNDATION (authenticated/' +
+          'admin-only, not a public webhook). Only normalized fields are ' +
+          'stored — no raw provider payload, no signature verification yet. ' +
+          'Duplicate (provider, providerEventId) is idempotent.',
+      )
+      .addTag(
+        'reconciliation',
+        'Reconciliation FOUNDATION: read models plus a manual status update. ' +
+          'A PENDING record is seeded on capture. NO settlement accounting, ' +
+          'NO provider reconciliation import, NO Zoho integration in this ' +
+          'phase.',
       )
       .addTag(
         'edge-registration',

@@ -18,6 +18,15 @@ import { DeviceDetailPage, DevicesPage } from './pages/DevicesPage';
 import { InventoryPage } from './pages/InventoryPage';
 import { LoginPage } from './pages/LoginPage';
 import { OrderDetailPage, OrdersPage } from './pages/OrdersPage';
+import { PaymentEventsPage } from './pages/PaymentEventsPage';
+import {
+  PaymentIntentDetailPage,
+  PaymentsPage,
+} from './pages/PaymentsPage';
+import {
+  ReconciliationDetailPage,
+  ReconciliationPage,
+} from './pages/ReconciliationPage';
 import { StoreDetailPage, StoresPage } from './pages/StoresPage';
 import { UnitDetailPage, UnitsPage } from './pages/UnitsPage';
 
@@ -49,6 +58,9 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/inventory">Inventory</NavLink>
         <NavLink to="/checkout-sessions">Checkout sessions</NavLink>
         <NavLink to="/orders">Orders</NavLink>
+        <NavLink to="/payments">Payments</NavLink>
+        <NavLink to="/payment-events">Payment events</NavLink>
+        <NavLink to="/reconciliation">Reconciliation</NavLink>
         <div className="spacer" />
         <div className="who">{user?.email}</div>
         <button onClick={() => void logout()}>Sign out</button>
@@ -89,6 +101,23 @@ export function App() {
                     />
                     <Route path="orders" element={<OrdersPage />} />
                     <Route path="orders/:id" element={<OrderDetailPage />} />
+                    <Route path="payments" element={<PaymentsPage />} />
+                    <Route
+                      path="payments/:id"
+                      element={<PaymentIntentDetailPage />}
+                    />
+                    <Route
+                      path="payment-events"
+                      element={<PaymentEventsPage />}
+                    />
+                    <Route
+                      path="reconciliation"
+                      element={<ReconciliationPage />}
+                    />
+                    <Route
+                      path="reconciliation/:id"
+                      element={<ReconciliationDetailPage />}
+                    />
                     <Route path="*" element={<Navigate to="/" replace />} />
                   </Routes>
                 </Shell>
