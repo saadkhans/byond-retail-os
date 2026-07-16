@@ -31,7 +31,11 @@ export type IngestEventInput = {
   actorId?: string;
 };
 
-export type IngestEventRejection = 'intent-not-found';
+export type IngestEventRejection =
+  | 'intent-not-found'
+  // The referenced intent belongs to a DIFFERENT provider than the event —
+  // a SIMULATED event must never attach to a MANUAL intent (and vice versa).
+  | 'intent-provider-mismatch';
 
 export interface IngestEventResult {
   event: PaymentEventWithRefs;
@@ -83,10 +87,15 @@ export class PaymentEventsRepository extends TenantScopedRepository {
       if (data.intentId) {
         const intent = await tx.paymentIntent.findFirst({
           where: { id: data.intentId, tenantId: scopedTenantId },
-          select: { id: true },
+          select: { id: true, provider: true },
         });
         if (!intent) {
           return 'intent-not-found' as const;
+        }
+        // A provider's event must not contaminate another provider's intent
+        // history (e.g. a SIMULATED event attaching to a MANUAL intent).
+        if (intent.provider !== data.provider) {
+          return 'intent-provider-mismatch' as const;
         }
       }
       const status =
@@ -120,6 +129,21 @@ export class PaymentEventsRepository extends TenantScopedRepository {
   ): Promise<PaymentEventWithRefs | null> {
     return this.prisma.paymentEvent.findFirst({
       where: this.scope(tenantId, { provider, providerEventId }),
+      include: EVENT_INCLUDE,
+    });
+  }
+
+  /**
+   * Lookup for the (tenantId, idempotencyKey) unique P2002: an idempotency key
+   * reused with a DIFFERENT provider event is a controlled conflict, not a
+   * replay (the dedupe replay only covers a matching provider/providerEventId).
+   */
+  findByIdempotencyKey(
+    tenantId: string,
+    idempotencyKey: string,
+  ): Promise<PaymentEventWithRefs | null> {
+    return this.prisma.paymentEvent.findFirst({
+      where: this.scope(tenantId, { idempotencyKey }),
       include: EVENT_INCLUDE,
     });
   }

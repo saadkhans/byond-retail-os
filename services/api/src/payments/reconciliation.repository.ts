@@ -105,8 +105,17 @@ export class ReconciliationRepository extends TenantScopedRepository {
       if (before.status === ReconciliationStatus.RECONCILED) {
         return 'terminal-blocked' as const;
       }
-      const after = await tx.paymentReconciliationRecord.update({
-        where: { id: before.id },
+      // CONDITIONAL update: the `status: { not: RECONCILED }` guard makes this
+      // race-safe under concurrent PATCHes. If another request reconciled the
+      // record between our read and this write, the update matches zero rows
+      // and we report a controlled conflict instead of moving it OUT of the
+      // terminal RECONCILED state.
+      const updated = await tx.paymentReconciliationRecord.updateMany({
+        where: {
+          id: before.id,
+          tenantId: scopedTenantId,
+          status: { not: ReconciliationStatus.RECONCILED },
+        },
         data: {
           status: input.status,
           reportedAmountMinor: input.reportedAmountMinor,
@@ -116,6 +125,12 @@ export class ReconciliationRepository extends TenantScopedRepository {
               ? new Date()
               : before.reconciledAt,
         },
+      });
+      if (updated.count === 0) {
+        return 'terminal-blocked' as const;
+      }
+      const after = await tx.paymentReconciliationRecord.findFirstOrThrow({
+        where: { id: before.id, tenantId: scopedTenantId },
         include: RECONCILIATION_INCLUDE,
       });
       await this.auditLog.record(buildAuditEntry(before, after), tx);

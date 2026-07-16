@@ -130,6 +130,37 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
     },
   ];
 
+  // Full PaymentIntent row shape with overrides — keeps fixtures terse.
+  const intentRow = (overrides: Partial<Row> & { id: string; tenantId: string }): Row =>
+    ({
+      orderId: null,
+      checkoutSessionId: null,
+      provider: 'SIMULATED',
+      status: 'CREATED',
+      amountMinor: 999,
+      currencyCode: 'SAR',
+      capturedAmountMinor: 0,
+      providerRef: null,
+      providerCustomerRef: null,
+      instrumentBrand: null,
+      instrumentLast4: null,
+      instrumentExpiryMonth: null,
+      instrumentExpiryYear: null,
+      instrumentWallet: null,
+      description: null,
+      failureReason: null,
+      authorizedAt: null,
+      capturedAt: null,
+      cancelledAt: null,
+      failedAt: null,
+      expiresAt: null,
+      idempotencyKey: null,
+      createdById: null,
+      createdAt: new Date('2026-07-12T00:00:00Z'),
+      updatedAt: new Date('2026-07-12T00:00:00Z'),
+      ...overrides,
+    }) as Row;
+
   // Cross-tenant "bait": tenant-b rows must stay invisible to tenant-a.
   const store = {
     orders: [
@@ -169,42 +200,69 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
         paidAt: null,
         placedAt: new Date('2026-07-12T00:00:00Z'),
       },
+      // Session-linked projection (finding 1): an order generated from a
+      // checkout session, to be bound by a session-only intent.
+      {
+        id: 'order-a3',
+        tenantId: 'tenant-a',
+        orderNumber: 'ORD-000003',
+        checkoutSessionId: 'sess-a3',
+        locationId: 'loc-a1',
+        unitId: 'unit-a1',
+        status: 'CONFIRMED',
+        paymentStatus: 'UNPAID',
+        paidAt: null,
+        placedAt: new Date('2026-07-12T00:00:00Z'),
+      },
+      // Already-paid guard (finding 4): two intents target this order.
+      {
+        id: 'order-a5',
+        tenantId: 'tenant-a',
+        orderNumber: 'ORD-000005',
+        checkoutSessionId: 'sess-a5',
+        locationId: 'loc-a1',
+        unitId: 'unit-a1',
+        status: 'CONFIRMED',
+        paymentStatus: 'UNPAID',
+        paidAt: null,
+        placedAt: new Date('2026-07-12T00:00:00Z'),
+      },
+      // Cancelled-order guard (finding 7): payments must not project onto it.
+      {
+        id: 'order-cx',
+        tenantId: 'tenant-a',
+        orderNumber: 'ORD-000009',
+        checkoutSessionId: 'sess-cx',
+        locationId: 'loc-a1',
+        unitId: 'unit-a1',
+        status: 'CANCELLED',
+        paymentStatus: 'UNPAID',
+        paidAt: null,
+        placedAt: new Date('2026-07-12T00:00:00Z'),
+      },
     ] as Row[],
     sessions: [
       { id: 'sess-a1', tenantId: 'tenant-a', status: 'COMPLETED' },
       { id: 'sess-a2', tenantId: 'tenant-a', status: 'COMPLETED' },
+      { id: 'sess-a3', tenantId: 'tenant-a', status: 'COMPLETED' },
+      // sess-a4 has NO generated order yet (projection safely no-ops).
+      { id: 'sess-a4', tenantId: 'tenant-a', status: 'COMPLETED' },
+      { id: 'sess-a5', tenantId: 'tenant-a', status: 'COMPLETED' },
+      { id: 'sess-cx', tenantId: 'tenant-a', status: 'COMPLETED' },
       { id: 'sess-b', tenantId: 'tenant-b', status: 'COMPLETED' },
     ] as Row[],
     intents: [
-      {
-        id: 'pi-b',
-        tenantId: 'tenant-b',
-        orderId: 'order-b',
-        checkoutSessionId: null,
-        provider: 'SIMULATED',
-        status: 'CREATED',
-        amountMinor: 999,
-        currencyCode: 'SAR',
-        capturedAmountMinor: 0,
-        providerRef: null,
-        providerCustomerRef: null,
-        instrumentBrand: null,
-        instrumentLast4: null,
-        instrumentExpiryMonth: null,
-        instrumentExpiryYear: null,
-        instrumentWallet: null,
-        description: null,
-        failureReason: null,
-        authorizedAt: null,
-        capturedAt: null,
-        cancelledAt: null,
-        failedAt: null,
-        expiresAt: null,
-        idempotencyKey: null,
-        createdById: null,
-        createdAt: new Date('2026-07-12T00:00:00Z'),
-        updatedAt: new Date('2026-07-12T00:00:00Z'),
-      },
+      intentRow({ id: 'pi-b', tenantId: 'tenant-b', orderId: 'order-b' }),
+      // Pre-AUTHORIZED intent linked to the CANCELLED order (finding 7): a
+      // capture attempt must be rejected and must not mark the order PAID.
+      intentRow({
+        id: 'pi-cx-auth',
+        tenantId: 'tenant-a',
+        orderId: 'order-cx',
+        status: 'AUTHORIZED',
+        amountMinor: 500,
+        authorizedAt: new Date('2026-07-12T00:00:00Z'),
+      }),
     ] as Row[],
     authorizations: [] as Row[],
     captures: [] as Row[],
@@ -395,8 +453,9 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
     },
     order: {
       findFirst: async ({ where }: { where: Where }) =>
-        store.orders.find((o) => scalarMatch(o, where, ['id', 'tenantId'])) ??
-        null,
+        store.orders.find((o) =>
+          scalarMatch(o, where, ['id', 'tenantId', 'checkoutSessionId']),
+        ) ?? null,
       update: async ({ where, data }: { where: Where; data: Where }) => {
         const row = store.orders.find((o) => o.id === where.id)!;
         Object.assign(row, stripUndefined(data), { updatedAt: new Date() });
@@ -669,10 +728,37 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
         store.reconciliations.filter((r) =>
           scalarMatch(r, where, ['tenantId', 'status', 'intentId']),
         ).length,
-      update: async ({ where, data }: { where: Where; data: Where }) => {
-        const row = store.reconciliations.find((r) => r.id === where.id)!;
+      updateMany: async ({ where, data }: { where: Where; data: Where }) => {
+        // Honors the conditional guard `status: { not: RECONCILED }` the
+        // repository uses to keep RECONCILED terminal under concurrency.
+        const notStatus =
+          typeof where.status === 'object' ? where.status.not : undefined;
+        const row = store.reconciliations.find(
+          (r) =>
+            r.id === where.id &&
+            r.tenantId === where.tenantId &&
+            (notStatus === undefined || r.status !== notStatus),
+        );
+        if (!row) {
+          return { count: 0 };
+        }
         Object.assign(row, stripUndefined(data), { updatedAt: new Date() });
-        return reconView(row);
+        return { count: 1 };
+      },
+      findFirstOrThrow: async ({
+        where,
+        include,
+      }: {
+        where: Where;
+        include?: Where;
+      }) => {
+        const row = store.reconciliations.find((r) =>
+          scalarMatch(r, where, ['id', 'tenantId']),
+        );
+        if (!row) {
+          throw new Error('PaymentReconciliationRecord not found');
+        }
+        return include ? reconView(row) : { ...row };
       },
     },
     paymentEvent: {
@@ -1192,6 +1278,220 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
         .set(auth(managerToken))
         .send({ status: 'MATCHED', notes: `token=${TEST_SECRET}` })
         .expect(400);
+    });
+  });
+
+  // ---- Codex hardening pass ------------------------------------------------
+
+  const authorizeThen = (id: string, path: string, body = {}) =>
+    request(app.getHttpServer())
+      .post(`/payments/intents/${id}/${path}`)
+      .set(auth(managerToken))
+      .send(body);
+
+  describe('session-linked order projection (finding 1)', () => {
+    it('capturing a session-only intent marks the generated order PAID', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 1200,
+        currencyCode: 'SAR',
+        checkoutSessionId: 'sess-a3',
+      }).expect(201);
+      expect(intent.body.orderId).toBeNull();
+      const id = intent.body.id;
+      await authorizeThen(id, 'authorize').expect(200);
+      await authorizeThen(id, 'capture', { idempotencyKey: 'f1-cap' }).expect(
+        200,
+      );
+      expect(orderPaymentStatus('order-a3')).toBe('PAID');
+      expect(store.orders.find((o) => o.id === 'order-a3')?.paidAt).not.toBeNull();
+    });
+
+    it('safely no-ops when the session has no generated order yet', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 100,
+        currencyCode: 'SAR',
+        checkoutSessionId: 'sess-a4',
+      }).expect(201);
+      const id = intent.body.id;
+      await authorizeThen(id, 'authorize').expect(200);
+      await authorizeThen(id, 'capture')
+        .expect(200)
+        .expect((res) => expect(res.body.status).toBe('CAPTURED'));
+    });
+
+    it('rejects linking another tenant’s checkout session (cross-tenant)', async () => {
+      await createIntent(managerToken, {
+        amountMinor: 100,
+        currencyCode: 'SAR',
+        checkoutSessionId: 'sess-b',
+      }).expect(400);
+    });
+  });
+
+  describe('already-paid order guard (finding 4)', () => {
+    it('rejects a second intent capturing an already-paid order; no rows written', async () => {
+      const first = await createIntent(managerToken, {
+        amountMinor: 700,
+        currencyCode: 'SAR',
+        orderId: 'order-a5',
+      }).expect(201);
+      await authorizeThen(first.body.id, 'authorize').expect(200);
+      await authorizeThen(first.body.id, 'capture', {
+        idempotencyKey: 'f4-cap-1',
+      }).expect(200);
+      expect(orderPaymentStatus('order-a5')).toBe('PAID');
+
+      const second = await createIntent(managerToken, {
+        amountMinor: 700,
+        currencyCode: 'SAR',
+        orderId: 'order-a5',
+      }).expect(201);
+      await authorizeThen(second.body.id, 'authorize').expect(200);
+      // A DIFFERENT fresh key cannot double-capture the already-paid order.
+      await authorizeThen(second.body.id, 'capture', {
+        idempotencyKey: 'f4-cap-2',
+      }).expect(409);
+
+      const caps = await request(app.getHttpServer())
+        .get(`/payments/captures?intentId=${second.body.id}`)
+        .set(auth(managerToken))
+        .expect(200);
+      expect(caps.body.total).toBe(0);
+      const recon = await request(app.getHttpServer())
+        .get(`/reconciliation/records?intentId=${second.body.id}`)
+        .set(auth(managerToken))
+        .expect(200);
+      expect(recon.body.total).toBe(0);
+
+      // Idempotent replay of the FIRST capture still works.
+      await authorizeThen(first.body.id, 'capture', {
+        idempotencyKey: 'f4-cap-1',
+      })
+        .expect(200)
+        .expect((res) => expect(res.body.status).toBe('CAPTURED'));
+    });
+  });
+
+  describe('failing an authorized intent clears its holds (finding 5)', () => {
+    it('voids active authorization rows when the intent is failed', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 250,
+        currencyCode: 'SAR',
+      }).expect(201);
+      const id = intent.body.id;
+      await authorizeThen(id, 'authorize').expect(200);
+      await authorizeThen(id, 'fail', { reason: 'timeout (simulated)' })
+        .expect(200)
+        .expect((res) => expect(res.body.status).toBe('FAILED'));
+      const detail = await request(app.getHttpServer())
+        .get(`/payments/intents/${id}`)
+        .set(auth(managerToken))
+        .expect(200);
+      expect(detail.body.authorizations.length).toBeGreaterThan(0);
+      expect(
+        detail.body.authorizations.every(
+          (a: { status: string }) => a.status === 'VOIDED',
+        ),
+      ).toBe(true);
+    });
+  });
+
+  describe('cancelled-order guard (finding 7)', () => {
+    it('rejects capturing an intent linked to a cancelled order; order stays UNPAID', async () => {
+      await authorizeThen('pi-cx-auth', 'capture').expect(409);
+      expect(orderPaymentStatus('order-cx')).toBe('UNPAID');
+    });
+
+    it('rejects authorizing an intent linked to a cancelled order', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 100,
+        currencyCode: 'SAR',
+        orderId: 'order-cx',
+      }).expect(201);
+      await authorizeThen(intent.body.id, 'authorize').expect(409);
+    });
+
+    it('failing an intent does not project PAYMENT_FAILED onto a cancelled order', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 100,
+        currencyCode: 'SAR',
+        orderId: 'order-cx',
+      }).expect(201);
+      await authorizeThen(intent.body.id, 'fail')
+        .expect(200)
+        .expect((res) => expect(res.body.status).toBe('FAILED'));
+      expect(orderPaymentStatus('order-cx')).toBe('UNPAID');
+    });
+  });
+
+  describe('provider-mismatched events (finding 8)', () => {
+    const simulateEvent = (body: Record<string, unknown>) =>
+      request(app.getHttpServer())
+        .post('/payment-events/simulate')
+        .set(auth(managerToken))
+        .send(body);
+
+    it('accepts a matching-provider event and rejects a mismatched one', async () => {
+      const manual = await createIntent(managerToken, {
+        amountMinor: 100,
+        currencyCode: 'SAR',
+        provider: 'MANUAL',
+      }).expect(201);
+      // Matching provider (MANUAL event → MANUAL intent) is accepted.
+      await simulateEvent({
+        provider: 'MANUAL',
+        providerEventId: 'evt-manual-1',
+        eventType: 'CAPTURE_SUCCEEDED',
+        intentId: manual.body.id,
+      }).expect(201);
+      // Mismatched provider (SIMULATED event → MANUAL intent) is rejected.
+      await simulateEvent({
+        provider: 'SIMULATED',
+        providerEventId: 'evt-manual-2',
+        eventType: 'CAPTURE_SUCCEEDED',
+        intentId: manual.body.id,
+      }).expect(409);
+    });
+
+    it('still rejects an event for another tenant’s intent', async () => {
+      await simulateEvent({
+        provider: 'SIMULATED',
+        providerEventId: 'evt-xtenant',
+        eventType: 'CAPTURE_SUCCEEDED',
+        intentId: 'pi-b',
+      }).expect(400);
+    });
+  });
+
+  describe('event idempotency-key conflicts (finding 3)', () => {
+    const simulateEvent = (body: Record<string, unknown>) =>
+      request(app.getHttpServer())
+        .post('/payment-events/simulate')
+        .set(auth(managerToken))
+        .send(body);
+
+    it('replays same event, but 409s a key reused for a different event', async () => {
+      const first = await simulateEvent({
+        provider: 'SIMULATED',
+        providerEventId: 'evt-k1',
+        eventType: 'CAPTURE_SUCCEEDED',
+        idempotencyKey: 'ikey-1',
+      }).expect(201);
+      // Same providerEventId + same key → dedupe replay (same record).
+      const replay = await simulateEvent({
+        provider: 'SIMULATED',
+        providerEventId: 'evt-k1',
+        eventType: 'CAPTURE_SUCCEEDED',
+        idempotencyKey: 'ikey-1',
+      }).expect(201);
+      expect(replay.body.id).toBe(first.body.id);
+      // DIFFERENT providerEventId reusing the key → controlled 409, not a 500.
+      await simulateEvent({
+        provider: 'SIMULATED',
+        providerEventId: 'evt-k2',
+        eventType: 'CAPTURE_SUCCEEDED',
+        idempotencyKey: 'ikey-1',
+      }).expect(409);
     });
   });
 });

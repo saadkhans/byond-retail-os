@@ -460,6 +460,16 @@ export class PaymentsService {
         'This idempotency key was already used for a different payment operation or intent',
       );
     }
+    if (result === 'order-cancelled') {
+      throw new ConflictException(
+        'The linked order is cancelled; it cannot be authorized or captured',
+      );
+    }
+    if (result === 'order-already-paid') {
+      throw new ConflictException(
+        'The linked order is already paid; capturing again would double-capture it',
+      );
+    }
     return result.intent;
   }
 

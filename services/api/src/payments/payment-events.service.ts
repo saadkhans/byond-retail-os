@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -41,7 +42,7 @@ export class PaymentEventsService {
       providerRef: dto.providerRef,
     });
     assertSafeIdempotencyKey(dto.idempotencyKey);
-    let result: IngestEventResult | 'intent-not-found';
+    let result: IngestEventResult | 'intent-not-found' | 'intent-provider-mismatch';
     try {
       result = await this.repository.ingest(
         tenantId,
@@ -64,16 +65,29 @@ export class PaymentEventsService {
           }),
       );
     } catch (error) {
-      // Duplicate delivery racing the (tenant, provider, providerEventId) or
-      // (tenant, idempotencyKey) unique: replay the recorded event.
       if (prismaErrorCode(error) === 'P2002') {
-        const existing = await this.repository.findByProviderEventId(
+        // Duplicate delivery of the SAME provider event: replay the record.
+        const sameEvent = await this.repository.findByProviderEventId(
           tenantId,
           dto.provider,
           dto.providerEventId,
         );
-        if (existing) {
-          return existing;
+        if (sameEvent) {
+          return sameEvent;
+        }
+        // Otherwise the (tenant, idempotencyKey) unique was hit by a DIFFERENT
+        // provider event reusing the same key — a controlled conflict, never a
+        // raw 500. (No key → the only unique is provider/eventId, handled above.)
+        if (dto.idempotencyKey) {
+          const keyOwner = await this.repository.findByIdempotencyKey(
+            tenantId,
+            dto.idempotencyKey,
+          );
+          if (keyOwner) {
+            throw new ConflictException(
+              'This idempotency key was already used for a different provider event',
+            );
+          }
         }
       }
       if (prismaErrorCode(error) === 'P2003') {
@@ -86,6 +100,11 @@ export class PaymentEventsService {
     if (result === 'intent-not-found') {
       throw new BadRequestException(
         `Payment intent "${dto.intentId}" not found`,
+      );
+    }
+    if (result === 'intent-provider-mismatch') {
+      throw new ConflictException(
+        'The referenced payment intent belongs to a different provider than this event',
       );
     }
     return result.event;

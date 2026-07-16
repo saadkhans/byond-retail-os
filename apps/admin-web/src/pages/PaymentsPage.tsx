@@ -202,7 +202,7 @@ export function PaymentIntentDetailPage() {
   const [actionError, setActionError] = useState<string | null>(null);
 
   const { data, error, loading } = useLoad<PaymentIntent>(
-    () => api(`/payments/${id}`),
+    () => api(`/payments/intents/${id}`),
     [id, reload],
   );
 

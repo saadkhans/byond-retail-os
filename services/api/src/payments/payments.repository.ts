@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import {
   Order,
   OrderPaymentStatus,
+  OrderStatus,
   PaymentAuthorization,
   PaymentAuthorizationStatus,
   PaymentCapture,
@@ -93,7 +94,13 @@ export type CreateIntentRejection =
 export type TransitionRejection =
   | 'terminal-blocked'
   | 'invalid-state'
-  | 'idempotency-key-conflict';
+  | 'idempotency-key-conflict'
+  // The linked order is CANCELLED — a cancelled order must never be
+  // authorized/paid without a returns/refunds flow.
+  | 'order-cancelled'
+  // The linked order is already PAID (by this or another intent) — capturing
+  // again would double-capture the same order.
+  | 'order-already-paid';
 
 export interface IntentResult {
   intent: PaymentIntentDetail;
@@ -379,6 +386,12 @@ export class PaymentsRepository extends TenantScopedRepository {
       if (!AUTHORIZABLE_STATUSES.includes(intent.status)) {
         return 'invalid-state' as const;
       }
+      // Resolve the linked order (by orderId, else by the checkout session the
+      // intent belongs to). A CANCELLED order must never be authorized.
+      const order = await this.resolveLinkedOrder(tx, scopedTenantId, intent);
+      if (order && order.status === OrderStatus.CANCELLED) {
+        return 'order-cancelled' as const;
+      }
       const now = new Date();
       const authorization = await tx.paymentAuthorization.create({
         data: {
@@ -402,11 +415,11 @@ export class PaymentsRepository extends TenantScopedRepository {
         builders.authorizationCreated(authorization),
         tx,
       );
-      // Project onto a linked order (never downgrades a PAID order).
+      // Project onto the linked order (never downgrades a PAID or touches a
+      // CANCELLED order).
       await this.projectOrderPaymentStatus(
         tx,
-        scopedTenantId,
-        intent.orderId,
+        order,
         OrderPaymentStatus.AUTHORIZED,
         null,
         builders.orderUpdated,
@@ -472,6 +485,19 @@ export class PaymentsRepository extends TenantScopedRepository {
       if (!CAPTURABLE_STATUSES.includes(intent.status)) {
         return 'invalid-state' as const;
       }
+      // Resolve the linked order — by orderId, else by the checkout session
+      // this intent was created for (a session-linked pre-order payment binds
+      // to the order generated from that same session). Reject before writing
+      // any capture/reconciliation row if the order is CANCELLED, or already
+      // PAID (by this or ANY other intent) — the latter blocks a double
+      // capture across multiple intents for the same order.
+      const order = await this.resolveLinkedOrder(tx, scopedTenantId, intent);
+      if (order && order.status === OrderStatus.CANCELLED) {
+        return 'order-cancelled' as const;
+      }
+      if (order && order.paymentStatus === OrderPaymentStatus.PAID) {
+        return 'order-already-paid' as const;
+      }
       const now = new Date();
       const capture = await tx.paymentCapture.create({
         data: {
@@ -513,11 +539,11 @@ export class PaymentsRepository extends TenantScopedRepository {
         builders.reconciliationCreated(reconciliation),
         tx,
       );
-      // CAPTURED is the ONLY state that marks an order PAID.
+      // CAPTURED is the ONLY state that marks an order PAID — including a
+      // session-linked intent whose order is resolved via its checkout session.
       await this.projectOrderPaymentStatus(
         tx,
-        scopedTenantId,
-        intent.orderId,
+        order,
         OrderPaymentStatus.PAID,
         now,
         builders.orderPaid,
@@ -588,10 +614,10 @@ export class PaymentsRepository extends TenantScopedRepository {
       }
       await this.auditLog.record(builders.intentCancelled(intent, after), tx);
       if (target === PaymentStatus.VOIDED) {
+        const order = await this.resolveLinkedOrder(tx, scopedTenantId, intent);
         await this.projectOrderPaymentStatus(
           tx,
-          scopedTenantId,
-          intent.orderId,
+          order,
           OrderPaymentStatus.VOIDED,
           null,
           builders.orderUpdated,
@@ -635,11 +661,25 @@ export class PaymentsRepository extends TenantScopedRepository {
           failureReason: input.reason,
         },
       });
+      // FAILED is terminal — an authorized intent can no longer be voided, so
+      // void its active authorization holds HERE in the same transaction. A
+      // simulated hold must never outlive its (now FAILED) intent.
+      await tx.paymentAuthorization.updateMany({
+        where: {
+          tenantId: scopedTenantId,
+          intentId: id,
+          status: PaymentAuthorizationStatus.AUTHORIZED,
+        },
+        data: {
+          status: PaymentAuthorizationStatus.VOIDED,
+          voidedAt: now,
+        },
+      });
       await this.auditLog.record(builders.intentFailed(intent, after), tx);
+      const order = await this.resolveLinkedOrder(tx, scopedTenantId, intent);
       await this.projectOrderPaymentStatus(
         tx,
-        scopedTenantId,
-        intent.orderId,
+        order,
         OrderPaymentStatus.PAYMENT_FAILED,
         null,
         builders.orderUpdated,
@@ -663,47 +703,73 @@ export class PaymentsRepository extends TenantScopedRepository {
   }
 
   /**
-   * Projects a payment transition onto a linked order's paymentStatus. NEVER
-   * downgrades a PAID order (CAPTURED is terminal; once paid, an order stays
-   * paid), so a later void/fail on a stray intent cannot un-pay it. Audits the
-   * change only when the status actually moves.
+   * Resolves the order a payment intent projects onto. Binds by explicit
+   * orderId first; otherwise, for a session-linked pre-order payment, by the
+   * order generated from the SAME checkout session (so capturing a
+   * session-only intent still marks that order PAID). Tenant-safe: both lookups
+   * are scoped to the caller's tenant, so a cross-tenant session/order can
+   * never be resolved. Returns null when nothing is linked yet (projection
+   * safely no-ops — no error).
+   */
+  private resolveLinkedOrder(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    intent: { orderId: string | null; checkoutSessionId: string | null },
+  ): Promise<Order | null> {
+    if (intent.orderId) {
+      return tx.order.findFirst({
+        where: { id: intent.orderId, tenantId },
+      });
+    }
+    if (intent.checkoutSessionId) {
+      return tx.order.findFirst({
+        where: { checkoutSessionId: intent.checkoutSessionId, tenantId },
+      });
+    }
+    return Promise.resolve(null);
+  }
+
+  /**
+   * Projects a payment transition onto the ALREADY-RESOLVED linked order (see
+   * resolveLinkedOrder). NEVER touches a CANCELLED order — a cancelled order
+   * must not become PAID/AUTHORIZED/PAYMENT_FAILED without a returns/refunds
+   * flow. NEVER downgrades a PAID order (CAPTURED is terminal; once paid, an
+   * order stays paid), so a later void/fail on a stray intent cannot un-pay it.
+   * Audits the change only when the status actually moves.
    */
   private async projectOrderPaymentStatus(
     tx: Prisma.TransactionClient,
-    tenantId: string,
-    orderId: string | null,
+    order: Order | null,
     target: OrderPaymentStatus,
     paidAt: Date | null,
     buildAuditEntry?: (before: Order, after: Order) => AuditEntry,
   ): Promise<void> {
-    if (!orderId) {
+    if (!order) {
       return;
     }
-    const before = await tx.order.findFirst({
-      where: { id: orderId, tenantId },
-    });
-    if (!before) {
+    // A cancelled order never becomes paid/authorized/failed here.
+    if (order.status === OrderStatus.CANCELLED) {
       return;
     }
     // Once PAID, stay PAID: a payment failure/void never un-pays an order.
     if (
-      before.paymentStatus === OrderPaymentStatus.PAID &&
+      order.paymentStatus === OrderPaymentStatus.PAID &&
       target !== OrderPaymentStatus.PAID
     ) {
       return;
     }
-    if (before.paymentStatus === target) {
+    if (order.paymentStatus === target) {
       return;
     }
     const after = await tx.order.update({
-      where: { id: before.id },
+      where: { id: order.id },
       data: {
         paymentStatus: target,
-        paidAt: target === OrderPaymentStatus.PAID ? paidAt : before.paidAt,
+        paidAt: target === OrderPaymentStatus.PAID ? paidAt : order.paidAt,
       },
     });
     if (buildAuditEntry) {
-      await this.auditLog.record(buildAuditEntry(before, after), tx);
+      await this.auditLog.record(buildAuditEntry(order, after), tx);
     }
   }
 
