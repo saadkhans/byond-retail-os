@@ -1,6 +1,13 @@
-import { FormEvent, useState } from 'react';
+import { FormEvent, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { api, ApiError, Paginated, PaymentIntent, PaymentStatus } from '../api';
+import {
+  api,
+  ApiError,
+  Paginated,
+  PaymentIntent,
+  PaymentStatus,
+  ReconciliationRecord,
+} from '../api';
 import { formatDate, Page, StatusBadge, useLoad } from '../components';
 
 const INTENT_STATUSES: (PaymentStatus | '')[] = [
@@ -46,6 +53,10 @@ export function PaymentsPage() {
   const [orderId, setOrderId] = useState('');
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  // One idempotency key per FORM SUBMISSION: a failed create retried by the
+  // user replays the same key (never a duplicate intent). A fresh key is
+  // generated only after confirmed success.
+  const createKeyRef = useRef<string>(crypto.randomUUID());
 
   const { data, error, loading } = useLoad<Paginated<PaymentIntent>>(
     () =>
@@ -72,9 +83,11 @@ export function PaymentsPage() {
           amountMinor,
           currencyCode: currency.trim().toUpperCase(),
           orderId: orderId.trim() || undefined,
-          idempotencyKey: crypto.randomUUID(),
+          idempotencyKey: createKeyRef.current,
         },
       });
+      // Success: rotate the key so the NEXT submission is a new intent.
+      createKeyRef.current = crypto.randomUUID();
       navigate(`/payments/${intent.id}`);
     } catch (err) {
       setCreateError(errorMessage(err));
@@ -203,6 +216,16 @@ export function PaymentIntentDetailPage() {
 
   const { data, error, loading } = useLoad<PaymentIntent>(
     () => api(`/payments/intents/${id}`),
+    [id, reload],
+  );
+  // Reconciliation records are guarded by the separate reconciliation:read
+  // permission and are no longer embedded in the intent detail — fetch them
+  // through their own endpoint and degrade quietly on 403.
+  const recon = useLoad<Paginated<ReconciliationRecord> | null>(
+    () =>
+      api<Paginated<ReconciliationRecord>>(
+        `/reconciliation/records?intentId=${id}`,
+      ).catch(() => null),
     [id, reload],
   );
 
@@ -372,8 +395,13 @@ export function PaymentIntentDetailPage() {
           </table>
 
           <h1 style={{ marginTop: '1.5rem' }}>
-            Reconciliation ({data.reconciliationRecords?.length ?? 0})
+            Reconciliation ({recon.data?.items.length ?? 0})
           </h1>
+          {recon.data === null ? (
+            <p className="muted">
+              Requires the reconciliation:read permission.
+            </p>
+          ) : null}
           <table>
             <thead>
               <tr>
@@ -384,7 +412,7 @@ export function PaymentIntentDetailPage() {
               </tr>
             </thead>
             <tbody>
-              {data.reconciliationRecords?.map((record) => (
+              {recon.data?.items.map((record) => (
                 <tr key={record.id}>
                   <td>
                     <Link to={`/reconciliation/${record.id}`}>{record.id}</Link>

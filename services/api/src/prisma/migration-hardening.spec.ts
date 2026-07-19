@@ -279,6 +279,19 @@ describe('payments module backfill migration', () => {
     expect(sql).toContain(`'tm-' || md5(t."id" || ':payments')`);
     expect(sql).toContain(`WHERE pm."code" = 'payments'`);
   });
+
+  it('backfills the payment permission catalog rows (migrate deploy runs without seed)', () => {
+    for (const code of [
+      'payment:read',
+      'payment:manage',
+      'payment:simulate',
+      'reconciliation:read',
+      'reconciliation:manage',
+    ]) {
+      expect(sql).toContain(`'${code}'`);
+    }
+    expect(sql).toContain('ON CONFLICT ("code") DO UPDATE SET');
+  });
 });
 
 describe('checkout line soft-delete migration hardening', () => {

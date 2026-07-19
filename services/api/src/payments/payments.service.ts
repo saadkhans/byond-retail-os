@@ -271,6 +271,16 @@ export class PaymentsService {
               after,
               reason: 'Order marked PAID by captured payment',
             }),
+          siblingHoldsVoided: (auths) =>
+            this.auditEntry(tenantId, actor, {
+              action: AuditAction.VOID,
+              entityType: 'PaymentAuthorization',
+              entityId: auths.map((auth) => auth.id).join(','),
+              before: auths,
+              reason:
+                'Sibling authorization holds released: their order was paid ' +
+                'by another intent’s capture',
+            }),
         },
       );
     } catch (error) {
@@ -338,6 +348,9 @@ export class PaymentsService {
     dto: BindIntentDto,
     actor?: AuditActor,
   ): Promise<PaymentIntentDetail> {
+    // Bind keys get the same sensitive-value screening as every other payment
+    // idempotency key (no credentials, no bare CVV/PIN-shaped digits).
+    assertSafeIdempotencyKey(dto.idempotencyKey);
     const result = await this.repository.bind(
       tenantId,
       id,
@@ -516,7 +529,7 @@ export class PaymentsService {
     }
     if (result === 'order-already-paid') {
       throw new ConflictException(
-        'The linked order is already paid; binding this captured intent would double-pay it',
+        'The order is already paid; a new payment intent cannot be bound to it',
       );
     }
     return result.intent;
@@ -556,8 +569,7 @@ export class PaymentsService {
     }
     if (result === 'order-not-ready') {
       throw new ConflictException(
-        'The checkout session has no order yet; capture once the session has ' +
-          'been completed into an order',
+        'Payment intent must be bound to an order before financial transition.',
       );
     }
     return result.intent;

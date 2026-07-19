@@ -78,7 +78,6 @@ export class OrdersService {
           after,
           reason: dto.reason?.trim() || 'Order cancelled',
         }),
-      actor,
     );
     if (result === null) {
       throw new NotFoundException(`Order "${id}" not found`);
@@ -89,6 +88,12 @@ export class OrdersService {
     if (result === 'order-paid') {
       throw new ConflictException(
         'Order is paid and cannot be cancelled here; returns/refunds are a later phase',
+      );
+    }
+    if (result === 'order-payment-active') {
+      throw new ConflictException(
+        'Order has an active payment authorization; void or cancel the ' +
+          'payment intent first, then cancel the order',
       );
     }
     return result;

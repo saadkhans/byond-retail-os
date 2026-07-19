@@ -135,7 +135,6 @@ describe('OrdersService', () => {
           'order-1',
           'Customer changed mind',
           expect.any(Function),
-          undefined,
         );
       });
     });

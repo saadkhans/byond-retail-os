@@ -311,7 +311,8 @@ export interface PaymentIntent {
   authorizations?: PaymentAuthorization[];
   captures?: PaymentCapture[];
   events?: PaymentEvent[];
-  reconciliationRecords?: ReconciliationRecord[];
+  // Reconciliation records are NOT embedded here — they require the separate
+  // reconciliation:read permission (GET /reconciliation/records?intentId=…).
 }
 
 /**

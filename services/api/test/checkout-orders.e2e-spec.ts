@@ -2140,22 +2140,27 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
       expect(detail.body.paymentStatus).toBe('PAID');
     });
 
-    it('cancelling an AUTHORIZED order releases the simulated hold (finding 7)', async () => {
-      const response = await request(app.getHttpServer())
+    it('refuses to cancel an AUTHORIZED order (void the payment first)', async () => {
+      // Phase 6 policy: order cancellation never releases payment holds — the
+      // payment intent must be voided/cancelled FIRST (payments module), so no
+      // active hold can be left behind and no void orchestration leaks into
+      // the orders module.
+      await request(app.getHttpServer())
         .post('/orders/order-auth-a/cancel')
         .set('Authorization', `Bearer ${managerToken}`)
         .send({ reason: 'abandoned' })
+        .expect(409);
+      const detail = await request(app.getHttpServer())
+        .get('/orders/order-auth-a')
+        .set('Authorization', `Bearer ${managerToken}`)
         .expect(200);
-      expect(response.body.status).toBe('CANCELLED');
-      // Order is not paid, and the linked intent + its hold are voided.
-      expect(response.body.paymentStatus).not.toBe('PAID');
-      expect(
-        store.paymentIntents.find((intent) => intent.id === 'pi-auth-a')?.status,
-      ).toBe('VOIDED');
+      expect(detail.body.status).toBe('CONFIRMED');
+      expect(detail.body.paymentStatus).toBe('AUTHORIZED');
+      // The simulated hold is untouched.
       expect(
         store.paymentAuthorizations.find((auth) => auth.id === 'auth-a')
           ?.status,
-      ).toBe('VOIDED');
+      ).toBe('AUTHORIZED');
     });
   });
 

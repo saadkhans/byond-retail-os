@@ -30,7 +30,26 @@ ON CONFLICT ("code") DO UPDATE SET
   "isActive" = true,
   "updatedAt" = CURRENT_TIMESTAMP;
 
--- 2. Enable the module for every existing tenant that does not already have an
+-- 2. Backfill the Phase 6 permission catalog rows. On an upgraded database,
+--    `prisma migrate deploy` runs WITHOUT the separately guarded `db:seed`, so
+--    without these inserts no tenant role could ever be granted the new
+--    payment/reconciliation permission codes (effective permissions load only
+--    through RolePermission → Permission rows) and every payment endpoint
+--    would stay 403 despite the module being enabled. Idempotent upsert keyed
+--    on the unique `code`, mirroring seedPermissions(); deterministic ids.
+INSERT INTO "Permission" ("id", "code", "description", "module", "createdAt", "updatedAt")
+VALUES
+  ('perm-payment-read-p6', 'payment:read', 'View payment intents, authorizations, captures, and events', 'payments', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  ('perm-payment-manage-p6', 'payment:manage', 'Create payment intents and manage their linkage (no live gateway)', 'payments', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  ('perm-payment-simulate-p6', 'payment:simulate', 'Simulate provider-abstract authorization, capture, cancel/void, failure, and provider events', 'payments', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  ('perm-reconciliation-read-p6', 'reconciliation:read', 'View payment reconciliation records', 'payments', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  ('perm-reconciliation-manage-p6', 'reconciliation:manage', 'Update reconciliation record status (mark reconciled/mismatch — no settlement accounting)', 'payments', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+ON CONFLICT ("code") DO UPDATE SET
+  "description" = EXCLUDED."description",
+  "module" = EXCLUDED."module",
+  "updatedAt" = CURRENT_TIMESTAMP;
+
+-- 3. Enable the module for every existing tenant that does not already have an
 --    enablement row. ON CONFLICT ("tenantId", "moduleId") DO NOTHING makes the
 --    backfill idempotent and never overwrites a tenant's own choice (e.g. a
 --    row a tenant admin already created or disabled). The id is deterministic

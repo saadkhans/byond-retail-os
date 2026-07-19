@@ -804,8 +804,15 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
               : typeof where.intentId === 'object' && where.intentId.in
                 ? where.intentId.in.includes(row.intentId)
                 : row.intentId === where.intentId;
+          const idMatch =
+            where.id === undefined
+              ? true
+              : typeof where.id === 'object' && where.id.in
+                ? where.id.in.includes(row.id)
+                : row.id === where.id;
           if (
             intentMatch &&
+            idMatch &&
             scalarMatch(row, where, ['tenantId', 'status'])
           ) {
             Object.assign(row, stripUndefined(data));
@@ -824,6 +831,20 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
                 : row.intentId === where.intentId;
           return intentMatch && scalarMatch(row, where, ['tenantId', 'status']);
         }).length,
+      findMany: async ({ where }: { where: Where }) =>
+        store.authorizations
+          .filter((row) => {
+            const intentMatch =
+              where.intentId === undefined
+                ? true
+                : typeof where.intentId === 'object' && where.intentId.in
+                  ? where.intentId.in.includes(row.intentId)
+                  : row.intentId === where.intentId;
+            return (
+              intentMatch && scalarMatch(row, where, ['tenantId', 'status'])
+            );
+          })
+          .map((row) => ({ ...row })),
     },
     paymentCapture: {
       create: async ({ data }: { data: Where }) => {
@@ -1114,6 +1135,33 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       .set(auth(token))
       .send(body);
 
+  // Phase 6 policy: financial transitions require a bound order, so tests that
+  // exercise the lifecycle mint a fresh CONFIRMED/UNPAID order on demand.
+  let fixtureSeq = 0;
+  const makeOrder = (): string => {
+    fixtureSeq += 1;
+    const sessionId = `sess-fx-${fixtureSeq}`;
+    const orderId = `order-fx-${fixtureSeq}`;
+    store.sessions.push({
+      id: sessionId,
+      tenantId: 'tenant-a',
+      status: 'COMPLETED',
+    } as Row);
+    store.orders.push({
+      id: orderId,
+      tenantId: 'tenant-a',
+      orderNumber: `ORD-FX${fixtureSeq}`,
+      checkoutSessionId: sessionId,
+      locationId: 'loc-a1',
+      unitId: 'unit-a1',
+      status: 'CONFIRMED',
+      paymentStatus: 'UNPAID',
+      paidAt: null,
+      placedAt: new Date('2026-07-12T00:00:00Z'),
+    } as Row);
+    return orderId;
+  };
+
   describe('access control & module gating', () => {
     it('rejects unauthenticated requests', async () => {
       await request(app.getHttpServer()).get('/payments/intents').expect(401);
@@ -1295,6 +1343,7 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       const intent = await createIntent(managerToken, {
         amountMinor: 300,
         currencyCode: 'SAR',
+        orderId: makeOrder(),
       }).expect(201);
       const id = intent.body.id;
       await request(app.getHttpServer())
@@ -1337,6 +1386,7 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       const intent = await createIntent(managerToken, {
         amountMinor: 100,
         currencyCode: 'SAR',
+        orderId: makeOrder(),
       }).expect(201);
       const id = intent.body.id;
       await request(app.getHttpServer())
@@ -1447,6 +1497,7 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       const intent = await createIntent(managerToken, {
         amountMinor: 800,
         currencyCode: 'SAR',
+        orderId: makeOrder(),
       }).expect(201);
       const id = intent.body.id;
       await request(app.getHttpServer())
@@ -1483,6 +1534,7 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       const intent = await createIntent(managerToken, {
         amountMinor: 800,
         currencyCode: 'SAR',
+        orderId: makeOrder(),
       }).expect(201);
       const id = intent.body.id;
       await request(app.getHttpServer())
@@ -1612,6 +1664,7 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       const intent = await createIntent(managerToken, {
         amountMinor: 250,
         currencyCode: 'SAR',
+        orderId: makeOrder(),
       }).expect(201);
       const id = intent.body.id;
       await authorizeThen(id, 'authorize').expect(200);
@@ -1776,17 +1829,27 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       }).expect(201);
       expect(intent.body.orderId).toBeNull();
       const id = intent.body.id;
-      // Standalone (no order/session) intent authorizes and captures freely.
+      // Phase 6 policy: a standalone intent CANNOT transition financially.
+      await authorizeThen(id, 'authorize').expect(409);
+      await authorizeThen(id, 'capture').expect(409);
+      await authorizeThen(id, 'fail').expect(409);
+      await authorizeThen(id, 'cancel').expect(409);
+      // Bind first (same idempotency key across attempts), THEN transition.
+      const bound = await bind(id, {
+        orderId: 'order-bind',
+        idempotencyKey: 'bind-key-1',
+      }).expect(200);
+      expect(bound.body.orderId).toBe('order-bind');
       await authorizeThen(id, 'authorize').expect(200);
       await authorizeThen(id, 'capture')
         .expect(200)
         .expect((res) => expect(res.body.status).toBe('CAPTURED'));
-      // Bind to the order → projects PAID immediately.
-      const bound = await bind(id, { orderId: 'order-bind' }).expect(200);
-      expect(bound.body.orderId).toBe('order-bind');
       expect(orderPaymentStatus('order-bind')).toBe('PAID');
-      // Re-binding to the SAME order replays.
-      await bind(id, { orderId: 'order-bind' }).expect(200);
+      // Re-binding to the SAME order replays (same key or not).
+      await bind(id, {
+        orderId: 'order-bind',
+        idempotencyKey: 'bind-key-1',
+      }).expect(200);
       // Re-binding to a DIFFERENT order is a conflict.
       await bind(id, { orderId: 'order-a2' }).expect(409);
     });
@@ -1818,15 +1881,29 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       await bind(intent.body.id, { orderId: 'order-b' }).expect(400);
     });
 
-    it('rejects binding a captured intent to an already-paid order', async () => {
+    it('rejects binding any new intent to an already-paid order', async () => {
       const intent = await createIntent(managerToken, {
         amountMinor: 100,
         currencyCode: 'SAR',
       }).expect(201);
-      const id = intent.body.id;
-      await authorizeThen(id, 'authorize').expect(200);
-      await authorizeThen(id, 'capture').expect(200);
-      await bind(id, { orderId: 'order-paid' }).expect(409);
+      await bind(intent.body.id, { orderId: 'order-paid' }).expect(409);
+    });
+
+    it('bind by checkoutSessionId resolves the session’s existing order', async () => {
+      const orderId = makeOrder();
+      const sessionId = store.orders.find((o) => o.id === orderId)!
+        .checkoutSessionId as string;
+      const intent = await createIntent(managerToken, {
+        amountMinor: 150,
+        currencyCode: 'SAR',
+      }).expect(201);
+      const bound = await bind(intent.body.id, {
+        checkoutSessionId: sessionId,
+      }).expect(200);
+      // The session's generated order was resolved and bound too.
+      expect(bound.body.orderId).toBe(orderId);
+      expect(bound.body.checkoutSessionId).toBe(sessionId);
+      await authorizeThen(intent.body.id, 'authorize').expect(200);
     });
   });
 
@@ -1835,6 +1912,7 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       const intent = await createIntent(managerToken, {
         amountMinor: 800,
         currencyCode: 'SAR',
+        orderId: makeOrder(),
       }).expect(201);
       const id = intent.body.id;
       await authorizeThen(id, 'authorize').expect(200);
@@ -1883,15 +1961,13 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       .get(`/payments/intents/${id}`)
       .set(auth(managerToken));
 
-  describe('rejected binds roll back without mutation (findings 1 & 6)', () => {
-    it('rejects binding a CAPTURED intent to a paid order and leaves it unbound', async () => {
+  describe('rejected binds roll back without mutation', () => {
+    it('rejects binding to a paid order; intent unchanged, no audit, retry works', async () => {
       const intent = await createIntent(managerToken, {
         amountMinor: 100,
         currencyCode: 'SAR',
       }).expect(201);
       const id = intent.body.id;
-      await authorizeThen(id, 'authorize').expect(200);
-      await authorizeThen(id, 'capture').expect(200);
       auditCreateSpy.mockClear();
       await bindReq(id, { orderId: 'order-paid' }).expect(409);
       // Intent NOT bound, and NO audit entry recorded for the failed bind.
@@ -1902,21 +1978,29 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
           (call) => call[0].data.entityId === id,
         ),
       ).toBe(false);
-      // A retry to a VALID order still works (not falsely idempotent).
+      // A retry to a VALID order still works (not falsely idempotent), and
+      // the full flow then pays that order.
       await bindReq(id, { orderId: 'order-rb' }).expect(200);
+      await authorizeThen(id, 'authorize').expect(200);
+      await authorizeThen(id, 'capture').expect(200);
       expect(orderPaymentStatus('order-rb')).toBe('PAID');
     });
 
-    it('rejects binding an AUTHORIZED intent to a paid order (finding 6)', async () => {
+    it('rejects binding to a cancelled order; intent unchanged, no audit', async () => {
       const intent = await createIntent(managerToken, {
         amountMinor: 100,
         currencyCode: 'SAR',
       }).expect(201);
       const id = intent.body.id;
-      await authorizeThen(id, 'authorize').expect(200);
-      await bindReq(id, { orderId: 'order-paid' }).expect(409);
+      auditCreateSpy.mockClear();
+      await bindReq(id, { orderId: 'order-cx' }).expect(409);
       const detail = await intentDetail(id).expect(200);
       expect(detail.body.orderId).toBeNull();
+      expect(
+        auditCreateSpy.mock.calls.some(
+          (call) => call[0].data.entityId === id,
+        ),
+      ).toBe(false);
     });
   });
 
@@ -1932,31 +2016,45 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
     });
 
     it('allows binding an order from the intent’s own session', async () => {
+      const orderId = makeOrder();
+      const sessionId = store.orders.find((o) => o.id === orderId)!
+        .checkoutSessionId as string;
       const intent = await createIntent(managerToken, {
         amountMinor: 100,
         currencyCode: 'SAR',
-        checkoutSessionId: 'sess-bind',
+        checkoutSessionId: sessionId,
       }).expect(201);
-      await bindReq(intent.body.id, { orderId: 'order-bind' }).expect(200);
+      await bindReq(intent.body.id, { orderId }).expect(200);
     });
   });
 
-  describe('binding a captured intent voids sibling holds (finding 5)', () => {
-    it('releases the pre-authorized sibling when a bound capture pays the order', async () => {
+  describe('capture after bind voids sibling holds (with audit)', () => {
+    it('releases the pre-authorized sibling when a bound intent captures', async () => {
       const intent = await createIntent(managerToken, {
         amountMinor: 500,
         currencyCode: 'SAR',
       }).expect(201);
       const id = intent.body.id;
-      await authorizeThen(id, 'authorize').expect(200);
-      await authorizeThen(id, 'capture').expect(200);
+      // Bind first (order-bindsib is AUTHORIZED — not PAID — so bind is legal),
+      // then authorize and capture through the normal lifecycle.
       await bindReq(id, { orderId: 'order-bindsib' }).expect(200);
+      await authorizeThen(id, 'authorize').expect(200);
+      auditCreateSpy.mockClear();
+      await authorizeThen(id, 'capture').expect(200);
       expect(orderPaymentStatus('order-bindsib')).toBe('PAID');
-      // The fixture sibling pi-bindsib-auth's hold is now voided.
+      // The fixture sibling pi-bindsib-auth's hold is now voided…
       const siblingDetail = await intentDetail('pi-bindsib-auth').expect(200);
       expect(
         siblingDetail.body.authorizations.every(
           (a: { status: string }) => a.status === 'VOIDED',
+        ),
+      ).toBe(true);
+      // …and the bulk release was AUDITED.
+      expect(
+        auditCreateSpy.mock.calls.some(
+          (call) =>
+            call[0].data.action === 'VOID' &&
+            call[0].data.entityType === 'PaymentAuthorization',
         ),
       ).toBe(true);
       await authorizeThen('pi-bindsib-auth', 'capture').expect(409);

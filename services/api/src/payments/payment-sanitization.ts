@@ -56,10 +56,14 @@ export function assertSafePaymentStrings(
 }
 
 export function assertSafeIdempotencyKey(key: string | undefined): void {
-  if (key !== undefined && containsSensitiveValue(key)) {
+  if (key === undefined) {
+    return;
+  }
+  if (containsSensitiveValue(key) || isBareCvvOrPin(key)) {
     throw new BadRequestException(
       'idempotencyKey must be an opaque identifier and must not contain ' +
-        'credential- or payment-bearing values',
+        'credential- or payment-bearing values (including bare CVV/PIN-shaped ' +
+        'digits)',
     );
   }
 }
