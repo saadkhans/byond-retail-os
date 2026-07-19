@@ -470,6 +470,12 @@ export class PaymentsService {
         'The linked order is already paid; capturing again would double-capture it',
       );
     }
+    if (result === 'order-not-ready') {
+      throw new ConflictException(
+        'The checkout session has no order yet; capture once the session has ' +
+          'been completed into an order',
+      );
+    }
     return result.intent;
   }
 

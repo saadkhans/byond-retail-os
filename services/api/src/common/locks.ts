@@ -134,6 +134,23 @@ export function paymentIntentAdvisoryLockKey(
 }
 
 /**
+ * Serializes payment mutations that project onto the SAME order, across
+ * DIFFERENT intents. The per-intent lock cannot cover this: two intents for
+ * one order, capturing concurrently, hold different intent locks and would
+ * both resolve the order while it is still UNPAID and each write a capture.
+ * Every payment path that authorizes/captures against a resolved order takes
+ * this lock (after the intent lock) before the paid-order check, so only one
+ * capture can pay a given order. Lock order is always intent → order, so no
+ * path can deadlock. MUST be derived identically by every call site.
+ */
+export function orderPaymentAdvisoryLockKey(
+  tenantId: string,
+  orderId: string,
+): string {
+  return `order-payment:${tenantId}:${orderId}`;
+}
+
+/**
  * Serializes provider-event ingestion per (tenant, provider, providerEventId):
  * the ingest path decides from a read-then-write ("have I seen this event?"),
  * so two concurrent deliveries of the SAME provider event must not both insert

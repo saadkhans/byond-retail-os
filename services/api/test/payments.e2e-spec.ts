@@ -240,6 +240,20 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
         paidAt: null,
         placedAt: new Date('2026-07-12T00:00:00Z'),
       },
+      // Already-PAID order (P2-D / capture guard): a pre-authorized intent
+      // linked to it must not be captured or produce new holds.
+      {
+        id: 'order-paid',
+        tenantId: 'tenant-a',
+        orderNumber: 'ORD-000010',
+        checkoutSessionId: 'sess-paid',
+        locationId: 'loc-a1',
+        unitId: 'unit-a1',
+        status: 'CONFIRMED',
+        paymentStatus: 'PAID',
+        paidAt: new Date('2026-07-12T01:00:00Z'),
+        placedAt: new Date('2026-07-12T00:00:00Z'),
+      },
     ] as Row[],
     sessions: [
       { id: 'sess-a1', tenantId: 'tenant-a', status: 'COMPLETED' },
@@ -249,6 +263,7 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       { id: 'sess-a4', tenantId: 'tenant-a', status: 'COMPLETED' },
       { id: 'sess-a5', tenantId: 'tenant-a', status: 'COMPLETED' },
       { id: 'sess-cx', tenantId: 'tenant-a', status: 'COMPLETED' },
+      { id: 'sess-paid', tenantId: 'tenant-a', status: 'COMPLETED' },
       { id: 'sess-b', tenantId: 'tenant-b', status: 'COMPLETED' },
     ] as Row[],
     intents: [
@@ -259,6 +274,16 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
         id: 'pi-cx-auth',
         tenantId: 'tenant-a',
         orderId: 'order-cx',
+        status: 'AUTHORIZED',
+        amountMinor: 500,
+        authorizedAt: new Date('2026-07-12T00:00:00Z'),
+      }),
+      // Pre-AUTHORIZED intent linked to an already-PAID order (P2-D / capture
+      // guard): capture must be rejected and write no rows.
+      intentRow({
+        id: 'pi-paid-auth',
+        tenantId: 'tenant-a',
+        orderId: 'order-paid',
         status: 'AUTHORIZED',
         amountMinor: 500,
         authorizedAt: new Date('2026-07-12T00:00:00Z'),
@@ -456,10 +481,35 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
         store.orders.find((o) =>
           scalarMatch(o, where, ['id', 'tenantId', 'checkoutSessionId']),
         ) ?? null,
-      update: async ({ where, data }: { where: Where; data: Where }) => {
-        const row = store.orders.find((o) => o.id === where.id)!;
-        Object.assign(row, stripUndefined(data), { updatedAt: new Date() });
+      findFirstOrThrow: async ({ where }: { where: Where }) => {
+        const row = store.orders.find((o) =>
+          scalarMatch(o, where, ['id', 'tenantId']),
+        );
+        if (!row) {
+          throw new Error('Order not found');
+        }
         return { ...row };
+      },
+      // Honors the conditional guards `status: { not }` / `paymentStatus:
+      // { not }` the projection uses to keep a PAID/CANCELLED order intact.
+      updateMany: async ({ where, data }: { where: Where; data: Where }) => {
+        const matchNot = (field: string, value: unknown) =>
+          where[field] === undefined ||
+          (typeof where[field] === 'object' && where[field].not !== undefined
+            ? value !== where[field].not
+            : value === where[field]);
+        const row = store.orders.find(
+          (o) =>
+            o.id === where.id &&
+            o.tenantId === where.tenantId &&
+            matchNot('status', o.status) &&
+            matchNot('paymentStatus', o.paymentStatus),
+        );
+        if (!row) {
+          return { count: 0 };
+        }
+        Object.assign(row, stripUndefined(data), { updatedAt: new Date() });
+        return { count: 1 };
       },
     },
     paymentIntent: {
@@ -574,7 +624,13 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
           ]),
         ).length,
       update: async ({ where, data }: { where: Where; data: Where }) => {
-        const row = store.intents.find((r) => r.id === where.id)!;
+        // Supports both `{ id }` and the tenant-scoped composite
+        // `{ id_tenantId: { id, tenantId } }` unique the repository now uses.
+        const wid = where.id_tenantId?.id ?? where.id;
+        const wtid = where.id_tenantId?.tenantId;
+        const row = store.intents.find(
+          (r) => r.id === wid && (wtid === undefined || r.tenantId === wtid),
+        )!;
         Object.assign(row, stripUndefined(data), { updatedAt: new Date() });
         return { ...row };
       },
@@ -1306,7 +1362,7 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       expect(store.orders.find((o) => o.id === 'order-a3')?.paidAt).not.toBeNull();
     });
 
-    it('safely no-ops when the session has no generated order yet', async () => {
+    it('rejects capturing a session-linked intent before its order exists (finding P2-C)', async () => {
       const intent = await createIntent(managerToken, {
         amountMinor: 100,
         currencyCode: 'SAR',
@@ -1314,9 +1370,14 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       }).expect(201);
       const id = intent.body.id;
       await authorizeThen(id, 'authorize').expect(200);
-      await authorizeThen(id, 'capture')
-        .expect(200)
-        .expect((res) => expect(res.body.status).toBe('CAPTURED'));
+      // sess-a4 has no generated order — capturing would leave that future
+      // order UNPAID forever, so it is rejected rather than silently no-op'd.
+      await authorizeThen(id, 'capture').expect(409);
+      const caps = await request(app.getHttpServer())
+        .get(`/payments/captures?intentId=${id}`)
+        .set(auth(managerToken))
+        .expect(200);
+      expect(caps.body.total).toBe(0);
     });
 
     it('rejects linking another tenant’s checkout session (cross-tenant)', async () => {
@@ -1328,8 +1389,8 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
     });
   });
 
-  describe('already-paid order guard (finding 4)', () => {
-    it('rejects a second intent capturing an already-paid order; no rows written', async () => {
+  describe('already-paid order guard (findings 4 & P2-D)', () => {
+    it('pays the order, replays the same capture, and blocks a second intent', async () => {
       const first = await createIntent(managerToken, {
         amountMinor: 700,
         currencyCode: 'SAR',
@@ -1341,34 +1402,36 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       }).expect(200);
       expect(orderPaymentStatus('order-a5')).toBe('PAID');
 
-      const second = await createIntent(managerToken, {
-        amountMinor: 700,
-        currencyCode: 'SAR',
-        orderId: 'order-a5',
-      }).expect(201);
-      await authorizeThen(second.body.id, 'authorize').expect(200);
-      // A DIFFERENT fresh key cannot double-capture the already-paid order.
-      await authorizeThen(second.body.id, 'capture', {
-        idempotencyKey: 'f4-cap-2',
-      }).expect(409);
-
-      const caps = await request(app.getHttpServer())
-        .get(`/payments/captures?intentId=${second.body.id}`)
-        .set(auth(managerToken))
-        .expect(200);
-      expect(caps.body.total).toBe(0);
-      const recon = await request(app.getHttpServer())
-        .get(`/reconciliation/records?intentId=${second.body.id}`)
-        .set(auth(managerToken))
-        .expect(200);
-      expect(recon.body.total).toBe(0);
-
-      // Idempotent replay of the FIRST capture still works.
+      // Idempotent replay of the SAME capture still works.
       await authorizeThen(first.body.id, 'capture', {
         idempotencyKey: 'f4-cap-1',
       })
         .expect(200)
         .expect((res) => expect(res.body.status).toBe('CAPTURED'));
+
+      // A SECOND intent for the same order cannot even be AUTHORIZED once the
+      // order is PAID (P2-D) — no new simulated hold can accumulate.
+      const second = await createIntent(managerToken, {
+        amountMinor: 700,
+        currencyCode: 'SAR',
+        orderId: 'order-a5',
+      }).expect(201);
+      await authorizeThen(second.body.id, 'authorize').expect(409);
+    });
+
+    it('rejects capturing a pre-authorized intent whose order is already paid; no rows written', async () => {
+      await authorizeThen('pi-paid-auth', 'capture').expect(409);
+      const caps = await request(app.getHttpServer())
+        .get('/payments/captures?intentId=pi-paid-auth')
+        .set(auth(managerToken))
+        .expect(200);
+      expect(caps.body.total).toBe(0);
+      const recon = await request(app.getHttpServer())
+        .get('/reconciliation/records?intentId=pi-paid-auth')
+        .set(auth(managerToken))
+        .expect(200);
+      expect(recon.body.total).toBe(0);
+      expect(orderPaymentStatus('order-paid')).toBe('PAID');
     });
   });
 

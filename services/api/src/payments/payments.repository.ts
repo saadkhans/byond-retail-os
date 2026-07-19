@@ -17,7 +17,10 @@ import {
   AuditEntry,
   AuditLogService,
 } from '../common/audit/audit-log.service';
-import { paymentIntentAdvisoryLockKey } from '../common/locks';
+import {
+  orderPaymentAdvisoryLockKey,
+  paymentIntentAdvisoryLockKey,
+} from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
 import { TenantScopedRepository } from '../prisma/tenant-scoped.repository';
 import {
@@ -100,7 +103,24 @@ export type TransitionRejection =
   | 'order-cancelled'
   // The linked order is already PAID (by this or another intent) — capturing
   // again would double-capture the same order.
-  | 'order-already-paid';
+  | 'order-already-paid'
+  // A session-linked intent was captured before its order exists yet. We
+  // reject rather than silently leave the (future) order UNPAID forever.
+  | 'order-not-ready';
+
+/**
+ * Thrown INSIDE the capture transaction when the linked-order projection loses
+ * a concurrency race (a competing capture already paid the order, or it was
+ * cancelled after we resolved it). Throwing rolls the whole capture back — no
+ * duplicate PaymentCapture/reconciliation row survives — and is mapped to a
+ * controlled 409 at the transaction boundary.
+ */
+class CaptureOrderConflict extends Error {
+  constructor() {
+    super('capture-order-conflict');
+    this.name = 'CaptureOrderConflict';
+  }
+}
 
 export interface IntentResult {
   intent: PaymentIntentDetail;
@@ -386,11 +406,17 @@ export class PaymentsRepository extends TenantScopedRepository {
       if (!AUTHORIZABLE_STATUSES.includes(intent.status)) {
         return 'invalid-state' as const;
       }
-      // Resolve the linked order (by orderId, else by the checkout session the
-      // intent belongs to). A CANCELLED order must never be authorized.
-      const order = await this.resolveLinkedOrder(tx, scopedTenantId, intent);
+      // Resolve and LOCK the linked order (by orderId, else by the checkout
+      // session the intent belongs to), then re-read it under the lock so the
+      // CANCELLED/PAID checks see the latest committed state. A CANCELLED order
+      // must never be authorized, and an already-PAID order must not accumulate
+      // further simulated holds.
+      const order = await this.lockAndReloadLinkedOrder(tx, scopedTenantId, intent);
       if (order && order.status === OrderStatus.CANCELLED) {
         return 'order-cancelled' as const;
+      }
+      if (order && order.paymentStatus === OrderPaymentStatus.PAID) {
+        return 'order-already-paid' as const;
       }
       const now = new Date();
       const authorization = await tx.paymentAuthorization.create({
@@ -407,7 +433,7 @@ export class PaymentsRepository extends TenantScopedRepository {
         },
       });
       const after = await tx.paymentIntent.update({
-        where: { id: intent.id },
+        where: { id_tenantId: { id: intent.id, tenantId: scopedTenantId } },
         data: { status: PaymentStatus.AUTHORIZED, authorizedAt: now },
       });
       await this.auditLog.record(builders.intentAuthorized(intent, after), tx);
@@ -450,106 +476,127 @@ export class PaymentsRepository extends TenantScopedRepository {
     builders: CaptureAuditBuilders,
   ): Promise<IntentResult | TransitionRejection | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
-    return this.prisma.$transaction(async (tx) => {
-      await this.lockIntent(tx, scopedTenantId, id);
-      const intent = await tx.paymentIntent.findFirst({
-        where: { id, tenantId: scopedTenantId },
-      });
-      if (!intent) {
-        return null;
-      }
-      if (input.idempotencyKey) {
-        const existing = await tx.paymentCapture.findFirst({
-          where: {
+    return this.prisma
+      .$transaction(async (tx) => {
+        await this.lockIntent(tx, scopedTenantId, id);
+        const intent = await tx.paymentIntent.findFirst({
+          where: { id, tenantId: scopedTenantId },
+        });
+        if (!intent) {
+          return null;
+        }
+        if (input.idempotencyKey) {
+          const existing = await tx.paymentCapture.findFirst({
+            where: {
+              tenantId: scopedTenantId,
+              idempotencyKey: input.idempotencyKey,
+            },
+          });
+          if (existing) {
+            if (
+              existing.intentId === id &&
+              intent.status === PaymentStatus.CAPTURED
+            ) {
+              return this.replay(tx, scopedTenantId, id);
+            }
+            return 'idempotency-key-conflict' as const;
+          }
+        }
+        if (intent.status === PaymentStatus.CAPTURED) {
+          // Already captured with no matching key: never a legal recapture.
+          return 'invalid-state' as const;
+        }
+        if (isTerminalPaymentStatus(intent.status)) {
+          return 'terminal-blocked' as const;
+        }
+        if (!CAPTURABLE_STATUSES.includes(intent.status)) {
+          return 'invalid-state' as const;
+        }
+        // Resolve and LOCK the linked order — by orderId, else by the checkout
+        // session this intent was created for. The order lock serializes
+        // captures across DIFFERENT intents for the SAME order, so only one can
+        // pay it. Re-read under the lock so the CANCELLED/PAID checks and the
+        // projection all see the latest committed state.
+        const order = await this.lockAndReloadLinkedOrder(tx, scopedTenantId, intent);
+        // A session-linked intent whose order has not been generated yet: we
+        // reject rather than record a capture the (future) order can never
+        // learn about (which would leave it UNPAID forever).
+        if (!order && intent.checkoutSessionId) {
+          return 'order-not-ready' as const;
+        }
+        if (order && order.status === OrderStatus.CANCELLED) {
+          return 'order-cancelled' as const;
+        }
+        if (order && order.paymentStatus === OrderPaymentStatus.PAID) {
+          return 'order-already-paid' as const;
+        }
+        const now = new Date();
+        const capture = await tx.paymentCapture.create({
+          data: {
             tenantId: scopedTenantId,
+            intentId: id,
+            status: PaymentCaptureStatus.SUCCEEDED,
+            amountMinor: intent.amountMinor,
+            providerRef: input.providerRef,
+            capturedAt: now,
             idempotencyKey: input.idempotencyKey,
+            createdById: input.actorId,
           },
         });
-        if (existing) {
-          if (
-            existing.intentId === id &&
-            intent.status === PaymentStatus.CAPTURED
-          ) {
-            return this.replay(tx, scopedTenantId, id);
+        const after = await tx.paymentIntent.update({
+          where: { id_tenantId: { id: intent.id, tenantId: scopedTenantId } },
+          data: {
+            status: PaymentStatus.CAPTURED,
+            capturedAmountMinor: intent.amountMinor,
+            capturedAt: now,
+          },
+        });
+        // Reconciliation foundation: a PENDING record links the captured
+        // payment to future provider settlement (no accounting in Phase 6).
+        const reconciliation = await tx.paymentReconciliationRecord.create({
+          data: {
+            tenantId: scopedTenantId,
+            intentId: id,
+            captureId: capture.id,
+            provider: intent.provider,
+            status: ReconciliationStatus.PENDING,
+            providerRef: capture.providerRef,
+            expectedAmountMinor: capture.amountMinor,
+            currencyCode: intent.currencyCode,
+          },
+        });
+        await this.auditLog.record(builders.intentCaptured(intent, after), tx);
+        await this.auditLog.record(builders.captureCreated(capture), tx);
+        await this.auditLog.record(
+          builders.reconciliationCreated(reconciliation),
+          tx,
+        );
+        // CAPTURED is the ONLY state that marks an order PAID. The projection
+        // is a CONDITIONAL, tenant-scoped update (status != CANCELLED,
+        // paymentStatus != PAID). If it matches zero rows, a concurrent
+        // capture/cancel won the order after our checks — throw to ROLL BACK
+        // this whole capture so no duplicate capture/reconciliation row
+        // survives, and the loser gets a controlled 409.
+        if (order) {
+          const projected = await this.projectOrderPaymentStatus(
+            tx,
+            order,
+            OrderPaymentStatus.PAID,
+            now,
+            builders.orderPaid,
+          );
+          if (!projected) {
+            throw new CaptureOrderConflict();
           }
-          return 'idempotency-key-conflict' as const;
         }
-      }
-      if (intent.status === PaymentStatus.CAPTURED) {
-        // Already captured with no matching key: never a legal recapture.
-        return 'invalid-state' as const;
-      }
-      if (isTerminalPaymentStatus(intent.status)) {
-        return 'terminal-blocked' as const;
-      }
-      if (!CAPTURABLE_STATUSES.includes(intent.status)) {
-        return 'invalid-state' as const;
-      }
-      // Resolve the linked order — by orderId, else by the checkout session
-      // this intent was created for (a session-linked pre-order payment binds
-      // to the order generated from that same session). Reject before writing
-      // any capture/reconciliation row if the order is CANCELLED, or already
-      // PAID (by this or ANY other intent) — the latter blocks a double
-      // capture across multiple intents for the same order.
-      const order = await this.resolveLinkedOrder(tx, scopedTenantId, intent);
-      if (order && order.status === OrderStatus.CANCELLED) {
-        return 'order-cancelled' as const;
-      }
-      if (order && order.paymentStatus === OrderPaymentStatus.PAID) {
-        return 'order-already-paid' as const;
-      }
-      const now = new Date();
-      const capture = await tx.paymentCapture.create({
-        data: {
-          tenantId: scopedTenantId,
-          intentId: id,
-          status: PaymentCaptureStatus.SUCCEEDED,
-          amountMinor: intent.amountMinor,
-          providerRef: input.providerRef,
-          capturedAt: now,
-          idempotencyKey: input.idempotencyKey,
-          createdById: input.actorId,
-        },
+        return this.replay(tx, scopedTenantId, id);
+      })
+      .catch((error: unknown) => {
+        if (error instanceof CaptureOrderConflict) {
+          return 'order-already-paid' as const;
+        }
+        throw error;
       });
-      const after = await tx.paymentIntent.update({
-        where: { id: intent.id },
-        data: {
-          status: PaymentStatus.CAPTURED,
-          capturedAmountMinor: intent.amountMinor,
-          capturedAt: now,
-        },
-      });
-      // Reconciliation foundation: a PENDING record links the captured
-      // payment to future provider settlement (no accounting in Phase 6).
-      const reconciliation = await tx.paymentReconciliationRecord.create({
-        data: {
-          tenantId: scopedTenantId,
-          intentId: id,
-          captureId: capture.id,
-          provider: intent.provider,
-          status: ReconciliationStatus.PENDING,
-          providerRef: capture.providerRef,
-          expectedAmountMinor: capture.amountMinor,
-          currencyCode: intent.currencyCode,
-        },
-      });
-      await this.auditLog.record(builders.intentCaptured(intent, after), tx);
-      await this.auditLog.record(builders.captureCreated(capture), tx);
-      await this.auditLog.record(
-        builders.reconciliationCreated(reconciliation),
-        tx,
-      );
-      // CAPTURED is the ONLY state that marks an order PAID — including a
-      // session-linked intent whose order is resolved via its checkout session.
-      await this.projectOrderPaymentStatus(
-        tx,
-        order,
-        OrderPaymentStatus.PAID,
-        now,
-        builders.orderPaid,
-      );
-      return this.replay(tx, scopedTenantId, id);
-    });
   }
 
   // ------------------------------------------------------------ cancel/void
@@ -592,7 +639,7 @@ export class PaymentsRepository extends TenantScopedRepository {
       }
       const now = new Date();
       const after = await tx.paymentIntent.update({
-        where: { id: intent.id },
+        where: { id_tenantId: { id: intent.id, tenantId: scopedTenantId } },
         data: {
           status: target,
           cancelledAt: now,
@@ -654,7 +701,7 @@ export class PaymentsRepository extends TenantScopedRepository {
       }
       const now = new Date();
       const after = await tx.paymentIntent.update({
-        where: { id: intent.id },
+        where: { id_tenantId: { id: intent.id, tenantId: scopedTenantId } },
         data: {
           status: PaymentStatus.FAILED,
           failedAt: now,
@@ -730,12 +777,38 @@ export class PaymentsRepository extends TenantScopedRepository {
   }
 
   /**
-   * Projects a payment transition onto the ALREADY-RESOLVED linked order (see
-   * resolveLinkedOrder). NEVER touches a CANCELLED order — a cancelled order
-   * must not become PAID/AUTHORIZED/PAYMENT_FAILED without a returns/refunds
-   * flow. NEVER downgrades a PAID order (CAPTURED is terminal; once paid, an
-   * order stays paid), so a later void/fail on a stray intent cannot un-pay it.
-   * Audits the change only when the status actually moves.
+   * Resolves the linked order, then takes the per-order advisory lock and
+   * re-reads it under that lock. The lock serializes payment mutations that
+   * project onto the SAME order across DIFFERENT intents (the per-intent lock
+   * cannot), and the re-read guarantees the CANCELLED/PAID checks and the
+   * projection observe the latest committed order state. Returns null when no
+   * order is linked yet (nothing to lock).
+   */
+  private async lockAndReloadLinkedOrder(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    intent: { orderId: string | null; checkoutSessionId: string | null },
+  ): Promise<Order | null> {
+    const order = await this.resolveLinkedOrder(tx, tenantId, intent);
+    if (!order) {
+      return null;
+    }
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${orderPaymentAdvisoryLockKey(
+      tenantId,
+      order.id,
+    )}))`;
+    return tx.order.findFirst({ where: { id: order.id, tenantId } });
+  }
+
+  /**
+   * Projects a payment transition onto the ALREADY-RESOLVED linked order via a
+   * CONDITIONAL, tenant-scoped update: it only fires when the order is NOT
+   * CANCELLED and NOT already PAID. This is the race backstop — under
+   * concurrency Postgres re-evaluates the WHERE after taking the row lock, so a
+   * competing capture/cancel that commits first makes this update match zero
+   * rows. Returns TRUE when the projection actually moved the order, FALSE when
+   * it was skipped or lost the race (the capture path treats a lost race on a
+   * linked order as a rollback-worthy conflict). Audits only on a real move.
    */
   private async projectOrderPaymentStatus(
     tx: Prisma.TransactionClient,
@@ -743,34 +816,37 @@ export class PaymentsRepository extends TenantScopedRepository {
     target: OrderPaymentStatus,
     paidAt: Date | null,
     buildAuditEntry?: (before: Order, after: Order) => AuditEntry,
-  ): Promise<void> {
-    if (!order) {
-      return;
-    }
-    // A cancelled order never becomes paid/authorized/failed here.
-    if (order.status === OrderStatus.CANCELLED) {
-      return;
-    }
-    // Once PAID, stay PAID: a payment failure/void never un-pays an order.
-    if (
-      order.paymentStatus === OrderPaymentStatus.PAID &&
-      target !== OrderPaymentStatus.PAID
-    ) {
-      return;
+  ): Promise<boolean> {
+    if (!order || order.status === OrderStatus.CANCELLED) {
+      return false;
     }
     if (order.paymentStatus === target) {
-      return;
+      return false;
     }
-    const after = await tx.order.update({
-      where: { id: order.id },
+    const updated = await tx.order.updateMany({
+      where: {
+        id: order.id,
+        tenantId: order.tenantId,
+        // Never overwrite a cancelled or already-paid order (a PAID order stays
+        // PAID; a failure/void never un-pays it).
+        status: { not: OrderStatus.CANCELLED },
+        paymentStatus: { not: OrderPaymentStatus.PAID },
+      },
       data: {
         paymentStatus: target,
         paidAt: target === OrderPaymentStatus.PAID ? paidAt : order.paidAt,
       },
     });
+    if (updated.count === 0) {
+      return false;
+    }
     if (buildAuditEntry) {
+      const after = await tx.order.findFirstOrThrow({
+        where: { id: order.id, tenantId: order.tenantId },
+      });
       await this.auditLog.record(buildAuditEntry(order, after), tx);
     }
+    return true;
   }
 
   private async lockIntent(
