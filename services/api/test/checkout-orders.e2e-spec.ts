@@ -237,6 +237,38 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
         idempotencyKey: null,
         createdById: null,
       },
+      // Phase 6: an already-PAID tenant-a order. Cancellation must reject it
+      // (no refund flow). Older placedAt keeps it out of the list-based cancel
+      // tests, which target the newest order.
+      {
+        id: 'order-paid-a',
+        tenantId: 'tenant-a',
+        orderNumber: 'ORD-000900',
+        checkoutSessionId: 'sess-paid-a',
+        locationId: 'loc-a1',
+        unitId: 'unit-a1',
+        status: 'CONFIRMED',
+        paymentStatus: 'PAID',
+        paidAt: new Date('2026-07-11T00:00:00Z'),
+        placedAt: new Date('2026-07-11T00:00:00Z'),
+        confirmedAt: new Date('2026-07-11T00:00:00Z'),
+        cancelledAt: null,
+        cancelReason: null,
+        totalQuantity: 1,
+        subtotalMinor: null,
+        totalMinor: null,
+        currencyCode: null,
+        sourceType: 'MANUAL',
+        sourceId: null,
+        evidenceBundleId: null,
+        visionEventId: null,
+        vlmReviewId: null,
+        evidenceScore: null,
+        evidenceQuality: null,
+        reasonCodes: [],
+        idempotencyKey: null,
+        createdById: null,
+      },
     ] as Row[],
     orderLines: [] as Row[],
     levels: [
@@ -791,7 +823,10 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
             candidate.id === where.id &&
             candidate.tenantId === where.tenantId &&
             (where.status?.in === undefined ||
-              where.status.in.includes(candidate.status)),
+              where.status.in.includes(candidate.status)) &&
+            // Phase 6 cancel guard: never cancel a PAID order.
+            (where.paymentStatus?.not === undefined ||
+              candidate.paymentStatus !== where.paymentStatus.not),
         );
         if (!row) {
           return { count: 0 };
@@ -1988,6 +2023,20 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
         .set('Authorization', `Bearer ${managerToken}`)
         .send({})
         .expect(409);
+    });
+
+    it('refuses to cancel a PAID order (no refund flow); it stays CONFIRMED + PAID', async () => {
+      await request(app.getHttpServer())
+        .post('/orders/order-paid-a/cancel')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ reason: 'change of mind' })
+        .expect(409);
+      const detail = await request(app.getHttpServer())
+        .get('/orders/order-paid-a')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .expect(200);
+      expect(detail.body.status).toBe('CONFIRMED');
+      expect(detail.body.paymentStatus).toBe('PAID');
     });
   });
 

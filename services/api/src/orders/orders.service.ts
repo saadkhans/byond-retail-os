@@ -85,6 +85,11 @@ export class OrdersService {
     if (result === 'already-cancelled') {
       throw new ConflictException('Order is already cancelled');
     }
+    if (result === 'order-paid') {
+      throw new ConflictException(
+        'Order is paid and cannot be cancelled here; returns/refunds are a later phase',
+      );
+    }
     return result;
   }
 

@@ -5,6 +5,7 @@ import {
   HttpCode,
   HttpStatus,
   Param,
+  Patch,
   Post,
   Query,
 } from '@nestjs/common';
@@ -28,6 +29,7 @@ import {
 } from '../auth/decorators/request-context.decorators';
 import { RequestContext } from '../auth/request-context';
 import { AuthorizeIntentDto } from './dto/authorize-intent.dto';
+import { BindIntentDto } from './dto/bind-intent.dto';
 import { CancelIntentDto } from './dto/cancel-intent.dto';
 import { CaptureIntentDto } from './dto/capture-intent.dto';
 import { CreatePaymentIntentDto } from './dto/create-payment-intent.dto';
@@ -229,6 +231,36 @@ export class PaymentsController {
     @CurrentUser() actor: RequestContext,
   ): Promise<PaymentIntentDetail> {
     return this.paymentsService.fail(tenantId, id, dto, {
+      id: actor.userId,
+      email: actor.email,
+    });
+  }
+
+  @Patch('intents/:id/bind')
+  @HttpCode(HttpStatus.OK)
+  @RequirePermissions('payment:manage')
+  @ApiOperation({
+    summary: 'Bind an unlinked intent to an order and/or checkout session',
+    description:
+      'Associates a standalone (or session-only) intent with an order/session ' +
+      'of the caller’s tenant AFTER creation — the walk-out flow: pay first, ' +
+      'associate to the eventual order later. Binding to an order projects the ' +
+      'intent’s current state onto it (a CAPTURED intent marks the order PAID). ' +
+      'Re-binding to the same target replays; a different order/session is a ' +
+      '409 conflict.',
+  })
+  @ApiOkResponse({ description: 'Intent bound (and order projected if linked)' })
+  @ApiNotFoundResponse({ description: 'Not found in this tenant' })
+  @ApiConflictResponse({
+    description: 'Already bound elsewhere, or the linked order is paid/cancelled',
+  })
+  bind(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Body() dto: BindIntentDto,
+    @CurrentUser() actor: RequestContext,
+  ): Promise<PaymentIntentDetail> {
+    return this.paymentsService.bind(tenantId, id, dto, {
       id: actor.userId,
       email: actor.email,
     });

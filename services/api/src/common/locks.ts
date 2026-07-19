@@ -151,6 +151,20 @@ export function orderPaymentAdvisoryLockKey(
 }
 
 /**
+ * Serializes a reconciliation record's status updates within a tenant. The
+ * update decides from a read-then-write (terminal check + audit before/after),
+ * so two concurrent PATCHes must not interleave and record an audit transition
+ * from a stale prior state. ReconciliationRepository.updateStatus MUST derive
+ * it identically.
+ */
+export function reconciliationAdvisoryLockKey(
+  tenantId: string,
+  recordId: string,
+): string {
+  return `reconciliation:${tenantId}:${recordId}`;
+}
+
+/**
  * Serializes provider-event ingestion per (tenant, provider, providerEventId):
  * the ingest path decides from a read-then-write ("have I seen this event?"),
  * so two concurrent deliveries of the SAME provider event must not both insert

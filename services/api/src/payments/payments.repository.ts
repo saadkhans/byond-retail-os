@@ -150,6 +150,20 @@ export interface FailAuditBuilders {
   orderUpdated?: (before: Order, after: Order) => AuditEntry;
 }
 
+export interface BindAuditBuilders {
+  intentBound: (before: PaymentIntent, after: PaymentIntent) => AuditEntry;
+  orderUpdated?: (before: Order, after: Order) => AuditEntry;
+}
+
+export type BindRejection =
+  | 'bind-requires-target'
+  | 'order-not-found'
+  | 'session-not-found'
+  | 'order-session-mismatch'
+  | 'already-bound'
+  | 'order-cancelled'
+  | 'order-already-paid';
+
 @Injectable()
 export class PaymentsRepository extends TenantScopedRepository {
   constructor(
@@ -412,6 +426,13 @@ export class PaymentsRepository extends TenantScopedRepository {
       // must never be authorized, and an already-PAID order must not accumulate
       // further simulated holds.
       const order = await this.lockAndReloadLinkedOrder(tx, scopedTenantId, intent);
+      // A session-linked intent whose order has not been generated yet: reject,
+      // matching capture. A pre-order authorization would otherwise be lost
+      // when the order is later created UNPAID (walk-out pre-auth uses a
+      // STANDALONE intent + the bind operation instead — see bind()).
+      if (!order && intent.checkoutSessionId) {
+        return 'order-not-ready' as const;
+      }
       if (order && order.status === OrderStatus.CANCELLED) {
         return 'order-cancelled' as const;
       }
@@ -588,6 +609,12 @@ export class PaymentsRepository extends TenantScopedRepository {
           if (!projected) {
             throw new CaptureOrderConflict();
           }
+          // The order is now PAID, so any SIBLING intent's simulated hold on
+          // this order is stale (its later capture is already blocked by the
+          // paid-order guard). Void those active holds in the SAME transaction
+          // so no hold outlives the paid order. The capturing intent's own
+          // authorization is left as-is (its hold was consumed by the capture).
+          await this.voidSiblingHolds(tx, scopedTenantId, order.id, id);
         }
         return this.replay(tx, scopedTenantId, id);
       })
@@ -735,7 +762,166 @@ export class PaymentsRepository extends TenantScopedRepository {
     });
   }
 
+  // -------------------------------------------------------------------- bind
+
+  /**
+   * Binds a previously-unlinked (or session-only) intent to an order and/or
+   * checkout session, then projects the intent's CURRENT state onto the bound
+   * order — this is how a standalone walk-out intent, once authorized/captured,
+   * finally marks its order PAID. Tenant-safe: order/session are resolved
+   * within the caller's tenant. Re-binding to the SAME target replays; a
+   * DIFFERENT order/session is a controlled conflict (no silent rebinding). The
+   * order lock + conditional projection make a CAPTURED bind race-safe against
+   * a concurrent capture/cancel on the same order.
+   */
+  bind(
+    tenantId: string,
+    id: string,
+    input: {
+      orderId?: string;
+      checkoutSessionId?: string;
+      actorId?: string;
+    },
+    builders: BindAuditBuilders,
+  ): Promise<IntentResult | BindRejection | null> {
+    const scopedTenantId = this.requireTenantId(tenantId);
+    return this.prisma
+      .$transaction(async (tx) => {
+        await this.lockIntent(tx, scopedTenantId, id);
+        const intent = await tx.paymentIntent.findFirst({
+          where: { id, tenantId: scopedTenantId },
+        });
+        if (!intent) {
+          return null;
+        }
+        if (!input.orderId && !input.checkoutSessionId) {
+          return 'bind-requires-target' as const;
+        }
+        // Rebinding to a DIFFERENT already-bound target is a conflict; the same
+        // target replays. A null current binding may be set for the first time.
+        if (
+          input.orderId &&
+          intent.orderId &&
+          intent.orderId !== input.orderId
+        ) {
+          return 'already-bound' as const;
+        }
+        if (
+          input.checkoutSessionId &&
+          intent.checkoutSessionId &&
+          intent.checkoutSessionId !== input.checkoutSessionId
+        ) {
+          return 'already-bound' as const;
+        }
+        let boundOrder: Order | null = null;
+        if (input.orderId) {
+          boundOrder = await tx.order.findFirst({
+            where: { id: input.orderId, tenantId: scopedTenantId },
+          });
+          if (!boundOrder) {
+            return 'order-not-found' as const;
+          }
+        }
+        if (input.checkoutSessionId) {
+          const session = await tx.checkoutSession.findFirst({
+            where: { id: input.checkoutSessionId, tenantId: scopedTenantId },
+            select: { id: true },
+          });
+          if (!session) {
+            return 'session-not-found' as const;
+          }
+          if (
+            boundOrder &&
+            boundOrder.checkoutSessionId !== input.checkoutSessionId
+          ) {
+            return 'order-session-mismatch' as const;
+          }
+        }
+        // Whether this call NEWLY establishes the order link (vs an idempotent
+        // re-bind to the same order, which must not re-project).
+        const orderNewlyBound = Boolean(input.orderId) && !intent.orderId;
+        const before = intent;
+        const after = await tx.paymentIntent.update({
+          where: { id_tenantId: { id: intent.id, tenantId: scopedTenantId } },
+          data: {
+            orderId: input.orderId ?? undefined,
+            checkoutSessionId: input.checkoutSessionId ?? undefined,
+          },
+        });
+        await this.auditLog.record(builders.intentBound(before, after), tx);
+
+        // Project the intent's current state onto the FRESHLY-bound order. A
+        // repeat bind to the same order already projected on the first bind, so
+        // it is a pure replay. A session-only bind has no order to project onto
+        // (it waits for the order plus a subsequent bind to that order).
+        const target = orderNewlyBound
+          ? this.orderPaymentStatusForIntent(after.status)
+          : null;
+        if (target) {
+          const order = await this.lockAndReloadLinkedOrder(
+            tx,
+            scopedTenantId,
+            after,
+          );
+          if (order) {
+            if (order.status === OrderStatus.CANCELLED) {
+              return 'order-cancelled' as const;
+            }
+            if (
+              target === OrderPaymentStatus.PAID &&
+              order.paymentStatus === OrderPaymentStatus.PAID
+            ) {
+              return 'order-already-paid' as const;
+            }
+            const projected = await this.projectOrderPaymentStatus(
+              tx,
+              order,
+              target,
+              target === OrderPaymentStatus.PAID
+                ? (after.capturedAt ?? new Date())
+                : null,
+              builders.orderUpdated,
+            );
+            // A CAPTURED bind that loses the paid/cancel race must roll back.
+            if (!projected && target === OrderPaymentStatus.PAID) {
+              throw new CaptureOrderConflict();
+            }
+          }
+        }
+        return this.replay(tx, scopedTenantId, id);
+      })
+      .catch((error: unknown) => {
+        if (error instanceof CaptureOrderConflict) {
+          return 'order-already-paid' as const;
+        }
+        throw error;
+      });
+  }
+
   // ---------------------------------------------------------------- helpers
+
+  /**
+   * Maps a payment intent's state to the order paymentStatus it should project
+   * on binding/creation. Non-financial states (CREATED/REQUIRES_AUTHORIZATION/
+   * CANCELLED) return null — no projection.
+   */
+  private orderPaymentStatusForIntent(
+    status: PaymentStatus,
+  ): OrderPaymentStatus | null {
+    switch (status) {
+      case PaymentStatus.CAPTURED:
+        return OrderPaymentStatus.PAID;
+      case PaymentStatus.AUTHORIZED:
+      case PaymentStatus.CAPTURE_PENDING:
+        return OrderPaymentStatus.AUTHORIZED;
+      case PaymentStatus.FAILED:
+        return OrderPaymentStatus.PAYMENT_FAILED;
+      case PaymentStatus.VOIDED:
+        return OrderPaymentStatus.VOIDED;
+      default:
+        return null;
+    }
+  }
 
   private async replay(
     tx: Prisma.TransactionClient,
@@ -798,6 +984,39 @@ export class PaymentsRepository extends TenantScopedRepository {
       order.id,
     )}))`;
     return tx.order.findFirst({ where: { id: order.id, tenantId } });
+  }
+
+  /**
+   * Voids the active authorization holds of SIBLING intents on the same order
+   * (every intent linked to orderId except the capturing one). Once the order
+   * is PAID, those holds are stale — the siblings' captures are already blocked
+   * by the paid-order guard — so their simulated holds are released here, in
+   * the same capture transaction. Tenant-scoped.
+   */
+  private async voidSiblingHolds(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    orderId: string,
+    capturingIntentId: string,
+  ): Promise<void> {
+    const siblings = await tx.paymentIntent.findMany({
+      where: { tenantId, orderId, id: { not: capturingIntentId } },
+      select: { id: true },
+    });
+    if (siblings.length === 0) {
+      return;
+    }
+    await tx.paymentAuthorization.updateMany({
+      where: {
+        tenantId,
+        intentId: { in: siblings.map((sibling) => sibling.id) },
+        status: PaymentAuthorizationStatus.AUTHORIZED,
+      },
+      data: {
+        status: PaymentAuthorizationStatus.VOIDED,
+        voidedAt: new Date(),
+      },
+    });
   }
 
   /**

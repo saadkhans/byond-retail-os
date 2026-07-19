@@ -16,6 +16,7 @@ import {
   assertSafePaymentStrings,
 } from './payment-sanitization';
 import {
+  BindRejection,
   CaptureWithIntent,
   CreateIntentRejection,
   IntentResult,
@@ -25,6 +26,7 @@ import {
   TransitionRejection,
 } from './payments.repository';
 import { AuthorizeIntentDto } from './dto/authorize-intent.dto';
+import { BindIntentDto } from './dto/bind-intent.dto';
 import { CancelIntentDto } from './dto/cancel-intent.dto';
 import { CaptureIntentDto } from './dto/capture-intent.dto';
 import { CreatePaymentIntentDto } from './dto/create-payment-intent.dto';
@@ -330,6 +332,44 @@ export class PaymentsService {
     return this.resolveTransition(result, id);
   }
 
+  async bind(
+    tenantId: string,
+    id: string,
+    dto: BindIntentDto,
+    actor?: AuditActor,
+  ): Promise<PaymentIntentDetail> {
+    const result = await this.repository.bind(
+      tenantId,
+      id,
+      {
+        orderId: dto.orderId,
+        checkoutSessionId: dto.checkoutSessionId,
+        actorId: actor?.id,
+      },
+      {
+        intentBound: (before, after) =>
+          this.auditEntry(tenantId, actor, {
+            action: AuditAction.UPDATE,
+            entityType: 'PaymentIntent',
+            entityId: after.id,
+            before,
+            after,
+            reason: 'Payment intent bound to order/session',
+          }),
+        orderUpdated: (before, after) =>
+          this.auditEntry(tenantId, actor, {
+            action: AuditAction.UPDATE,
+            entityType: 'Order',
+            entityId: after.id,
+            before,
+            after,
+            reason: `Order payment status → ${after.paymentStatus} (intent bind)`,
+          }),
+      },
+    );
+    return this.resolveBind(result, id, dto);
+  }
+
   async fail(
     tenantId: string,
     id: string,
@@ -436,6 +476,50 @@ export class PaymentsService {
       );
     }
     return this.repository.findIntentById(tenantId, intentId);
+  }
+
+  private resolveBind(
+    result: IntentResult | BindRejection | null,
+    id: string,
+    dto: BindIntentDto,
+  ): PaymentIntentDetail {
+    if (result === null) {
+      throw new NotFoundException(`Payment intent "${id}" not found`);
+    }
+    if (result === 'bind-requires-target') {
+      throw new BadRequestException(
+        'Provide an orderId and/or checkoutSessionId to bind to',
+      );
+    }
+    if (result === 'order-not-found') {
+      throw new BadRequestException(`Order "${dto.orderId}" not found`);
+    }
+    if (result === 'session-not-found') {
+      throw new BadRequestException(
+        `Checkout session "${dto.checkoutSessionId}" not found`,
+      );
+    }
+    if (result === 'order-session-mismatch') {
+      throw new BadRequestException(
+        'The order and checkout session refer to different checkouts',
+      );
+    }
+    if (result === 'already-bound') {
+      throw new ConflictException(
+        'This intent is already bound to a different order or checkout session',
+      );
+    }
+    if (result === 'order-cancelled') {
+      throw new ConflictException(
+        'The linked order is cancelled; the intent cannot project onto it',
+      );
+    }
+    if (result === 'order-already-paid') {
+      throw new ConflictException(
+        'The linked order is already paid; binding this captured intent would double-pay it',
+      );
+    }
+    return result.intent;
   }
 
   private resolveTransition(

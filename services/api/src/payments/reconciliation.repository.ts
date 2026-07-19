@@ -8,6 +8,7 @@ import {
   AuditEntry,
   AuditLogService,
 } from '../common/audit/audit-log.service';
+import { reconciliationAdvisoryLockKey } from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
 import { TenantScopedRepository } from '../prisma/tenant-scoped.repository';
 
@@ -96,6 +97,15 @@ export class ReconciliationRepository extends TenantScopedRepository {
   > {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
+      // Serialize concurrent PATCHes on this record so the `before` snapshot
+      // (used for terminal check AND the audit entry) reflects the REAL
+      // immediately-prior state — not a stale row another request already
+      // transitioned. Without this, a MATCHED→RECONCILED update could audit a
+      // before-state of PENDING, dropping the MATCHED transition from the trail.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${reconciliationAdvisoryLockKey(
+        scopedTenantId,
+        id,
+      )}))`;
       const before = await tx.paymentReconciliationRecord.findFirst({
         where: { id, tenantId: scopedTenantId },
       });
@@ -105,11 +115,9 @@ export class ReconciliationRepository extends TenantScopedRepository {
       if (before.status === ReconciliationStatus.RECONCILED) {
         return 'terminal-blocked' as const;
       }
-      // CONDITIONAL update: the `status: { not: RECONCILED }` guard makes this
-      // race-safe under concurrent PATCHes. If another request reconciled the
-      // record between our read and this write, the update matches zero rows
-      // and we report a controlled conflict instead of moving it OUT of the
-      // terminal RECONCILED state.
+      // CONDITIONAL update backstop: the `status: { not: RECONCILED }` guard
+      // keeps RECONCILED terminal even if a caller bypassed the lock. Under the
+      // lock above, `before` already reflects the latest committed state.
       const updated = await tx.paymentReconciliationRecord.updateMany({
         where: {
           id: before.id,

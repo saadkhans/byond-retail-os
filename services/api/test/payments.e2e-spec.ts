@@ -254,6 +254,33 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
         paidAt: new Date('2026-07-12T01:00:00Z'),
         placedAt: new Date('2026-07-12T00:00:00Z'),
       },
+      // Sibling-hold guard (finding 4): two intents authorize this UNPAID
+      // order; capturing one must void the other's hold.
+      {
+        id: 'order-sib',
+        tenantId: 'tenant-a',
+        orderNumber: 'ORD-000011',
+        checkoutSessionId: 'sess-sib',
+        locationId: 'loc-a1',
+        unitId: 'unit-a1',
+        status: 'CONFIRMED',
+        paymentStatus: 'UNPAID',
+        paidAt: null,
+        placedAt: new Date('2026-07-12T00:00:00Z'),
+      },
+      // Bind target (finding 5): a standalone captured intent binds here.
+      {
+        id: 'order-bind',
+        tenantId: 'tenant-a',
+        orderNumber: 'ORD-000012',
+        checkoutSessionId: 'sess-bind',
+        locationId: 'loc-a1',
+        unitId: 'unit-a1',
+        status: 'CONFIRMED',
+        paymentStatus: 'UNPAID',
+        paidAt: null,
+        placedAt: new Date('2026-07-12T00:00:00Z'),
+      },
     ] as Row[],
     sessions: [
       { id: 'sess-a1', tenantId: 'tenant-a', status: 'COMPLETED' },
@@ -264,6 +291,8 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       { id: 'sess-a5', tenantId: 'tenant-a', status: 'COMPLETED' },
       { id: 'sess-cx', tenantId: 'tenant-a', status: 'COMPLETED' },
       { id: 'sess-paid', tenantId: 'tenant-a', status: 'COMPLETED' },
+      { id: 'sess-sib', tenantId: 'tenant-a', status: 'COMPLETED' },
+      { id: 'sess-bind', tenantId: 'tenant-a', status: 'COMPLETED' },
       { id: 'sess-b', tenantId: 'tenant-b', status: 'COMPLETED' },
     ] as Row[],
     intents: [
@@ -601,14 +630,18 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
         take?: number;
       }) =>
         store.intents
-          .filter((r) =>
-            scalarMatch(r, where, [
-              'tenantId',
-              'status',
-              'provider',
-              'orderId',
-              'checkoutSessionId',
-            ]),
+          .filter(
+            (r) =>
+              scalarMatch(r, where, [
+                'tenantId',
+                'status',
+                'provider',
+                'orderId',
+                'checkoutSessionId',
+              ]) &&
+              // Honors `id: { not }` (sibling-hold lookup excludes the
+              // capturing intent).
+              (where.id?.not === undefined || r.id !== where.id.not),
           )
           .sort(byCreatedDesc)
           .slice(skip ?? 0, (skip ?? 0) + (take ?? 25))
@@ -673,7 +706,16 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       updateMany: async ({ where, data }: { where: Where; data: Where }) => {
         let count = 0;
         for (const row of store.authorizations) {
-          if (scalarMatch(row, where, ['tenantId', 'intentId', 'status'])) {
+          const intentMatch =
+            where.intentId === undefined
+              ? true
+              : typeof where.intentId === 'object' && where.intentId.in
+                ? where.intentId.in.includes(row.intentId)
+                : row.intentId === where.intentId;
+          if (
+            intentMatch &&
+            scalarMatch(row, where, ['tenantId', 'status'])
+          ) {
             Object.assign(row, stripUndefined(data));
             count += 1;
           }
@@ -1362,16 +1404,17 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       expect(store.orders.find((o) => o.id === 'order-a3')?.paidAt).not.toBeNull();
     });
 
-    it('rejects capturing a session-linked intent before its order exists (finding P2-C)', async () => {
+    it('rejects authorize AND capture for a session-linked intent before its order exists (finding 3)', async () => {
       const intent = await createIntent(managerToken, {
         amountMinor: 100,
         currencyCode: 'SAR',
         checkoutSessionId: 'sess-a4',
       }).expect(201);
       const id = intent.body.id;
-      await authorizeThen(id, 'authorize').expect(200);
-      // sess-a4 has no generated order — capturing would leave that future
-      // order UNPAID forever, so it is rejected rather than silently no-op'd.
+      // sess-a4 has no generated order yet. A pre-order authorization/capture
+      // would be lost when the order is later created UNPAID, so both are
+      // rejected (walk-out pre-auth uses a STANDALONE intent + bind instead).
+      await authorizeThen(id, 'authorize').expect(409);
       await authorizeThen(id, 'capture').expect(409);
       const caps = await request(app.getHttpServer())
         .get(`/payments/captures?intentId=${id}`)
@@ -1555,6 +1598,149 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
         eventType: 'CAPTURE_SUCCEEDED',
         idempotencyKey: 'ikey-1',
       }).expect(409);
+    });
+  });
+
+  describe('sibling authorization holds released after capture (finding 4)', () => {
+    it('voids a sibling intent’s active hold when the order is paid', async () => {
+      const first = await createIntent(managerToken, {
+        amountMinor: 600,
+        currencyCode: 'SAR',
+        orderId: 'order-sib',
+      }).expect(201);
+      const second = await createIntent(managerToken, {
+        amountMinor: 600,
+        currencyCode: 'SAR',
+        orderId: 'order-sib',
+      }).expect(201);
+      // Both authorized while the order is still UNPAID.
+      await authorizeThen(first.body.id, 'authorize').expect(200);
+      await authorizeThen(second.body.id, 'authorize').expect(200);
+      // Capture the first → order PAID.
+      await authorizeThen(first.body.id, 'capture').expect(200);
+      expect(orderPaymentStatus('order-sib')).toBe('PAID');
+      // The sibling's hold is now voided, and its capture is rejected.
+      const siblingDetail = await request(app.getHttpServer())
+        .get(`/payments/intents/${second.body.id}`)
+        .set(auth(managerToken))
+        .expect(200);
+      expect(
+        siblingDetail.body.authorizations.every(
+          (a: { status: string }) => a.status === 'VOIDED',
+        ),
+      ).toBe(true);
+      await authorizeThen(second.body.id, 'capture').expect(409);
+    });
+  });
+
+  describe('post-create intent bind (finding 5)', () => {
+    const bind = (id: string, body: Record<string, unknown>) =>
+      request(app.getHttpServer())
+        .patch(`/payments/intents/${id}/bind`)
+        .set(auth(managerToken))
+        .send(body);
+
+    it('binds a standalone captured intent to an order and marks it PAID', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 900,
+        currencyCode: 'SAR',
+      }).expect(201);
+      expect(intent.body.orderId).toBeNull();
+      const id = intent.body.id;
+      // Standalone (no order/session) intent authorizes and captures freely.
+      await authorizeThen(id, 'authorize').expect(200);
+      await authorizeThen(id, 'capture')
+        .expect(200)
+        .expect((res) => expect(res.body.status).toBe('CAPTURED'));
+      // Bind to the order → projects PAID immediately.
+      const bound = await bind(id, { orderId: 'order-bind' }).expect(200);
+      expect(bound.body.orderId).toBe('order-bind');
+      expect(orderPaymentStatus('order-bind')).toBe('PAID');
+      // Re-binding to the SAME order replays.
+      await bind(id, { orderId: 'order-bind' }).expect(200);
+      // Re-binding to a DIFFERENT order is a conflict.
+      await bind(id, { orderId: 'order-a2' }).expect(409);
+    });
+
+    it('binds an unlinked intent to a checkout session (no projection needed)', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 100,
+        currencyCode: 'SAR',
+      }).expect(201);
+      const bound = await bind(intent.body.id, {
+        checkoutSessionId: 'sess-a4',
+      }).expect(200);
+      expect(bound.body.checkoutSessionId).toBe('sess-a4');
+    });
+
+    it('rejects binding with no target', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 100,
+        currencyCode: 'SAR',
+      }).expect(201);
+      await bind(intent.body.id, {}).expect(400);
+    });
+
+    it('rejects binding to another tenant’s order (cross-tenant)', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 100,
+        currencyCode: 'SAR',
+      }).expect(201);
+      await bind(intent.body.id, { orderId: 'order-b' }).expect(400);
+    });
+
+    it('rejects binding a captured intent to an already-paid order', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 100,
+        currencyCode: 'SAR',
+      }).expect(201);
+      const id = intent.body.id;
+      await authorizeThen(id, 'authorize').expect(200);
+      await authorizeThen(id, 'capture').expect(200);
+      await bind(id, { orderId: 'order-paid' }).expect(409);
+    });
+  });
+
+  describe('reconciliation audit snapshot (finding 2)', () => {
+    it('records the ACTUAL previous state, not a stale one, across updates', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 800,
+        currencyCode: 'SAR',
+      }).expect(201);
+      const id = intent.body.id;
+      await authorizeThen(id, 'authorize').expect(200);
+      await authorizeThen(id, 'capture').expect(200);
+      const list = await request(app.getHttpServer())
+        .get(`/reconciliation/records?intentId=${id}`)
+        .set(auth(managerToken))
+        .expect(200);
+      const recordId = list.body.items[0].id as string;
+
+      auditCreateSpy.mockClear();
+      await request(app.getHttpServer())
+        .patch(`/reconciliation/records/${recordId}`)
+        .set(auth(managerToken))
+        .send({ status: 'MATCHED' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .patch(`/reconciliation/records/${recordId}`)
+        .set(auth(managerToken))
+        .send({ status: 'RECONCILED' })
+        .expect(200);
+
+      const reconcileAudits = auditCreateSpy.mock.calls
+        .map((call) => call[0].data)
+        .filter(
+          (data: { action: string; entityId: string }) =>
+            data.action === 'RECONCILE' && data.entityId === recordId,
+        );
+      expect(reconcileAudits).toHaveLength(2);
+      // PENDING -> MATCHED
+      expect(reconcileAudits[0].before.status).toBe('PENDING');
+      expect(reconcileAudits[0].after.status).toBe('MATCHED');
+      // MATCHED -> RECONCILED (before is MATCHED, NOT a stale PENDING)
+      expect(reconcileAudits[1].before.status).toBe('MATCHED');
+      expect(reconcileAudits[1].after.status).toBe('RECONCILED');
     });
   });
 });
