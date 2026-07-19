@@ -1,13 +1,18 @@
 import { Injectable } from '@nestjs/common';
 import {
+  AuditAction,
   Order,
   OrderPaymentStatus,
   OrderStatus,
+  PaymentAuthorizationStatus,
+  PaymentStatus,
   Prisma,
 } from '@prisma/client';
 import {
+  AuditActor,
   AuditEntry,
   AuditLogService,
+  SYSTEM_ACTOR_EMAIL,
 } from '../common/audit/audit-log.service';
 import { orderPaymentAdvisoryLockKey } from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
@@ -120,6 +125,7 @@ export class OrdersRepository extends TenantScopedRepository {
     id: string,
     reason: string | undefined,
     buildAuditEntry: (before: Order, after: OrderDetail) => AuditEntry,
+    actor?: AuditActor,
   ): Promise<OrderDetail | OrderCancelRejection | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
@@ -159,6 +165,13 @@ export class OrdersRepository extends TenantScopedRepository {
           status: OrderStatus.CANCELLED,
           cancelledAt: new Date(),
           cancelReason: reason ?? null,
+          // Releasing the order also releases any authorization: an AUTHORIZED
+          // order's simulated hold is voided below, so its payment projection
+          // becomes VOIDED (an UNPAID order stays UNPAID; PAID was rejected).
+          paymentStatus:
+            locked.paymentStatus === OrderPaymentStatus.AUTHORIZED
+              ? OrderPaymentStatus.VOIDED
+              : locked.paymentStatus,
         },
       });
       if (updated.count === 0) {
@@ -174,6 +187,58 @@ export class OrdersRepository extends TenantScopedRepository {
       // Audit from the under-lock snapshot so before/after reflect the real
       // immediately-prior state.
       await this.auditLog.record(buildAuditEntry(locked, after), tx);
+
+      // Phase 6: cancelling an order releases any SIMULATED authorization holds
+      // its linked payment intents still carry (AUTHORIZED/CAPTURE_PENDING) —
+      // the money was authorized but never captured, so no refund is involved.
+      // Runs under the SAME order-payment lock as capture, so it cannot race a
+      // capture. A PAID order was already rejected above, so no CAPTURED intent
+      // is voided here.
+      const heldIntents = await tx.paymentIntent.findMany({
+        where: {
+          tenantId: scopedTenantId,
+          status: {
+            in: [PaymentStatus.AUTHORIZED, PaymentStatus.CAPTURE_PENDING],
+          },
+          OR: [{ orderId: id }, { checkoutSessionId: locked.checkoutSessionId }],
+        },
+      });
+      if (heldIntents.length > 0) {
+        const heldIds = heldIntents.map((intent) => intent.id);
+        await tx.paymentAuthorization.updateMany({
+          where: {
+            tenantId: scopedTenantId,
+            intentId: { in: heldIds },
+            status: PaymentAuthorizationStatus.AUTHORIZED,
+          },
+          data: {
+            status: PaymentAuthorizationStatus.VOIDED,
+            voidedAt: new Date(),
+          },
+        });
+        for (const heldIntent of heldIntents) {
+          const voidedIntent = await tx.paymentIntent.update({
+            where: {
+              id_tenantId: { id: heldIntent.id, tenantId: scopedTenantId },
+            },
+            data: { status: PaymentStatus.VOIDED, cancelledAt: new Date() },
+          });
+          await this.auditLog.record(
+            {
+              tenantId: scopedTenantId,
+              actorId: actor?.id ?? null,
+              actorEmail: actor?.email ?? SYSTEM_ACTOR_EMAIL,
+              action: AuditAction.VOID,
+              entityType: 'PaymentIntent',
+              entityId: heldIntent.id,
+              before: heldIntent,
+              after: voidedIntent,
+              reason: `Authorization hold released by order ${after.orderNumber} cancellation`,
+            },
+            tx,
+          );
+        }
+      }
       return after;
     });
   }

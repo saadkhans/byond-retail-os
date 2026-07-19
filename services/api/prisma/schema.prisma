@@ -1097,6 +1097,7 @@ model PaymentCapture {
   tenant    Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   intent    PaymentIntent @relation(fields: [intentId], references: [id], onDelete: Restrict)
   createdBy User?         @relation("PaymentCaptureActor", fields: [createdById], references: [id], onDelete: Restrict)
+  reconciliationRecords PaymentReconciliationRecord[]
 
   @@unique([id, tenantId])
   @@unique([tenantId, idempotencyKey])
@@ -1154,9 +1155,13 @@ model PaymentReconciliationRecord {
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
-  tenant    Tenant         @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  intent    PaymentIntent? @relation(fields: [intentId], references: [id], onDelete: Restrict)
-  createdBy User?          @relation("PaymentReconciliationActor", fields: [createdById], references: [id], onDelete: Restrict)
+  tenant    Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  intent    PaymentIntent?  @relation(fields: [intentId], references: [id], onDelete: Restrict)
+  // Navigable relation for the captureId FK the migration already creates
+  // (PaymentReconciliationRecord_captureId_fkey). The composite same-tenant FK
+  // stays as hand-written hardening in migration SQL.
+  capture   PaymentCapture? @relation(fields: [captureId], references: [id], onDelete: Restrict)
+  createdBy User?           @relation("PaymentReconciliationActor", fields: [createdById], references: [id], onDelete: Restrict)
 
   @@unique([id, tenantId])
   @@index([tenantId, status, createdAt, id])

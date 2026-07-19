@@ -233,6 +233,18 @@ describe('payments & reconciliation migration hardening', () => {
     }
   });
 
+  it('backs the Prisma captureId relation with a single-column FK', () => {
+    // The schema now models `capture PaymentCapture?` on
+    // PaymentReconciliationRecord; the migration must already create the
+    // matching FK so the relation aligns with the database.
+    expect(sql).toContain(
+      'ADD CONSTRAINT "PaymentReconciliationRecord_captureId_fkey"',
+    );
+    expect(sql).toContain(
+      'FOREIGN KEY ("captureId") REFERENCES "PaymentCapture"("id")',
+    );
+  });
+
   it('never cascades deletes into payment tables', () => {
     expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
   });

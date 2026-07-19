@@ -281,6 +281,58 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
         paidAt: null,
         placedAt: new Date('2026-07-12T00:00:00Z'),
       },
+      // Two-authorized-intents order (finding 8): fail one, stays AUTHORIZED.
+      {
+        id: 'order-multi',
+        tenantId: 'tenant-a',
+        orderNumber: 'ORD-000013',
+        checkoutSessionId: 'sess-multi',
+        locationId: 'loc-a1',
+        unitId: 'unit-a1',
+        status: 'CONFIRMED',
+        paymentStatus: 'UNPAID',
+        paidAt: null,
+        placedAt: new Date('2026-07-12T00:00:00Z'),
+      },
+      // Session-linked siblings order (finding 4).
+      {
+        id: 'order-ssib',
+        tenantId: 'tenant-a',
+        orderNumber: 'ORD-000014',
+        checkoutSessionId: 'sess-ssib',
+        locationId: 'loc-a1',
+        unitId: 'unit-a1',
+        status: 'CONFIRMED',
+        paymentStatus: 'UNPAID',
+        paidAt: null,
+        placedAt: new Date('2026-07-12T00:00:00Z'),
+      },
+      // Bind-voids-sibling order (finding 5): has a pre-authorized sibling.
+      {
+        id: 'order-bindsib',
+        tenantId: 'tenant-a',
+        orderNumber: 'ORD-000015',
+        checkoutSessionId: 'sess-bindsib',
+        locationId: 'loc-a1',
+        unitId: 'unit-a1',
+        status: 'CONFIRMED',
+        paymentStatus: 'AUTHORIZED',
+        paidAt: null,
+        placedAt: new Date('2026-07-12T00:00:00Z'),
+      },
+      // Fresh UNPAID order for the rejected-bind retry (finding 1).
+      {
+        id: 'order-rb',
+        tenantId: 'tenant-a',
+        orderNumber: 'ORD-000016',
+        checkoutSessionId: 'sess-rb',
+        locationId: 'loc-a1',
+        unitId: 'unit-a1',
+        status: 'CONFIRMED',
+        paymentStatus: 'UNPAID',
+        paidAt: null,
+        placedAt: new Date('2026-07-12T00:00:00Z'),
+      },
     ] as Row[],
     sessions: [
       { id: 'sess-a1', tenantId: 'tenant-a', status: 'COMPLETED' },
@@ -293,6 +345,10 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       { id: 'sess-paid', tenantId: 'tenant-a', status: 'COMPLETED' },
       { id: 'sess-sib', tenantId: 'tenant-a', status: 'COMPLETED' },
       { id: 'sess-bind', tenantId: 'tenant-a', status: 'COMPLETED' },
+      { id: 'sess-multi', tenantId: 'tenant-a', status: 'COMPLETED' },
+      { id: 'sess-ssib', tenantId: 'tenant-a', status: 'COMPLETED' },
+      { id: 'sess-bindsib', tenantId: 'tenant-a', status: 'COMPLETED' },
+      { id: 'sess-rb', tenantId: 'tenant-a', status: 'COMPLETED' },
       { id: 'sess-b', tenantId: 'tenant-b', status: 'COMPLETED' },
     ] as Row[],
     intents: [
@@ -317,8 +373,34 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
         amountMinor: 500,
         authorizedAt: new Date('2026-07-12T00:00:00Z'),
       }),
+      // Pre-AUTHORIZED sibling on order-bindsib (finding 5): a standalone
+      // captured intent bound to that order must void THIS hold.
+      intentRow({
+        id: 'pi-bindsib-auth',
+        tenantId: 'tenant-a',
+        orderId: 'order-bindsib',
+        status: 'AUTHORIZED',
+        amountMinor: 500,
+        authorizedAt: new Date('2026-07-12T00:00:00Z'),
+      }),
     ] as Row[],
-    authorizations: [] as Row[],
+    authorizations: [
+      {
+        id: 'auth-bindsib',
+        tenantId: 'tenant-a',
+        intentId: 'pi-bindsib-auth',
+        status: 'AUTHORIZED',
+        amountMinor: 500,
+        providerRef: null,
+        authorizedAt: new Date('2026-07-12T00:00:00Z'),
+        expiresAt: null,
+        voidedAt: null,
+        idempotencyKey: null,
+        createdById: null,
+        createdAt: new Date('2026-07-12T00:00:00Z'),
+        updatedAt: new Date('2026-07-12T00:00:00Z'),
+      },
+    ] as Row[],
     captures: [] as Row[],
     events: [] as Row[],
     reconciliations: [] as Row[],
@@ -641,7 +723,17 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
               ]) &&
               // Honors `id: { not }` (sibling-hold lookup excludes the
               // capturing intent).
-              (where.id?.not === undefined || r.id !== where.id.not),
+              (where.id?.not === undefined || r.id !== where.id.not) &&
+              // Honors `OR: [{ orderId }, { checkoutSessionId }]` — the
+              // order-linked-intent lookup (recompute / sibling holds).
+              (where.OR === undefined ||
+                where.OR.some(
+                  (clause: Where) =>
+                    (clause.orderId === undefined ||
+                      r.orderId === clause.orderId) &&
+                    (clause.checkoutSessionId === undefined ||
+                      r.checkoutSessionId === clause.checkoutSessionId),
+                )),
           )
           .sort(byCreatedDesc)
           .slice(skip ?? 0, (skip ?? 0) + (take ?? 25))
@@ -722,6 +814,16 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
         }
         return { count };
       },
+      count: async ({ where }: { where: Where }) =>
+        store.authorizations.filter((row) => {
+          const intentMatch =
+            where.intentId === undefined
+              ? true
+              : typeof where.intentId === 'object' && where.intentId.in
+                ? where.intentId.in.includes(row.intentId)
+                : row.intentId === where.intentId;
+          return intentMatch && scalarMatch(row, where, ['tenantId', 'status']);
+        }).length,
     },
     paymentCapture: {
       create: async ({ data }: { data: Where }) => {
@@ -1105,6 +1207,32 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       }).expect(400);
     });
 
+    it('rejects bare CVV/PIN-shaped values in metadata, but allows last4 (finding 10)', async () => {
+      // 3- or 4-digit bare values (CVV/PIN shape) are rejected in metadata.
+      for (const field of [
+        { instrumentBrand: '123' },
+        { instrumentWallet: '1234' },
+        { description: '123' },
+        { description: '1 2 3 4' },
+      ]) {
+        await createIntent(managerToken, {
+          amountMinor: 500,
+          currencyCode: 'SAR',
+          ...field,
+        }).expect(400);
+      }
+      // Exactly four digits is allowed ONLY in instrumentLast4.
+      const ok = await createIntent(managerToken, {
+        amountMinor: 500,
+        currencyCode: 'SAR',
+        instrumentLast4: '4242',
+        instrumentBrand: 'VISA',
+        instrumentWallet: 'APPLE_PAY',
+        description: 'Walk-out purchase',
+      }).expect(201);
+      expect(ok.body.instrumentLast4).toBe('4242');
+    });
+
     it('replays the same intent for a duplicate create idempotencyKey', async () => {
       const first = await createIntent(managerToken, {
         amountMinor: 700,
@@ -1411,11 +1539,12 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
         checkoutSessionId: 'sess-a4',
       }).expect(201);
       const id = intent.body.id;
-      // sess-a4 has no generated order yet. A pre-order authorization/capture
-      // would be lost when the order is later created UNPAID, so both are
+      // sess-a4 has no generated order yet. A pre-order authorization/capture/
+      // fail would be lost when the order is later created UNPAID, so all are
       // rejected (walk-out pre-auth uses a STANDALONE intent + bind instead).
       await authorizeThen(id, 'authorize').expect(409);
       await authorizeThen(id, 'capture').expect(409);
+      await authorizeThen(id, 'fail').expect(409); // finding 3
       const caps = await request(app.getHttpServer())
         .get(`/payments/captures?intentId=${id}`)
         .set(auth(managerToken))
@@ -1741,6 +1870,146 @@ describe('Payments & reconciliation (e2e, no live database)', () => {
       // MATCHED -> RECONCILED (before is MATCHED, NOT a stale PENDING)
       expect(reconcileAudits[1].before.status).toBe('MATCHED');
       expect(reconcileAudits[1].after.status).toBe('RECONCILED');
+    });
+  });
+
+  const bindReq = (id: string, body: Record<string, unknown>) =>
+    request(app.getHttpServer())
+      .patch(`/payments/intents/${id}/bind`)
+      .set(auth(managerToken))
+      .send(body);
+  const intentDetail = (id: string) =>
+    request(app.getHttpServer())
+      .get(`/payments/intents/${id}`)
+      .set(auth(managerToken));
+
+  describe('rejected binds roll back without mutation (findings 1 & 6)', () => {
+    it('rejects binding a CAPTURED intent to a paid order and leaves it unbound', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 100,
+        currencyCode: 'SAR',
+      }).expect(201);
+      const id = intent.body.id;
+      await authorizeThen(id, 'authorize').expect(200);
+      await authorizeThen(id, 'capture').expect(200);
+      auditCreateSpy.mockClear();
+      await bindReq(id, { orderId: 'order-paid' }).expect(409);
+      // Intent NOT bound, and NO audit entry recorded for the failed bind.
+      const detail = await intentDetail(id).expect(200);
+      expect(detail.body.orderId).toBeNull();
+      expect(
+        auditCreateSpy.mock.calls.some(
+          (call) => call[0].data.entityId === id,
+        ),
+      ).toBe(false);
+      // A retry to a VALID order still works (not falsely idempotent).
+      await bindReq(id, { orderId: 'order-rb' }).expect(200);
+      expect(orderPaymentStatus('order-rb')).toBe('PAID');
+    });
+
+    it('rejects binding an AUTHORIZED intent to a paid order (finding 6)', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 100,
+        currencyCode: 'SAR',
+      }).expect(201);
+      const id = intent.body.id;
+      await authorizeThen(id, 'authorize').expect(200);
+      await bindReq(id, { orderId: 'order-paid' }).expect(409);
+      const detail = await intentDetail(id).expect(200);
+      expect(detail.body.orderId).toBeNull();
+    });
+  });
+
+  describe('bind validates the intent’s existing session (finding 2)', () => {
+    it('rejects binding an order whose session differs from the intent’s session', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 100,
+        currencyCode: 'SAR',
+        checkoutSessionId: 'sess-a4',
+      }).expect(201);
+      // order-bind belongs to sess-bind, not sess-a4 → mismatch.
+      await bindReq(intent.body.id, { orderId: 'order-bind' }).expect(400);
+    });
+
+    it('allows binding an order from the intent’s own session', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 100,
+        currencyCode: 'SAR',
+        checkoutSessionId: 'sess-bind',
+      }).expect(201);
+      await bindReq(intent.body.id, { orderId: 'order-bind' }).expect(200);
+    });
+  });
+
+  describe('binding a captured intent voids sibling holds (finding 5)', () => {
+    it('releases the pre-authorized sibling when a bound capture pays the order', async () => {
+      const intent = await createIntent(managerToken, {
+        amountMinor: 500,
+        currencyCode: 'SAR',
+      }).expect(201);
+      const id = intent.body.id;
+      await authorizeThen(id, 'authorize').expect(200);
+      await authorizeThen(id, 'capture').expect(200);
+      await bindReq(id, { orderId: 'order-bindsib' }).expect(200);
+      expect(orderPaymentStatus('order-bindsib')).toBe('PAID');
+      // The fixture sibling pi-bindsib-auth's hold is now voided.
+      const siblingDetail = await intentDetail('pi-bindsib-auth').expect(200);
+      expect(
+        siblingDetail.body.authorizations.every(
+          (a: { status: string }) => a.status === 'VOIDED',
+        ),
+      ).toBe(true);
+      await authorizeThen('pi-bindsib-auth', 'capture').expect(409);
+    });
+  });
+
+  describe('session-linked siblings are released after capture (finding 4)', () => {
+    it('voids a session-only sibling’s hold when one captures', async () => {
+      const first = await createIntent(managerToken, {
+        amountMinor: 400,
+        currencyCode: 'SAR',
+        checkoutSessionId: 'sess-ssib',
+      }).expect(201);
+      const second = await createIntent(managerToken, {
+        amountMinor: 400,
+        currencyCode: 'SAR',
+        checkoutSessionId: 'sess-ssib',
+      }).expect(201);
+      // order-ssib exists (its session is sess-ssib), so authorize resolves it.
+      await authorizeThen(first.body.id, 'authorize').expect(200);
+      await authorizeThen(second.body.id, 'authorize').expect(200);
+      await authorizeThen(first.body.id, 'capture').expect(200);
+      expect(orderPaymentStatus('order-ssib')).toBe('PAID');
+      const siblingDetail = await intentDetail(second.body.id).expect(200);
+      expect(
+        siblingDetail.body.authorizations.every(
+          (a: { status: string }) => a.status === 'VOIDED',
+        ),
+      ).toBe(true);
+    });
+  });
+
+  describe('order projection preserves AUTHORIZED while a sibling hold remains (finding 8)', () => {
+    it('failing one of two authorized intents keeps the order AUTHORIZED', async () => {
+      const first = await createIntent(managerToken, {
+        amountMinor: 300,
+        currencyCode: 'SAR',
+        orderId: 'order-multi',
+      }).expect(201);
+      const second = await createIntent(managerToken, {
+        amountMinor: 300,
+        currencyCode: 'SAR',
+        orderId: 'order-multi',
+      }).expect(201);
+      await authorizeThen(first.body.id, 'authorize').expect(200);
+      await authorizeThen(second.body.id, 'authorize').expect(200);
+      expect(orderPaymentStatus('order-multi')).toBe('AUTHORIZED');
+      // Fail the first → the second still holds → order STAYS AUTHORIZED.
+      await authorizeThen(first.body.id, 'fail').expect(200);
+      expect(orderPaymentStatus('order-multi')).toBe('AUTHORIZED');
+      // Fail the second → no active hold, no capture → PAYMENT_FAILED.
+      await authorizeThen(second.body.id, 'fail').expect(200);
+      expect(orderPaymentStatus('order-multi')).toBe('PAYMENT_FAILED');
     });
   });
 });

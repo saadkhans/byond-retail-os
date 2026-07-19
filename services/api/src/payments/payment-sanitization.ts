@@ -15,18 +15,41 @@ import { containsSensitiveValue } from '../common/sensitive-keys';
  * repository write.
  */
 
+/**
+ * A bare 3- or 4-digit numeric string (optionally space/dash grouped) is the
+ * shape of an UNLABELED CVV/CVC (3–4 digits) or PIN (4 digits).
+ * `containsSensitiveValue` only catches LABELED/Luhn-valid material, so a value
+ * like "123" or "1 2 3 4" in instrumentBrand/instrumentWallet/description/notes
+ * would otherwise persist. instrumentLast4 is the ONLY field allowed to be four
+ * digits, and it is validated separately (assertSafeLast4) — it never flows
+ * through here.
+ */
+function isBareCvvOrPin(value: string): boolean {
+  const compact = value.replace(/[\s-]/g, '');
+  return /^\d{3,4}$/.test(compact);
+}
+
 /** Throws 400 if any provided value carries credential-/payment-bearing content. */
 export function assertSafePaymentStrings(
   fields: Record<string, string | undefined>,
 ): void {
   for (const [name, value] of Object.entries(fields)) {
-    if (value !== undefined && containsSensitiveValue(value)) {
+    if (value === undefined) {
+      continue;
+    }
+    if (containsSensitiveValue(value)) {
       throw new BadRequestException(
         `${name} must be an opaque reference/note and must not contain ` +
           `credential- or payment-bearing values (no raw card numbers, ` +
           `CVV/PIN, tokens, API keys, secrets, or credential URLs). Secrets ` +
           `belong in a dedicated secret store, referenced by name; payment ` +
           `data must never be stored.`,
+      );
+    }
+    if (isBareCvvOrPin(value)) {
+      throw new BadRequestException(
+        `${name} looks like a bare CVV/PIN (3–4 digits) and must not be ` +
+          `stored. Only instrumentLast4 may hold four digits.`,
       );
     }
   }

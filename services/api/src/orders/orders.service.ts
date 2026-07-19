@@ -78,6 +78,7 @@ export class OrdersService {
           after,
           reason: dto.reason?.trim() || 'Order cancelled',
         }),
+      actor,
     );
     if (result === null) {
       throw new NotFoundException(`Order "${id}" not found`);
