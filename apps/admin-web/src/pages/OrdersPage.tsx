@@ -97,6 +97,17 @@ export function OrderDetailPage() {
             <dd>
               <StatusBadge status={data.status} />
             </dd>
+            <dt>Payment status</dt>
+            <dd>
+              <StatusBadge status={data.paymentStatus} />{' '}
+              <Link to="/payments">payment intents</Link>
+              <span className="muted">
+                {' '}
+                — simulated/provider-abstract; PAID only after a captured intent
+              </span>
+            </dd>
+            <dt>Paid at</dt>
+            <dd>{formatDate(data.paidAt)}</dd>
             <dt>Checkout session</dt>
             <dd>
               <Link to={`/checkout-sessions/${data.checkoutSessionId}`}>

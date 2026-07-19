@@ -81,6 +81,13 @@ enum AuditAction {
   COMPLETE
   CANCEL
   EXPIRE
+  // Phase 6 — payment lifecycle. Intent creation reuses CREATE; these cover
+  // the state-machine transitions that have no generic equivalent.
+  AUTHORIZE
+  CAPTURE
+  VOID
+  FAIL
+  RECONCILE
 }
 
 enum ProductStatus {
@@ -193,6 +200,12 @@ model Tenant {
   checkoutSessionLines CheckoutSessionLine[]
   orders               Order[]
   orderLines           OrderLine[]
+
+  paymentIntents               PaymentIntent[]
+  paymentAuthorizations        PaymentAuthorization[]
+  paymentCaptures              PaymentCapture[]
+  paymentEvents                PaymentEvent[]
+  paymentReconciliationRecords PaymentReconciliationRecord[]
 }
 
 model User {
@@ -221,6 +234,12 @@ model User {
   checkoutSessionLinesCreated CheckoutSessionLine[] @relation("CheckoutSessionLineActor")
   ordersCreated               Order[]               @relation("OrderActor")
   orderLinesCreated           OrderLine[]           @relation("OrderLineActor")
+
+  paymentIntentsCreated        PaymentIntent[]               @relation("PaymentIntentActor")
+  paymentAuthorizationsCreated PaymentAuthorization[]        @relation("PaymentAuthorizationActor")
+  paymentCapturesCreated       PaymentCapture[]              @relation("PaymentCaptureActor")
+  paymentEventsCreated         PaymentEvent[]                @relation("PaymentEventActor")
+  paymentReconciliationCreated PaymentReconciliationRecord[] @relation("PaymentReconciliationActor")
 
   @@index([tenantId, status])
 }
@@ -705,6 +724,7 @@ model CheckoutSession {
   createdBy User?      @relation("CheckoutSessionActor", fields: [createdById], references: [id], onDelete: Restrict)
   lines     CheckoutSessionLine[]
   order     Order?
+  paymentIntents PaymentIntent[]
 
   // Enables composite same-tenant FKs (lines/orders must reference a session
   // of the SAME tenant) — mirrors the Phase 3/4 hardening pattern.
@@ -791,11 +811,18 @@ model Order {
   cancelledAt       DateTime?
   cancelReason      String?
   totalQuantity     Int
-  // Pricing/payment placeholders — ALWAYS NULL in Phase 5 (no paid/captured
-  // semantics anywhere).
+  // Pricing placeholders — ALWAYS NULL until the pricing phase.
   subtotalMinor Int?
   totalMinor    Int?
   currencyCode  String?
+  // Phase 6 — payment linkage. paymentStatus is UNPAID until the internal
+  // payment state machine reaches a valid captured/success state (only a
+  // CAPTURED PaymentIntent flips it to PAID; a failed/voided intent NEVER
+  // marks an order paid). REFUND_PENDING/REFUNDED are reserved for a later
+  // returns/refunds phase (no money movement in Phase 6). paidAt is set
+  // exactly when paymentStatus becomes PAID.
+  paymentStatus OrderPaymentStatus @default(UNPAID)
+  paidAt        DateTime?
   // Evidence lineage copied from the completed session.
   sourceType       EvidenceSourceType @default(MANUAL)
   sourceId         String?
@@ -818,6 +845,7 @@ model Order {
   unit      RetailUnit      @relation(fields: [unitId], references: [id], onDelete: Restrict)
   createdBy User?           @relation("OrderActor", fields: [createdById], references: [id], onDelete: Restrict)
   lines     OrderLine[]
+  paymentIntents PaymentIntent[]
 
   @@unique([id, tenantId])
   @@unique([tenantId, orderNumber])
@@ -866,4 +894,276 @@ model OrderLine {
 
   @@unique([id, tenantId])
   @@index([tenantId, orderId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 — payment authorization, payment abstraction & reconciliation
+// foundation.
+//
+// PROVIDER-NEUTRAL BY CONSTRUCTION. There is NO live payment gateway in this
+// phase: authorization and capture are SIMULATED through the internal state
+// machine, and every "provider" reference is an OPAQUE, normalized identifier
+// a future gateway adapter will populate. Real adapters (and their webhook
+// signature verification) arrive in a later phase — the models below are
+// sized for that without schema churn.
+//
+// SECURITY INVARIANT (AGENTS.md): no raw card data or secrets are EVER stored,
+// logged, or audited. These tables carry only opaque provider references and
+// SAFE card metadata (brand, last4, expiry month/year, wallet type). Raw PAN,
+// CVV, PIN, magnetic-track data, provider secret keys, bearer tokens, API
+// keys, and raw webhook secrets/payloads never reach any column here — every
+// free-form string that is persisted or audited is additionally screened by
+// common/sensitive-keys before any write.
+// ---------------------------------------------------------------------------
+
+// Provider-neutral payment provider. SIMULATED is the built-in Phase 6
+// simulator; MANUAL is a staff-recorded reference. Real gateways append
+// values here through their adapter phase — no provider SDK in this phase.
+enum PaymentProvider {
+  SIMULATED
+  MANUAL
+}
+
+// The payment intent lifecycle state machine. CREATED and
+// REQUIRES_AUTHORIZATION are pre-auth; AUTHORIZED holds funds;
+// CAPTURE_PENDING/CAPTURED move money (simulated). CAPTURED is the ONLY
+// success terminal state that may flip an order to PAID. FAILED, CANCELLED,
+// VOIDED, and EXPIRED are the terminal non-success states — nothing about a
+// terminal intent may change again. Reconciliation is tracked on
+// PaymentReconciliationRecord, not on this financial lifecycle.
+enum PaymentStatus {
+  CREATED
+  REQUIRES_AUTHORIZATION
+  AUTHORIZED
+  CAPTURE_PENDING
+  CAPTURED
+  FAILED
+  CANCELLED
+  VOIDED
+  EXPIRED
+}
+
+// Order-level payment status projection. UNPAID until the intent state
+// machine reaches a valid captured/success state. REFUND_PENDING and REFUNDED
+// are RESERVED placeholders — Phase 6 implements no refund money movement.
+enum OrderPaymentStatus {
+  UNPAID
+  AUTHORIZED
+  PAID
+  PAYMENT_FAILED
+  VOIDED
+  REFUND_PENDING
+  REFUNDED
+}
+
+enum PaymentAuthorizationStatus {
+  AUTHORIZED
+  VOIDED
+  EXPIRED
+}
+
+enum PaymentCaptureStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+// Normalized, provider-neutral event types. A gateway adapter maps its native
+// event names onto these; UNKNOWN safely records an unsupported event.
+enum PaymentEventType {
+  AUTHORIZATION_SUCCEEDED
+  AUTHORIZATION_FAILED
+  CAPTURE_SUCCEEDED
+  CAPTURE_FAILED
+  PAYMENT_CANCELLED
+  PAYMENT_VOIDED
+  PAYMENT_EXPIRED
+  UNKNOWN
+}
+
+enum PaymentEventStatus {
+  RECEIVED
+  PROCESSED
+  IGNORED
+  FAILED
+}
+
+enum ReconciliationStatus {
+  PENDING
+  MATCHED
+  MISMATCH
+  RECONCILED
+  FAILED
+}
+
+// The payment intent aggregate. Tenant-owned; optionally linked to an order
+// and/or checkout session of the SAME tenant (composite same-tenant FKs in
+// migration SQL). An intent may be created before an order exists (walk-out:
+// payment association happens before/during checkout) and later bound to one.
+model PaymentIntent {
+  id                String          @id @default(cuid())
+  tenantId          String
+  orderId           String?
+  checkoutSessionId String?
+  provider          PaymentProvider @default(SIMULATED)
+  status            PaymentStatus   @default(CREATED)
+  amountMinor       Int
+  currencyCode      String
+  // Simulated capture accumulates here; only ever set by the capture path.
+  capturedAmountMinor Int @default(0)
+  // OPAQUE provider references — never secrets. Screened for credential- and
+  // payment-bearing values before any write.
+  providerRef         String?
+  providerCustomerRef String?
+  // SAFE instrument metadata ONLY — never raw PAN/CVV/PIN/track/token.
+  instrumentBrand       String?
+  instrumentLast4       String?
+  instrumentExpiryMonth Int?
+  instrumentExpiryYear  Int?
+  instrumentWallet      String?
+  description   String?
+  failureReason String?
+  authorizedAt  DateTime?
+  capturedAt    DateTime?
+  cancelledAt   DateTime?
+  failedAt      DateTime?
+  expiresAt     DateTime?
+  // Tenant-scoped idempotency for intent creation.
+  idempotencyKey String?
+  createdById    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  tenant                Tenant                        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  order                 Order?                        @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  session               CheckoutSession?              @relation(fields: [checkoutSessionId], references: [id], onDelete: Restrict)
+  createdBy             User?                         @relation("PaymentIntentActor", fields: [createdById], references: [id], onDelete: Restrict)
+  authorizations        PaymentAuthorization[]
+  captures              PaymentCapture[]
+  events                PaymentEvent[]
+  reconciliationRecords PaymentReconciliationRecord[]
+
+  // Enables composite same-tenant FKs (authorizations/captures/events must
+  // reference an intent of the SAME tenant).
+  @@unique([id, tenantId])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, status, createdAt, id])
+  @@index([tenantId, orderId])
+  @@index([tenantId, checkoutSessionId])
+}
+
+// A simulated authorization hold recorded when an intent is authorized. Voided
+// when the intent is cancelled/voided.
+model PaymentAuthorization {
+  id           String                     @id @default(cuid())
+  tenantId     String
+  intentId     String
+  status       PaymentAuthorizationStatus @default(AUTHORIZED)
+  amountMinor  Int
+  providerRef  String?
+  authorizedAt DateTime                   @default(now())
+  expiresAt    DateTime?
+  voidedAt     DateTime?
+  idempotencyKey String?
+  createdById    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  tenant    Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  intent    PaymentIntent @relation(fields: [intentId], references: [id], onDelete: Restrict)
+  createdBy User?         @relation("PaymentAuthorizationActor", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, intentId, createdAt, id])
+}
+
+// A simulated capture. The (tenantId, idempotencyKey) unique is the last-line
+// backstop against a DUPLICATE CAPTURE: a retried capture with the same key
+// replays the original instead of moving money twice.
+model PaymentCapture {
+  id          String               @id @default(cuid())
+  tenantId    String
+  intentId    String
+  status      PaymentCaptureStatus @default(SUCCEEDED)
+  amountMinor Int
+  providerRef String?
+  capturedAt  DateTime?
+  idempotencyKey String?
+  createdById    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  tenant    Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  intent    PaymentIntent @relation(fields: [intentId], references: [id], onDelete: Restrict)
+  createdBy User?         @relation("PaymentCaptureActor", fields: [createdById], references: [id], onDelete: Restrict)
+  reconciliationRecords PaymentReconciliationRecord[]
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, intentId, createdAt, id])
+  @@index([tenantId, status, createdAt, id])
+}
+
+// Provider event / webhook ingestion foundation. NO raw provider payload is
+// stored — only normalized fields. (tenantId, provider, providerEventId) is
+// unique so a duplicate provider event is idempotent per tenant/provider.
+model PaymentEvent {
+  id              String             @id @default(cuid())
+  tenantId        String
+  intentId        String?
+  provider        PaymentProvider    @default(SIMULATED)
+  providerEventId String
+  eventType       PaymentEventType   @default(UNKNOWN)
+  status          PaymentEventStatus @default(RECEIVED)
+  providerRef     String?
+  receivedAt      DateTime           @default(now())
+  processedAt     DateTime?
+  idempotencyKey  String?
+  createdById     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant    Tenant         @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  intent    PaymentIntent? @relation(fields: [intentId], references: [id], onDelete: Restrict)
+  createdBy User?          @relation("PaymentEventActor", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, provider, providerEventId])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, status, receivedAt, id])
+  @@index([tenantId, intentId])
+}
+
+// Reconciliation foundation: a read/list model tracking whether a captured
+// payment reconciles against provider-reported settlement. Phase 6 seeds a
+// PENDING record on capture; no settlement accounting or provider import.
+model PaymentReconciliationRecord {
+  id                  String               @id @default(cuid())
+  tenantId            String
+  intentId            String?
+  captureId           String?
+  provider            PaymentProvider      @default(SIMULATED)
+  status              ReconciliationStatus @default(PENDING)
+  providerRef         String?
+  expectedAmountMinor Int?
+  reportedAmountMinor Int?
+  currencyCode        String?
+  notes               String?
+  reconciledAt        DateTime?
+  createdById         String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  tenant    Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  intent    PaymentIntent?  @relation(fields: [intentId], references: [id], onDelete: Restrict)
+  // Navigable relation for the captureId FK the migration already creates
+  // (PaymentReconciliationRecord_captureId_fkey). The composite same-tenant FK
+  // stays as hand-written hardening in migration SQL.
+  capture   PaymentCapture? @relation(fields: [captureId], references: [id], onDelete: Restrict)
+  createdBy User?           @relation("PaymentReconciliationActor", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@index([tenantId, status, createdAt, id])
+  @@index([tenantId, intentId])
 }

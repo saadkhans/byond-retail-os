@@ -237,6 +237,69 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
         idempotencyKey: null,
         createdById: null,
       },
+      // Phase 6: an already-PAID tenant-a order. Cancellation must reject it
+      // (no refund flow). Older placedAt keeps it out of the list-based cancel
+      // tests, which target the newest order.
+      {
+        id: 'order-paid-a',
+        tenantId: 'tenant-a',
+        orderNumber: 'ORD-000900',
+        checkoutSessionId: 'sess-paid-a',
+        locationId: 'loc-a1',
+        unitId: 'unit-a1',
+        status: 'CONFIRMED',
+        paymentStatus: 'PAID',
+        paidAt: new Date('2026-07-11T00:00:00Z'),
+        placedAt: new Date('2026-07-11T00:00:00Z'),
+        confirmedAt: new Date('2026-07-11T00:00:00Z'),
+        cancelledAt: null,
+        cancelReason: null,
+        totalQuantity: 1,
+        subtotalMinor: null,
+        totalMinor: null,
+        currencyCode: null,
+        sourceType: 'MANUAL',
+        sourceId: null,
+        evidenceBundleId: null,
+        visionEventId: null,
+        vlmReviewId: null,
+        evidenceScore: null,
+        evidenceQuality: null,
+        reasonCodes: [],
+        idempotencyKey: null,
+        createdById: null,
+      },
+      // Phase 6: an AUTHORIZED tenant-a order with a live simulated hold.
+      // Cancelling it must release the hold (finding 7) and stay non-PAID.
+      {
+        id: 'order-auth-a',
+        tenantId: 'tenant-a',
+        orderNumber: 'ORD-000901',
+        checkoutSessionId: 'sess-auth-a',
+        locationId: 'loc-a1',
+        unitId: 'unit-a1',
+        status: 'CONFIRMED',
+        paymentStatus: 'AUTHORIZED',
+        paidAt: null,
+        placedAt: new Date('2026-07-11T00:00:00Z'),
+        confirmedAt: new Date('2026-07-11T00:00:00Z'),
+        cancelledAt: null,
+        cancelReason: null,
+        totalQuantity: 1,
+        subtotalMinor: null,
+        totalMinor: null,
+        currencyCode: null,
+        sourceType: 'MANUAL',
+        sourceId: null,
+        evidenceBundleId: null,
+        visionEventId: null,
+        vlmReviewId: null,
+        evidenceScore: null,
+        evidenceQuality: null,
+        reasonCodes: [],
+        idempotencyKey: null,
+        createdById: null,
+      },
     ] as Row[],
     orderLines: [] as Row[],
     levels: [
@@ -256,6 +319,27 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
       },
     ] as (Row & { quantity: number })[],
     movements: [] as Row[],
+    // Phase 6 payment tables — used by the order-cancellation hold-release
+    // path (finding 7). An AUTHORIZED order with a live simulated hold.
+    paymentIntents: [
+      {
+        id: 'pi-auth-a',
+        tenantId: 'tenant-a',
+        orderId: 'order-auth-a',
+        checkoutSessionId: null,
+        status: 'AUTHORIZED',
+        cancelledAt: null,
+      },
+    ] as Row[],
+    paymentAuthorizations: [
+      {
+        id: 'auth-a',
+        tenantId: 'tenant-a',
+        intentId: 'pi-auth-a',
+        status: 'AUTHORIZED',
+        voidedAt: null,
+      },
+    ] as Row[],
   };
 
   const auditCreateSpy = jest.fn().mockResolvedValue({});
@@ -416,6 +500,8 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
     'orderLines',
     'levels',
     'movements',
+    'paymentIntents',
+    'paymentAuthorizations',
   ] as const;
 
   const prismaStub = {
@@ -791,7 +877,10 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
             candidate.id === where.id &&
             candidate.tenantId === where.tenantId &&
             (where.status?.in === undefined ||
-              where.status.in.includes(candidate.status)),
+              where.status.in.includes(candidate.status)) &&
+            // Phase 6 cancel guard: never cancel a PAID order.
+            (where.paymentStatus?.not === undefined ||
+              candidate.paymentStatus !== where.paymentStatus.not),
         );
         if (!row) {
           return { count: 0 };
@@ -901,6 +990,53 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
         } as Row;
         store.movements.push(row);
         return row;
+      },
+    },
+    // Phase 6: order cancellation releases linked payment holds (finding 7).
+    paymentIntent: {
+      findMany: async ({ where }: { where: Where }) =>
+        store.paymentIntents.filter((row) => {
+          if (row.tenantId !== where.tenantId) {
+            return false;
+          }
+          if (where.status?.in && !where.status.in.includes(row.status)) {
+            return false;
+          }
+          if (where.OR) {
+            return where.OR.some(
+              (clause: Where) =>
+                (clause.orderId === undefined ||
+                  row.orderId === clause.orderId) &&
+                (clause.checkoutSessionId === undefined ||
+                  row.checkoutSessionId === clause.checkoutSessionId),
+            );
+          }
+          return true;
+        }),
+      update: async ({ where, data }: { where: Where; data: Where }) => {
+        const wid = where.id_tenantId?.id ?? where.id;
+        const row = store.paymentIntents.find((r) => r.id === wid)!;
+        Object.assign(row, stripUndefined(data), { updatedAt: new Date() });
+        return { ...row };
+      },
+    },
+    paymentAuthorization: {
+      updateMany: async ({ where, data }: { where: Where; data: Where }) => {
+        let count = 0;
+        for (const row of store.paymentAuthorizations) {
+          const intentMatch = where.intentId?.in
+            ? where.intentId.in.includes(row.intentId)
+            : where.intentId === undefined || row.intentId === where.intentId;
+          if (
+            row.tenantId === where.tenantId &&
+            intentMatch &&
+            (where.status === undefined || row.status === where.status)
+          ) {
+            Object.assign(row, stripUndefined(data));
+            count += 1;
+          }
+        }
+        return { count };
       },
     },
   };
@@ -1988,6 +2124,43 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
         .set('Authorization', `Bearer ${managerToken}`)
         .send({})
         .expect(409);
+    });
+
+    it('refuses to cancel a PAID order (no refund flow); it stays CONFIRMED + PAID', async () => {
+      await request(app.getHttpServer())
+        .post('/orders/order-paid-a/cancel')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ reason: 'change of mind' })
+        .expect(409);
+      const detail = await request(app.getHttpServer())
+        .get('/orders/order-paid-a')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .expect(200);
+      expect(detail.body.status).toBe('CONFIRMED');
+      expect(detail.body.paymentStatus).toBe('PAID');
+    });
+
+    it('refuses to cancel an AUTHORIZED order (void the payment first)', async () => {
+      // Phase 6 policy: order cancellation never releases payment holds — the
+      // payment intent must be voided/cancelled FIRST (payments module), so no
+      // active hold can be left behind and no void orchestration leaks into
+      // the orders module.
+      await request(app.getHttpServer())
+        .post('/orders/order-auth-a/cancel')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ reason: 'abandoned' })
+        .expect(409);
+      const detail = await request(app.getHttpServer())
+        .get('/orders/order-auth-a')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .expect(200);
+      expect(detail.body.status).toBe('CONFIRMED');
+      expect(detail.body.paymentStatus).toBe('AUTHORIZED');
+      // The simulated hold is untouched.
+      expect(
+        store.paymentAuthorizations.find((auth) => auth.id === 'auth-a')
+          ?.status,
+      ).toBe('AUTHORIZED');
     });
   });
 

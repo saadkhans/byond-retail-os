@@ -117,3 +117,64 @@ export function checkoutSessionAdvisoryLockKey(
 export function tenantOrderNumberAdvisoryLockKey(tenantId: string): string {
   return `order-number:${tenantId}`;
 }
+
+/**
+ * Serializes a payment intent's mutations (authorize, capture, cancel/void,
+ * fail) against each other within a tenant. Each transition decides from a
+ * read-then-write of the intent's status, so two concurrent requests (e.g. a
+ * duplicate capture racing a cancel) must not interleave and double-capture or
+ * revive a terminal intent. All PaymentsRepository intent-mutation methods
+ * MUST derive it identically.
+ */
+export function paymentIntentAdvisoryLockKey(
+  tenantId: string,
+  intentId: string,
+): string {
+  return `payment-intent:${tenantId}:${intentId}`;
+}
+
+/**
+ * Serializes payment mutations that project onto the SAME order, across
+ * DIFFERENT intents. The per-intent lock cannot cover this: two intents for
+ * one order, capturing concurrently, hold different intent locks and would
+ * both resolve the order while it is still UNPAID and each write a capture.
+ * Every payment path that authorizes/captures against a resolved order takes
+ * this lock (after the intent lock) before the paid-order check, so only one
+ * capture can pay a given order. Lock order is always intent → order, so no
+ * path can deadlock. MUST be derived identically by every call site.
+ */
+export function orderPaymentAdvisoryLockKey(
+  tenantId: string,
+  orderId: string,
+): string {
+  return `order-payment:${tenantId}:${orderId}`;
+}
+
+/**
+ * Serializes a reconciliation record's status updates within a tenant. The
+ * update decides from a read-then-write (terminal check + audit before/after),
+ * so two concurrent PATCHes must not interleave and record an audit transition
+ * from a stale prior state. ReconciliationRepository.updateStatus MUST derive
+ * it identically.
+ */
+export function reconciliationAdvisoryLockKey(
+  tenantId: string,
+  recordId: string,
+): string {
+  return `reconciliation:${tenantId}:${recordId}`;
+}
+
+/**
+ * Serializes provider-event ingestion per (tenant, provider, providerEventId):
+ * the ingest path decides from a read-then-write ("have I seen this event?"),
+ * so two concurrent deliveries of the SAME provider event must not both insert
+ * before either sees the other. Any code path that ingests a provider event
+ * MUST take this lock first.
+ */
+export function paymentEventAdvisoryLockKey(
+  tenantId: string,
+  provider: string,
+  providerEventId: string,
+): string {
+  return `payment-event:${tenantId}:${provider}:${providerEventId}`;
+}
