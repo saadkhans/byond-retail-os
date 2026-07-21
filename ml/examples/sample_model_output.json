@@ -1,0 +1,18 @@
+{
+  "modelKey": "byond-sku-detector",
+  "modelVersion": "0.1.0",
+  "sourceType": "VISION",
+  "eventType": "PRODUCT_PICKUP",
+  "quantityDelta": 1,
+  "checkoutSessionId": "sess-demo-001",
+  "locationId": "loc-demo-001",
+  "unitId": "unit-demo-001",
+  "deviceId": "cam-demo-001",
+  "occurredAt": "2026-07-21T10:00:00.000Z",
+  "captureStartedAt": "2026-07-21T09:59:58.000Z",
+  "captureEndedAt": "2026-07-21T10:00:02.000Z",
+  "detections": [
+    { "sku": "COLA-330", "label": "cola-330", "confidence": 0.93 },
+    { "sku": "CHIPS-50", "label": "chips-50", "confidence": 0.41 }
+  ]
+}

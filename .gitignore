@@ -25,3 +25,35 @@ Thumbs.db
 # Local editor/agent state — commit .claude/commands/, never local settings
 .vscode/
 .claude/settings.local.json
+
+# ML datasets, models, and media (Phase 8)
+# Datasets and trained weights are external artifacts, never committed.
+ml/datasets/**/raw/
+ml/datasets/**/processed/
+ml/models/
+ml/runs/
+ml/outputs/
+
+# Model weight files — never committed, wherever they appear (global,
+# not scoped to ml/, since a model artifact could land anywhere by mistake).
+*.pt
+*.onnx
+*.engine
+*.safetensors
+*.weights
+
+# Media files scoped to ml/ only — repo-wide *.png/*.jpg would swallow
+# future web/app image assets, so these patterns are deliberately
+# restricted to the ml/ workspace.
+ml/**/*.jpg
+ml/**/*.jpeg
+ml/**/*.png
+ml/**/*.mp4
+ml/**/*.mov
+ml/**/*.avi
+
+# Python noise (ml/ workspace)
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/

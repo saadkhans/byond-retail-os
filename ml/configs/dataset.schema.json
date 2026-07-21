@@ -1,0 +1,113 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "BYOND CV Dataset Manifest",
+  "description": "Manifest format shared by RPC, SKU-110K, and BYOND custom datasets used to train the Phase 8 CV pipeline. This file is the documentation copy of the format; ml/scripts/validate_dataset_manifest.py implements the same rules by hand (no jsonschema dependency) so validation works with the Python standard library only.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "datasetName",
+    "datasetVersion",
+    "source",
+    "licenseNotes",
+    "classes",
+    "splits"
+  ],
+  "properties": {
+    "datasetName": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:[-_][a-z0-9]+)*$",
+      "description": "Lowercase slug identifying the dataset."
+    },
+    "datasetVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Semantic version of this manifest / dataset snapshot."
+    },
+    "source": {
+      "type": "string",
+      "enum": ["rpc", "sku-110k", "byond-custom"],
+      "description": "Origin of the dataset. byond-custom manifests additionally require a sku on every class."
+    },
+    "licenseNotes": {
+      "type": "string",
+      "minLength": 1,
+      "description": "License / redistribution notes for this dataset snapshot."
+    },
+    "classes": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Class list. classId and label must each be unique across the array.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["classId", "label"],
+        "properties": {
+          "classId": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Zero-based class index, unique across classes."
+          },
+          "label": {
+            "type": "string",
+            "pattern": "^[a-z0-9]+(?:[-_][a-z0-9]+)*$",
+            "description": "Lowercase slug class label, unique across classes."
+          },
+          "sku": {
+            "type": "string",
+            "pattern": "^[A-Z0-9][A-Z0-9._-]{0,99}$",
+            "description": "Tenant catalog SKU mapping. Optional in the schema; the validator requires it on every class when source == \"byond-custom\"."
+          }
+        }
+      }
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional dataset-level label defaults, overridable per sample.",
+      "properties": {
+        "tenantId": { "type": "string" },
+        "storeId": { "type": "string" },
+        "planogramZone": { "type": "string" }
+      }
+    },
+    "splits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["train", "val", "test"],
+      "description": "Exactly the three named splits. Arrays may be individually empty, but at least one split must contain samples.",
+      "properties": {
+        "train": { "$ref": "#/definitions/split" },
+        "val": { "$ref": "#/definitions/split" },
+        "test": { "$ref": "#/definitions/split" }
+      }
+    }
+  },
+  "definitions": {
+    "split": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/sample" }
+    },
+    "sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image"],
+      "properties": {
+        "image": {
+          "type": "string",
+          "description": "Path to the image, relative to the dataset root. Absolute paths, backslashes, \"..\" traversal, and URI schemes are rejected by the validator."
+        },
+        "annotation": {
+          "type": "string",
+          "description": "Path to the annotation file, relative to the dataset root. Same path rules as image."
+        },
+        "captureContext": {
+          "type": "string",
+          "enum": ["shelf", "pickup", "return", "cart_insertion", "exit"]
+        },
+        "planogramZone": { "type": "string" },
+        "storeId": { "type": "string" },
+        "tenantId": { "type": "string" }
+      }
+    }
+  }
+}

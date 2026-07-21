@@ -16,6 +16,8 @@ packages/        Shared workspace packages
   shared/        Shared types and utilities
   config/        Shared lint/TS/build configuration
   ui/            Shared UI components
+ml/              CV training dataset + model pipeline (Phase 8) — schemas
+                 and scripts only; datasets/weights external
 infra/           Infrastructure
   docker/        Dockerfiles and compose configs
   github-actions/ Reusable CI building blocks
@@ -72,3 +74,16 @@ inventory, plus a manual checkout test flow: create a checkout session, manage
 basket lines, and complete it into an order (no payment capture — pricing and
 payments arrive in a later phase). The API's CORS allowlist defaults to
 `http://localhost:5173` (override with `CORS_ORIGINS`).
+
+### ML pipeline (Phase 8)
+
+`ml/` is a foundation for preparing CV training datasets and mapping model
+output onto the Phase 7 `POST /vision-events` API — see
+[ml/README.md](ml/README.md). Datasets and trained models are external
+artifacts and are never committed; this repo stores pipeline code and
+schemas only.
+
+```bash
+pnpm run ml:test
+python ml/scripts/prepare_rpc.py --input ml/datasets/rpc/raw --output ml/datasets/rpc/processed --dry-run
+```
