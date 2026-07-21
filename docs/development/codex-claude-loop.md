@@ -3,6 +3,41 @@
 A safe, human-supervised workflow where Claude Code builds and fixes,
 Codex reviews, and a human always makes the final merge decision.
 
+## Orchestrator-worker architecture
+
+Inside a `/fix-codex-review` or `/codex-auto-loop` session, the main Claude
+instance is the **orchestrator**: it plans the cycle, decides which findings
+are MVP-blocking, reviews worker output, runs the final gate, and performs
+commit / push / PR comments. Routine work is delegated to lightweight
+subagents defined in `.claude/agents/`:
+
+| Agent | Role | Model | Edits files? |
+| --- | --- | --- | --- |
+| `codex-review-reader` | Fetch + distill latest active Codex findings (P0–P3) | haiku | no |
+| `repo-investigator` | Map a finding to exact files/functions/DTOs/migrations/tests; minimal plan | sonnet | no |
+| `fix-worker` | Apply narrow, explicitly-planned code fixes; preserve tenant isolation, RBAC, audit, tests | sonnet | yes |
+| `docs-worker` | Fix README/Swagger/PR-description/API-doc mismatches; never runtime logic | sonnet | yes |
+| `test-runner` | Run lint · typecheck · test · build · security:secrets; summarize failures | haiku | no |
+| `secret-scan-worker` | Diagnose Gitleaks hits (current files vs branch history); recommend clean squash for history-only false positives | inherit | no* |
+| `final-reviewer` | Pre-push PASS/BLOCK gate: tenant isolation, RBAC/module gating, audit, data-loss, migration safety, secret/payment safety, MVP scope | inherit | no |
+
+\* `secret-scan-worker` only performs a history rewrite (soft-reset squash +
+`--force-with-lease`) when the orchestrator explicitly instructs it; by
+default it recommends. It never suppresses real secrets and never bypasses
+scanning.
+
+Delegation rules:
+
+- The orchestrator does a worker's job inline only when the worker has
+  failed the same task twice, or the task is safety-critical (real secrets,
+  destructive git operations, invariant conflicts).
+- Workers never commit, push, comment on the PR, or resolve review
+  threads — those belong to the orchestrator (and the merge to the human).
+- Independent worker tasks (e.g. investigating several findings) run in
+  parallel.
+- New/changed agent files load at session start — restart the Claude Code
+  session after editing `.claude/agents/`.
+
 ## Two modes
 
 | Mode | Command | Behavior |
@@ -58,10 +93,11 @@ only when the uncommitted changes were made by the current loop session.
 | E | Codex | Reviews the PR, leaves prioritized findings (P1/P2/P3) |
 | F | Developer | `pnpm run codex:summary` — see the active findings |
 | G | Developer | Invoke the Claude command: `/fix-codex-review` |
-| H | Claude | Fixes **only** the Codex findings |
-| I | Claude | Runs `pnpm run lint`, `typecheck`, `test`, `build` — all must pass |
-| J | Claude | Commits and pushes to the **same** branch |
-| K | Claude | Comments `@codex review` on the PR to request re-review |
+| H | Claude (orchestrator → workers) | Fixes **only** the Codex findings — reader → investigator → fix/docs workers |
+| I | Claude (test-runner) | Runs `pnpm run lint`, `typecheck`, `test`, `build`, `security:secrets` — all must pass |
+| I' | Claude (final-reviewer) | PASS/BLOCK gate on the full diff before anything is pushed |
+| J | Claude (orchestrator) | Commits and pushes to the **same** branch |
+| K | Claude (orchestrator) | Comments `@codex review` on the PR to request re-review |
 | L | Both | Repeat E–K until Codex has no blocking issues |
 | M | **Human** | Reviews and merges. Always. |
 

@@ -23,6 +23,12 @@
  * comments — those actions belong to Claude Code (push/comment) and the
  * human (merge), per docs/development/codex-claude-loop.md.
  *
+ * Inside a /codex-auto-loop session, the main Claude instance acts as the
+ * ORCHESTRATOR: it delegates the routine steps below to the subagents in
+ * .claude/agents/ (codex-review-reader, repo-investigator, fix-worker,
+ * docs-worker, test-runner, secret-scan-worker, final-reviewer) and keeps
+ * triage, commit, push, and PR comments for itself.
+ *
  * Usage:
  *   pnpm run codex:auto-loop -- --pr 2
  *   pnpm run codex:auto-loop -- --pr 2 --max-cycles 5 --dry-run
@@ -349,30 +355,42 @@ function main() {
     console.log(`Findings saved to: ${FINDINGS_FILE}`);
   }
   console.log('');
-  console.log('Instructions for Claude Code (one cycle):');
-  console.log(`  1. Read ${args.dryRun ? 'the summary above' : FINDINGS_FILE}.`);
+  console.log('Instructions for Claude Code (one cycle, orchestrator mode):');
   console.log(
-    '  2. Fix ONLY the latest-review findings (P0/P1/P2 blocking; P3 ' +
-      'fix-or-defer). Never auto-fix previous-review-active findings — ' +
-      'verify them against current code first.',
+    `  1. codex-review-reader: read ${args.dryRun ? 'the summary above' : FINDINGS_FILE} ` +
+      'and return the grouped work list.',
   );
   console.log(
-    '  3. Run: pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build',
+    '  2. Orchestrator triage: ONLY latest-review findings (P0/P1/P2 ' +
+      'blocking; P3 fix-or-defer). Never auto-fix previous-review-active ' +
+      'findings — verify them against current code first.',
   );
   console.log(
-    '  4. Commit: "fix: address latest Codex review findings" (list each ' +
-      'finding in the body).',
+    '  3. repo-investigator per finding → minimal plan; fix-worker applies ' +
+      'it (docs-worker for docs-only findings). No scope creep.',
+  );
+  console.log(
+    '  4. test-runner: pnpm run lint && pnpm run typecheck && pnpm run test ' +
+      '&& pnpm run build && pnpm run security:secrets ' +
+      '(secret-scan-worker on secret-scan failures).',
+  );
+  console.log(
+    '  5. final-reviewer on the full diff — must return PASS before commit.',
+  );
+  console.log(
+    '  6. Orchestrator commits: "fix: address latest Codex review findings" ' +
+      '(list each finding in the body).',
   );
   if (args.noPush) {
-    console.log('  5. STOP (--no-push requested): do not push or comment.');
+    console.log('  7. STOP (--no-push requested): do not push or comment.');
   } else {
-    console.log(`  5. Push to '${branch}' ONLY.`);
+    console.log(`  7. Orchestrator pushes to '${branch}' ONLY.`);
     console.log(
-      '  6. Comment on the PR: "@codex review the latest changes and ' +
+      '  8. Comment on the PR: "@codex review the latest changes and ' +
         'confirm whether all previous findings are resolved."',
     );
     console.log(
-      `  7. Wait ~${args.waitSeconds}s for Codex, then re-run this script. ` +
+      `  9. Wait ~${args.waitSeconds}s for Codex, then re-run this script. ` +
         `If Codex has not re-reviewed yet, stop and tell the user to re-run ` +
         `/codex-auto-loop later. Max cycles: ${args.maxCycles}.`,
     );
