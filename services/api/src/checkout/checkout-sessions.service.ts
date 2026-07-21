@@ -157,6 +157,7 @@ export class CheckoutSessionsService {
             after: session,
             reason: 'Checkout session opened',
           }),
+        this.buildEventClaimedAudit(tenantId, actor),
       );
     } catch (error) {
       // Two firsts racing the same idempotency key: the loser's insert hits
@@ -196,7 +197,8 @@ export class CheckoutSessionsService {
         `Device "${dto.deviceId}" is not attached to unit "${dto.unitId}"`,
       );
     }
-    return result.session;
+    this.throwEvidenceRefRejection(result, dto);
+    return (result as { session: CheckoutSessionDetail }).session;
   }
 
   async findById(
@@ -301,6 +303,7 @@ export class CheckoutSessionsService {
             after: line,
             reason: 'Basket line added',
           }),
+        this.buildEventClaimedAudit(tenantId, actor),
       );
     } catch (error) {
       if (prismaErrorCode(error) === 'P2002') {
@@ -316,7 +319,7 @@ export class CheckoutSessionsService {
       }
       throw error;
     }
-    this.throwLineRejection(result, sessionId, dto.productId);
+    this.throwLineRejection(result, sessionId, dto.productId, undefined, dto);
     return (result as { line: CheckoutSessionLine }).line;
   }
 
@@ -349,8 +352,9 @@ export class CheckoutSessionsService {
           after,
           reason: 'Basket line updated',
         }),
+      this.buildEventClaimedAudit(tenantId, actor),
     );
-    this.throwLineRejection(result, sessionId, undefined, lineId);
+    this.throwLineRejection(result, sessionId, undefined, lineId, dto);
     return result as CheckoutSessionLine;
   }
 
@@ -513,6 +517,7 @@ export class CheckoutSessionsService {
     sessionId: string,
     productId?: string,
     lineId?: string,
+    refs?: EvidenceRefs,
   ): void {
     if (result === 'session-not-found') {
       throw new NotFoundException(
@@ -544,6 +549,101 @@ export class CheckoutSessionsService {
           'the product again.',
       );
     }
+    this.throwEvidenceRefRejection(result, refs);
+  }
+
+  /**
+   * Maps a tenant-scoped evidence lineage rejection to a controlled 400.
+   * Lineage refs are canonical (they flow onto order lines at completion),
+   * so an id that does not resolve within the caller's tenant is a caller
+   * error, never persisted.
+   */
+  private throwEvidenceRefRejection(
+    result: unknown,
+    refs?: EvidenceRefs,
+  ): void {
+    if (result === 'evidence-bundle-not-found') {
+      throw new BadRequestException(
+        `Evidence bundle "${refs?.evidenceBundleId ?? ''}" not found; ` +
+          'evidenceBundleId must reference an evidence bundle in this tenant',
+      );
+    }
+    if (result === 'vision-event-not-found') {
+      throw new BadRequestException(
+        `Vision event "${refs?.visionEventId ?? ''}" not found; ` +
+          'visionEventId must reference a vision event in this tenant',
+      );
+    }
+    if (result === 'vision-event-session-mismatch') {
+      throw new BadRequestException(
+        `Vision event "${refs?.visionEventId ?? ''}" is bound to a ` +
+          'different checkout session and cannot be stamped onto this ' +
+          "one's lineage",
+      );
+    }
+    if (result === 'vision-event-unit-mismatch') {
+      throw new BadRequestException(
+        `Vision event "${refs?.visionEventId ?? ''}" happened at a ` +
+          "different retail unit and cannot become this session's lineage",
+      );
+    }
+    if (result === 'vision-event-location-mismatch') {
+      throw new BadRequestException(
+        `Vision event "${refs?.visionEventId ?? ''}" happened at a ` +
+          "different store and cannot become this session's lineage",
+      );
+    }
+    if (result === 'vision-event-decided') {
+      throw new ConflictException(
+        `Vision event "${refs?.visionEventId ?? ''}" has already been ` +
+          'decided (approved, rejected, or overridden); decisions are ' +
+          'terminal, so it can no longer be bound as new lineage',
+      );
+    }
+    if (result === 'vision-event-pending-review') {
+      throw new ConflictException(
+        `Vision event "${refs?.visionEventId ?? ''}" is a basket-affecting ` +
+          'event still awaiting review; it can only reach the basket ' +
+          'through POST /vision-events/:id/review and cannot be cited as ' +
+          'manual checkout line lineage (the product would be counted ' +
+          'twice when the event is later approved)',
+      );
+    }
+    if (result === 'vision-event-already-applied') {
+      throw new ConflictException(
+        `Vision event "${refs?.visionEventId ?? ''}" is a basket-affecting ` +
+          'event whose review decision has already been recorded; its ' +
+          'exact basket effect (or non-effect) is final, so it cannot be ' +
+          'cited as lineage for another manual line change',
+      );
+    }
+    if (result === 'evidence-bundle-event-mismatch') {
+      throw new BadRequestException(
+        `Evidence bundle "${refs?.evidenceBundleId ?? ''}" does not belong ` +
+          `to vision event "${refs?.visionEventId ?? ''}"; supply the ` +
+          "event's own bundle or omit one of the references",
+      );
+    }
+  }
+
+  /**
+   * Claiming an unbound vision event as session/line lineage is a state
+   * change ON THE EVENT (its sessionId is set), so it gets its own audit
+   * entry alongside the session/line entry.
+   */
+  private buildEventClaimedAudit(
+    tenantId: string,
+    actor: AuditActor | undefined,
+  ): (eventId: string, sessionId: string) => AuditEntry {
+    return (eventId, sessionId) =>
+      this.auditEntry(tenantId, actor, {
+        action: AuditAction.UPDATE,
+        entityType: 'VisionEvent',
+        entityId: eventId,
+        reason:
+          `Vision event claimed as lineage by checkout session ` +
+          `${sessionId} (bound atomically with the mutation)`,
+      });
   }
 
   private auditEntry(

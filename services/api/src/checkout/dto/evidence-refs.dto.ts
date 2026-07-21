@@ -53,7 +53,11 @@ export class EvidenceRefsDto {
   sourceId?: string;
 
   @ApiPropertyOptional({
-    description: 'Opaque reference to a future evidence bundle.',
+    description:
+      'CANONICAL reference to a Phase 7 EvidenceBundle in this tenant ' +
+      '(validated; unknown or cross-tenant ids are rejected). Pre-Phase-7 ' +
+      'opaque values live in the read-only externalEvidenceBundleRef ' +
+      'column instead and are never accepted here.',
     maxLength: 200,
   })
   @IsOptionalNonNull()
@@ -63,7 +67,15 @@ export class EvidenceRefsDto {
   evidenceBundleId?: string;
 
   @ApiPropertyOptional({
-    description: 'Opaque reference to a future normalized vision event.',
+    description:
+      'CANONICAL reference to a Phase 7 VisionEvent in this tenant ' +
+      '(validated; unknown or cross-tenant ids are rejected). ' +
+      'Basket-affecting events (pickup/insertion/return) are applied only ' +
+      'via POST /vision-events/:id/review and cannot be cited as NEW line ' +
+      'lineage in any status — a patched line may only keep the reference ' +
+      'it already carries. Pre-Phase-7 opaque values live in the ' +
+      'read-only externalVisionEventRef column instead and are never ' +
+      'accepted here.',
     maxLength: 200,
   })
   @IsOptionalNonNull()
@@ -73,7 +85,10 @@ export class EvidenceRefsDto {
   visionEventId?: string;
 
   @ApiPropertyOptional({
-    description: 'Opaque reference to a future VLM review.',
+    description:
+      'Opaque reference to a future VLM review. Screened but NOT resolved ' +
+      'against any table until a VLM adapter/registry phase lands — it is ' +
+      'not a VisionEventReview id.',
     maxLength: 200,
   })
   @IsOptionalNonNull()

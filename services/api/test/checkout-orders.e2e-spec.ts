@@ -183,6 +183,88 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
     },
   ];
 
+  // Vision lineage rows the checkout evidence refs resolve against: lineage
+  // ids are validated tenant-scoped at the data-access layer, so every id a
+  // test persists must exist here for the right tenant. The tenant-b rows
+  // are cross-tenant bait — referencing them from tenant A must 400.
+  const evidenceBundles = [
+    { id: 'bundle-001', tenantId: 'tenant-a' },
+    { id: 'bundle-complete-1', tenantId: 'tenant-a' },
+    { id: 'opaque-bundle-xyz', tenantId: 'tenant-a' },
+    { id: 'bundle-of-tenant-b', tenantId: 'tenant-b' },
+  ];
+  const visionEvents: {
+    id: string;
+    tenantId: string;
+    sessionId: string | null;
+    evidenceBundleId: string | null;
+    unitId: string;
+    locationId: string;
+    status: string;
+  }[] = [
+    // Unbound events: legitimate lineage that checkout mutations CLAIM
+    // (bind to the target session) atomically on first use. When an event
+    // and a bundle are cited together, the bundle must be the event's own;
+    // the event must also match the session's unit AND store, and only a
+    // PENDING_REVIEW event is claimable.
+    {
+      id: 'vision-evt-42',
+      tenantId: 'tenant-a',
+      sessionId: null,
+      evidenceBundleId: 'bundle-001',
+      unitId: 'unit-a1',
+      locationId: 'loc-a1',
+      status: 'PENDING_REVIEW',
+    },
+    {
+      id: 'vision-evt-77',
+      tenantId: 'tenant-a',
+      sessionId: null,
+      evidenceBundleId: null,
+      unitId: 'unit-a1',
+      locationId: 'loc-a1',
+      status: 'PENDING_REVIEW',
+    },
+    {
+      id: 'vision-evt-cola',
+      tenantId: 'tenant-a',
+      sessionId: null,
+      evidenceBundleId: null,
+      unitId: 'unit-a1',
+      locationId: 'loc-a1',
+      status: 'PENDING_REVIEW',
+    },
+    {
+      id: 'opaque-vision-evt',
+      tenantId: 'tenant-a',
+      sessionId: null,
+      evidenceBundleId: null,
+      unitId: 'unit-a1',
+      locationId: 'loc-a1',
+      status: 'PENDING_REVIEW',
+    },
+    // Bound-elsewhere bait: stamping it onto another session must 400.
+    {
+      id: 'vision-evt-bound-elsewhere',
+      tenantId: 'tenant-a',
+      sessionId: 'sess-somewhere-else',
+      evidenceBundleId: null,
+      unitId: 'unit-a1',
+      locationId: 'loc-a1',
+      status: 'PENDING_REVIEW',
+    },
+    // Decided bait: a terminal event never binds anywhere new (409).
+    {
+      id: 'vision-evt-decided',
+      tenantId: 'tenant-a',
+      sessionId: null,
+      evidenceBundleId: null,
+      unitId: 'unit-a1',
+      locationId: 'loc-a1',
+      status: 'APPROVED',
+    },
+  ];
+
   // Stateful in-memory tables. Tenant B rows exist purely as cross-tenant
   // "bait" — every test asserts they stay invisible to tenant A callers.
   const store = {
@@ -575,6 +657,48 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
       },
     },
     auditLog: { create: auditCreateSpy },
+    evidenceBundle: {
+      findFirst: async ({ where }: { where: Where }) =>
+        evidenceBundles.find(
+          (bundle) =>
+            bundle.id === where.id && bundle.tenantId === where.tenantId,
+        ) ?? null,
+    },
+    visionEvent: {
+      findFirst: async ({ where }: { where: Where }) =>
+        visionEvents.find(
+          (event) =>
+            event.id === where.id && event.tenantId === where.tenantId,
+        ) ?? null,
+      // The claim compare-and-set: binds an UNBOUND, still-PENDING event.
+      updateMany: async ({
+        where,
+        data,
+      }: {
+        where: Where;
+        data: { sessionId?: string };
+      }) => {
+        const row = visionEvents.find(
+          (event) =>
+            event.id === where.id && event.tenantId === where.tenantId,
+        );
+        if (!row) {
+          return { count: 0 };
+        }
+        // WHERE sessionId IS NULL — the CAS only hits unbound events.
+        if (where.sessionId === null && row.sessionId !== null) {
+          return { count: 0 };
+        }
+        // WHERE status = ... — decided events are never claimed.
+        if (where.status !== undefined && row.status !== where.status) {
+          return { count: 0 };
+        }
+        if (data.sessionId !== undefined) {
+          row.sessionId = data.sessionId;
+        }
+        return { count: 1 };
+      },
+    },
     platformModule: {
       findUnique: async ({ where }: { where: Where }) =>
         platformModules.find((module) => module.code === where.code) ?? null,
@@ -1148,6 +1272,76 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
           }),
         }),
       );
+    });
+
+    it('rejects lineage refs that are unknown or belong to another tenant', async () => {
+      // A fabricated id must never become canonical lineage.
+      await request(app.getHttpServer())
+        .post('/checkout-sessions')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          locationId: 'loc-a1',
+          unitId: 'unit-a1',
+          visionEventId: 'vision-evt-GHOST',
+        })
+        .expect(400);
+      // A real bundle of ANOTHER tenant is equally invisible (scoped lookup).
+      await request(app.getHttpServer())
+        .post('/checkout-sessions')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          locationId: 'loc-a1',
+          unitId: 'unit-a1',
+          evidenceBundleId: 'bundle-of-tenant-b',
+        })
+        .expect(400);
+    });
+
+    it('rejects an event bound to a different session as lineage', async () => {
+      // Session-level lineage: an event bound elsewhere cannot "create" a
+      // new session.
+      await request(app.getHttpServer())
+        .post('/checkout-sessions')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          locationId: 'loc-a1',
+          unitId: 'unit-a1',
+          visionEventId: 'vision-evt-bound-elsewhere',
+        })
+        .expect(400);
+      // Line-level lineage: the same event cannot be stamped onto a line of
+      // a session it is not bound to.
+      const session = await request(app.getHttpServer())
+        .post('/checkout-sessions')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ locationId: 'loc-a1', unitId: 'unit-a1' })
+        .expect(201);
+      await request(app.getHttpServer())
+        .post(`/checkout-sessions/${session.body.id}/lines`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          productId: 'prod-a1',
+          quantity: 1,
+          visionEventId: 'vision-evt-bound-elsewhere',
+        })
+        .expect(400);
+    });
+
+    it('rejects a decided event as new lineage (409) — decisions are terminal', async () => {
+      const session = await request(app.getHttpServer())
+        .post('/checkout-sessions')
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({ locationId: 'loc-a1', unitId: 'unit-a1' })
+        .expect(201);
+      await request(app.getHttpServer())
+        .post(`/checkout-sessions/${session.body.id}/lines`)
+        .set('Authorization', `Bearer ${managerToken}`)
+        .send({
+          productId: 'prod-a1',
+          quantity: 1,
+          visionEventId: 'vision-evt-decided',
+        })
+        .expect(409);
     });
 
     it('replays the same idempotency key instead of opening a duplicate', async () => {

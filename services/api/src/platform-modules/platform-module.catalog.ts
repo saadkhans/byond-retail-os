@@ -97,9 +97,19 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
   {
     code: 'cv',
     name: 'Computer Vision',
-    description: 'CV event proposal pipeline (later phase).',
-    defaultEnabled: false,
-    isActive: false,
+    description:
+      'Normalized CV product recognition events, evidence bundles, SKU ' +
+      'candidates, and the review flow that turns approved events into ' +
+      'virtual basket lines (provider-neutral; no edge runtime or training ' +
+      'pipeline).',
+    // Shipped in Phase 7 and DEFAULT-ENABLED for the same reason as
+    // inventory/devices/checkout (see above): the only enable endpoint is
+    // @TenantOnly(), so leaving this false would strand new tenants behind
+    // 403s. RBAC still gates every route independently. Tenants that existed
+    // BEFORE Phase 7 are covered by the 20260719000001_cv_module_backfill
+    // migration — defaultEnabled only applies at tenant creation time.
+    defaultEnabled: true,
+    isActive: true,
   },
   {
     code: 'esl',

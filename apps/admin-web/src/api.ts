@@ -377,6 +377,96 @@ export interface OrderLine extends EvidenceRefs {
   createdAt: string;
 }
 
+export type VisionEventType =
+  | 'PRODUCT_PICKUP'
+  | 'PRODUCT_RETURN'
+  | 'PRODUCT_TRANSFER'
+  | 'CART_INSERTION'
+  | 'EXIT_RECONCILIATION';
+
+export type VisionEventStatus =
+  | 'PENDING_REVIEW'
+  | 'APPROVED'
+  | 'REJECTED'
+  | 'OVERRIDDEN';
+
+export interface VisionEventCandidate {
+  id: string;
+  eventId: string;
+  productId: string;
+  rank: number;
+  score: number | null;
+  label: string | null;
+  sku: string;
+  productName: string;
+  createdAt: string;
+}
+
+export interface VisionEventReview {
+  id: string;
+  eventId: string;
+  decision: 'APPROVE' | 'REJECT' | 'OVERRIDE';
+  reason: string | null;
+  appliedProductId: string | null;
+  appliedQuantity: number | null;
+  basketEffect:
+    | 'LINE_ADDED'
+    | 'LINE_INCREASED'
+    | 'LINE_DECREASED'
+    | 'LINE_REMOVED'
+    | 'NONE';
+  sessionLineId: string | null;
+  reviewedById: string | null;
+  createdAt: string;
+}
+
+/** Evidence METADATA only — artifact descriptors, never binary media. */
+export interface EvidenceBundle {
+  id: string;
+  sourceType: string;
+  sourceId: string | null;
+  modelName: string | null;
+  modelVersion: string | null;
+  captureStartedAt: string | null;
+  captureEndedAt: string | null;
+  artifacts: Record<string, unknown>[] | null;
+  metadata: Record<string, unknown> | null;
+  createdAt: string;
+}
+
+export interface VisionEvent {
+  id: string;
+  locationId: string;
+  unitId: string;
+  deviceId: string | null;
+  sessionId: string | null;
+  type: VisionEventType;
+  status: VisionEventStatus;
+  quantity: number;
+  occurredAt: string;
+  ingestedAt: string;
+  sourceType: string;
+  sourceId: string | null;
+  modelName: string | null;
+  modelVersion: string | null;
+  evidenceBundleId: string | null;
+  evidenceScore: number | null;
+  evidenceQuality: string | null;
+  reasonCodes: string[];
+  // Detail-only: list rows exclude the free-form metadata to keep pages light.
+  metadata?: Record<string, unknown> | null;
+  idempotencyKey: string | null;
+  createdAt: string;
+  updatedAt: string;
+  location?: { id: string; name: string; code: string } | null;
+  unit?: { id: string; name: string; code: string } | null;
+  device?: { id: string; name: string; serialNumber: string } | null;
+  session?: { id: string; status: CheckoutSessionStatus } | null;
+  candidates?: VisionEventCandidate[];
+  review?: VisionEventReview | null;
+  evidenceBundle?: EvidenceBundle | null;
+}
+
 export interface Order extends EvidenceRefs {
   id: string;
   orderNumber: string;

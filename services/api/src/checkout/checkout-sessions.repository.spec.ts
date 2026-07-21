@@ -42,6 +42,8 @@ describe('CheckoutSessionsRepository', () => {
       sourceId: 'src-1',
       evidenceBundleId: 'bundle-1',
       visionEventId: 'vision-1',
+      externalVisionEventRef: null,
+      externalEvidenceBundleRef: null,
       vlmReviewId: null,
       evidenceScore: 0.9,
       evidenceQuality: 'HIGH',
@@ -59,6 +61,10 @@ describe('CheckoutSessionsRepository', () => {
       sourceId: null,
       evidenceBundleId: null,
       visionEventId: null,
+      // A pre-Phase-7 line: its opaque ref was moved to the external
+      // column by the legacy_vision_ref_compat migration.
+      externalVisionEventRef: 'legacy-vision-ref-7',
+      externalEvidenceBundleRef: 'legacy-bundle-ref-7',
       vlmReviewId: null,
       evidenceScore: null,
       evidenceQuality: null,
@@ -76,6 +82,8 @@ describe('CheckoutSessionsRepository', () => {
     sourceId: null,
     evidenceBundleId: null,
     visionEventId: 'vision-session-1',
+    externalVisionEventRef: 'legacy-session-vision-ref',
+    externalEvidenceBundleRef: null,
     vlmReviewId: null,
     evidenceScore: null,
     evidenceQuality: null,
@@ -93,6 +101,8 @@ describe('CheckoutSessionsRepository', () => {
       findUniqueOrThrow: jest.Mock;
     };
     orderLine: { create: jest.Mock };
+    evidenceBundle: { findFirst: jest.Mock };
+    visionEvent: { findFirst: jest.Mock; updateMany: jest.Mock };
   };
   let inventoryRepository: { applyMovement: jest.Mock };
   let auditLog: { record: jest.Mock };
@@ -120,6 +130,26 @@ describe('CheckoutSessionsRepository', () => {
           .mockResolvedValue({ id: 'order-1', orderNumber: 'ORD-000001' }),
       },
       orderLine: { create: jest.fn().mockResolvedValue({}) },
+      // Evidence lineage refs resolve within the tenant by default; tests
+      // flip these to prove unknown/mismatched refs are rejected. The
+      // default event is unbound and carries bundle-1 (the default bundle).
+      evidenceBundle: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'bundle-1' }),
+      },
+      visionEvent: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'vision-9',
+          sessionId: null,
+          evidenceBundleId: 'bundle-1',
+          unitId: 'unit-a1',
+          locationId: 'loc-a1',
+          status: 'PENDING_REVIEW',
+          // Record-only by default: pending BASKET-AFFECTING types are
+          // rejected as line lineage (only review may apply them).
+          type: 'PRODUCT_TRANSFER',
+        }),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
     };
     inventoryRepository = {
       applyMovement: jest.fn().mockResolvedValue({
@@ -226,6 +256,32 @@ describe('CheckoutSessionsRepository', () => {
       );
       // 2 stock audits + session COMPLETE + order CREATE.
       expect(auditLog.record).toHaveBeenCalledTimes(4);
+    });
+
+    it('copies legacy external refs verbatim and never promotes them to canonical lineage', async () => {
+      await repository.complete('tenant-a', 'sess-1', {}, builders);
+      // The session's pre-Phase-7 opaque ref travels in its own column;
+      // the canonical visionEventId is the validated Phase 7 reference.
+      expect(tx.order.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            visionEventId: 'vision-session-1',
+            externalVisionEventRef: 'legacy-session-vision-ref',
+            externalEvidenceBundleRef: null,
+          }),
+        }),
+      );
+      // The pre-Phase-7 line keeps its opaque refs external, with NO
+      // canonical event/bundle claimed.
+      expect(tx.orderLine.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          sessionLineId: 'line-1',
+          visionEventId: null,
+          evidenceBundleId: null,
+          externalVisionEventRef: 'legacy-vision-ref-7',
+          externalEvidenceBundleRef: 'legacy-bundle-ref-7',
+        }),
+      });
     });
 
     it('aborts the whole completion when a line has insufficient stock', async () => {
@@ -509,6 +565,8 @@ describe('CheckoutSessionsRepository', () => {
       tx.checkoutSession.findFirst.mockResolvedValue({
         id: 'sess-1',
         status: CheckoutSessionStatus.OPEN,
+        unitId: 'unit-a1',
+        locationId: 'loc-a1',
       });
     });
 
@@ -645,6 +703,369 @@ describe('CheckoutSessionsRepository', () => {
       );
     });
 
+    it('resolves lineage refs tenant-scoped and rejects an unknown vision event', async () => {
+      tx.visionEvent.findFirst.mockResolvedValue(null);
+      const createMock = (
+        tx as unknown as { checkoutSessionLine: { create: jest.Mock } }
+      ).checkoutSessionLine.create;
+      await expect(
+        repository.addLine(
+          'tenant-a',
+          'sess-1',
+          { productId: 'prod-a', quantity: 1, visionEventId: 'vision-GHOST' },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toBe('vision-event-not-found');
+      // The lookup is scoped to the tenant: a cross-tenant event id is
+      // simply "not found" and never becomes canonical lineage.
+      expect(tx.visionEvent.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'vision-GHOST', tenantId: 'tenant-a' },
+        }),
+      );
+      expect(createMock).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
+    });
+
+    it('rejects an event bound to a DIFFERENT session as line lineage', async () => {
+      tx.visionEvent.findFirst.mockResolvedValue({
+        id: 'vision-9',
+        sessionId: 'sess-OTHER',
+        evidenceBundleId: null,
+        unitId: 'unit-a1',
+        locationId: 'loc-a1',
+        status: 'PENDING_REVIEW',
+      });
+      await expect(
+        repository.addLine(
+          'tenant-a',
+          'sess-1',
+          { productId: 'prod-a', quantity: 1, visionEventId: 'vision-9' },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toBe('vision-event-session-mismatch');
+    });
+
+    it('accepts an event bound to the TARGET session (and unbound events)', async () => {
+      tx.visionEvent.findFirst.mockResolvedValue({
+        id: 'vision-9',
+        sessionId: 'sess-1',
+        evidenceBundleId: null,
+        unitId: 'unit-a1',
+        locationId: 'loc-a1',
+        // Deliberately DECIDED: an event already bound to this session
+        // stays citable whatever its decision — only CLAIMING (binding an
+        // unbound event) requires PENDING_REVIEW.
+        status: 'APPROVED',
+      });
+      await expect(
+        repository.addLine(
+          'tenant-a',
+          'sess-1',
+          { productId: 'prod-a', quantity: 1, visionEventId: 'vision-9' },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toEqual(expect.objectContaining({ replayed: false }));
+    });
+
+    it('rejects an event that happened at a DIFFERENT unit', async () => {
+      tx.visionEvent.findFirst.mockResolvedValue({
+        id: 'vision-9',
+        sessionId: null,
+        evidenceBundleId: null,
+        unitId: 'unit-OTHER',
+        locationId: 'loc-a1',
+        status: 'PENDING_REVIEW',
+      });
+      const createMock = (
+        tx as unknown as { checkoutSessionLine: { create: jest.Mock } }
+      ).checkoutSessionLine.create;
+      await expect(
+        repository.addLine(
+          'tenant-a',
+          'sess-1',
+          { productId: 'prod-a', quantity: 1, visionEventId: 'vision-9' },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toBe('vision-event-unit-mismatch');
+      expect(tx.visionEvent.updateMany).not.toHaveBeenCalled();
+      expect(createMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects an event from the same unit but a DIFFERENT store', async () => {
+      // A relocated unit: the event happened at the unit's new store while
+      // this session still belongs to the old one.
+      tx.visionEvent.findFirst.mockResolvedValue({
+        id: 'vision-9',
+        sessionId: null,
+        evidenceBundleId: null,
+        unitId: 'unit-a1',
+        locationId: 'loc-OTHER',
+        status: 'PENDING_REVIEW',
+      });
+      await expect(
+        repository.addLine(
+          'tenant-a',
+          'sess-1',
+          { productId: 'prod-a', quantity: 1, visionEventId: 'vision-9' },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toBe('vision-event-location-mismatch');
+      expect(tx.visionEvent.updateMany).not.toHaveBeenCalled();
+    });
+
+    it.each(['APPROVED', 'REJECTED', 'OVERRIDDEN'])(
+      'never claims an unbound %s event — decisions are terminal',
+      async (status) => {
+        tx.visionEvent.findFirst.mockResolvedValue({
+          id: 'vision-9',
+          sessionId: null,
+          evidenceBundleId: null,
+          unitId: 'unit-a1',
+          locationId: 'loc-a1',
+          status,
+        });
+        const createMock = (
+          tx as unknown as { checkoutSessionLine: { create: jest.Mock } }
+        ).checkoutSessionLine.create;
+        await expect(
+          repository.addLine(
+            'tenant-a',
+            'sess-1',
+            { productId: 'prod-a', quantity: 1, visionEventId: 'vision-9' },
+            () => auditEntry('CheckoutSessionLine'),
+          ),
+        ).resolves.toBe('vision-event-decided');
+        expect(tx.visionEvent.updateMany).not.toHaveBeenCalled();
+        expect(createMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['PRODUCT_PICKUP', 'CART_INSERTION', 'PRODUCT_RETURN'])(
+      'rejects a PENDING_REVIEW basket-affecting %s event as line lineage',
+      async (type) => {
+        // Only POST /vision-events/:id/review may apply such an event to
+        // the basket: a manual line citing it now AND an approval applying
+        // it later would double-count the product.
+        tx.visionEvent.findFirst.mockResolvedValue({
+          id: 'vision-9',
+          sessionId: null,
+          evidenceBundleId: null,
+          unitId: 'unit-a1',
+          locationId: 'loc-a1',
+          status: 'PENDING_REVIEW',
+          type,
+        });
+        const createMock = (
+          tx as unknown as { checkoutSessionLine: { create: jest.Mock } }
+        ).checkoutSessionLine.create;
+        await expect(
+          repository.addLine(
+            'tenant-a',
+            'sess-1',
+            { productId: 'prod-a', quantity: 1, visionEventId: 'vision-9' },
+            () => auditEntry('CheckoutSessionLine'),
+          ),
+        ).resolves.toBe('vision-event-pending-review');
+        // Neither claimed nor written: the event stays fully applicable by
+        // the review flow, exactly once.
+        expect(tx.visionEvent.updateMany).not.toHaveBeenCalled();
+        expect(createMock).not.toHaveBeenCalled();
+        expect(auditLog.record).not.toHaveBeenCalled();
+      },
+    );
+
+    it('rejects a pending basket-affecting event even when already bound to THIS session', async () => {
+      // Bound-but-pending is still applicable by review later — citing it
+      // on a manual line would count the interaction twice.
+      tx.visionEvent.findFirst.mockResolvedValue({
+        id: 'vision-9',
+        sessionId: 'sess-1',
+        evidenceBundleId: null,
+        unitId: 'unit-a1',
+        locationId: 'loc-a1',
+        status: 'PENDING_REVIEW',
+        type: 'PRODUCT_PICKUP',
+      });
+      await expect(
+        repository.addLine(
+          'tenant-a',
+          'sess-1',
+          { productId: 'prod-a', quantity: 1, visionEventId: 'vision-9' },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toBe('vision-event-pending-review');
+    });
+
+    it.each(['APPROVED', 'REJECTED', 'OVERRIDDEN'])(
+      'rejects a %s basket-affecting event as NEW line lineage even when bound to this session',
+      async (status) => {
+        // The one-shot review already recorded the event's exact basket
+        // effect (or, for REJECT, that it had none) — a NEW manual line
+        // citing it would re-apply or contradict that record.
+        tx.visionEvent.findFirst.mockResolvedValue({
+          id: 'vision-9',
+          sessionId: 'sess-1',
+          evidenceBundleId: null,
+          unitId: 'unit-a1',
+          locationId: 'loc-a1',
+          status,
+          type: 'PRODUCT_PICKUP',
+        });
+        const createMock = (
+          tx as unknown as { checkoutSessionLine: { create: jest.Mock } }
+        ).checkoutSessionLine.create;
+        await expect(
+          repository.addLine(
+            'tenant-a',
+            'sess-1',
+            { productId: 'prod-a', quantity: 1, visionEventId: 'vision-9' },
+            () => auditEntry('CheckoutSessionLine'),
+          ),
+        ).resolves.toBe('vision-event-already-applied');
+        expect(createMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it('rejects a bundle the referenced event does not carry', async () => {
+      tx.visionEvent.findFirst.mockResolvedValue({
+        id: 'vision-9',
+        sessionId: null,
+        evidenceBundleId: 'bundle-REAL',
+        unitId: 'unit-a1',
+        locationId: 'loc-a1',
+        status: 'PENDING_REVIEW',
+      });
+      await expect(
+        repository.addLine(
+          'tenant-a',
+          'sess-1',
+          {
+            productId: 'prod-a',
+            quantity: 1,
+            visionEventId: 'vision-9',
+            evidenceBundleId: 'bundle-1',
+          },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toBe('evidence-bundle-event-mismatch');
+    });
+
+    it('rejects a bundle when the referenced event carries NONE', async () => {
+      tx.visionEvent.findFirst.mockResolvedValue({
+        id: 'vision-9',
+        sessionId: null,
+        evidenceBundleId: null,
+        unitId: 'unit-a1',
+        locationId: 'loc-a1',
+        status: 'PENDING_REVIEW',
+      });
+      await expect(
+        repository.addLine(
+          'tenant-a',
+          'sess-1',
+          {
+            productId: 'prod-a',
+            quantity: 1,
+            visionEventId: 'vision-9',
+            evidenceBundleId: 'bundle-1',
+          },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toBe('evidence-bundle-event-mismatch');
+    });
+
+    it('CLAIMS an unbound cited event for the session with a compare-and-set', async () => {
+      await repository.addLine(
+        'tenant-a',
+        'sess-1',
+        { productId: 'prod-a', quantity: 1, visionEventId: 'vision-9' },
+        () => auditEntry('CheckoutSessionLine'),
+        () => auditEntry('VisionEvent'),
+      );
+      expect(tx.visionEvent.updateMany).toHaveBeenCalledWith({
+        // WHERE sessionId IS NULL AND status PENDING: never rebinds an
+        // already-bound event, never binds a decided one.
+        where: {
+          id: 'vision-9',
+          tenantId: 'tenant-a',
+          sessionId: null,
+          status: 'PENDING_REVIEW',
+        },
+        data: { sessionId: 'sess-1' },
+      });
+      // The claim is a state change on the event — audited.
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ entityType: 'VisionEvent' }),
+        tx,
+      );
+    });
+
+    it('rejects when a concurrent bind wins the claim race', async () => {
+      tx.visionEvent.updateMany.mockResolvedValue({ count: 0 });
+      tx.visionEvent.findFirst
+        .mockResolvedValueOnce({
+          id: 'vision-9',
+          sessionId: null,
+          evidenceBundleId: null,
+          unitId: 'unit-a1',
+          locationId: 'loc-a1',
+          status: 'PENDING_REVIEW',
+        })
+        .mockResolvedValueOnce({
+          sessionId: 'sess-OTHER',
+          status: 'PENDING_REVIEW',
+        });
+      const createMock = (
+        tx as unknown as { checkoutSessionLine: { create: jest.Mock } }
+      ).checkoutSessionLine.create;
+      await expect(
+        repository.addLine(
+          'tenant-a',
+          'sess-1',
+          { productId: 'prod-a', quantity: 1, visionEventId: 'vision-9' },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toBe('vision-event-session-mismatch');
+      expect(createMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects an unknown evidence bundle ref without inserting a line', async () => {
+      tx.evidenceBundle.findFirst.mockResolvedValue(null);
+      await expect(
+        repository.addLine(
+          'tenant-a',
+          'sess-1',
+          {
+            productId: 'prod-a',
+            quantity: 1,
+            evidenceBundleId: 'bundle-GHOST',
+          },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toBe('evidence-bundle-not-found');
+      expect(tx.evidenceBundle.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'bundle-GHOST', tenantId: 'tenant-a' },
+        }),
+      );
+    });
+
+    it('persists vlmReviewId verbatim — an OPAQUE future-VLM ref, never resolved here', async () => {
+      const createMock = (
+        tx as unknown as { checkoutSessionLine: { create: jest.Mock } }
+      ).checkoutSessionLine.create;
+      await repository.addLine(
+        'tenant-a',
+        'sess-1',
+        { productId: 'prod-a', quantity: 1, vlmReviewId: 'opaque-vlm-ref-1' },
+        () => auditEntry('CheckoutSessionLine'),
+      );
+      expect(createMock).toHaveBeenCalledWith({
+        data: expect.objectContaining({ vlmReviewId: 'opaque-vlm-ref-1' }),
+      });
+    });
+
     it('rejects a product that went non-ACTIVE under the lock without inserting a line', async () => {
       (
         tx as unknown as { product: { findFirst: jest.Mock } }
@@ -668,6 +1089,199 @@ describe('CheckoutSessionsRepository', () => {
       ).resolves.toBe('product-not-saleable');
       expect(createMock).not.toHaveBeenCalled();
       expect(auditLog.record).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('updateLine', () => {
+    let lineMocks: { findFirst: jest.Mock; update: jest.Mock };
+
+    beforeEach(() => {
+      lineMocks = {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'line-1',
+          sessionId: 'sess-1',
+          status: 'ACTIVE',
+          quantity: 2,
+        }),
+        update: jest
+          .fn()
+          .mockImplementation(({ data }: { data: Record<string, unknown> }) =>
+            Promise.resolve({ id: 'line-1', ...data }),
+          ),
+      };
+      (tx as Record<string, unknown>).checkoutSessionLine = lineMocks;
+      tx.checkoutSession.findFirst.mockResolvedValue({
+        id: 'sess-1',
+        status: CheckoutSessionStatus.OPEN,
+        unitId: 'unit-a1',
+        locationId: 'loc-a1',
+      });
+    });
+
+    it('rejects lineage refs that do not resolve within the tenant', async () => {
+      tx.evidenceBundle.findFirst.mockResolvedValue(null);
+      await expect(
+        repository.updateLine(
+          'tenant-a',
+          'sess-1',
+          'line-1',
+          { quantity: 4, evidenceBundleId: 'bundle-GHOST' },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toBe('evidence-bundle-not-found');
+      expect(tx.evidenceBundle.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'bundle-GHOST', tenantId: 'tenant-a' },
+        }),
+      );
+      expect(lineMocks.update).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
+    });
+
+    it('updates the line when lineage refs resolve within the tenant', async () => {
+      await expect(
+        repository.updateLine(
+          'tenant-a',
+          'sess-1',
+          'line-1',
+          { quantity: 4, visionEventId: 'vision-9' },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toEqual(
+        expect.objectContaining({ quantity: 4, visionEventId: 'vision-9' }),
+      );
+    });
+
+    it('validates the EFFECTIVE post-update pair, not just the patched fields', async () => {
+      // The line already cites event vision-9 (which carries bundle-1); a
+      // patch supplying ONLY a different bundle must be checked against the
+      // event the line keeps.
+      lineMocks.findFirst.mockResolvedValue({
+        id: 'line-1',
+        sessionId: 'sess-1',
+        status: 'ACTIVE',
+        quantity: 2,
+        visionEventId: 'vision-9',
+        evidenceBundleId: 'bundle-1',
+      });
+      tx.evidenceBundle.findFirst.mockResolvedValue({ id: 'bundle-2' });
+      await expect(
+        repository.updateLine(
+          'tenant-a',
+          'sess-1',
+          'line-1',
+          { evidenceBundleId: 'bundle-2' },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toBe('evidence-bundle-event-mismatch');
+      expect(lineMocks.update).not.toHaveBeenCalled();
+    });
+
+    it('keeps a review-created line patchable: the KEPT decided event is not new lineage', async () => {
+      // The line already cites the APPROVED pickup (the review created this
+      // very line); patching only its quantity keeps the reference and must
+      // stay allowed — nothing is re-applied.
+      lineMocks.findFirst.mockResolvedValue({
+        id: 'line-1',
+        sessionId: 'sess-1',
+        status: 'ACTIVE',
+        quantity: 2,
+        visionEventId: 'vision-9',
+        evidenceBundleId: null,
+      });
+      tx.visionEvent.findFirst.mockResolvedValue({
+        id: 'vision-9',
+        sessionId: 'sess-1',
+        evidenceBundleId: null,
+        unitId: 'unit-a1',
+        locationId: 'loc-a1',
+        status: 'APPROVED',
+        type: 'PRODUCT_PICKUP',
+      });
+      await expect(
+        repository.updateLine(
+          'tenant-a',
+          'sess-1',
+          'line-1',
+          { quantity: 5 },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toEqual(expect.objectContaining({ quantity: 5 }));
+    });
+
+    it('rejects NEWLY citing a decided basket-affecting event on update', async () => {
+      // line-1 carries no event; asserting the already-applied pickup as
+      // fresh lineage would forge a second manual application of it.
+      tx.visionEvent.findFirst.mockResolvedValue({
+        id: 'vision-9',
+        sessionId: 'sess-1',
+        evidenceBundleId: null,
+        unitId: 'unit-a1',
+        locationId: 'loc-a1',
+        status: 'APPROVED',
+        type: 'PRODUCT_PICKUP',
+      });
+      await expect(
+        repository.updateLine(
+          'tenant-a',
+          'sess-1',
+          'line-1',
+          { quantity: 4, visionEventId: 'vision-9' },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toBe('vision-event-already-applied');
+      expect(lineMocks.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects a PENDING_REVIEW basket-affecting event as update lineage', async () => {
+      tx.visionEvent.findFirst.mockResolvedValue({
+        id: 'vision-9',
+        sessionId: null,
+        evidenceBundleId: null,
+        unitId: 'unit-a1',
+        locationId: 'loc-a1',
+        status: 'PENDING_REVIEW',
+        type: 'CART_INSERTION',
+      });
+      await expect(
+        repository.updateLine(
+          'tenant-a',
+          'sess-1',
+          'line-1',
+          { quantity: 4, visionEventId: 'vision-9' },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toBe('vision-event-pending-review');
+      expect(tx.visionEvent.updateMany).not.toHaveBeenCalled();
+      expect(lineMocks.update).not.toHaveBeenCalled();
+    });
+
+    it('checks the KEPT event when a patch omits it (bound to this session passes)', async () => {
+      lineMocks.findFirst.mockResolvedValue({
+        id: 'line-1',
+        sessionId: 'sess-1',
+        status: 'ACTIVE',
+        quantity: 2,
+        visionEventId: 'vision-9',
+        evidenceBundleId: null,
+      });
+      tx.visionEvent.findFirst.mockResolvedValue({
+        id: 'vision-9',
+        sessionId: 'sess-1',
+        evidenceBundleId: null,
+        unitId: 'unit-a1',
+        locationId: 'loc-a1',
+        status: 'PENDING_REVIEW',
+      });
+      await expect(
+        repository.updateLine(
+          'tenant-a',
+          'sess-1',
+          'line-1',
+          { quantity: 5 },
+          () => auditEntry('CheckoutSessionLine'),
+        ),
+      ).resolves.toEqual(expect.objectContaining({ quantity: 5 }));
     });
   });
 
@@ -696,6 +1310,8 @@ describe('CheckoutSessionsRepository', () => {
       tx.checkoutSession.findFirst.mockResolvedValue({
         id: 'sess-1',
         status: CheckoutSessionStatus.OPEN,
+        unitId: 'unit-a1',
+        locationId: 'loc-a1',
       });
     });
 
@@ -808,6 +1424,93 @@ describe('CheckoutSessionsRepository', () => {
         }),
       );
       expect(createMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects lineage refs that do not resolve within the tenant', async () => {
+      tx.visionEvent.findFirst.mockResolvedValue(null);
+      await expect(
+        repository.create(
+          'tenant-a',
+          { ...data, visionEventId: 'vision-GHOST' },
+          () => auditEntry('CheckoutSession'),
+        ),
+      ).resolves.toBe('vision-event-not-found');
+      expect(tx.visionEvent.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'vision-GHOST', tenantId: 'tenant-a' },
+        }),
+      );
+      expect(createMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects an event already bound to a session as create lineage', async () => {
+      // The session being created cannot be the one the event is bound to —
+      // any existing binding means the event belongs to another session.
+      tx.visionEvent.findFirst.mockResolvedValue({
+        id: 'vision-9',
+        sessionId: 'sess-OTHER',
+        evidenceBundleId: null,
+        unitId: 'unit-a1',
+        locationId: 'loc-a1',
+        status: 'PENDING_REVIEW',
+      });
+      await expect(
+        repository.create(
+          'tenant-a',
+          { ...data, visionEventId: 'vision-9' },
+          () => auditEntry('CheckoutSession'),
+        ),
+      ).resolves.toBe('vision-event-session-mismatch');
+      expect(createMock).not.toHaveBeenCalled();
+    });
+
+    it('still accepts a PENDING basket-affecting event as SESSION lineage (bind-then-review)', async () => {
+      // Session creation claims the event but creates NO basket line — the
+      // basket effect is applied exactly once, by the later review. Only
+      // LINE mutations reject pending basket-affecting events.
+      tx.visionEvent.findFirst.mockResolvedValue({
+        id: 'vision-9',
+        sessionId: null,
+        evidenceBundleId: null,
+        unitId: 'unit-a1',
+        locationId: 'loc-a1',
+        status: 'PENDING_REVIEW',
+        type: 'PRODUCT_PICKUP',
+      });
+      const result = await repository.create(
+        'tenant-a',
+        { ...data, visionEventId: 'vision-9' },
+        () => auditEntry('CheckoutSession'),
+      );
+      expect(result).toEqual(expect.objectContaining({ replayed: false }));
+      expect(tx.visionEvent.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 'vision-9', sessionId: null }),
+        }),
+      );
+    });
+
+    it('accepts lineage refs that resolve within the tenant', async () => {
+      const result = await repository.create(
+        'tenant-a',
+        {
+          ...data,
+          evidenceBundleId: 'bundle-1',
+          visionEventId: 'vision-9',
+          vlmReviewId: 'review-1',
+        },
+        () => auditEntry('CheckoutSession'),
+      );
+      expect(result).toEqual(expect.objectContaining({ replayed: false }));
+      expect(createMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            evidenceBundleId: 'bundle-1',
+            visionEventId: 'vision-9',
+            vlmReviewId: 'review-1',
+          }),
+        }),
+      );
     });
 
     it('takes the unit advisory lock BEFORE the unit/store validation and holds it through the insert', async () => {

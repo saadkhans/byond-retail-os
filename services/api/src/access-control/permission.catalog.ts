@@ -41,4 +41,7 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   { code: 'payment:simulate', module: 'payments', description: 'Simulate provider-abstract authorization, capture, cancel/void, failure, and provider events' },
   { code: 'reconciliation:read', module: 'payments', description: 'View payment reconciliation records' },
   { code: 'reconciliation:manage', module: 'payments', description: 'Update reconciliation record status (mark reconciled/mismatch — no settlement accounting)' },
+  { code: 'vision:read', module: 'cv', description: 'View vision events, SKU candidates, reviews, and evidence bundle lineage records' },
+  { code: 'vision:ingest', module: 'cv', description: 'Ingest normalized product interaction events (with lineage-only evidence bundles) from vision adapters' },
+  { code: 'vision:review', module: 'cv', description: 'Approve, reject, or manually override vision events, applying approved events to checkout baskets' },
 ];

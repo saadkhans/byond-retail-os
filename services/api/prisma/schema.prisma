@@ -81,6 +81,10 @@ enum AuditAction {
   COMPLETE
   CANCEL
   EXPIRE
+  // Phase 7 — vision review decisions.
+  APPROVE
+  REJECT
+  OVERRIDE
   // Phase 6 — payment lifecycle. Intent creation reuses CREATE; these cover
   // the state-machine transitions that have no generic equivalent.
   AUTHORIZE
@@ -200,6 +204,10 @@ model Tenant {
   checkoutSessionLines CheckoutSessionLine[]
   orders               Order[]
   orderLines           OrderLine[]
+  evidenceBundles       EvidenceBundle[]
+  visionEvents          VisionEvent[]
+  visionEventCandidates VisionEventCandidate[]
+  visionEventReviews    VisionEventReview[]
 
   paymentIntents               PaymentIntent[]
   paymentAuthorizations        PaymentAuthorization[]
@@ -234,6 +242,9 @@ model User {
   checkoutSessionLinesCreated CheckoutSessionLine[] @relation("CheckoutSessionLineActor")
   ordersCreated               Order[]               @relation("OrderActor")
   orderLinesCreated           OrderLine[]           @relation("OrderLineActor")
+  evidenceBundlesCreated      EvidenceBundle[]      @relation("EvidenceBundleActor")
+  visionEventsCreated         VisionEvent[]         @relation("VisionEventActor")
+  visionEventReviews          VisionEventReview[]   @relation("VisionEventReviewer")
 
   paymentIntentsCreated        PaymentIntent[]               @relation("PaymentIntentActor")
   paymentAuthorizationsCreated PaymentAuthorization[]        @relation("PaymentAuthorizationActor")
@@ -326,6 +337,7 @@ model Location {
   retailUnits        RetailUnit[]
   checkoutSessions   CheckoutSession[]
   orders             Order[]
+  visionEvents       VisionEvent[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -468,6 +480,8 @@ model Product {
   inventoryMovements InventoryMovement[]
   checkoutSessionLines CheckoutSessionLine[]
   orderLines           OrderLine[]
+  visionEventCandidates VisionEventCandidate[]
+  visionReviewsApplied  VisionEventReview[]   @relation("VisionReviewAppliedProduct")
 
   @@unique([tenantId, sku])
   @@unique([id, tenantId])
@@ -541,6 +555,7 @@ model RetailUnit {
   devices  Device[]
   checkoutSessions CheckoutSession[]
   orders           Order[]
+  visionEvents     VisionEvent[]
 
   @@unique([tenantId, code])
   // Enables composite same-tenant FKs (devices must reference a unit of the
@@ -583,6 +598,7 @@ model Device {
   tenant Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   unit   RetailUnit @relation(fields: [unitId], references: [id], onDelete: Restrict)
   checkoutSessions CheckoutSession[]
+  visionEvents     VisionEvent[]
 
   @@unique([tenantId, serialNumber])
   @@unique([id, tenantId])
@@ -702,10 +718,19 @@ model CheckoutSession {
   startedAt DateTime              @default(now())
   endedAt   DateTime?
   // Vendor-neutral evidence/source lineage (see Phase 5 header comment).
+  // Since Phase 7, evidenceBundleId/visionEventId are CANONICAL references
+  // to the Phase 7 EvidenceBundle/VisionEvent tables (validated at the
+  // data-access layer, backstopped by same-tenant FKs in migration SQL).
   sourceType       EvidenceSourceType @default(MANUAL)
   sourceId         String?
   evidenceBundleId String?
   visionEventId    String?
+  // Pre-Phase-7 compatibility: opaque evidence references accepted by the
+  // Phase 5 API before the canonical tables existed. Preserved verbatim by
+  // the legacy_vision_ref_compat migration, NEVER resolved against Phase 7
+  // tables, and not writable through the API.
+  externalVisionEventRef    String?
+  externalEvidenceBundleRef String?
   vlmReviewId      String?
   evidenceScore    Float?
   evidenceQuality  EvidenceQuality?
@@ -724,6 +749,7 @@ model CheckoutSession {
   createdBy User?      @relation("CheckoutSessionActor", fields: [createdById], references: [id], onDelete: Restrict)
   lines     CheckoutSessionLine[]
   order     Order?
+  visionEvents   VisionEvent[]
   paymentIntents PaymentIntent[]
 
   // Enables composite same-tenant FKs (lines/orders must reference a session
@@ -758,11 +784,15 @@ model CheckoutSessionLine {
   unitPriceMinor Int?
   lineTotalMinor Int?
   currencyCode   String?
-  // Vendor-neutral evidence/source lineage (same set as the session).
+  // Vendor-neutral evidence/source lineage (same set as the session,
+  // including the pre-Phase-7 external compatibility refs — see
+  // CheckoutSession for the canonical-vs-external split).
   sourceType       EvidenceSourceType @default(MANUAL)
   sourceId         String?
   evidenceBundleId String?
   visionEventId    String?
+  externalVisionEventRef    String?
+  externalEvidenceBundleRef String?
   vlmReviewId      String?
   evidenceScore    Float?
   evidenceQuality  EvidenceQuality?
@@ -778,6 +808,7 @@ model CheckoutSessionLine {
   product    Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
   createdBy  User?           @relation("CheckoutSessionLineActor", fields: [createdById], references: [id], onDelete: Restrict)
   orderLines OrderLine[]
+  visionEventReviews VisionEventReview[]
 
   @@unique([id, tenantId])
   // One ACTIVE line per product per session ("adds aggregate into updates")
@@ -823,11 +854,15 @@ model Order {
   // exactly when paymentStatus becomes PAID.
   paymentStatus OrderPaymentStatus @default(UNPAID)
   paidAt        DateTime?
-  // Evidence lineage copied from the completed session.
+  // Evidence lineage copied from the completed session (canonical Phase 7
+  // refs and pre-Phase-7 external compatibility refs stay separate — see
+  // CheckoutSession).
   sourceType       EvidenceSourceType @default(MANUAL)
   sourceId         String?
   evidenceBundleId String?
   visionEventId    String?
+  externalVisionEventRef    String?
+  externalEvidenceBundleRef String?
   vlmReviewId      String?
   evidenceScore    Float?
   evidenceQuality  EvidenceQuality?
@@ -874,11 +909,15 @@ model OrderLine {
   unitPriceMinor Int?
   lineTotalMinor Int?
   currencyCode   String?
-  // Vendor-neutral evidence/source lineage copied from the session line.
+  // Vendor-neutral evidence/source lineage copied from the session line
+  // (canonical Phase 7 refs and pre-Phase-7 external compatibility refs
+  // stay separate — see CheckoutSession).
   sourceType       EvidenceSourceType @default(MANUAL)
   sourceId         String?
   evidenceBundleId String?
   visionEventId    String?
+  externalVisionEventRef    String?
+  externalEvidenceBundleRef String?
   vlmReviewId      String?
   evidenceScore    Float?
   evidenceQuality  EvidenceQuality?
@@ -1166,4 +1205,221 @@ model PaymentReconciliationRecord {
   @@unique([id, tenantId])
   @@index([tenantId, status, createdAt, id])
   @@index([tenantId, intentId])
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase 7 — CV product recognition & virtual basket foundation.
+//
+// The core USP flow: camera/CV event → evidence bundle → SKU candidates →
+// review/policy decision → virtual basket line. Everything here is VENDOR-
+// NEUTRAL: no dependency on any camera SDK, detector, or (V)LM provider.
+// sourceType/sourceId/modelName/modelVersion are OPAQUE metadata a future
+// adapter layer populates; the core never interprets them. There is NO edge
+// runtime, camera integration, or training pipeline in this phase — only the
+// normalized business/data flow that lets any provider's outputs become
+// basket events.
+//
+// All models are tenant-owned (TenantScopedRepository subclasses only), with
+// the same composite same-tenant FKs in migration SQL as Phases 3–5.
+// ---------------------------------------------------------------------------
+
+// Normalized product interaction event types (provider-neutral).
+enum VisionEventType {
+  PRODUCT_PICKUP
+  PRODUCT_RETURN
+  PRODUCT_TRANSFER
+  CART_INSERTION
+  EXIT_RECONCILIATION
+}
+
+// Event review lifecycle. PENDING_REVIEW is the only mutable state; APPROVED,
+// REJECTED, and OVERRIDDEN are terminal — a decided event never changes again
+// (its VisionEventReview row records the decision, append-only).
+enum VisionEventStatus {
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  OVERRIDDEN
+}
+
+enum VisionReviewDecision {
+  APPROVE
+  REJECT
+  OVERRIDE
+}
+
+// What a decision actually did to the linked session's basket. NONE covers
+// rejections and the record-only event types (PRODUCT_TRANSFER,
+// EXIT_RECONCILIATION) that never mutate the basket in this phase.
+enum VisionBasketEffect {
+  LINE_ADDED
+  LINE_INCREASED
+  LINE_DECREASED
+  LINE_REMOVED
+  NONE
+}
+
+// Evidence METADATA container for a capture window — never binary media.
+// `artifacts` holds opaque descriptors only (kind, uri, contentType, sha256,
+// durations, ...): the store of record for actual frames/clips is external
+// and provider-owned. Screened for credential-/payment-bearing content
+// before persistence (same shared detection as device metadata) — a
+// rtsp://user:pass@... artifact URI must never reach storage.
+//
+// Append-only: no updatedAt, no update/delete repository methods, and
+// migration-SQL triggers reject UPDATE/DELETE/TRUNCATE — evidence is
+// tamper-evident by construction. All relations are Restrict/NoAction so no
+// FK action can ever need to mutate a bundle row.
+model EvidenceBundle {
+  id       String @id @default(cuid())
+  tenantId String
+  // Opaque, vendor-neutral provenance (adapter-populated; never interpreted).
+  sourceType   EvidenceSourceType @default(VISION)
+  sourceId     String?
+  modelName    String?
+  modelVersion String?
+  // Capture window reported by the source.
+  captureStartedAt DateTime?
+  captureEndedAt   DateTime?
+  // Opaque artifact descriptors (kind/uri/contentType/sha256/...) — metadata
+  // ONLY, no binaries, screened for sensitive content before persistence.
+  artifacts Json?
+  metadata  Json?
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  tenant    Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  createdBy User?  @relation("EvidenceBundleActor", fields: [createdById], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  visionEvents VisionEvent[]
+
+  @@unique([id, tenantId])
+  @@index([tenantId, createdAt(sort: Desc)])
+}
+
+// A normalized product interaction event proposed by a vision source (or any
+// future adapter). Ingested via the API, reviewed by a human/policy, and —
+// only when approved — applied to the linked checkout session's basket.
+// The event itself NEVER mutates inventory or the basket at ingest time.
+model VisionEvent {
+  id         String @id @default(cuid())
+  tenantId   String
+  locationId String
+  unitId     String
+  // Optional source camera/device (no edge runtime in Phase 7).
+  deviceId String?
+  // Optional checkout session binding. Basket-affecting approvals REQUIRE a
+  // session; events may still be ingested unbound (e.g. before the shopper's
+  // session is known) and reviewed for the record.
+  sessionId String?
+  type   VisionEventType
+  status VisionEventStatus @default(PENDING_REVIEW)
+  // Units of the product the source believes were moved (integer, in the
+  // product's unit of measure — same integer-exact rule as the ledger).
+  quantity Int @default(1)
+  // When the interaction happened per the source; ingestedAt is server time.
+  occurredAt DateTime
+  ingestedAt DateTime @default(now())
+  // Opaque, vendor-neutral provenance (same set as EvidenceBundle).
+  sourceType   EvidenceSourceType @default(VISION)
+  sourceId     String?
+  modelName    String?
+  modelVersion String?
+  evidenceBundleId String?
+  evidenceScore    Float?
+  evidenceQuality  EvidenceQuality?
+  reasonCodes      String[]         @default([])
+  // SAFE, NON-SECRET normalized extras only (screened before persistence).
+  metadata Json?
+  // Tenant-scoped ingestion idempotency: at-least-once delivery from edge
+  // adapters replays the original event instead of duplicating it.
+  idempotencyKey String?
+  createdById    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  tenant         Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location       Location         @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit           RetailUnit       @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  device         Device?          @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  session        CheckoutSession? @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  evidenceBundle EvidenceBundle?  @relation(fields: [evidenceBundleId], references: [id], onDelete: Restrict)
+  createdBy      User?            @relation("VisionEventActor", fields: [createdById], references: [id], onDelete: Restrict)
+  candidates VisionEventCandidate[]
+  review     VisionEventReview?
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, status, occurredAt(sort: Desc), id(sort: Desc)])
+  @@index([tenantId, occurredAt(sort: Desc), id(sort: Desc)])
+  @@index([tenantId, type])
+  @@index([tenantId, sessionId])
+  @@index([tenantId, unitId])
+  @@index([tenantId, locationId])
+}
+
+// Ranked SKU candidate proposed for an event (rank 1 = strongest). Snapshots
+// the product's sku/name at ingest time so review history never rewrites when
+// the catalog is edited later. Append-only (triggers in migration SQL):
+// candidates are evidence of what the source proposed and never change.
+model VisionEventCandidate {
+  id        String @id @default(cuid())
+  tenantId  String
+  eventId   String
+  productId String
+  rank      Int
+  // Normalized [0, 1] confidence for THIS candidate, if the source ranks by
+  // score. Opaque label is whatever the source called the object.
+  score Float?
+  label String?
+  // Product snapshot at ingest time.
+  sku         String
+  productName String
+  createdAt   DateTime @default(now())
+
+  tenant  Tenant      @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  event   VisionEvent @relation(fields: [eventId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  product Product     @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, eventId, rank])
+  @@unique([tenantId, eventId, productId])
+  @@index([productId])
+}
+
+// The review/policy decision for an event — exactly one per event (the
+// (tenantId, eventId) unique), created atomically WITH the basket effect it
+// describes. Append-only (triggers in migration SQL): a decision is never
+// edited; correcting a mistake is a new manual basket mutation with its own
+// audit trail.
+//
+// Lineage note: the basket line written by an approval carries
+// visionEventId (+ evidence refs) back to the event; this row carries
+// sessionLineId forward to the line. The line's vlmReviewId column stays
+// NULL in Phase 7 — line → event → review is the canonical chain.
+model VisionEventReview {
+  id       String @id @default(cuid())
+  tenantId String
+  eventId  String @unique
+  decision VisionReviewDecision
+  reason   String?
+  // What was actually applied: the top candidate (APPROVE) or the reviewer's
+  // choice (OVERRIDE). NULL for rejections and record-only event types.
+  appliedProductId String?
+  appliedQuantity  Int?
+  basketEffect     VisionBasketEffect @default(NONE)
+  // The basket line the decision created/updated/removed, when any.
+  sessionLineId String?
+  reviewedById  String?
+  createdAt     DateTime @default(now())
+
+  tenant         Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  event          VisionEvent          @relation(fields: [eventId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  appliedProduct Product?             @relation("VisionReviewAppliedProduct", fields: [appliedProductId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  sessionLine    CheckoutSessionLine? @relation(fields: [sessionLineId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  reviewedBy     User?                @relation("VisionEventReviewer", fields: [reviewedById], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, eventId])
+  @@index([tenantId, createdAt(sort: Desc)])
 }
