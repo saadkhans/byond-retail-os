@@ -47,11 +47,11 @@ export function useLoad<T>(
 
 export function StatusBadge({ status }: { status: string }) {
   const tone =
-    status === 'ACTIVE' || status === 'ONLINE' || status === 'OPEN' || status === 'COMPLETED' || status === 'CONFIRMED'
+    status === 'ACTIVE' || status === 'ONLINE' || status === 'OPEN' || status === 'COMPLETED' || status === 'CONFIRMED' || status === 'APPROVED'
       ? 'ok'
-      : status === 'MAINTENANCE' || status === 'DRAFT' || status === 'PROVISIONED' || status === 'PENDING_REVIEW'
+      : status === 'MAINTENANCE' || status === 'DRAFT' || status === 'PROVISIONED' || status === 'PENDING_REVIEW' || status === 'OVERRIDDEN'
         ? 'warn'
-        : status === 'OFFLINE' || status === 'DISABLED' || status === 'RETIRED' || status === 'CLOSED' || status === 'INACTIVE' || status === 'CANCELLED' || status === 'EXPIRED'
+        : status === 'OFFLINE' || status === 'DISABLED' || status === 'RETIRED' || status === 'CLOSED' || status === 'INACTIVE' || status === 'CANCELLED' || status === 'EXPIRED' || status === 'REJECTED'
           ? 'down'
           : '';
   return <span className={`badge ${tone}`}>{status}</span>;

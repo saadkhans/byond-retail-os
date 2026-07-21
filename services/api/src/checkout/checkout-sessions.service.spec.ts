@@ -190,6 +190,7 @@ describe('CheckoutSessionsService', () => {
           reasonCodes: ['shelf_pickup_observed'],
         }),
         expect.any(Function),
+        expect.any(Function),
       );
       await service.addLine('tenant-a', 'sess-1', {
         productId: 'prod-a',
@@ -259,6 +260,7 @@ describe('CheckoutSessionsService', () => {
       expect(repository.create).toHaveBeenCalledWith(
         'tenant-a',
         expect.objectContaining({ idempotencyKey }),
+        expect.any(Function),
         expect.any(Function),
       );
       await service.addLine('tenant-a', 'sess-1', {
@@ -391,6 +393,106 @@ describe('CheckoutSessionsService', () => {
       ).rejects.toBeInstanceOf(ConflictException);
     });
 
+    it.each([
+      ['evidence-bundle-not-found', { evidenceBundleId: 'bundle-GHOST' }],
+      ['vision-event-not-found', { visionEventId: 'vision-GHOST' }],
+      ['vision-event-session-mismatch', { visionEventId: 'vision-BOUND' }],
+      ['vision-event-unit-mismatch', { visionEventId: 'vision-9' }],
+      ['vision-event-location-mismatch', { visionEventId: 'vision-9' }],
+      [
+        'evidence-bundle-event-mismatch',
+        { visionEventId: 'vision-9', evidenceBundleId: 'bundle-X' },
+      ],
+    ])('maps an unresolved lineage ref (%s) to a 400', async (rejection, refs) => {
+      repository.addLine.mockResolvedValue(rejection);
+      await expect(
+        service.addLine('tenant-a', 'sess-1', {
+          productId: 'prod-a',
+          quantity: 1,
+          ...refs,
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      repository.updateLine.mockResolvedValue(rejection);
+      await expect(
+        service.updateLine('tenant-a', 'sess-1', 'line-1', refs),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      repository.create.mockResolvedValue(rejection);
+      await expect(
+        service.create('tenant-a', {
+          locationId: 'loc-a1',
+          unitId: 'unit-a1',
+          ...refs,
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it('maps a decided (terminal) cited event to a 409 conflict', async () => {
+      repository.addLine.mockResolvedValue('vision-event-decided');
+      await expect(
+        service.addLine('tenant-a', 'sess-1', {
+          productId: 'prod-a',
+          quantity: 1,
+          visionEventId: 'vision-9',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      repository.updateLine.mockResolvedValue('vision-event-decided');
+      await expect(
+        service.updateLine('tenant-a', 'sess-1', 'line-1', {
+          visionEventId: 'vision-9',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      repository.create.mockResolvedValue('vision-event-decided');
+      await expect(
+        service.create('tenant-a', {
+          locationId: 'loc-a1',
+          unitId: 'unit-a1',
+          visionEventId: 'vision-9',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+    });
+
+    it('maps a pending basket-affecting cited event to a 409 conflict', async () => {
+      // Review is the only path that may apply such an event to a basket —
+      // citing it as manual line lineage would double-count the product.
+      repository.addLine.mockResolvedValue('vision-event-pending-review');
+      await expect(
+        service.addLine('tenant-a', 'sess-1', {
+          productId: 'prod-a',
+          quantity: 1,
+          visionEventId: 'vision-9',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      repository.updateLine.mockResolvedValue('vision-event-pending-review');
+      await expect(
+        service.updateLine('tenant-a', 'sess-1', 'line-1', {
+          visionEventId: 'vision-9',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+    });
+
+    it('maps an already-applied basket-affecting cited event to a 409 conflict', async () => {
+      repository.addLine.mockResolvedValue('vision-event-already-applied');
+      await expect(
+        service.addLine('tenant-a', 'sess-1', {
+          productId: 'prod-a',
+          quantity: 1,
+          visionEventId: 'vision-9',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      repository.updateLine.mockResolvedValue('vision-event-already-applied');
+      await expect(
+        service.updateLine('tenant-a', 'sess-1', 'line-1', {
+          visionEventId: 'vision-9',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+    });
+
     it('maps a duplicate product line to 409', async () => {
       repository.addLine.mockRejectedValue({ code: 'P2002' });
       await expect(
@@ -428,6 +530,7 @@ describe('CheckoutSessionsService', () => {
         'sess-1',
         'line-1',
         expect.objectContaining({ vlmReviewId: 'review-1' }),
+        expect.any(Function),
         expect.any(Function),
       );
     });

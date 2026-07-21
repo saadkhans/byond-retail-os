@@ -29,6 +29,10 @@ import {
 } from './pages/ReconciliationPage';
 import { StoreDetailPage, StoresPage } from './pages/StoresPage';
 import { UnitDetailPage, UnitsPage } from './pages/UnitsPage';
+import {
+  VisionEventDetailPage,
+  VisionEventsPage,
+} from './pages/VisionEventsPage';
 
 function RequireAuth({ children }: { children: ReactNode }) {
   const { user } = useAuth();
@@ -61,6 +65,7 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/payments">Payments</NavLink>
         <NavLink to="/payment-events">Payment events</NavLink>
         <NavLink to="/reconciliation">Reconciliation</NavLink>
+        <NavLink to="/vision-events">CV events</NavLink>
         <div className="spacer" />
         <div className="who">{user?.email}</div>
         <button onClick={() => void logout()}>Sign out</button>
@@ -117,6 +122,11 @@ export function App() {
                     <Route
                       path="reconciliation/:id"
                       element={<ReconciliationDetailPage />}
+                    />
+                    <Route path="vision-events" element={<VisionEventsPage />} />
+                    <Route
+                      path="vision-events/:id"
+                      element={<VisionEventDetailPage />}
                     />
                     <Route path="*" element={<Navigate to="/" replace />} />
                   </Routes>

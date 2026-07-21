@@ -119,6 +119,23 @@ export function tenantOrderNumberAdvisoryLockKey(tenantId: string): string {
 }
 
 /**
+ * Serializes review decisions on a vision event within a tenant: a decision
+ * is a read-then-write of the event's status (plus the basket effect it
+ * applies), so two concurrent reviewers must not both observe
+ * PENDING_REVIEW and each apply the basket mutation. The (tenantId, eventId)
+ * unique on VisionEventReview backstops the race at the database level.
+ * Lock ordering: vision-event → checkout-session → product; no other path
+ * takes the vision-event lock, so no cycle with checkout/inventory paths
+ * (which take at most session → product in the same order) is possible.
+ */
+export function visionEventAdvisoryLockKey(
+  tenantId: string,
+  eventId: string,
+): string {
+  return `vision-event:${tenantId}:${eventId}`;
+}
+
+/**
  * Serializes a payment intent's mutations (authorize, capture, cancel/void,
  * fail) against each other within a tenant. Each transition decides from a
  * read-then-write of the intent's status, so two concurrent requests (e.g. a
