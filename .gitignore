@@ -45,20 +45,22 @@ ml/datasets/byond-custom/**
 
 # Model weight files — never committed, wherever they appear (global,
 # not scoped to ml/, since a model artifact could land anywhere by mistake).
-*.pt
-*.onnx
-*.engine
-*.safetensors
-*.weights
-*.ckpt
-*.pth
-*.h5
-*.tflite
-*.mlmodel
-*.pb
-*.keras
-*.joblib
-*.gguf
+# Patterns use character classes so uppercase/mixed-case artifacts (e.g.
+# detector.PT, model.ONNX) are caught on case-sensitive filesystems.
+*.[pP][tT]
+*.[oO][nN][nN][xX]
+*.[eE][nN][gG][iI][nN][eE]
+*.[sS][aA][fF][eE][tT][eE][nN][sS][oO][rR][sS]
+*.[wW][eE][iI][gG][hH][tT][sS]
+*.[cC][kK][pP][tT]
+*.[pP][tT][hH]
+*.[hH]5
+*.[tT][fF][lL][iI][tT][eE]
+*.[mM][lL][mM][oO][dD][eE][lL]
+*.[pP][bB]
+*.[kK][eE][rR][aA][sS]
+*.[jJ][oO][bB][lL][iI][bB]
+*.[gG][gG][uU][fF]
 
 # Media files scoped to ml/ only — repo-wide *.png/*.jpg would swallow
 # future web/app image assets, so these patterns are deliberately
@@ -66,7 +68,7 @@ ml/datasets/byond-custom/**
 # *.bin is also scoped to ml/ only (not global): repo-wide *.bin could
 # swallow legitimate non-ML binaries, and Hugging Face-style
 # pytorch_model.bin files would land under ml/.
-ml/**/*.bin
+ml/**/*.[bB][iI][nN]
 ml/**/*.jpg
 ml/**/*.jpeg
 ml/**/*.png

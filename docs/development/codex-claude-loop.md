@@ -61,11 +61,22 @@ pnpm run codex:auto-loop -- --pr 2                 # status + findings file
 pnpm run codex:auto-loop -- --pr 2 --dry-run       # status only, writes nothing
 pnpm run codex:auto-loop -- --pr 2 --max-cycles 5  # echoed into loop budget
 pnpm run codex:auto-loop -- --pr 2 --no-push       # stop before push/comment
+pnpm run codex:auto-loop -- --pr 2 --ml-gates-passed  # ML PR: attest gates, get READY_FOR_HUMAN_MERGE
 ```
 
 STATUS meanings:
 - `READY_FOR_HUMAN_MERGE` — no active latest-review findings; the human
   reviews the PR and merges manually. Nothing ever merges automatically.
+  For ML PRs this status only appears after a `--ml-gates-passed` re-run
+  (see `ML_SAFETY_GATES_REQUIRED` below).
+- `ML_SAFETY_GATES_REQUIRED` — Codex findings are clean (clean-verdict
+  comment or zero latest findings) on an ML PR, but the four ML safety
+  gates (`dataset-safety-worker`, `ml-pipeline-reviewer`,
+  `vision-event-contract-worker`, `final-reviewer`) have not yet been
+  attested. Run the gates; any failed gate is treated as
+  `CLAUDE_FIX_REQUIRED`. Once all four return
+  SAFE/PASS/COMPATIBLE/PASS, re-run the helper with `--ml-gates-passed` to
+  receive `READY_FOR_HUMAN_MERGE`.
 - `CLAUDE_FIX_REQUIRED (n)` — findings saved for Claude Code to fix inside
   a `/codex-auto-loop` or `/fix-codex-review` session.
 - `WAITING_FOR_CODEX_REVIEW` — the latest Codex review predates the PR
@@ -117,12 +128,17 @@ keywords (`phase8`, `ml`, `training`, `dataset`, `cv-training`,
 word-boundary match) as a fallback when the changed-file list cannot be
 fetched — the loop runs `ml-pipeline-reviewer`, `dataset-safety-worker`,
 and `vision-event-contract-worker` before `final-reviewer` (step I').
-These gates run before ANY `READY_FOR_HUMAN_MERGE` declaration, including
-clean reviews where Codex reports zero findings — an
+These gates gate ANY `READY_FOR_HUMAN_MERGE` declaration: when Codex
+findings are clean on an ML PR (including zero latest findings), the
+helper reports `ML_SAFETY_GATES_REQUIRED` instead of
+`READY_FOR_HUMAN_MERGE`, and the orchestrator must run all four gates. An
 UNSAFE/BLOCK/INCOMPATIBLE verdict re-enters the fix pipeline as if the
-status were `CLAUDE_FIX_REQUIRED`. `ml/` is a
-stdlib-only Python workspace outside the pnpm workspace; datasets and model
-weights are external artifacts and must never be committed.
+status were `CLAUDE_FIX_REQUIRED`; only once all four gates return
+SAFE/PASS/COMPATIBLE/PASS does the orchestrator re-run the helper with
+`--ml-gates-passed`, which is the only way `READY_FOR_HUMAN_MERGE` is
+reported for an ML PR. `ml/` is a stdlib-only Python workspace outside the
+pnpm workspace; datasets and model weights are external artifacts and must
+never be committed.
 
 Merge-blockers specific to Phase 8:
 1. Datasets/images/videos committed to the repo

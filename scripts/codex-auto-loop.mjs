@@ -9,7 +9,11 @@
  *   - guardrail checks (branch, gh auth, PR ↔ branch match)
  *   - fetches the latest-review findings via codex:summary --latest-only
  *   - decides the cycle status:
- *       STATUS: READY_FOR_HUMAN_MERGE     (no latest-review findings)
+ *       STATUS: READY_FOR_HUMAN_MERGE     (no latest-review findings; for ML
+ *                                          PRs, only with --ml-gates-passed)
+ *       STATUS: ML_SAFETY_GATES_REQUIRED  (ML PR is Codex-clean but the ML
+ *                                          safety gates have not been attested
+ *                                          via --ml-gates-passed)
  *       STATUS: CLAUDE_FIX_REQUIRED       (findings saved for Claude to fix)
  *       STATUS: WAITING_FOR_CODEX_REVIEW  (latest Codex review predates the
  *                                          PR head — stop, wait for Codex)
@@ -42,6 +46,11 @@
  *   --wait-seconds <number>  suggested wait before rechecking Codex (default 90)
  *   --allow-dirty            proceed despite uncommitted changes (default:
  *                            a dirty tree is a hard stop)
+ *   --ml-gates-passed        attestation from the orchestrator that the ML
+ *                            safety gates (dataset-safety-worker,
+ *                            ml-pipeline-reviewer, vision-event-contract-worker,
+ *                            final-reviewer) ALL returned clean on the current
+ *                            head — required for READY_FOR_HUMAN_MERGE on ML PRs
  */
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -83,14 +92,43 @@ function runOrFail(command, args, context) {
   return result.stdout;
 }
 
-function printMlMergeGates() {
+// Single source of truth for the ML safety gates that must pass before an
+// ML PR may be handed to human merge.
+const ML_MERGE_GATES = [
+  'dataset-safety-worker',
+  'ml-pipeline-reviewer',
+  'vision-event-contract-worker',
+  'final-reviewer',
+];
+
+function printMlGatesRequired() {
   console.log('');
   console.log(
-    'ML PR — safety gates are REQUIRED before handing off to human merge: ' +
-      'spawn dataset-safety-worker, ml-pipeline-reviewer, and ' +
-      'vision-event-contract-worker, then final-reviewer. Any ' +
-      'UNSAFE/BLOCK/INCOMPATIBLE verdict must be treated as ' +
-      'CLAUDE_FIX_REQUIRED even though Codex reported no findings.',
+    'ML PR — Codex is clean on the current head, but the ML safety gates ' +
+      'have not been attested via --ml-gates-passed, so ' +
+      'READY_FOR_HUMAN_MERGE is withheld.',
+  );
+  console.log('');
+  console.log('Instructions for Claude Code (orchestrator):');
+  console.log(
+    '  1. Run ALL four ML safety gates against the current head: ' +
+      `${ML_MERGE_GATES.join(', ')}.`,
+  );
+  console.log(
+    '  2. If every gate returns clean, re-run this command with ' +
+      '--ml-gates-passed to obtain READY_FOR_HUMAN_MERGE.',
+  );
+  console.log(
+    '  3. If ANY gate fails (UNSAFE/BLOCK/INCOMPATIBLE), treat it as ' +
+      'CLAUDE_FIX_REQUIRED: fix, push, and request a Codex re-review. ' +
+      'NEVER hand a PR to human merge with a failed gate.',
+  );
+}
+
+function printMlGatesAttested() {
+  console.log(
+    `ML PR: the ML safety gates (${ML_MERGE_GATES.join(', ')}) were ` +
+      'attested passed by the caller via --ml-gates-passed.',
   );
 }
 
@@ -101,7 +139,12 @@ const USAGE =
   '  --dry-run            report status only; write nothing\n' +
   '  --no-push            tell Claude to stop before push/comment\n' +
   '  --wait-seconds <n>   suggested Codex recheck wait (default 90)\n' +
-  '  --allow-dirty        proceed despite uncommitted changes';
+  '  --allow-dirty        proceed despite uncommitted changes\n' +
+  '  --ml-gates-passed    attestation from the orchestrator that\n' +
+  '                       dataset-safety-worker, ml-pipeline-reviewer,\n' +
+  '                       vision-event-contract-worker, and final-reviewer\n' +
+  '                       ALL returned clean on the current head (required\n' +
+  '                       for READY_FOR_HUMAN_MERGE on ML PRs)';
 
 function parseArgs(argv) {
   const args = {
@@ -111,6 +154,7 @@ function parseArgs(argv) {
     noPush: false,
     waitSeconds: 90,
     allowDirty: false,
+    mlGatesPassed: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -132,6 +176,8 @@ function parseArgs(argv) {
       args.noPush = true;
     } else if (arg === '--allow-dirty') {
       args.allowDirty = true;
+    } else if (arg === '--ml-gates-passed') {
+      args.mlGatesPassed = true;
     } else if (arg === '--help' || arg === '-h') {
       console.log(USAGE);
       process.exit(0);
@@ -218,24 +264,61 @@ function main() {
   // list cannot be fetched or parsed.
   let mlByFiles = false;
   let filesFetched = false;
-  const filesResult = run('gh', [
-    'pr',
-    'view',
-    String(pr.number),
-    '--json',
-    'files',
+  // Primary fetch: the REST files endpoint. Unlike `gh pr view --json files`
+  // (new paths only), it reports `previous_filename` for renames, so moving
+  // e.g. ml/models/x.bin to artifacts/x.bin still trips ML detection.
+  const apiFilesResult = run('gh', [
+    'api',
+    `repos/{owner}/{repo}/pulls/${pr.number}/files`,
+    '--paginate',
   ]);
-  if (filesResult.status === 0) {
+  if (apiFilesResult.status === 0) {
     try {
-      const files = JSON.parse(filesResult.stdout).files;
-      if (Array.isArray(files)) {
+      // --paginate concatenates the JSON arrays of successive pages
+      // ("...][..."), which is not valid JSON — join them before parsing.
+      const entries = JSON.parse(
+        apiFilesResult.stdout.trim().replace(/\]\s*\[/g, ','),
+      );
+      if (Array.isArray(entries) && entries.length > 0) {
         filesFetched = true;
-        mlByFiles = files.some((file) =>
-          ML_PATHS.test(typeof file?.path === 'string' ? file.path : ''),
+        mlByFiles = entries.some(
+          (entry) =>
+            ML_PATHS.test(
+              typeof entry?.filename === 'string' ? entry.filename : '',
+            ) ||
+            ML_PATHS.test(
+              typeof entry?.previous_filename === 'string'
+                ? entry.previous_filename
+                : '',
+            ),
         );
       }
     } catch {
-      // Unparseable output — treated like a failed fetch below.
+      // Unparseable output — fall back to `gh pr view` below.
+    }
+  }
+  // Fallback fetch: `gh pr view --json files` (new paths only — renames out
+  // of ml/ are invisible here, hence the REST endpoint above is preferred).
+  if (!filesFetched) {
+    const filesResult = run('gh', [
+      'pr',
+      'view',
+      String(pr.number),
+      '--json',
+      'files',
+    ]);
+    if (filesResult.status === 0) {
+      try {
+        const files = JSON.parse(filesResult.stdout).files;
+        if (Array.isArray(files)) {
+          filesFetched = true;
+          mlByFiles = files.some((file) =>
+            ML_PATHS.test(typeof file?.path === 'string' ? file.path : ''),
+          );
+        }
+      } catch {
+        // Unparseable output — treated like a failed fetch below.
+      }
     }
   }
   if (!filesFetched) {
@@ -342,7 +425,12 @@ function main() {
   console.log('');
 
   if (cleanVerdictCoversHead) {
-    console.log('STATUS: READY_FOR_HUMAN_MERGE');
+    const mlGatesPending = isMlPr && !args.mlGatesPassed;
+    console.log(
+      mlGatesPending
+        ? 'STATUS: ML_SAFETY_GATES_REQUIRED'
+        : 'STATUS: READY_FOR_HUMAN_MERGE',
+    );
     console.log('');
     console.log(
       `Codex reviewed the current head ${headSha.slice(0, 7)} clean ` +
@@ -356,8 +444,12 @@ function main() {
           'resolve them manually (or leave them for Codex to mark outdated).',
       );
     }
+    if (mlGatesPending) {
+      printMlGatesRequired();
+      return;
+    }
     if (isMlPr) {
-      printMlMergeGates();
+      printMlGatesAttested();
     }
     console.log(
       'Next step is HUMAN-ONLY: review the PR and merge it manually. ' +
@@ -385,7 +477,12 @@ function main() {
   }
 
   if (latestCount === 0) {
-    console.log('STATUS: READY_FOR_HUMAN_MERGE');
+    const mlGatesPending = isMlPr && !args.mlGatesPassed;
+    console.log(
+      mlGatesPending
+        ? 'STATUS: ML_SAFETY_GATES_REQUIRED'
+        : 'STATUS: READY_FOR_HUMAN_MERGE',
+    );
     console.log('');
     console.log(
       `No active latest-review Codex findings on PR #${pr.number}.` +
@@ -394,8 +491,12 @@ function main() {
             'GitHub — verified-stale threads awaiting Codex outdated-marking.)'
           : ''),
     );
+    if (mlGatesPending) {
+      printMlGatesRequired();
+      return;
+    }
     if (isMlPr) {
-      printMlMergeGates();
+      printMlGatesAttested();
     }
     console.log(
       'Next step is HUMAN-ONLY: review the PR and merge it manually. ' +

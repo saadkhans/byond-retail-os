@@ -9,6 +9,7 @@ root without a shared conftest or installed package.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -140,6 +141,35 @@ class FieldRuleTests(unittest.TestCase):
         manifest["splits"]["train"][0]["unexpected"] = True
         errors = validate_manifest(manifest)
         self.assertTrue(any("unexpected" in e for e in errors), errors)
+
+
+class EnumTypeGuardTests(unittest.TestCase):
+    """Unhashable enum values (list/dict) must yield validation errors, not
+    TypeError from set-membership tests."""
+
+    def test_source_as_list_reports_error_not_traceback(self) -> None:
+        manifest = _valid_manifest()
+        manifest["source"] = ["rpc"]
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("source must be one of" in e for e in errors), errors)
+
+    def test_capture_context_as_dict_reports_error_not_traceback(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["captureContext"] = {"stage": "shelf"}
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("captureContext" in e for e in errors), errors)
+
+    def test_cli_on_unhashable_enum_values_exits_1_without_traceback(self) -> None:
+        manifest = _valid_manifest()
+        manifest["source"] = ["rpc"]
+        manifest["splits"]["train"][0]["captureContext"] = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = _run_script("validate_dataset_manifest.py", [str(manifest_path)])
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("ERROR", result.stdout)
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
 
 
 class CrossSplitDuplicateTests(unittest.TestCase):
@@ -293,6 +323,73 @@ class CheckFilesTests(unittest.TestCase):
             )
 
 
+class FilesystemAliasTests(unittest.TestCase):
+    """check_files must reject two lexically distinct image refs that resolve
+    to one underlying file (hardlink/symlink) — a hidden split overlap."""
+
+    def _manifest_two_images(self) -> dict:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"] = [{"image": "images/a.jpg"}]
+        manifest["splits"]["val"] = [{"image": "images/b.jpg"}]
+        return manifest
+
+    def test_hardlinked_image_across_splits_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "images").mkdir()
+            original = base / "images" / "a.jpg"
+            original.touch()
+            try:
+                os.link(str(original), str(base / "images" / "b.jpg"))
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"hardlinks unsupported on this platform/filesystem: {exc}")
+            errors = validate_manifest(
+                self._manifest_two_images(), base_dir=base, check_files=True
+            )
+            self.assertTrue(
+                any(
+                    "splits.val[0].image aliases splits.train[0].image "
+                    "(same underlying file)" in e
+                    for e in errors
+                ),
+                errors,
+            )
+
+    def test_symlinked_image_across_splits_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "images").mkdir()
+            original = base / "images" / "a.jpg"
+            original.touch()
+            try:
+                os.symlink(str(original), str(base / "images" / "b.jpg"))
+            except (OSError, NotImplementedError) as exc:
+                # Windows may lack the symlink privilege.
+                self.skipTest(f"symlinks unsupported on this platform/filesystem: {exc}")
+            errors = validate_manifest(
+                self._manifest_two_images(), base_dir=base, check_files=True
+            )
+            self.assertTrue(
+                any(
+                    "splits.val[0].image aliases splits.train[0].image "
+                    "(same underlying file)" in e
+                    for e in errors
+                ),
+                errors,
+            )
+
+    def test_distinct_files_across_splits_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "images").mkdir()
+            (base / "images" / "a.jpg").touch()
+            (base / "images" / "b.jpg").touch()
+            errors = validate_manifest(
+                self._manifest_two_images(), base_dir=base, check_files=True
+            )
+            self.assertEqual(errors, [])
+
+
 class PrepareScriptDryRunTests(unittest.TestCase):
     """Dry runs must require nothing on disk and write nothing."""
 
@@ -392,6 +489,39 @@ class PrepareByondStagingTests(unittest.TestCase):
     def test_staged_manifest_with_relative_source_root_resolves_to_input(self) -> None:
         self._stage_and_check(self._byond_manifest(sourceRoot="."))
 
+    def test_manifest_with_subdir_source_root_validates_and_stages(self) -> None:
+        # sourceRoot "data": references live under <input>/data/..., so
+        # validation must resolve through sourceRoot (not the input dir
+        # itself) exactly like the standalone validator does.
+        manifest = self._byond_manifest(sourceRoot="data")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            input_dir = base / "input"
+            data_dir = input_dir / "data"
+            (data_dir / "raw" / "shelves").mkdir(parents=True)
+            (data_dir / "annotations").mkdir()
+            (data_dir / "raw" / "shelves" / "a.jpg").touch()
+            (data_dir / "annotations" / "a.json").write_text("{}", encoding="utf-8")
+            (input_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            output_dir = base / "out"
+
+            result = _run_script(
+                "prepare_byond_dataset.py",
+                ["--input", str(input_dir), "--output", str(output_dir)],
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            staged = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+            staged_root = Path(staged["sourceRoot"])
+            resolved = staged_root if staged_root.is_absolute() else output_dir / staged_root
+            self.assertEqual(resolved.resolve(), data_dir.resolve())
+
+            check = _run_script(
+                "validate_dataset_manifest.py",
+                [str(output_dir / "manifest.json"), "--check-files"],
+            )
+            self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+
 
 class PrepareRpcEndToEndTests(unittest.TestCase):
     """Non-dry-run prepare_rpc.py against a tiny synthetic raw layout."""
@@ -444,6 +574,28 @@ class PrepareRpcEndToEndTests(unittest.TestCase):
             self.assertIn("missing file: val2019/v1.jpg", result.stdout)
             self.assertIn(str(raw), result.stdout)
 
+    def test_failed_rerun_preserves_previous_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            out = Path(tmp) / "out"
+            self._write_raw(raw)
+            first = _run_script(
+                "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+            )
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            original = (out / "manifest.json").read_text(encoding="utf-8")
+
+            (raw / "val2019" / "v1.jpg").unlink()
+            second = _run_script(
+                "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+            )
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn("missing file: val2019/v1.jpg", second.stdout)
+            self.assertEqual(
+                (out / "manifest.json").read_text(encoding="utf-8"), original
+            )
+            self.assertEqual(list(out.glob("*.tmp")), [])
+
 
 class PrepareSku110kEndToEndTests(unittest.TestCase):
     """Non-dry-run prepare_sku110k.py against a tiny synthetic raw layout."""
@@ -494,6 +646,28 @@ class PrepareSku110kEndToEndTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("missing file: images/c.jpg", result.stdout)
             self.assertIn(str(raw), result.stdout)
+
+    def test_failed_rerun_preserves_previous_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            out = Path(tmp) / "out"
+            self._write_raw(raw)
+            first = _run_script(
+                "prepare_sku110k.py", ["--input", str(raw), "--output", str(out)]
+            )
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            original = (out / "manifest.json").read_text(encoding="utf-8")
+
+            (raw / "images" / "b.jpg").unlink()
+            second = _run_script(
+                "prepare_sku110k.py", ["--input", str(raw), "--output", str(out)]
+            )
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn("missing file: images/b.jpg", second.stdout)
+            self.assertEqual(
+                (out / "manifest.json").read_text(encoding="utf-8"), original
+            )
+            self.assertEqual(list(out.glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

@@ -109,7 +109,9 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
     source = manifest.get("source")
     if "source" not in manifest:
         errors.append("missing required field: source")
-    elif source not in SOURCE_VALUES:
+    elif not isinstance(source, str) or source not in SOURCE_VALUES:
+        # isinstance guard first: unhashable values (list/dict) would raise
+        # TypeError from the set membership test instead of validating.
         errors.append(f"source must be one of {sorted(SOURCE_VALUES)}, got {source!r}")
 
     if "sourceRoot" in manifest:
@@ -273,7 +275,7 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
 
                     if "captureContext" in sample:
                         capture_context = sample["captureContext"]
-                        if capture_context not in CAPTURE_CONTEXT_VALUES:
+                        if not isinstance(capture_context, str) or capture_context not in CAPTURE_CONTEXT_VALUES:
                             errors.append(
                                 f"{sample_path}.captureContext must be one of "
                                 f"{sorted(CAPTURE_CONTEXT_VALUES)}, got {capture_context!r}"
@@ -299,21 +301,58 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                                 missing.append(f"missing file: {rel}")
                             elif not target.is_file():
                                 missing.append(f"not a regular file: {rel}")
+                seen_image_identities: dict = {}
                 for split_name in SPLIT_NAMES:
                     samples = splits.get(split_name)
                     if not isinstance(samples, list):
                         continue
-                    for sample in samples:
+                    for idx, sample in enumerate(samples):
                         if not isinstance(sample, dict):
                             continue
                         for key in ("image", "annotation"):
                             rel = sample.get(key)
-                            if isinstance(rel, str) and not _is_bad_path(rel):
-                                target = root / rel
-                                if not target.exists():
-                                    missing.append(f"missing file: {rel}")
-                                elif not target.is_file():
-                                    missing.append(f"not a regular file: {rel}")
+                            if not isinstance(rel, str) or _is_bad_path(rel):
+                                continue
+                            target = root / rel
+                            if not target.exists():
+                                missing.append(f"missing file: {rel}")
+                                continue
+                            if not target.is_file():
+                                missing.append(f"not a regular file: {rel}")
+                                continue
+                            if key != "image":
+                                # Annotations may legitimately be shared across
+                                # splits (split-level files); only images get
+                                # alias dedup.
+                                continue
+                            # Two lexically distinct image refs can still be
+                            # one underlying file via symlinks/hardlinks,
+                            # silently leaking samples across splits past the
+                            # exact-string overlap check above. Dedupe by
+                            # filesystem identity (st_dev, st_ino) of the
+                            # resolved path; if identity cannot be determined,
+                            # skip aliasing detection for this entry (the
+                            # existence checks above still applied).
+                            try:
+                                stat_result = target.resolve().stat()
+                            except OSError:
+                                continue
+                            if stat_result.st_ino == 0:
+                                # Filesystem does not report inodes; identity
+                                # would be meaningless and every file would
+                                # "alias" every other.
+                                continue
+                            identity = (stat_result.st_dev, stat_result.st_ino)
+                            ref = f"splits.{split_name}[{idx}].image"
+                            prior = seen_image_identities.get(identity)
+                            if prior is None:
+                                seen_image_identities[identity] = (ref, rel)
+                            elif prior[1] != rel:
+                                # Same-string duplicates are already reported
+                                # by the exact-string check above.
+                                errors.append(
+                                    f"{ref} aliases {prior[0]} (same underlying file)"
+                                )
                 for line in missing[:25]:
                     errors.append(line)
                 if len(missing) > 25:

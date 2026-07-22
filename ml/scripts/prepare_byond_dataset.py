@@ -53,6 +53,22 @@ def _source_root(input_dir, output_dir) -> str:
     return Path(rel).as_posix()
 
 
+def _effective_source_root(manifest: dict, input_dir: Path) -> Path:
+    """Directory the manifest's file references resolve against.
+
+    A relative sourceRoot resolves against the manifest's own directory
+    (the input dir); an absolute one is used as-is; absent/invalid falls
+    back to the input dir. Used both for check_files validation and for
+    recomputing the staged manifest's sourceRoot, so the two can never
+    disagree.
+    """
+    source_root = manifest.get("sourceRoot")
+    if isinstance(source_root, str) and source_root:
+        source_root_path = Path(source_root)
+        return source_root_path if source_root_path.is_absolute() else input_dir / source_root_path
+    return input_dir
+
+
 def _print_plan(input_dir: str, output_dir) -> None:
     print("BYOND custom dataset validation plan (dry run — nothing read or written):")
     print(f"  input:  {input_dir}")
@@ -101,7 +117,10 @@ def _extra_byond_checks(manifest: dict) -> list:
                 path = f"splits.{split_name}[{idx}]"
 
                 capture_context = sample.get("captureContext")
-                if capture_context is not None and capture_context not in CAPTURE_CONTEXT_VALUES:
+                if capture_context is not None and (
+                    not isinstance(capture_context, str)
+                    or capture_context not in CAPTURE_CONTEXT_VALUES
+                ):
                     errors.append(
                         f"{path}.captureContext must be one of {sorted(CAPTURE_CONTEXT_VALUES)}, "
                         f"got {capture_context!r}"
@@ -132,7 +151,11 @@ def validate(input_dir: Path, output_dir) -> int:
         print(f"ERROR: {manifest_path} is not valid JSON: {exc}")
         return 1
 
-    errors = validate_manifest(manifest, base_dir=input_dir, check_files=True)
+    # References resolve through sourceRoot (when present), exactly like the
+    # standalone validator's CLI — validating against input_dir directly would
+    # wrongly fail manifests whose sourceRoot points elsewhere (e.g. "data").
+    effective_source_root = _effective_source_root(manifest if isinstance(manifest, dict) else {}, input_dir)
+    errors = validate_manifest(manifest, base_dir=effective_source_root, check_files=True)
     errors.extend(_extra_byond_checks(manifest))
 
     if errors:
@@ -150,17 +173,9 @@ def validate(input_dir: Path, output_dir) -> int:
 
         # A verbatim copy would break path resolution: a relative (or absent)
         # sourceRoot resolves against the manifest's own directory, which is
-        # now the output dir. Recompute sourceRoot so the staged copy still
-        # points at the input dataset's media (never copied/staged).
-        source_root = manifest.get("sourceRoot")
-        if isinstance(source_root, str) and source_root:
-            source_root_path = Path(source_root)
-            effective_source_root = (
-                source_root_path if source_root_path.is_absolute() else input_dir / source_root_path
-            )
-        else:
-            effective_source_root = input_dir
-
+        # now the output dir. Recompute sourceRoot (from the same effective
+        # root the validation above used) so the staged copy still points at
+        # the input dataset's media (never copied/staged).
         staged = dict(manifest)
         staged["sourceRoot"] = _source_root(effective_source_root, output_dir)
         with destination.open("w", encoding="utf-8") as fh:

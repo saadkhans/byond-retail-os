@@ -26,7 +26,9 @@ Cross-reference all three against the block list below.
   tracked
 - Model weights: `*.pt`, `*.pth`, `*.onnx`, `*.engine`, `*.safetensors`,
   `*.weights`, `*.ckpt`, `*.h5`, `*.tflite`, `*.mlmodel`, `*.pb`, `*.keras`,
-  `*.joblib`, `*.gguf`, plus `ml/`-scoped `*.bin`
+  `*.joblib`, `*.gguf`, plus `ml/`-scoped `*.bin` — matched case-insensitively
+  (e.g. `*.pt`/`*.PT`, any case), so treat extension matches on these as
+  case-insensitive when scanning diffs
 - Video/image media: `*.mp4`, `*.mov`, `*.avi`, `*.mkv`, `*.jpg`, `*.jpeg`,
   `*.png`, `*.webp`
 - Binary blobs: `*.npy`, `*.npz`, `*.parquet`, `*.pkl`, `*.pickle`

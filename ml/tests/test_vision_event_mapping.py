@@ -7,7 +7,9 @@ even be producible).
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -207,6 +209,33 @@ class TimestampValidationTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     to_vision_event(inference)
 
+    def test_offsetless_occurred_at_rejected(self) -> None:
+        inference = _base_inference()
+        inference["occurredAt"] = "2026-07-21T10:00:00"
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        self.assertIn("occurredAt must be a timezone-aware ISO-8601 timestamp", str(ctx.exception))
+
+    def test_offsetless_capture_started_at_rejected(self) -> None:
+        inference = _base_inference()
+        inference["captureStartedAt"] = "2026-07-21T09:59:58"
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        self.assertIn("captureStartedAt must be a timezone-aware ISO-8601 timestamp", str(ctx.exception))
+
+    def test_offsetless_capture_ended_at_rejected(self) -> None:
+        inference = _base_inference()
+        inference["captureEndedAt"] = "2026-07-21T10:00:02"
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        self.assertIn("captureEndedAt must be a timezone-aware ISO-8601 timestamp", str(ctx.exception))
+
+    def test_plus_three_offset_timestamp_accepted(self) -> None:
+        inference = _base_inference()
+        inference["occurredAt"] = "2026-07-21T13:00:00+03:00"
+        payload = to_vision_event(inference)
+        self.assertEqual(payload["occurredAt"], "2026-07-21T13:00:00+03:00")
+
 
 class ForbiddenFieldTests(unittest.TestCase):
     def test_forbidden_fields_never_appear_in_generated_payload(self) -> None:
@@ -281,6 +310,20 @@ class ValidationErrorTests(unittest.TestCase):
         inference["eventType"] = "NOT_A_TYPE"
         with self.assertRaises(ValueError):
             to_vision_event(inference)
+
+    def test_event_type_list_rejected_with_value_error(self) -> None:
+        inference = _base_inference()
+        inference["eventType"] = ["PRODUCT_PICKUP"]
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        self.assertIn("eventType is required and must be a non-empty string", str(ctx.exception))
+
+    def test_event_type_dict_rejected_with_value_error(self) -> None:
+        inference = _base_inference()
+        inference["eventType"] = {"type": "PRODUCT_PICKUP"}
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        self.assertIn("eventType is required and must be a non-empty string", str(ctx.exception))
 
 
 class SensitiveValueScreeningTests(unittest.TestCase):
@@ -403,6 +446,31 @@ class QuantityBoundTests(unittest.TestCase):
         inference["quantityDelta"] = 2_147_483_647
         payload = to_vision_event(inference)
         self.assertEqual(payload["quantity"], 2_147_483_647)
+
+
+class CliErrorHandlingTests(unittest.TestCase):
+    """main() must turn every malformed-input failure into the documented
+    ERROR: line with a non-zero exit — never a raw traceback."""
+
+    def test_non_string_event_type_prints_error_line_not_traceback(self) -> None:
+        inference = _base_inference()
+        inference["eventType"] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            model_output = Path(tmp) / "model_output.json"
+            model_output.write_text(json.dumps(inference), encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "sample_inference_to_vision_event.py"),
+                    str(model_output),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ERROR: eventType is required and must be a non-empty string", result.stdout)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

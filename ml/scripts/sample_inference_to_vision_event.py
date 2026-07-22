@@ -336,23 +336,27 @@ def _require_nonempty_string(value, field: str) -> str:
     return value
 
 
-def _parse_iso8601(value: str) -> datetime.datetime:
+def _parse_iso8601(name: str, value: str) -> datetime.datetime:
     # .replace keeps trailing-Z inputs parseable on Python < 3.11.
-    parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"{name} must be an ISO-8601 timestamp string, got {value!r}") from None
     if parsed.tzinfo is None:
-        # Treat offset-naive stamps as UTC so mixed naive/aware capture
-        # windows stay comparable (never a TypeError).
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        # An offset-less stamp would be emitted verbatim and the API's
+        # `new Date()` would interpret it in server-local time, silently
+        # shifting stored event times — so reject rather than normalize.
+        raise ValueError(
+            f"{name} must be a timezone-aware ISO-8601 timestamp (include an offset or 'Z'), got {value!r}"
+        )
     return parsed
 
 
 def _require_iso8601(name: str, value) -> str:
-    """Require a non-empty ISO-8601 timestamp string (trailing 'Z' accepted)."""
+    """Require a non-empty, timezone-aware ISO-8601 timestamp string
+    (trailing 'Z' or an explicit UTC offset)."""
     _require_nonempty_string(value, name)
-    try:
-        _parse_iso8601(value)
-    except ValueError:
-        raise ValueError(f"{name} must be an ISO-8601 timestamp string, got {value!r}")
+    _parse_iso8601(name, value)
     return value
 
 
@@ -370,6 +374,10 @@ def to_vision_event(inference: dict) -> dict:
         raise ValueError(f"sourceType must be 'VISION' for vision model inference, got {source_type!r}")
 
     event_type = inference.get("eventType")
+    # isinstance guard first: a non-string (list/dict/...) must be a clear
+    # ValueError, not a TypeError from the frozenset membership test below.
+    if not isinstance(event_type, str) or not event_type:
+        raise ValueError(f"eventType is required and must be a non-empty string, got {event_type!r}")
     if event_type not in EVENT_TYPES:
         raise ValueError(f"eventType must be one of {sorted(EVENT_TYPES)}, got {event_type!r}")
 
@@ -487,7 +495,9 @@ def to_vision_event(inference: dict) -> dict:
         # Mirror the service's normalizeBundle: a strictly reversed capture
         # window is a 400 (equal timestamps are allowed).
         if capture_started_at is not None and capture_ended_at is not None:
-            if _parse_iso8601(bundle["captureEndedAt"]) < _parse_iso8601(bundle["captureStartedAt"]):
+            if _parse_iso8601("captureEndedAt", bundle["captureEndedAt"]) < _parse_iso8601(
+                "captureStartedAt", bundle["captureStartedAt"]
+            ):
                 raise ValueError("captureEndedAt must not be before captureStartedAt")
         payload["evidenceBundle"] = bundle
 

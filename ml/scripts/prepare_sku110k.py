@@ -31,6 +31,7 @@ import csv
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 from validate_dataset_manifest import validate_manifest
@@ -63,6 +64,29 @@ def _source_root(input_dir, output_dir) -> str:
     except ValueError:
         return Path(input_dir).resolve().as_posix()
     return Path(rel).as_posix()
+
+
+def _write_json_atomically(payload: dict, destination: Path) -> None:
+    """Write JSON via a same-directory temp file + os.replace.
+
+    A crash mid-write can therefore never leave a truncated/partial
+    manifest.json behind — the destination either keeps its previous
+    content or receives the complete new one.
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(destination.parent), prefix=destination.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp_name, destination)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _missing_markers(input_dir: Path) -> list:
@@ -149,21 +173,22 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
         "splits": splits,
     }
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "manifest.json"
-    with manifest_path.open("w", encoding="utf-8") as fh:
-        json.dump(manifest, fh, indent=2, sort_keys=True)
-        fh.write("\n")
 
+    # Validate BEFORE writing anything: a failed run must never clobber a
+    # previously valid manifest.json with a rejected one.
     errors = validate_manifest(manifest, check_files=True, base_dir=input_dir)
     if errors:
         print(
-            f"ERROR: generated manifest at {manifest_path} failed validation "
-            f"against input root {input_dir}:"
+            f"ERROR: generated manifest for {manifest_path} failed validation "
+            f"against input root {input_dir}; existing output was left untouched:"
         )
         for error in errors:
             print(f"  - {error}")
         return 1
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_json_atomically(manifest, manifest_path)
 
     train_n = len(splits["train"])
     val_n = len(splits["val"])

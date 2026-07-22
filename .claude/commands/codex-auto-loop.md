@@ -60,14 +60,19 @@ a. Run `pnpm run codex:auto-loop -- --pr <N>` (append `--no-push` or
 b. **STATUS: READY_FOR_HUMAN_MERGE** → stop the loop and report: the PR has
    no active latest-review findings; the human reviews and merges manually.
    (A clean Codex re-review arrives as a "didn't find any major issues" PR
-   comment, not a formal review — the helper detects that too.)
-   **ML PRs (per the ML-aware trigger below):** the loop is NOT done yet —
-   before declaring ready-for-merge, spawn `dataset-safety-worker`,
-   `ml-pipeline-reviewer`, and `vision-event-contract-worker`, then
-   `final-reviewer`, and require all four to run clean. These gates run
-   even when Codex reports zero findings; any UNSAFE/BLOCK/INCOMPATIBLE
-   verdict re-enters the fix pipeline as if the status were
-   CLAUDE_FIX_REQUIRED.
+   comment, not a formal review — the helper detects that too.) For ML PRs
+   the helper never reports this status directly on a plain run — see
+   `ML_SAFETY_GATES_REQUIRED` below; it only appears after a
+   `--ml-gates-passed` re-run.
+b1. **STATUS: ML_SAFETY_GATES_REQUIRED** → Codex findings are clean (a clean
+   verdict comment or zero latest findings), but this is an ML PR (per the
+   ML-aware trigger below) and the four ML safety gates have not yet been
+   attested. Spawn `dataset-safety-worker`, `ml-pipeline-reviewer`,
+   `vision-event-contract-worker`, and `final-reviewer`; require all four to
+   return SAFE/PASS/COMPATIBLE/PASS. Any failed gate re-enters the fix
+   pipeline as if the status were CLAUDE_FIX_REQUIRED. Only once all four
+   pass, re-run step (a) with `--ml-gates-passed` appended — that re-run is
+   the only way an ML PR can receive READY_FOR_HUMAN_MERGE.
 b'. **STATUS: WAITING_FOR_CODEX_REVIEW** → the latest Codex review predates
    the PR head; any reported findings are stale. STOP and tell the user to
    re-run `/codex-auto-loop` after Codex replies — never re-fix them.
@@ -124,8 +129,11 @@ word-boundary match — `ml` must not fire on `html`/`yaml`) as a fallback
 when the changed-file list cannot be fetched — spawn
 `dataset-safety-worker`, `ml-pipeline-reviewer`, and
 `vision-event-contract-worker` before `final-reviewer` in the pre-push
-step. These gates also run before ANY ready-for-merge declaration, even
-when Codex reports zero findings (see step b).
+step. These gates also gate ANY ready-for-merge declaration: on a clean
+Codex verdict for an ML PR, the helper reports `ML_SAFETY_GATES_REQUIRED`
+instead of `READY_FOR_HUMAN_MERGE` (see step b1), and only a subsequent
+`--ml-gates-passed` re-run — after all four gates pass — reports
+READY_FOR_HUMAN_MERGE.
 
 Phase 8 merge blockers (any one blocks push/merge): (1) datasets/images/videos
 committed; (2) model weights committed; (3) heavy ML dependencies required by
