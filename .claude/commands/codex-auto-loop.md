@@ -61,6 +61,13 @@ b. **STATUS: READY_FOR_HUMAN_MERGE** → stop the loop and report: the PR has
    no active latest-review findings; the human reviews and merges manually.
    (A clean Codex re-review arrives as a "didn't find any major issues" PR
    comment, not a formal review — the helper detects that too.)
+   **ML PRs (per the ML-aware trigger below):** the loop is NOT done yet —
+   before declaring ready-for-merge, spawn `dataset-safety-worker`,
+   `ml-pipeline-reviewer`, and `vision-event-contract-worker`, then
+   `final-reviewer`, and require all four to run clean. These gates run
+   even when Codex reports zero findings; any UNSAFE/BLOCK/INCOMPATIBLE
+   verdict re-enters the fix pipeline as if the status were
+   CLAUDE_FIX_REQUIRED.
 b'. **STATUS: WAITING_FOR_CODEX_REVIEW** → the latest Codex review predates
    the PR head; any reported findings are stale. STOP and tell the user to
    re-run `/codex-auto-loop` after Codex replies — never re-fix them.
@@ -108,10 +115,17 @@ g. Codex re-reviews asynchronously (typically a few minutes). Re-run step
 
 ### ML-aware review (Phase 8)
 
-Trigger: if the PR title or branch name contains `phase8`, `ml`, `training`,
-`dataset`, or `cv-training` (word-boundary match — `ml` must not fire on
-`html`/`yaml`), spawn `dataset-safety-worker`, `ml-pipeline-reviewer`, and
-`vision-event-contract-worker` before `final-reviewer` in the pre-push step.
+Trigger: if the PR diff changes any path under `ml/` or one of the ML agent
+files (`.claude/agents/ml-pipeline-reviewer.md`,
+`.claude/agents/dataset-safety-worker.md`,
+`.claude/agents/vision-event-contract-worker.md`) — with branch/title
+keywords (`phase8`, `ml`, `training`, `dataset`, `cv-training`;
+word-boundary match — `ml` must not fire on `html`/`yaml`) as a fallback
+when the changed-file list cannot be fetched — spawn
+`dataset-safety-worker`, `ml-pipeline-reviewer`, and
+`vision-event-contract-worker` before `final-reviewer` in the pre-push
+step. These gates also run before ANY ready-for-merge declaration, even
+when Codex reports zero findings (see step b).
 
 Phase 8 merge blockers (any one blocks push/merge): (1) datasets/images/videos
 committed; (2) model weights committed; (3) heavy ML dependencies required by

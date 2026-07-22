@@ -36,6 +36,15 @@ ml/outputs/
 ml/checkpoints/
 ml/**/.cache/
 
+# Real BYOND capture data (customer labels, tenant/store identifiers) must
+# never be committed; only READMEs and synthetic examples under ml/examples/
+# are tracked.
+ml/datasets/byond-custom/annotations/
+ml/datasets/byond-custom/manifest.json
+ml/datasets/byond-custom/**/*.json
+ml/datasets/byond-custom/**/*.csv
+!ml/datasets/byond-custom/README.md
+
 # Model weight files — never committed, wherever they appear (global,
 # not scoped to ml/, since a model artifact could land anywhere by mistake).
 *.pt
@@ -44,10 +53,19 @@ ml/**/.cache/
 *.safetensors
 *.weights
 *.ckpt
+*.pth
+*.h5
+*.tflite
+*.mlmodel
+*.pb
 
 # Media files scoped to ml/ only — repo-wide *.png/*.jpg would swallow
 # future web/app image assets, so these patterns are deliberately
 # restricted to the ml/ workspace.
+# *.bin is also scoped to ml/ only (not global): repo-wide *.bin could
+# swallow legitimate non-ML binaries, and Hugging Face-style
+# pytorch_model.bin files would land under ml/.
+ml/**/*.bin
 ml/**/*.jpg
 ml/**/*.jpeg
 ml/**/*.png

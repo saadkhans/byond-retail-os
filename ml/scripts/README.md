@@ -13,8 +13,11 @@ python ml/scripts/validate_dataset_manifest.py <manifest.json> [--check-files] [
 ```
 
 - `--check-files` — additionally confirms every file the manifest
-  references exists on disk (resolved relative to `--base-dir`, default:
-  the manifest's own directory).
+  references (sample images/annotations and per-split `annotations`
+  files) exists on disk, resolved relative to `--base-dir`. When
+  `--base-dir` is not given, it defaults to the manifest's `sourceRoot`
+  resolved against the manifest's own directory (or that directory
+  itself when no `sourceRoot` is present).
 - Exit `0`: manifest is schema-valid (and, with `--check-files`, every
   referenced file exists). Exit `1`: schema violation or a missing file.
 
@@ -46,6 +49,14 @@ python ml/scripts/prepare_sku110k.py --input DIR --output DIR [--dry-run]
   requires nothing on disk, writes nothing.
 - Exit `0`: prepared (or planned) successfully. Exit `1`: validation
   failure.
+
+Both `prepare_rpc.py` and `prepare_sku110k.py` write reference-only
+manifests: samples and per-split `annotations` entries point at the
+original files in place via a `sourceRoot` (typically `../raw`) — nothing
+is copied into the output directory. Their non-dry-run path validates the
+generated manifest with file checks enabled, so a manifest that references
+images or annotation files missing under the input root fails with a
+non-zero exit and a capped list of the missing paths.
 
 ## `prepare_byond_dataset.py`
 

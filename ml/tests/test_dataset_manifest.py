@@ -26,6 +26,16 @@ EXAMPLES_DIR = REPO_ROOT / "ml" / "examples"
 CONFIGS_DIR = REPO_ROOT / "ml" / "configs"
 
 
+def _run_script(script_name: str, args: list) -> subprocess.CompletedProcess:
+    script_path = SCRIPTS_DIR / script_name
+    return subprocess.run(
+        [sys.executable, str(script_path)] + args,
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+    )
+
+
 def _valid_manifest() -> dict:
     return {
         "datasetName": "example-dataset",
@@ -120,6 +130,117 @@ class FieldRuleTests(unittest.TestCase):
         self.assertTrue(any("unexpected" in e for e in errors), errors)
 
 
+class CrossSplitDuplicateTests(unittest.TestCase):
+    def test_duplicate_image_within_split_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"] = [{"image": "images/a.jpg"}, {"image": "images/a.jpg"}]
+        errors = validate_manifest(manifest)
+        self.assertTrue(
+            any("splits.train[1].image duplicates splits.train[0].image" in e for e in errors),
+            errors,
+        )
+
+    def test_duplicate_image_across_splits_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["test"] = [{"image": "images/a.jpg"}]
+        errors = validate_manifest(manifest)
+        self.assertTrue(
+            any("splits.test[0].image duplicates splits.train[0].image" in e for e in errors),
+            errors,
+        )
+
+    def test_unique_images_across_splits_accepted(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["val"] = [{"image": "images/b.jpg"}]
+        manifest["splits"]["test"] = [{"image": "images/c.jpg"}]
+        self.assertEqual(validate_manifest(manifest), [])
+
+
+class SourceRootTests(unittest.TestCase):
+    def test_source_root_accepted(self) -> None:
+        manifest = _valid_manifest()
+        manifest["sourceRoot"] = "../raw"
+        self.assertEqual(validate_manifest(manifest), [])
+
+    def test_non_string_source_root_rejected(self) -> None:
+        for bad in (123, "", None, ["../raw"]):
+            with self.subTest(bad=bad):
+                manifest = _valid_manifest()
+                manifest["sourceRoot"] = bad
+                errors = validate_manifest(manifest)
+                self.assertTrue(any("sourceRoot" in e for e in errors), errors)
+
+    def test_main_resolves_relative_source_root_against_manifest_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            manifest = _valid_manifest()
+            manifest["sourceRoot"] = "../raw"
+            processed = base / "processed"
+            processed.mkdir()
+            manifest_path = processed / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            image_path = base / "raw" / "images" / "a.jpg"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            image_path.touch()
+
+            result = _run_script(
+                "validate_dataset_manifest.py", [str(manifest_path), "--check-files"]
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_main_source_root_resolution_reports_missing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            manifest = _valid_manifest()
+            manifest["sourceRoot"] = "../raw"
+            processed = base / "processed"
+            processed.mkdir()
+            manifest_path = processed / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            (base / "raw").mkdir()
+
+            result = _run_script(
+                "validate_dataset_manifest.py", [str(manifest_path), "--check-files"]
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("missing file: images/a.jpg", result.stdout)
+
+
+class AnnotationsFieldTests(unittest.TestCase):
+    def test_annotations_accepted(self) -> None:
+        manifest = _valid_manifest()
+        manifest["annotations"] = {"train": "instances_train2019.json"}
+        self.assertEqual(validate_manifest(manifest), [])
+
+    def test_annotations_unknown_key_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["annotations"] = {"holdout": "x.json"}
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("annotations" in e and "holdout" in e for e in errors), errors)
+
+    def test_annotations_bad_path_rejected(self) -> None:
+        for bad in ("../escape.json", "/abs.json", 42):
+            with self.subTest(bad=bad):
+                manifest = _valid_manifest()
+                manifest["annotations"] = {"train": bad}
+                errors = validate_manifest(manifest)
+                self.assertTrue(any("annotations.train" in e for e in errors), errors)
+
+    def test_missing_annotation_file_reported_with_check_files(self) -> None:
+        manifest = _valid_manifest()
+        manifest["annotations"] = {"train": "instances_train2019.json"}
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            image_path = base / "images" / "a.jpg"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            image_path.touch()
+            errors = validate_manifest(manifest, base_dir=base, check_files=True)
+            self.assertTrue(
+                any("missing file: instances_train2019.json" in e for e in errors), errors
+            )
+
+
 class CheckFilesTests(unittest.TestCase):
     def test_missing_referenced_file_is_named(self) -> None:
         manifest = _valid_manifest()
@@ -176,6 +297,109 @@ class PrepareScriptDryRunTests(unittest.TestCase):
             result = self._run("prepare_rpc.py", ["--input", str(empty_input), "--output", str(output)])
             self.assertEqual(result.returncode, 1)
             self.assertIn("train2019", result.stdout)
+
+
+class PrepareRpcEndToEndTests(unittest.TestCase):
+    """Non-dry-run prepare_rpc.py against a tiny synthetic raw layout."""
+
+    IMAGE_NAMES = {"train": "t1.jpg", "val": "v1.jpg", "test": "e1.jpg"}
+
+    def _write_raw(self, raw: Path, *, omit_split_image: str = "") -> None:
+        for split, image_name in self.IMAGE_NAMES.items():
+            image_dir = raw / f"{split}2019"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            coco: dict = {"images": [{"file_name": image_name}]}
+            if split == "train":
+                coco["categories"] = [{"id": 1, "name": "Cola 330"}]
+            (raw / f"instances_{split}2019.json").write_text(
+                json.dumps(coco), encoding="utf-8"
+            )
+            if split != omit_split_image:
+                open(image_dir / image_name, "w").close()
+
+    def test_prepared_manifest_has_source_root_and_annotation_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            out = Path(tmp) / "out"
+            self._write_raw(raw)
+            result = _run_script(
+                "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["sourceRoot"], "../raw")
+            self.assertEqual(
+                manifest["annotations"],
+                {
+                    "train": "instances_train2019.json",
+                    "val": "instances_val2019.json",
+                    "test": "instances_test2019.json",
+                },
+            )
+            self.assertEqual(manifest["splits"]["train"], [{"image": "train2019/t1.jpg"}])
+
+    def test_missing_referenced_image_fails_loudly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            out = Path(tmp) / "out"
+            self._write_raw(raw, omit_split_image="val")
+            result = _run_script(
+                "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("missing file: val2019/v1.jpg", result.stdout)
+            self.assertIn(str(raw), result.stdout)
+
+
+class PrepareSku110kEndToEndTests(unittest.TestCase):
+    """Non-dry-run prepare_sku110k.py against a tiny synthetic raw layout."""
+
+    IMAGE_NAMES = {"train": "a.jpg", "val": "b.jpg", "test": "c.jpg"}
+
+    def _write_raw(self, raw: Path, *, omit_split_image: str = "") -> None:
+        images_dir = raw / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        annotations_dir = raw / "annotations"
+        annotations_dir.mkdir(parents=True, exist_ok=True)
+        for split, image_name in self.IMAGE_NAMES.items():
+            (annotations_dir / f"annotations_{split}.csv").write_text(
+                f"{image_name},10,10,20,20,object,100,100\n", encoding="utf-8"
+            )
+            if split != omit_split_image:
+                open(images_dir / image_name, "w").close()
+
+    def test_prepared_manifest_has_source_root_and_annotation_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            out = Path(tmp) / "out"
+            self._write_raw(raw)
+            result = _run_script(
+                "prepare_sku110k.py", ["--input", str(raw), "--output", str(out)]
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["sourceRoot"], "../raw")
+            self.assertEqual(
+                manifest["annotations"],
+                {
+                    "train": "annotations/annotations_train.csv",
+                    "val": "annotations/annotations_val.csv",
+                    "test": "annotations/annotations_test.csv",
+                },
+            )
+            self.assertEqual(manifest["splits"]["val"], [{"image": "images/b.jpg"}])
+
+    def test_missing_referenced_image_fails_loudly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            out = Path(tmp) / "out"
+            self._write_raw(raw, omit_split_image="test")
+            result = _run_script(
+                "prepare_sku110k.py", ["--input", str(raw), "--output", str(out)]
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("missing file: images/c.jpg", result.stdout)
+            self.assertIn(str(raw), result.stdout)
 
 
 if __name__ == "__main__":

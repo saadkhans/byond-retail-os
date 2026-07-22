@@ -30,6 +30,12 @@ ml/datasets/sku-110k/raw/
 python ml/scripts/prepare_sku110k.py --input ml/datasets/sku-110k/raw --output ml/datasets/sku-110k/processed
 ```
 
+The generated `processed/manifest.json` references the source images and
+per-split annotation CSVs in place via its `sourceRoot` field (`../raw`
+in the layout above) — nothing is copied out of `raw/`. The non-dry-run
+also verifies every referenced file exists under the input root and
+fails otherwise.
+
 Use `--dry-run` to check the script's plan without requiring anything on
 disk (useful for CI and for reviewing the intended output layout before
 downloading the real dataset).

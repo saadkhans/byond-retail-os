@@ -6,20 +6,24 @@ documented here so the pipeline and tooling can be built against it now.
 
 **Customer and store media never leaves controlled storage and is NEVER
 committed to this repo.** `ml/datasets/byond-custom/raw/` and
-`ml/datasets/byond-custom/processed/` are gitignored.
+`ml/datasets/byond-custom/processed/` are gitignored. The real
+`manifest.json` and `annotations/` are gitignored too — they may contain
+store/tenant identifiers and label data, so they stay local. Only this
+README is tracked. A synthetic reference example lives at
+`ml/examples/sample_dataset_manifest.json`.
 
 ## Expected layout
 
 ```
 ml/datasets/byond-custom/
-  raw/
+  raw/            # gitignored
     products/
     shelves/
     pickup/
     return/
     cart/
-  annotations/
-  manifest.json
+  annotations/    # gitignored
+  manifest.json   # gitignored
 ```
 
 Capture contexts map to the Phase 7 `VisionEvent` types this data

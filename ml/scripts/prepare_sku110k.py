@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -49,6 +50,21 @@ LICENSE_NOTES = (
 )
 
 
+def _source_root(input_dir, output_dir) -> str:
+    """Relative path (POSIX separators) from the output dir to the input root.
+
+    The manifest references source images/annotations in place (nothing is
+    copied), so it records where the source root lives relative to the
+    manifest's own directory. Falls back to the absolute input root when no
+    relative path exists (e.g. different drives on Windows).
+    """
+    try:
+        rel = os.path.relpath(str(input_dir), str(output_dir))
+    except ValueError:
+        return Path(input_dir).resolve().as_posix()
+    return Path(rel).as_posix()
+
+
 def _missing_markers(input_dir: Path) -> list:
     missing = []
     if not (input_dir / "images").is_dir():
@@ -62,10 +78,12 @@ def _missing_markers(input_dir: Path) -> list:
     return missing
 
 
-def _print_plan(input_dir: str, output_dir: str) -> None:
+def _print_plan(input_dir, output_dir: str) -> None:
+    planned_root = _source_root(input_dir, output_dir) if input_dir else "<depends on --input>"
     print("SKU-110K preparation plan (dry run — nothing read or written):")
-    print(f"  input:  {input_dir}")
+    print(f"  input:  {input_dir or '<not provided>'}")
     print(f"  output: {output_dir}")
+    print(f"  planned sourceRoot: {planned_root}")
     print("  expected input layout:")
     print("    images/  (flat image directory)")
     print("    annotations/annotations_train.csv")
@@ -73,8 +91,11 @@ def _print_plan(input_dir: str, output_dir: str) -> None:
     print("    annotations/annotations_test.csv")
     print("  would generate:")
     print(f"    {output_dir}/manifest.json — single generic 'product' class,")
-    print("    samples deduped from each split CSV's image-name column, self-")
-    print("    validated against ml/configs/dataset.schema.json before reporting OK.")
+    print("    samples deduped from each split CSV's image-name column")
+    print("    (referenced in place via sourceRoot; nothing copied), per-split")
+    print("    annotation CSV refs, and validated — including file existence")
+    print("    under the input root — against ml/configs/dataset.schema.json")
+    print("    before reporting OK.")
 
 
 def _image_names_from_csv(csv_path: Path) -> list:
@@ -111,15 +132,19 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
         return 1
 
     splits = {}
+    annotations = {}
     for split_name, csv_name in SPLIT_CSV_NAMES.items():
         image_names = _image_names_from_csv(input_dir / "annotations" / csv_name)
         splits[split_name] = [{"image": f"images/{name}"} for name in image_names]
+        annotations[split_name] = f"annotations/{csv_name}"
 
     manifest = {
         "datasetName": DATASET_NAME,
         "datasetVersion": DATASET_VERSION,
         "source": "sku-110k",
+        "sourceRoot": _source_root(input_dir, output_dir),
         "licenseNotes": LICENSE_NOTES,
+        "annotations": annotations,
         "classes": [{"classId": 0, "label": "product"}],
         "splits": splits,
     }
@@ -130,9 +155,12 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
         json.dump(manifest, fh, indent=2, sort_keys=True)
         fh.write("\n")
 
-    errors = validate_manifest(manifest, check_files=False)
+    errors = validate_manifest(manifest, check_files=True, base_dir=input_dir)
     if errors:
-        print(f"ERROR: generated manifest at {manifest_path} failed self-validation:")
+        print(
+            f"ERROR: generated manifest at {manifest_path} failed validation "
+            f"against input root {input_dir}:"
+        )
         for error in errors:
             print(f"  - {error}")
         return 1
@@ -159,7 +187,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if args.dry_run:
-        _print_plan(args.input or "<not provided>", args.output)
+        _print_plan(args.input, args.output)
         return 0
 
     if not args.input:

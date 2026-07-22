@@ -101,6 +101,21 @@ against `ml/configs/dataset.schema.json`. See
 `ml/scripts/validate_dataset_manifest.py` and the per-dataset READMEs
 under `ml/datasets/` for the exact shape each `prepare_*` script produces.
 
+Two fields keep manifests reference-only (nothing is ever copied for the
+MVP — no dataset duplication under `processed/`):
+
+- **`sourceRoot`** (optional string) — the dataset source root that all
+  `image`/`annotation` references resolve against. A relative `sourceRoot`
+  resolves against the manifest file's own directory; generated manifests
+  live in `processed/` while media stays under `raw/`, so prepare scripts
+  emit `../raw`-style values. `validate_dataset_manifest.py --check-files`
+  uses it automatically when `--base-dir` isn't given.
+- **`annotations`** (optional object, `train`/`val`/`test` keys) — the
+  per-split annotation source file (RPC's COCO JSON, SKU-110K's CSV),
+  relative to `sourceRoot`, same path rules as sample paths. Original
+  annotation data is referenced, not copied or discarded, so future
+  detector training can consume the full label set.
+
 ## VisionEvent mapping
 
 `ml/scripts/sample_inference_to_vision_event.py` takes a model's raw

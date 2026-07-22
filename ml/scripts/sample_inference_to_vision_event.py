@@ -19,7 +19,9 @@ produced this inference) and are NEVER emitted into the payload.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -127,6 +129,17 @@ def _require_nonempty_string(value, field: str) -> str:
     return value
 
 
+def _require_iso8601(name: str, value) -> str:
+    """Require a non-empty ISO-8601 timestamp string (trailing 'Z' accepted)."""
+    _require_nonempty_string(value, name)
+    try:
+        # .replace keeps trailing-Z inputs parseable on Python < 3.11.
+        datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"{name} must be an ISO-8601 timestamp string, got {value!r}")
+    return value
+
+
 def to_vision_event(inference: dict) -> dict:
     """Map ML model output (internal shape) to a POST /vision-events payload.
 
@@ -161,7 +174,7 @@ def to_vision_event(inference: dict) -> dict:
 
     location_id = _require_nonempty_string(inference.get("locationId"), "locationId")
     unit_id = _require_nonempty_string(inference.get("unitId"), "unitId")
-    occurred_at = _require_nonempty_string(inference.get("occurredAt"), "occurredAt")
+    occurred_at = _require_iso8601("occurredAt", inference.get("occurredAt"))
 
     detections = inference.get("detections")
     if not isinstance(detections, list):
@@ -177,6 +190,8 @@ def to_vision_event(inference: dict) -> dict:
         confidence = detection.get("confidence")
         if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
             raise ValueError(f"detections[{idx}].confidence is required and must be a number")
+        if not math.isfinite(confidence):
+            raise ValueError(f"detections[{idx}].confidence must be a finite number, got {confidence!r}")
         if confidence < 0 or confidence > 1:
             raise ValueError(f"detections[{idx}].confidence must be within [0, 1], got {confidence!r}")
 
@@ -190,6 +205,17 @@ def to_vision_event(inference: dict) -> dict:
 
     if not candidates and event_type != "EXIT_RECONCILIATION":
         raise ValueError("basket-affecting events need >= 1 candidate")
+
+    # Collapse duplicate SKUs (already uppercase-normalized above): keep the
+    # strongest detection per SKU — the Phase 7 API rejects case-insensitive
+    # duplicate candidate SKUs with a 400. On an exact confidence tie the
+    # first-seen entry wins.
+    strongest_by_sku: dict[str, dict] = {}
+    for candidate in candidates:
+        existing = strongest_by_sku.get(candidate["sku"])
+        if existing is None or candidate["confidence"] > existing["confidence"]:
+            strongest_by_sku[candidate["sku"]] = candidate
+    candidates = list(strongest_by_sku.values())
 
     candidates.sort(key=lambda c: c["confidence"], reverse=True)
     candidates = candidates[:MAX_CANDIDATES]
@@ -227,9 +253,9 @@ def to_vision_event(inference: dict) -> dict:
     if capture_started_at is not None or capture_ended_at is not None:
         bundle = {"sourceType": "VISION"}
         if capture_started_at is not None:
-            bundle["captureStartedAt"] = _require_nonempty_string(capture_started_at, "captureStartedAt")
+            bundle["captureStartedAt"] = _require_iso8601("captureStartedAt", capture_started_at)
         if capture_ended_at is not None:
-            bundle["captureEndedAt"] = _require_nonempty_string(capture_ended_at, "captureEndedAt")
+            bundle["captureEndedAt"] = _require_iso8601("captureEndedAt", capture_ended_at)
         payload["evidenceBundle"] = bundle
 
     idempotency_key = inference.get("idempotencyKey")
@@ -266,7 +292,7 @@ def main(argv=None) -> int:
         print(f"ERROR: {exc}")
         return 1
 
-    rendered = json.dumps(payload, indent=2, sort_keys=True)
+    rendered = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
     if args.out:
         Path(args.out).write_text(rendered + "\n", encoding="utf-8")
     else:

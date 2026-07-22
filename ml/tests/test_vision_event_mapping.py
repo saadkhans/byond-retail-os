@@ -89,6 +89,125 @@ class CandidateMappingTests(unittest.TestCase):
         self.assertEqual(payload["candidates"][0]["rank"], 1)
 
 
+class DuplicateSkuCollapseTests(unittest.TestCase):
+    def test_duplicate_same_case_sku_collapsed_to_one_candidate(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [
+            {"sku": "COLA-330", "confidence": 0.4},
+            {"sku": "COLA-330", "confidence": 0.6},
+        ]
+        payload = to_vision_event(inference)
+        self.assertEqual(len(payload["candidates"]), 1)
+        self.assertEqual(payload["candidates"][0]["sku"], "COLA-330")
+
+    def test_duplicate_different_case_sku_collapsed(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [
+            {"sku": "cola-330", "confidence": 0.4},
+            {"sku": "COLA-330", "confidence": 0.6},
+        ]
+        payload = to_vision_event(inference)
+        self.assertEqual(len(payload["candidates"]), 1)
+        self.assertEqual(payload["candidates"][0]["sku"], "COLA-330")
+
+    def test_strongest_confidence_and_label_retained_and_reranked(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [
+            {"sku": "cola-330", "confidence": 0.3, "label": "weak-label"},
+            {"sku": "chips-50", "confidence": 0.5, "label": "chips"},
+            {"sku": "COLA-330", "confidence": 0.9, "label": "strong-label"},
+        ]
+        payload = to_vision_event(inference)
+        candidates = payload["candidates"]
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(candidates[0]["sku"], "COLA-330")
+        self.assertEqual(candidates[0]["rank"], 1)
+        self.assertEqual(candidates[0]["score"], 0.9)
+        self.assertEqual(candidates[0]["label"], "strong-label")
+        self.assertEqual(candidates[1]["sku"], "CHIPS-50")
+        self.assertEqual(candidates[1]["rank"], 2)
+        self.assertEqual(candidates[1]["score"], 0.5)
+
+    def test_output_never_contains_duplicate_skus(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [
+            {"sku": "cola-330", "confidence": 0.1},
+            {"sku": "COLA-330", "confidence": 0.2},
+            {"sku": "Cola-330", "confidence": 0.3},
+            {"sku": "chips-50", "confidence": 0.4},
+            {"sku": "CHIPS-50", "confidence": 0.5},
+            {"sku": "water-500", "confidence": 0.6},
+        ]
+        payload = to_vision_event(inference)
+        skus = [candidate["sku"] for candidate in payload["candidates"]]
+        self.assertEqual(len(skus), len(set(skus)))
+        self.assertEqual(sorted(skus), ["CHIPS-50", "COLA-330", "WATER-500"])
+
+
+class NonFiniteConfidenceTests(unittest.TestCase):
+    def test_nan_confidence_rejected(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [{"sku": "x", "confidence": float("nan")}]
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_positive_infinity_confidence_rejected(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [{"sku": "x", "confidence": float("inf")}]
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_negative_infinity_confidence_rejected(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [{"sku": "x", "confidence": float("-inf")}]
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+
+class TimestampValidationTests(unittest.TestCase):
+    def test_trailing_z_timestamp_accepted(self) -> None:
+        inference = _base_inference()
+        inference["occurredAt"] = "2026-07-21T10:00:00.000Z"
+        inference["captureStartedAt"] = "2026-07-21T09:59:58.000Z"
+        inference["captureEndedAt"] = "2026-07-21T10:00:02.000Z"
+        payload = to_vision_event(inference)
+        self.assertEqual(payload["occurredAt"], "2026-07-21T10:00:00.000Z")
+        self.assertEqual(payload["evidenceBundle"]["captureStartedAt"], "2026-07-21T09:59:58.000Z")
+        self.assertEqual(payload["evidenceBundle"]["captureEndedAt"], "2026-07-21T10:00:02.000Z")
+
+    def test_explicit_offset_timestamp_accepted(self) -> None:
+        inference = _base_inference()
+        inference["occurredAt"] = "2026-07-21T10:00:00+04:00"
+        inference["captureStartedAt"] = "2026-07-21T09:59:58+04:00"
+        payload = to_vision_event(inference)
+        self.assertEqual(payload["occurredAt"], "2026-07-21T10:00:00+04:00")
+        self.assertEqual(payload["evidenceBundle"]["captureStartedAt"], "2026-07-21T09:59:58+04:00")
+
+    def test_malformed_occurred_at_rejected(self) -> None:
+        for bad in ("not-a-date", "2026-99-99T99:00:00Z"):
+            with self.subTest(value=bad):
+                inference = _base_inference()
+                inference["occurredAt"] = bad
+                with self.assertRaises(ValueError):
+                    to_vision_event(inference)
+
+    def test_malformed_capture_started_at_rejected(self) -> None:
+        for bad in ("not-a-date", "2026-99-99T99:00:00Z"):
+            with self.subTest(value=bad):
+                inference = _base_inference()
+                inference["captureStartedAt"] = bad
+                with self.assertRaises(ValueError):
+                    to_vision_event(inference)
+
+    def test_malformed_capture_ended_at_rejected(self) -> None:
+        for bad in ("not-a-date", "2026-99-99T99:00:00Z"):
+            with self.subTest(value=bad):
+                inference = _base_inference()
+                inference["captureEndedAt"] = bad
+                with self.assertRaises(ValueError):
+                    to_vision_event(inference)
+
+
 class ForbiddenFieldTests(unittest.TestCase):
     def test_forbidden_fields_never_appear_in_generated_payload(self) -> None:
         payload = to_vision_event(_load_json("sample_model_output.json"))

@@ -12,7 +12,7 @@
     "typecheck": "pnpm -r --if-present run typecheck",
     "test": "pnpm -r --if-present run test",
     "build": "pnpm -r --if-present run build",
-    "security:secrets": "echo \"[placeholder] security:secrets: run gitleaks detect --source . locally or rely on CI\" && exit 0",
+    "security:secrets": "node scripts/security-secrets.mjs",
     "security:scan": "echo \"[placeholder] security:scan: semgrep/trivy scanning not configured yet\" && exit 0",
     "codex:summary": "node scripts/codex-review-summary.mjs",
     "codex:auto-loop": "node scripts/codex-auto-loop.mjs",

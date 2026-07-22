@@ -6,7 +6,9 @@
 video, no trained weights, no RPC or SKU-110K files, no customer or store
 media. This repo stores pipeline code, the manifest schema, docs, tests,
 and tiny synthetic JSON examples only — the root `.gitignore` enforces
-this by ignoring every dataset's `raw/` and `processed/` subdirectory.
+this by ignoring every dataset's `raw/` and `processed/` subdirectory (and,
+for `byond-custom/`, its `manifest.json` and `annotations/` too, since real
+captures there carry store/tenant identifiers and label data).
 
 Each dataset directory below follows the same shape:
 

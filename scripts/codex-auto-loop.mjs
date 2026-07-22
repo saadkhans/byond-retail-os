@@ -51,6 +51,11 @@ const PROTECTED_BRANCHES = new Set(['main', 'dev']);
 const FINDINGS_FILE = path.join('.tmp', 'codex-latest-findings.md');
 const ML_KEYWORDS =
   /(^|[^a-z0-9])(phase8|ml|training|dataset|cv-training)(?=[^a-z0-9]|$)/i;
+// Paths whose presence in the PR diff marks it as an ML PR: the ml/
+// workspace (dataset scripts + VisionEvent mapper) and the ML agent
+// definitions themselves.
+const ML_PATHS =
+  /^(ml\/|\.claude\/agents\/(ml-pipeline-reviewer|dataset-safety-worker|vision-event-contract-worker)\.md$)/;
 
 function fail(message) {
   console.error(`\nERROR: ${message}\n`);
@@ -76,6 +81,17 @@ function runOrFail(command, args, context) {
     fail(`${context}:\n${(result.stderr || result.stdout || '').trim()}`);
   }
   return result.stdout;
+}
+
+function printMlMergeGates() {
+  console.log('');
+  console.log(
+    'ML PR — safety gates are REQUIRED before handing off to human merge: ' +
+      'spawn dataset-safety-worker, ml-pipeline-reviewer, and ' +
+      'vision-event-contract-worker, then final-reviewer. Any ' +
+      'UNSAFE/BLOCK/INCOMPATIBLE verdict must be treated as ' +
+      'CLAUDE_FIX_REQUIRED even though Codex reported no findings.',
+  );
 }
 
 const USAGE =
@@ -196,7 +212,40 @@ function main() {
   );
   const pr = JSON.parse(prJson);
   const prTitle = typeof pr.title === 'string' ? pr.title : '';
-  const isMlPr = ML_KEYWORDS.test(branch) || ML_KEYWORDS.test(prTitle);
+
+  // ML detection is path-based (changed files under ml/ or the ML agent
+  // definitions), with branch/title keywords as a fallback when the file
+  // list cannot be fetched or parsed.
+  let mlByFiles = false;
+  let filesFetched = false;
+  const filesResult = run('gh', [
+    'pr',
+    'view',
+    String(pr.number),
+    '--json',
+    'files',
+  ]);
+  if (filesResult.status === 0) {
+    try {
+      const files = JSON.parse(filesResult.stdout).files;
+      if (Array.isArray(files)) {
+        filesFetched = true;
+        mlByFiles = files.some((file) =>
+          ML_PATHS.test(typeof file?.path === 'string' ? file.path : ''),
+        );
+      }
+    } catch {
+      // Unparseable output — treated like a failed fetch below.
+    }
+  }
+  if (!filesFetched) {
+    console.error(
+      'note: could not read PR changed files — ML detection falls back to ' +
+        'branch/title keywords.',
+    );
+  }
+  const isMlPr =
+    mlByFiles || ML_KEYWORDS.test(branch) || ML_KEYWORDS.test(prTitle);
   if (pr.state !== 'OPEN') {
     fail(`PR #${pr.number} is ${pr.state}, not OPEN — nothing to loop on.`);
   }
@@ -307,6 +356,9 @@ function main() {
           'resolve them manually (or leave them for Codex to mark outdated).',
       );
     }
+    if (isMlPr) {
+      printMlMergeGates();
+    }
     console.log(
       'Next step is HUMAN-ONLY: review the PR and merge it manually. ' +
         'Nothing here merges automatically.',
@@ -342,6 +394,9 @@ function main() {
             'GitHub — verified-stale threads awaiting Codex outdated-marking.)'
           : ''),
     );
+    if (isMlPr) {
+      printMlMergeGates();
+    }
     console.log(
       'Next step is HUMAN-ONLY: review the PR and merge it manually. ' +
         'Nothing here merges automatically.',

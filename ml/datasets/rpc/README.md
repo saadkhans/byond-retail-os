@@ -29,6 +29,12 @@ ml/datasets/rpc/raw/
 python ml/scripts/prepare_rpc.py --input ml/datasets/rpc/raw --output ml/datasets/rpc/processed
 ```
 
+The generated `processed/manifest.json` references the source images and
+per-split COCO annotation files in place via its `sourceRoot` field
+(`../raw` in the layout above) — nothing is copied out of `raw/`. The
+non-dry-run also verifies every referenced file exists under the input
+root and fails otherwise.
+
 Use `--dry-run` to check the script's plan without requiring anything on
 disk (useful for CI and for reviewing the intended output layout before
 downloading the real dataset).

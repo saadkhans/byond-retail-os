@@ -109,10 +109,18 @@ stops — the loop advances only when a human re-invokes it.
 
 ## Phase 8 ML-aware review
 
-When the PR title or branch name contains `phase8`, `ml`, `training`,
-`dataset`, or `cv-training` (word-boundary match), the loop runs
-`ml-pipeline-reviewer`, `dataset-safety-worker`, and
-`vision-event-contract-worker` before `final-reviewer` (step I'). `ml/` is a
+When the PR diff changes any path under `ml/` or one of the ML agent files
+(`.claude/agents/ml-pipeline-reviewer.md`,
+`.claude/agents/dataset-safety-worker.md`,
+`.claude/agents/vision-event-contract-worker.md`) — with branch/title
+keywords (`phase8`, `ml`, `training`, `dataset`, `cv-training`,
+word-boundary match) as a fallback when the changed-file list cannot be
+fetched — the loop runs `ml-pipeline-reviewer`, `dataset-safety-worker`,
+and `vision-event-contract-worker` before `final-reviewer` (step I').
+These gates run before ANY `READY_FOR_HUMAN_MERGE` declaration, including
+clean reviews where Codex reports zero findings — an
+UNSAFE/BLOCK/INCOMPATIBLE verdict re-enters the fix pipeline as if the
+status were `CLAUDE_FIX_REQUIRED`. `ml/` is a
 stdlib-only Python workspace outside the pnpm workspace; datasets and model
 weights are external artifacts and must never be committed.
 
@@ -227,6 +235,11 @@ review + green CI) enforces the last step regardless of tooling.
   `/codex-auto-loop` after the review lands. If Codex never responds,
   check that the ChatGPT/Codex GitHub app is installed on the repo with
   code review enabled, then re-request from the PR page.
+- **`security:secrets` reports UNAVAILABLE (exit 2)** — gitleaks is not
+  installed locally. Install it
+  (https://github.com/gitleaks/gitleaks) to scan locally, or rely on the
+  GitHub secret-scanning check — but never report UNAVAILABLE as a pass.
+  Exit 1 means gitleaks found real leaks: route to `secret-scan-worker`.
 - **Stale findings keep reappearing** — threads from older reviews stay
   "active" on GitHub until Codex marks them outdated on re-review or a
   human resolves them. They are classified `previous-review-active` and
@@ -240,6 +253,11 @@ review + green CI) enforces the last step regardless of tooling.
 2. **Codex connected to the repo** (the ChatGPT/Codex GitHub app with code
    review enabled) so review comments exist to fetch.
 3. Node 22 + pnpm via corepack (already required by this repo).
+4. **gitleaks** (recommended) for the local secret scan.
+   `pnpm run security:secrets` runs a real `gitleaks detect` when gitleaks
+   is installed (exit 0 = clean, exit 1 = leaks found). When gitleaks is
+   not installed it exits 2 (`UNAVAILABLE`) — that is NOT a pass; the
+   GitHub secret-scanning check remains the authoritative gate.
 
 ## How the summary script works & limitations
 

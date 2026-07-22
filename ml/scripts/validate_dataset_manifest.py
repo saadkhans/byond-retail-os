@@ -32,7 +32,9 @@ TOP_LEVEL_KEYS = {
     "datasetName",
     "datasetVersion",
     "source",
+    "sourceRoot",
     "licenseNotes",
+    "annotations",
     "classes",
     "labels",
     "splits",
@@ -104,6 +106,11 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
         errors.append("missing required field: source")
     elif source not in SOURCE_VALUES:
         errors.append(f"source must be one of {sorted(SOURCE_VALUES)}, got {source!r}")
+
+    if "sourceRoot" in manifest:
+        source_root = manifest["sourceRoot"]
+        if not isinstance(source_root, str) or not source_root:
+            errors.append(f"sourceRoot must be a non-empty string, got {source_root!r}")
 
     if "licenseNotes" not in manifest:
         errors.append("missing required field: licenseNotes")
@@ -179,6 +186,21 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                 if key in labels and not isinstance(labels[key], str):
                     errors.append(f"labels.{key} must be a string")
 
+    if "annotations" in manifest:
+        annotations = manifest["annotations"]
+        if not isinstance(annotations, dict):
+            errors.append("annotations must be an object")
+        else:
+            unknown_annotations = set(annotations.keys()) - set(SPLIT_NAMES)
+            for key in sorted(unknown_annotations):
+                errors.append(f"annotations: unknown field {key!r}")
+            for key in SPLIT_NAMES:
+                if key in annotations and _is_bad_path(annotations[key]):
+                    errors.append(
+                        f"annotations.{key} must be a relative path with no '..', "
+                        f"backslashes, absolute prefix, or URI scheme, got {annotations[key]!r}"
+                    )
+
     if "splits" not in manifest:
         errors.append("missing required field: splits")
     else:
@@ -197,6 +219,7 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                     structurally_ok = False
 
             any_non_empty = False
+            seen_images: dict = {}
             for split_name in SPLIT_NAMES:
                 if split_name not in splits:
                     continue
@@ -224,6 +247,15 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                             f"{sample_path}.image must be a relative path with no '..', "
                             f"backslashes, absolute prefix, or URI scheme, got {sample['image']!r}"
                         )
+                    else:
+                        image = sample["image"]
+                        if image in seen_images:
+                            errors.append(
+                                f"{sample_path}.image duplicates "
+                                f"splits.{seen_images[image]}.image ({image!r})"
+                            )
+                        else:
+                            seen_images[image] = f"{split_name}[{idx}]"
 
                     if "annotation" in sample and _is_bad_path(sample["annotation"]):
                         errors.append(
@@ -249,6 +281,13 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
             if check_files and base_dir is not None:
                 root = Path(base_dir)
                 missing = []
+                annotations = manifest.get("annotations")
+                if isinstance(annotations, dict):
+                    for split_name in SPLIT_NAMES:
+                        rel = annotations.get(split_name)
+                        if isinstance(rel, str) and not _is_bad_path(rel):
+                            if not (root / rel).exists():
+                                missing.append(f"missing file: {rel}")
                 for split_name in SPLIT_NAMES:
                     samples = splits.get(split_name)
                     if not isinstance(samples, list):
@@ -292,7 +331,8 @@ def main(argv=None) -> int:
         "--base-dir",
         default=None,
         help="Dataset root used to resolve relative paths when --check-files is set "
-        "(defaults to the manifest's parent directory)",
+        "(defaults to the manifest's sourceRoot resolved against the manifest's own "
+        "directory, or that directory itself when no sourceRoot is present)",
     )
     args = parser.parse_args(argv)
 
@@ -309,7 +349,14 @@ def main(argv=None) -> int:
         print(f"ERROR: {manifest_path} is not valid JSON: {exc}")
         return 1
 
-    base_dir = Path(args.base_dir) if args.base_dir is not None else manifest_path.resolve().parent
+    if args.base_dir is not None:
+        base_dir = Path(args.base_dir)
+    else:
+        base_dir = manifest_path.resolve().parent
+        source_root = manifest.get("sourceRoot") if isinstance(manifest, dict) else None
+        if isinstance(source_root, str) and source_root:
+            source_root_path = Path(source_root)
+            base_dir = source_root_path if source_root_path.is_absolute() else base_dir / source_root_path
     errors = validate_manifest(manifest, base_dir=base_dir, check_files=args.check_files)
 
     if errors:
