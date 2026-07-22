@@ -33,6 +33,8 @@ ml/datasets/**/processed/
 ml/models/
 ml/runs/
 ml/outputs/
+ml/checkpoints/
+ml/**/.cache/
 
 # Model weight files — never committed, wherever they appear (global,
 # not scoped to ml/, since a model artifact could land anywhere by mistake).
@@ -41,6 +43,7 @@ ml/outputs/
 *.engine
 *.safetensors
 *.weights
+*.ckpt
 
 # Media files scoped to ml/ only — repo-wide *.png/*.jpg would swallow
 # future web/app image assets, so these patterns are deliberately
@@ -48,9 +51,18 @@ ml/outputs/
 ml/**/*.jpg
 ml/**/*.jpeg
 ml/**/*.png
+ml/**/*.webp
 ml/**/*.mp4
 ml/**/*.mov
 ml/**/*.avi
+ml/**/*.mkv
+
+# Numeric/tabular dataset blobs scoped to ml/ — same reasoning as media.
+ml/**/*.npy
+ml/**/*.npz
+ml/**/*.parquet
+ml/**/*.pkl
+ml/**/*.pickle
 
 # Python noise (ml/ workspace)
 __pycache__/

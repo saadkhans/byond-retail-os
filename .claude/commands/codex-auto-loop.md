@@ -29,6 +29,9 @@ first-hand. Launch independent worker tasks in parallel where possible
 | `docs-worker` | Docs-only findings (README, Swagger, PR description, API docs) |
 | `test-runner` | lint · typecheck · test · build · security:secrets, failure summary |
 | `secret-scan-worker` | Diagnose Gitleaks failures; recommend clean-squash remediation |
+| `dataset-safety-worker` | Scan diff/.gitignore for datasets, media, model weights, training outputs |
+| `ml-pipeline-reviewer` | Phase 8 ML pipeline MVP-safety review (PASS/BLOCK) |
+| `vision-event-contract-worker` | Verify ML output matches the Phase 7 VisionEvent contract |
 | `final-reviewer` | Pre-push PASS/BLOCK review of the full diff |
 
 Reserved for the orchestrator (never delegated): deciding which findings
@@ -80,7 +83,7 @@ c. **STATUS: CLAUDE_FIX_REQUIRED** → run the delegation pipeline:
       parallel only when the findings touch disjoint files). Docs-only
       findings go to `docs-worker` instead.
    5. **Verify** — spawn `test-runner` for the full suite: lint ·
-      typecheck · test · build · security:secrets.
+      typecheck · test · build · security:secrets · ml:test.
    6. **Repair** — failures caused by this cycle's changes go back to the
       responsible `fix-worker` with the failure summary (max 2 attempts per
       worker per finding, then do it yourself). If `security:secrets`
@@ -102,6 +105,20 @@ g. Codex re-reviews asynchronously (typically a few minutes). Re-run step
    (a) once; if the latest Codex review still predates your push, STOP and
    tell the user to re-run `/codex-auto-loop` after Codex replies — do not
    busy-wait or burn cycles polling.
+
+### ML-aware review (Phase 8)
+
+Trigger: if the PR title or branch name contains `phase8`, `ml`, `training`,
+`dataset`, or `cv-training` (word-boundary match — `ml` must not fire on
+`html`/`yaml`), spawn `dataset-safety-worker`, `ml-pipeline-reviewer`, and
+`vision-event-contract-worker` before `final-reviewer` in the pre-push step.
+
+Phase 8 merge blockers (any one blocks push/merge): (1) datasets/images/videos
+committed; (2) model weights committed; (3) heavy ML dependencies required by
+normal CI; (4) generated training outputs committed; (5) VisionEvent payload
+incompatible with Phase 7; (6) reintroduction of evidence
+artifacts/metadata/URIs/storageKeys into app ingestion; (7) secret scanning
+failure; (8) failing CI/build/tests.
 
 ## Loop exit criteria
 

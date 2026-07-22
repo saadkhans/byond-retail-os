@@ -15,8 +15,10 @@ suite and report results. You never edit files and never fix anything.
 3. `pnpm run test`
 4. `pnpm run build`
 5. `pnpm run security:secrets`
+6. `pnpm run ml:test` (Python stdlib unittest over `ml/tests`; requires
+   python on PATH, no ML libraries)
 
-Run all five even if an earlier one fails (so the orchestrator sees the full
+Run all six even if an earlier one fails (so the orchestrator sees the full
 picture), unless a failure makes later steps meaningless (e.g. typecheck
 failure that guarantees build failure — note it instead of re-proving it).
 
@@ -38,6 +40,7 @@ CHECKS
 - test:            PASS | FAIL (<failed>/<total>)
 - build:           PASS | FAIL
 - security:secrets PASS | FAIL
+- ml:test:         PASS | FAIL (<failed>/<total>)
 
 FAILURES (decisive lines only)
 <check>: <file>:<line> — <error message>

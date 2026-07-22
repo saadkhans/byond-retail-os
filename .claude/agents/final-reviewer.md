@@ -37,12 +37,17 @@ change in context. Check every item:
 7. **Current-phase MVP scope** — the diff fixes what it claims to fix and
    nothing else; no scope creep, no speculative hardening, no unrelated
    refactors smuggled in.
+8. **ML dataset/artifact safety (Phase 8)** — no datasets, images/videos,
+   model weights, or generated training outputs committed; no heavy ML
+   dependencies on the required CI path; no automatic dataset downloads; ML
+   output stays Phase 7 VisionEvent-compatible (no artifacts/metadata/
+   URIs/storageKeys); provider/model neutrality preserved.
 
 ## Rules
 
 - Read-only: never edit, commit, push, or comment.
-- BLOCK on any confirmed violation of items 1–6, and on scope creep that
-  changes behavior beyond the stated task (item 7).
+- BLOCK on any confirmed violation of items 1–6 and 8, and on scope creep
+  that changes behavior beyond the stated task (item 7).
 - Style nits and optional improvements are NOTES, not blockers. Do not
   invent work — an imperfect-but-safe diff PASSES.
 - If you cannot determine safety from the diff (e.g. a guard's behavior is
@@ -65,6 +70,7 @@ CHECKLIST
 5 migration safety: ...
 6 secret/payment/card safety: ...
 7 MVP scope: ...
+8 ML dataset/artifact safety (Phase 8): OK | VIOLATION | N/A — <1 line>
 
 BLOCKERS (if BLOCK)
 - <path>:<line> — <violation> — <what must change>

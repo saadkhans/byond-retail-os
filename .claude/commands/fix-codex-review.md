@@ -25,6 +25,9 @@ safety-critical (secrets, destructive git operations, invariant conflicts):
 - `docs-worker` — docs-only findings (README, Swagger, PR description)
 - `test-runner` — lint · typecheck · test · build · security:secrets
 - `secret-scan-worker` — diagnose Gitleaks failures, recommend remediation
+- `dataset-safety-worker` — scan diff/.gitignore for datasets, media, model weights, training outputs
+- `ml-pipeline-reviewer` — Phase 8 ML pipeline MVP-safety review (PASS/BLOCK)
+- `vision-event-contract-worker` — verify ML output matches the Phase 7 VisionEvent contract
 - `final-reviewer` — pre-push PASS/BLOCK on the full diff
 
 You keep for yourself: MVP-blocking triage, plan review, commit, push, PR
@@ -75,11 +78,17 @@ comments, and every escalation. Workers never commit, push, or comment.
    on the same finding → do that fix yourself.
 6. **Verify.** Spawn `test-runner`:
    `pnpm run lint` · `pnpm run typecheck` · `pnpm run test` ·
-   `pnpm run build` · `pnpm run security:secrets`.
+   `pnpm run build` · `pnpm run security:secrets` · `pnpm run ml:test`.
    Route failures caused by this cycle's changes back to the responsible
    worker. `security:secrets` failures → `secret-scan-worker`
    (REAL_SECRET_FOUND = immediate stop + escalate). If a failure is
    unrelated and cannot be fixed safely, STOP and report instead of pushing.
+6a. **ML-aware review.** On ML-flagged branches/PRs (title or branch contains
+   `phase8`, `ml`, `training`, `dataset`, or `cv-training`, word-boundary
+   match — `ml` must not fire on `html`/`yaml`), spawn
+   `dataset-safety-worker`, `ml-pipeline-reviewer`, and
+   `vision-event-contract-worker` before `final-reviewer`; their
+   BLOCK/UNSAFE/INCOMPATIBLE verdicts are merge blockers.
 7. **Final review.** Spawn `final-reviewer` on the full diff. BLOCK →
    resolve the blockers (back through steps 4–6) and re-review; never push
    a BLOCKed diff.

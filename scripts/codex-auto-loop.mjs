@@ -26,8 +26,9 @@
  * Inside a /codex-auto-loop session, the main Claude instance acts as the
  * ORCHESTRATOR: it delegates the routine steps below to the subagents in
  * .claude/agents/ (codex-review-reader, repo-investigator, fix-worker,
- * docs-worker, test-runner, secret-scan-worker, final-reviewer) and keeps
- * triage, commit, push, and PR comments for itself.
+ * docs-worker, test-runner, secret-scan-worker, dataset-safety-worker,
+ * ml-pipeline-reviewer, vision-event-contract-worker, final-reviewer) and
+ * keeps triage, commit, push, and PR comments for itself.
  *
  * Usage:
  *   pnpm run codex:auto-loop -- --pr 2
@@ -48,6 +49,8 @@ import path from 'node:path';
 
 const PROTECTED_BRANCHES = new Set(['main', 'dev']);
 const FINDINGS_FILE = path.join('.tmp', 'codex-latest-findings.md');
+const ML_KEYWORDS =
+  /(^|[^a-z0-9])(phase8|ml|training|dataset|cv-training)(?=[^a-z0-9]|$)/i;
 
 function fail(message) {
   console.error(`\nERROR: ${message}\n`);
@@ -180,12 +183,20 @@ function main() {
   const prArgs = args.pr !== null ? [String(args.pr)] : [];
   const prJson = runOrFail(
     'gh',
-    ['pr', 'view', ...prArgs, '--json', 'number,url,state,headRefName,headRefOid'],
+    [
+      'pr',
+      'view',
+      ...prArgs,
+      '--json',
+      'number,url,state,headRefName,headRefOid,title',
+    ],
     args.pr !== null
       ? `Could not load PR #${args.pr}`
       : 'Could not auto-detect a PR for the current branch (open one first, or pass --pr <n>)',
   );
   const pr = JSON.parse(prJson);
+  const prTitle = typeof pr.title === 'string' ? pr.title : '';
+  const isMlPr = ML_KEYWORDS.test(branch) || ML_KEYWORDS.test(prTitle);
   if (pr.state !== 'OPEN') {
     fail(`PR #${pr.number} is ${pr.state}, not OPEN — nothing to loop on.`);
   }
@@ -371,9 +382,20 @@ function main() {
   );
   console.log(
     '  4. test-runner: pnpm run lint && pnpm run typecheck && pnpm run test ' +
-      '&& pnpm run build && pnpm run security:secrets ' +
+      '&& pnpm run build && pnpm run security:secrets && pnpm run ml:test ' +
       '(secret-scan-worker on secret-scan failures).',
   );
+  if (isMlPr) {
+    console.log(
+      '  4a. ML-flagged branch/PR: spawn dataset-safety-worker, ' +
+        'ml-pipeline-reviewer, and vision-event-contract-worker before ' +
+        'final-reviewer. Blockers: datasets/media/weights/training outputs ' +
+        'committed, heavy ML deps required by normal CI, VisionEvent ' +
+        'payload incompatible with Phase 7, reintroduction of evidence ' +
+        'artifacts/metadata/URIs/storageKeys into app ingestion, or a ' +
+        'secret-scan/CI/build/test failure.',
+    );
+  }
   console.log(
     '  5. final-reviewer on the full diff — must return PASS before commit.',
   );

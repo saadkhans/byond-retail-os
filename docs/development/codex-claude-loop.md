@@ -17,8 +17,11 @@ subagents defined in `.claude/agents/`:
 | `repo-investigator` | Map a finding to exact files/functions/DTOs/migrations/tests; minimal plan | sonnet | no |
 | `fix-worker` | Apply narrow, explicitly-planned code fixes; preserve tenant isolation, RBAC, audit, tests | sonnet | yes |
 | `docs-worker` | Fix README/Swagger/PR-description/API-doc mismatches; never runtime logic | sonnet | yes |
-| `test-runner` | Run lint · typecheck · test · build · security:secrets; summarize failures | haiku | no |
+| `test-runner` | Run lint · typecheck · test · build · security:secrets · ml:test; summarize failures | haiku | no |
 | `secret-scan-worker` | Diagnose Gitleaks hits (current files vs branch history); recommend clean squash for history-only false positives | inherit | no* |
+| `ml-pipeline-reviewer` | PASS/BLOCK review of `ml/` pipeline changes for MVP safety | inherit | no |
+| `dataset-safety-worker` | SAFE/UNSAFE scan of the diff and `.gitignore` for datasets/media/model weights/training outputs | sonnet | no |
+| `vision-event-contract-worker` | COMPATIBLE/INCOMPATIBLE check that ML output examples and the mapper match the Phase 7 VisionEvent ingest contract | sonnet | no |
 | `final-reviewer` | Pre-push PASS/BLOCK gate: tenant isolation, RBAC/module gating, audit, data-loss, migration safety, secret/payment safety, MVP scope | inherit | no |
 
 \* `secret-scan-worker` only performs a history rewrite (soft-reset squash +
@@ -94,7 +97,7 @@ only when the uncommitted changes were made by the current loop session.
 | F | Developer | `pnpm run codex:summary` — see the active findings |
 | G | Developer | Invoke the Claude command: `/fix-codex-review` |
 | H | Claude (orchestrator → workers) | Fixes **only** the Codex findings — reader → investigator → fix/docs workers |
-| I | Claude (test-runner) | Runs `pnpm run lint`, `typecheck`, `test`, `build`, `security:secrets` — all must pass |
+| I | Claude (test-runner) | Runs `pnpm run lint`, `typecheck`, `test`, `build`, `security:secrets`, `ml:test` — all must pass |
 | I' | Claude (final-reviewer) | PASS/BLOCK gate on the full diff before anything is pushed |
 | J | Claude (orchestrator) | Commits and pushes to the **same** branch |
 | K | Claude (orchestrator) | Comments `@codex review` on the PR to request re-review |
@@ -103,6 +106,25 @@ only when the uncommitted changes were made by the current loop session.
 
 Each `/fix-codex-review` invocation performs **exactly one** fix cycle and
 stops — the loop advances only when a human re-invokes it.
+
+## Phase 8 ML-aware review
+
+When the PR title or branch name contains `phase8`, `ml`, `training`,
+`dataset`, or `cv-training` (word-boundary match), the loop runs
+`ml-pipeline-reviewer`, `dataset-safety-worker`, and
+`vision-event-contract-worker` before `final-reviewer` (step I'). `ml/` is a
+stdlib-only Python workspace outside the pnpm workspace; datasets and model
+weights are external artifacts and must never be committed.
+
+Merge-blockers specific to Phase 8:
+1. Datasets/images/videos committed to the repo
+2. Model weights committed to the repo
+3. Heavy ML dependencies required by normal CI
+4. Generated training outputs committed
+5. VisionEvent payload incompatible with the Phase 7 ingest contract
+6. Reintroduction of evidence artifacts/metadata/URIs/storageKeys into app ingestion
+7. Secret scanning failure
+8. Failing CI/build/tests
 
 ## Commands
 
@@ -121,6 +143,9 @@ pnpm run codex:summary -- --pr 2 --latest-only --include-previous-active
 
 # Reminder of the Claude command
 pnpm run codex:fix-loop:docs
+
+# Run the Phase 8 ML pipeline's stdlib-only Python tests
+pnpm run ml:test
 ```
 
 ### Finding states

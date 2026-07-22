@@ -27,6 +27,14 @@ explicitly instructs it).
   current phase's MVP scope.
 - Never run git commit or git push. The orchestrator commits.
 
+## Phase 8 ML docs
+
+When touching `ml/` or Phase 8 docs, ensure they state that: (1) Phase 8 is
+a dataset/training pipeline MVP only; (2) no real training data is
+committed; (3) no model weights are committed; (4) real media storage is
+deferred to a future evidence phase; (5) model output feeds the Phase 7
+VisionEvent JSON contract (`POST /vision-events`).
+
 ## Output format (your final message)
 
 ```
