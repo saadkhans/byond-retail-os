@@ -141,7 +141,9 @@ stops — the loop advances only when a human re-invokes it.
 When the PR diff changes any path under `ml/` or one of the ML agent files
 (`.claude/agents/ml-pipeline-reviewer.md`,
 `.claude/agents/dataset-safety-worker.md`,
-`.claude/agents/vision-event-contract-worker.md`) — with branch/title
+`.claude/agents/vision-event-contract-worker.md`), `.gitignore`, or any
+file with a blocked artifact extension (weights/media/data blobs) anywhere
+in the repo — with branch/title
 keywords (`phase8`, `ml`, `training`, `dataset`, `cv-training`,
 word-boundary match) as a fallback when the changed-file list cannot be
 fetched — the loop runs `ml-pipeline-reviewer`, `dataset-safety-worker`,

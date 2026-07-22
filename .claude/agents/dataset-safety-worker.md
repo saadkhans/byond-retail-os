@@ -14,8 +14,15 @@ Phase 8 ML change is pushed, you check that no unsafe artifact slipped past
 1. Resolve the PR base first — `gh pr view --json baseRefName` (or the base
    ref given in the spawning prompt); fall back to `origin/dev` only if no
    PR/base can be resolved. Then `git fetch origin <base>` if the ref is
-   missing locally, and run `git diff origin/<base>...HEAD --name-only` —
-   files added/changed on this branch.
+   missing locally, and run
+   `git diff origin/<base>...HEAD --name-status --diff-filter=ACMR` to get
+   block-list candidates — added/copied/modified/renamed files only.
+   Deletions are intentionally excluded from the block-list scan: a cleanup
+   PR that DELETES a previously committed artifact is SAFE (removing an
+   offending file is desirable), not UNSAFE. If you notice a blocked
+   artifact being deleted (e.g. via a separate `--diff-filter=D` pass or
+   `git status`), mention it in the report as informational, not as an
+   offending path.
 2. `git status --short` — anything staged or untracked right now.
 3. `git ls-files ml/` — everything already tracked under `ml/`.
 
@@ -33,9 +40,9 @@ Cross-reference all three against the block list below.
   (e.g. `*.pt`/`*.PT`, any case), so treat extension matches on these as
   case-insensitive when scanning diffs
 - Video/image media: `*.mp4`, `*.mov`, `*.avi`, `*.mkv`, `*.jpg`, `*.jpeg`,
-  `*.png`, `*.webp` — matched case-insensitively (e.g. `*.jpg`/`*.JPG`, any
-  case), so treat extension matches on these as case-insensitive when
-  scanning diffs
+  `*.png`, `*.webp`, `*.bmp`, `*.tif`, `*.tiff`, `*.gif`, `*.webm` — matched
+  case-insensitively (e.g. `*.jpg`/`*.JPG`, any case), so treat extension
+  matches on these as case-insensitive when scanning diffs
 - Binary blobs: `*.npy`, `*.npz`, `*.parquet`, `*.pkl`, `*.pickle` — matched
   case-insensitively (e.g. `*.pkl`/`*.PKL`, any case), so treat extension
   matches on these as case-insensitive when scanning diffs

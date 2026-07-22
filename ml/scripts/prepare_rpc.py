@@ -65,14 +65,51 @@ def _source_root(input_dir, output_dir) -> str:
 
     The manifest references source images/annotations in place (nothing is
     copied), so it records where the source root lives relative to the
-    manifest's own directory. Falls back to the absolute input root when no
-    relative path exists (e.g. different drives on Windows).
+    manifest's own directory. Both endpoints are resolved to physical paths
+    first so symlinked input/output dirs record a root that actually
+    resolves. Falls back to the absolute input root when no relative path
+    exists (e.g. different drives on Windows).
     """
+    input_root = Path(input_dir).resolve()
+    output_root = Path(output_dir).resolve()
     try:
-        rel = os.path.relpath(str(input_dir), str(output_dir))
+        rel = os.path.relpath(str(input_root), str(output_root))
     except ValueError:
-        return Path(input_dir).resolve().as_posix()
+        return input_root.as_posix()
     return Path(rel).as_posix()
+
+
+def _category_id_names(coco: dict) -> dict:
+    """id -> name mapping of a COCO payload's `categories` list."""
+    mapping = {}
+    for category in coco.get("categories", []):
+        if isinstance(category, dict):
+            mapping[category.get("id")] = category.get("name")
+    return mapping
+
+
+def _category_map_mismatches(train_map: dict, split_map: dict) -> list:
+    """Human-readable differences between a split's category map and train's.
+
+    Empty list means the maps are exactly equal (same id set, same names).
+    """
+    mismatches = []
+    for cid in sorted(set(train_map) - set(split_map), key=repr):
+        mismatches.append(
+            f"category id {cid!r} is missing (train names it {train_map[cid]!r})"
+        )
+    for cid in sorted(set(split_map) - set(train_map), key=repr):
+        mismatches.append(
+            f"category id {cid!r} is not in the training categories "
+            f"(named {split_map[cid]!r})"
+        )
+    for cid in sorted(set(train_map) & set(split_map), key=repr):
+        if train_map[cid] != split_map[cid]:
+            mismatches.append(
+                f"category id {cid!r} is named {split_map[cid]!r} but train "
+                f"names it {train_map[cid]!r}"
+            )
+    return mismatches
 
 
 def _write_json_atomically(payload: dict, destination: Path) -> None:
@@ -89,6 +126,12 @@ def _write_json_atomically(payload: dict, destination: Path) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, sort_keys=True)
             fh.write("\n")
+        # mkstemp creates the temp file 0600; give the final manifest the
+        # normal umask-derived mode so shared-pipeline readers can open it.
+        # (On Windows chmod is mostly a no-op — harmless.)
+        current_umask = os.umask(0)
+        os.umask(current_umask)
+        os.chmod(tmp_name, 0o666 & ~current_umask)
         os.replace(tmp_name, destination)
     except BaseException:
         try:
@@ -162,11 +205,27 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
             entry["sourceId"] = source_id
         classes.append(entry)
 
+    # The annotation files reference categories by id; a val/test file whose
+    # id -> name mapping differs from training's would silently mislabel
+    # those splits, so every split must carry the exact same category map.
+    train_categories = _category_id_names(train_annotations)
+
     splits = {}
     annotations = {}
     for split_name, (image_dir, annotation_file) in SPLIT_MARKERS.items():
         with (input_dir / annotation_file).open("r", encoding="utf-8") as fh:
             coco = json.load(fh)
+        if split_name != "train":
+            mismatches = _category_map_mismatches(train_categories, _category_id_names(coco))
+            if mismatches:
+                print(
+                    f"ERROR: {annotation_file} ({split_name} split) categories do "
+                    f"not match {SPLIT_MARKERS['train'][1]}; every split must use "
+                    "the same category id -> name mapping:"
+                )
+                for mismatch in mismatches:
+                    print(f"  - {mismatch}")
+                return 1
         samples = []
         for image in coco.get("images", []):
             file_name = image.get("file_name")
@@ -176,11 +235,16 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
         splits[split_name] = samples
         annotations[split_name] = annotation_file
 
+    # Resolve to the physical input root so the written sourceRoot and the
+    # check_files validation below agree on the same real location even when
+    # --input/--output are symlinks.
+    resolved_input = Path(input_dir).resolve()
+
     manifest = {
         "datasetName": DATASET_NAME,
         "datasetVersion": DATASET_VERSION,
         "source": "rpc",
-        "sourceRoot": _source_root(input_dir, output_dir),
+        "sourceRoot": _source_root(resolved_input, output_dir),
         "licenseNotes": LICENSE_NOTES,
         "annotations": annotations,
         "classes": classes,
@@ -191,7 +255,7 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
 
     # Validate BEFORE writing anything: a failed run must never clobber a
     # previously valid manifest.json with a rejected one.
-    errors = validate_manifest(manifest, check_files=True, base_dir=input_dir)
+    errors = validate_manifest(manifest, check_files=True, base_dir=resolved_input)
     if errors:
         print(
             f"ERROR: generated manifest for {manifest_path} failed validation "

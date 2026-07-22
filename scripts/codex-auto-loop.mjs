@@ -80,6 +80,23 @@ const ML_KEYWORDS =
 // definitions themselves.
 const ML_PATHS =
   /^(ml\/|\.claude\/agents\/(ml-pipeline-reviewer|dataset-safety-worker|vision-event-contract-worker)\.md$)/;
+// Blocked artifact extensions (model weights, media, data blobs). A file
+// with one of these extensions ANYWHERE in the repo warrants the
+// dataset-safety gate, so it marks the PR as ML regardless of directory.
+const ML_ARTIFACT_EXTENSIONS =
+  /\.(pt|pth|onnx|engine|safetensors|weights|ckpt|h5|tflite|mlmodel|pb|keras|joblib|gguf|bin|npy|npz|parquet|pkl|pickle|jpg|jpeg|png|webp|bmp|tif|tiff|gif|mp4|mov|avi|mkv|webm)$/i;
+
+// A changed file counts as ML when it lives under an ML path, is the
+// .gitignore (ML safety configuration — an overly broad trigger is safe,
+// it just runs extra review), or carries a blocked artifact extension
+// anywhere in the repo.
+function isMlChangedPath(filePath) {
+  return (
+    ML_PATHS.test(filePath) ||
+    filePath === '.gitignore' ||
+    ML_ARTIFACT_EXTENSIONS.test(filePath)
+  );
+}
 
 function fail(message) {
   console.error(`\nERROR: ${message}\n`);
@@ -342,9 +359,10 @@ function main() {
   const pr = JSON.parse(prJson);
   const prTitle = typeof pr.title === 'string' ? pr.title : '';
 
-  // ML detection is path-based (changed files under ml/ or the ML agent
-  // definitions), with branch/title keywords as a fallback when the file
-  // list cannot be fetched or parsed.
+  // ML detection is path-based (changed files under ml/, the ML agent
+  // definitions, .gitignore, or any blocked artifact extension — see
+  // isMlChangedPath), with branch/title keywords as a fallback ONLY when
+  // the file list cannot be fetched or parsed.
   let mlByFiles = false;
   let filesFetched = false;
   // Primary fetch: the REST files endpoint. Unlike `gh pr view --json files`
@@ -366,10 +384,10 @@ function main() {
         filesFetched = true;
         mlByFiles = entries.some(
           (entry) =>
-            ML_PATHS.test(
+            isMlChangedPath(
               typeof entry?.filename === 'string' ? entry.filename : '',
             ) ||
-            ML_PATHS.test(
+            isMlChangedPath(
               typeof entry?.previous_filename === 'string'
                 ? entry.previous_filename
                 : '',
@@ -396,7 +414,7 @@ function main() {
         if (Array.isArray(files)) {
           filesFetched = true;
           mlByFiles = files.some((file) =>
-            ML_PATHS.test(typeof file?.path === 'string' ? file.path : ''),
+            isMlChangedPath(typeof file?.path === 'string' ? file.path : ''),
           );
         }
       } catch {
@@ -410,8 +428,12 @@ function main() {
         'branch/title keywords.',
     );
   }
-  const isMlPr =
-    mlByFiles || ML_KEYWORDS.test(branch) || ML_KEYWORDS.test(prTitle);
+  // Keywords are a FALLBACK only: when the changed files were fetched, they
+  // alone decide — a successfully-inspected non-ML PR is never ML-flagged
+  // just because its branch or title mentions e.g. "dataset".
+  const isMlPr = filesFetched
+    ? mlByFiles
+    : ML_KEYWORDS.test(branch) || ML_KEYWORDS.test(prTitle);
   if (pr.state !== 'OPEN') {
     fail(`PR #${pr.number} is ${pr.state}, not OPEN — nothing to loop on.`);
   }

@@ -15,11 +15,16 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+import prepare_byond_dataset  # noqa: E402
+import prepare_rpc  # noqa: E402
+import prepare_sku110k  # noqa: E402
+import validate_dataset_manifest  # noqa: E402
 from validate_dataset_manifest import validate_manifest  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -701,14 +706,18 @@ class PrepareRpcEndToEndTests(unittest.TestCase):
         for split, image_name in self.IMAGE_NAMES.items():
             image_dir = raw / f"{split}2019"
             image_dir.mkdir(parents=True, exist_ok=True)
-            coco: dict = {"images": [{"file_name": image_name}]}
-            if split == "train":
-                # Non-contiguous COCO category ids on purpose: classId must be
-                # remapped to 0..N-1 while sourceId preserves these originals.
-                coco["categories"] = [
+            coco: dict = {
+                "images": [{"file_name": image_name}],
+                # Every split carries the same category map (as real RPC
+                # files do); prepare_rpc rejects any val/test drift from
+                # train. Non-contiguous COCO category ids on purpose: classId
+                # must be remapped to 0..N-1 while sourceId preserves these
+                # originals.
+                "categories": [
                     {"id": 7, "name": "Cola 330"},
                     {"id": 3, "name": "Chips 50"},
-                ]
+                ],
+            }
             (raw / f"instances_{split}2019.json").write_text(
                 json.dumps(coco), encoding="utf-8"
             )
@@ -864,6 +873,189 @@ class PrepareSku110kEndToEndTests(unittest.TestCase):
                 (out / "manifest.json").read_text(encoding="utf-8"), original
             )
             self.assertEqual(list(out.glob("*.tmp")), [])
+
+
+class RpcCategoryConsistencyTests(unittest.TestCase):
+    """prepare_rpc must reject val/test COCO files whose category id -> name
+    map differs from the training split's (renamed, missing, or extra id) —
+    annotations join on category id, so any drift silently mislabels."""
+
+    CATEGORIES = [{"id": 7, "name": "Cola 330"}, {"id": 3, "name": "Chips 50"}]
+    IMAGE_NAMES = {"train": "t1.jpg", "val": "v1.jpg", "test": "e1.jpg"}
+
+    def _run_prepare(self, tmp: Path, val_categories: list) -> tuple:
+        raw = tmp / "raw"
+        out = tmp / "out"
+        for split, image_name in self.IMAGE_NAMES.items():
+            image_dir = raw / f"{split}2019"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            categories = val_categories if split == "val" else self.CATEGORIES
+            coco = {"images": [{"file_name": image_name}], "categories": categories}
+            (raw / f"instances_{split}2019.json").write_text(
+                json.dumps(coco), encoding="utf-8"
+            )
+            (image_dir / image_name).write_text(f"pixels-{image_name}", encoding="utf-8")
+        result = _run_script(
+            "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+        )
+        return result, out
+
+    def _assert_rejected(self, result, out: Path, expected_fragment: str) -> None:
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("instances_val2019.json", result.stdout)
+        self.assertIn("val split", result.stdout)
+        self.assertIn(expected_fragment, result.stdout)
+        self.assertFalse((out / "manifest.json").exists())
+
+    def test_renamed_category_in_val_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp),
+                [{"id": 7, "name": "Soap"}, {"id": 3, "name": "Chips 50"}],
+            )
+            self._assert_rejected(result, out, "category id 7 is named 'Soap'")
+
+    def test_missing_category_id_in_val_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(Path(tmp), [{"id": 7, "name": "Cola 330"}])
+            self._assert_rejected(result, out, "category id 3 is missing")
+
+    def test_extra_category_id_in_val_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), self.CATEGORIES + [{"id": 9, "name": "Extra"}]
+            )
+            self._assert_rejected(
+                result, out, "category id 9 is not in the training categories"
+            )
+
+    def test_identical_category_maps_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(Path(tmp), list(self.CATEGORIES))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((out / "manifest.json").exists())
+
+
+class SourceRootHelperTests(unittest.TestCase):
+    """All three preparers' _source_root must relate the physical (resolved)
+    endpoints, so symlinked input/output dirs never record a bogus root."""
+
+    MODULES = (prepare_rpc, prepare_sku110k, prepare_byond_dataset)
+
+    def test_source_root_of_sibling_dirs_is_relative(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "raw").mkdir()
+            (base / "out").mkdir()
+            for module in self.MODULES:
+                with self.subTest(module=module.__name__):
+                    self.assertEqual(
+                        module._source_root(base / "raw", base / "out"), "../raw"
+                    )
+
+    def test_source_root_resolves_symlinked_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            real = base / "real-raw"
+            real.mkdir()
+            (base / "out").mkdir()
+            link = base / "link-raw"
+            try:
+                os.symlink(str(real), str(link), target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                # Windows may lack the symlink privilege for directories.
+                self.skipTest(f"directory symlinks unsupported: {exc}")
+            for module in self.MODULES:
+                with self.subTest(module=module.__name__):
+                    self.assertEqual(
+                        module._source_root(link, base / "out"), "../real-raw"
+                    )
+
+
+class AtomicWritePermissionTests(unittest.TestCase):
+    """Atomically-written manifests must not keep mkstemp's private 0600
+    mode — shared-pipeline readers need the normal umask-derived mode."""
+
+    def test_written_manifest_is_readable(self) -> None:
+        for module in (prepare_rpc, prepare_sku110k, prepare_byond_dataset):
+            with self.subTest(module=module.__name__):
+                with tempfile.TemporaryDirectory() as tmp:
+                    destination = Path(tmp) / "manifest.json"
+                    module._write_json_atomically({"k": "v"}, destination)
+                    self.assertTrue(os.access(str(destination), os.R_OK))
+                    if sys.platform != "win32":
+                        current_umask = os.umask(0)
+                        os.umask(current_umask)
+                        self.assertEqual(
+                            destination.stat().st_mode & 0o777,
+                            0o666 & ~current_umask,
+                        )
+
+
+class UnreadableImageTests(unittest.TestCase):
+    """An image that exists but cannot be read for hashing must fail
+    validation — silently skipping it would let duplicates evade the leak
+    check and unusable samples pass."""
+
+    def test_undigestable_image_reported_as_unreadable(self) -> None:
+        manifest = _valid_manifest()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "images").mkdir()
+            (base / "images" / "a.jpg").write_text("pixels-a", encoding="utf-8")
+            with mock.patch.object(
+                validate_dataset_manifest,
+                "_digest_file",
+                side_effect=OSError("permission denied"),
+            ):
+                errors = validate_manifest(manifest, base_dir=base, check_files=True)
+            self.assertTrue(
+                any("unreadable file: images/a.jpg" in e for e in errors), errors
+            )
+
+
+class SourceRootResolutionTests(unittest.TestCase):
+    """A sourceRoot that is not a valid filesystem string must be rejected as
+    a validation error, never crash path resolution with a traceback."""
+
+    def test_nul_in_source_root_rejected_by_shape_check(self) -> None:
+        manifest = _valid_manifest()
+        manifest["sourceRoot"] = "\x00bad"
+        errors = validate_manifest(manifest)
+        self.assertTrue(
+            any("sourceRoot contains invalid characters" in e for e in errors), errors
+        )
+
+    def test_cli_nul_source_root_exits_1_without_traceback(self) -> None:
+        manifest = _valid_manifest()
+        manifest["sourceRoot"] = "\x00bad"
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = _run_script(
+                "validate_dataset_manifest.py", [str(manifest_path), "--check-files"]
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("ERROR", result.stdout)
+            self.assertIn("sourceRoot contains invalid characters", result.stdout)
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+    def test_unresolvable_base_dir_reported_not_raised(self) -> None:
+        bad_root = Path("\x00bad")
+        manifest = _valid_manifest()
+        try:
+            errors = validate_manifest(manifest, base_dir=bad_root, check_files=True)
+        except (OSError, ValueError):
+            self.fail("validate_manifest raised instead of reporting an error")
+        self.assertTrue(errors)
+        # Whether Path.resolve raises on an embedded NUL is platform
+        # dependent; the specific error line is only owed where it does.
+        try:
+            bad_root.resolve()
+        except (OSError, ValueError):
+            self.assertTrue(
+                any("sourceRoot cannot be resolved" in e for e in errors), errors
+            )
 
 
 if __name__ == "__main__":

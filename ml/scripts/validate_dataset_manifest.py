@@ -76,6 +76,16 @@ def _is_bad_path(value) -> bool:
     return False
 
 
+def _digest_file(path: Path) -> bytes:
+    """SHA-256 digest of a file, streamed in 1 MiB chunks (images can be
+    large). Raises OSError when the file cannot be read."""
+    hasher = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.digest()
+
+
 def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: bool = False) -> list:
     """Validate a parsed manifest dict; return a list of error strings (empty = valid).
 
@@ -119,6 +129,10 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
         source_root = manifest["sourceRoot"]
         if not isinstance(source_root, str) or not source_root:
             errors.append(f"sourceRoot must be a non-empty string, got {source_root!r}")
+        elif "\x00" in source_root:
+            # An embedded NUL is not a valid filesystem string and would make
+            # every later Path operation raise instead of validate.
+            errors.append("sourceRoot contains invalid characters")
 
     if "licenseNotes" not in manifest:
         errors.append("missing required field: licenseNotes")
@@ -315,15 +329,21 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                 root = Path(base_dir)
                 try:
                     resolved_root = root.resolve()
-                except OSError:
+                except (OSError, ValueError):
+                    # An unresolvable base dir (e.g. a sourceRoot with an
+                    # embedded NUL) must surface as a validation error, never
+                    # a traceback; file checks are skipped because no
+                    # reference could resolve against such a root anyway.
+                    errors.append(f"sourceRoot cannot be resolved: {str(base_dir)!r}")
+                    root = None
                     resolved_root = None
 
                 def _resolve(target: Path):
                     """Resolved target, or None when resolution fails (broken
-                    symlink loops, permission errors, ...)."""
+                    symlink loops, permission errors, invalid characters, ...)."""
                     try:
                         return target.resolve()
-                    except OSError:
+                    except (OSError, ValueError):
                         return None
 
                 def _escapes_root(resolved) -> bool:
@@ -338,7 +358,7 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                         return True
 
                 missing = []
-                annotations = manifest.get("annotations")
+                annotations = manifest.get("annotations") if root is not None else None
                 if isinstance(annotations, dict):
                     for split_name in SPLIT_NAMES:
                         rel = annotations.get(split_name)
@@ -353,7 +373,7 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                 seen_image_identities: dict = {}
                 seen_image_digests: dict = {}
                 for split_name in SPLIT_NAMES:
-                    samples = splits.get(split_name)
+                    samples = splits.get(split_name) if root is not None else None
                     if not isinstance(samples, list):
                         continue
                     for idx, sample in enumerate(samples):
@@ -420,16 +440,15 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                                 continue
                             # Inode identity misses byte-for-byte copies of an
                             # image across splits — an equally real train/eval
-                            # leak. Stream a content digest (1 MiB chunks; image
-                            # files can be large) and reject digest collisions.
+                            # leak. Stream a content digest and reject digest
+                            # collisions. An unreadable image is unusable for
+                            # training AND evades the duplicate check, so it
+                            # fails validation rather than being skipped.
                             try:
-                                hasher = hashlib.sha256()
-                                with target.open("rb") as fh:
-                                    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-                                        hasher.update(chunk)
+                                digest = _digest_file(target)
                             except OSError:
+                                missing.append(f"unreadable file: {rel}")
                                 continue
-                            digest = hasher.digest()
                             prior_ref = seen_image_digests.get(digest)
                             if prior_ref is None:
                                 seen_image_digests[digest] = ref
@@ -489,11 +508,17 @@ def main(argv=None) -> int:
     if args.base_dir is not None:
         base_dir = Path(args.base_dir)
     else:
-        base_dir = manifest_path.resolve().parent
         source_root = manifest.get("sourceRoot") if isinstance(manifest, dict) else None
-        if isinstance(source_root, str) and source_root:
-            source_root_path = Path(source_root)
-            base_dir = source_root_path if source_root_path.is_absolute() else base_dir / source_root_path
+        try:
+            base_dir = manifest_path.resolve().parent
+            if isinstance(source_root, str) and source_root:
+                source_root_path = Path(source_root)
+                base_dir = source_root_path if source_root_path.is_absolute() else base_dir / source_root_path
+        except (OSError, ValueError):
+            # e.g. a sourceRoot with an embedded NUL: report a normal ERROR
+            # line instead of crashing with a traceback.
+            print(f"ERROR: sourceRoot cannot be resolved: {source_root!r}")
+            return 1
     errors = validate_manifest(manifest, base_dir=base_dir, check_files=args.check_files)
 
     if errors:

@@ -11,18 +11,23 @@ tripped it and produce a safe remediation plan.
 
 ## Diagnosis steps
 
-1. Reproduce/inspect: read the CI log the orchestrator gives you, or run
+1. Resolve the PR base first — `gh pr view --json baseRefName` (or accept
+   the base ref given directly in the spawning prompt); fall back to
+   `origin/dev` only if no PR/base can be resolved. Fetch it
+   (`git fetch origin <base>`) if missing locally, and use `origin/<base>`
+   consistently for every diff/log-opts scoping below.
+2. Reproduce/inspect: read the CI log the orchestrator gives you, or run
    `gitleaks detect --source . -v` (working tree) and
-   `gitleaks detect --log-opts="origin/dev..HEAD" -v` (branch history) if
+   `gitleaks detect --log-opts="origin/<base>..HEAD" -v` (branch history) if
    gitleaks is installed. Otherwise inspect the flagged paths/commits with
    git and Grep.
-2. Classify EVERY hit:
+3. Classify EVERY hit:
    - **REAL SECRET** — a plausible live credential (API key, token,
      password, private key, card data).
    - **Test-string false positive** — obviously fake fixture data
      (e.g. `sk_test_…`, `whsec_dummy…`, sample JWTs in tests).
-3. Locate each hit: is it in the CURRENT working tree, or only in earlier
-   commits of this branch's history (`origin/dev..HEAD`)?
+4. Locate each hit: is it in the CURRENT working tree, or only in earlier
+   commits of this branch's history (`origin/<base>..HEAD`)?
 
 ## Remediation rules
 
@@ -36,11 +41,12 @@ tripped it and produce a safe remediation plan.
   narrowly scoped (path + rule) with a comment explaining why — recommend
   it, do not silently add it.
 - **False positive only in branch history** (current files clean): the fix is
-  a clean squash of the branch onto origin/dev so the offending blobs leave
+  a clean squash of the branch onto the resolved base (`origin/<base>` from
+  step 1 above — never hardcode `origin/dev`) so the offending blobs leave
   the pushed history:
   ```
   git fetch origin
-  git reset --soft $(git merge-base HEAD origin/dev)
+  git reset --soft $(git merge-base HEAD origin/<base>)
   git commit -m "<original feature commit message>"
   git push --force-with-lease
   ```

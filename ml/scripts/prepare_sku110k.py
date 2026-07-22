@@ -56,13 +56,17 @@ def _source_root(input_dir, output_dir) -> str:
 
     The manifest references source images/annotations in place (nothing is
     copied), so it records where the source root lives relative to the
-    manifest's own directory. Falls back to the absolute input root when no
-    relative path exists (e.g. different drives on Windows).
+    manifest's own directory. Both endpoints are resolved to physical paths
+    first so symlinked input/output dirs record a root that actually
+    resolves. Falls back to the absolute input root when no relative path
+    exists (e.g. different drives on Windows).
     """
+    input_root = Path(input_dir).resolve()
+    output_root = Path(output_dir).resolve()
     try:
-        rel = os.path.relpath(str(input_dir), str(output_dir))
+        rel = os.path.relpath(str(input_root), str(output_root))
     except ValueError:
-        return Path(input_dir).resolve().as_posix()
+        return input_root.as_posix()
     return Path(rel).as_posix()
 
 
@@ -80,6 +84,12 @@ def _write_json_atomically(payload: dict, destination: Path) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, sort_keys=True)
             fh.write("\n")
+        # mkstemp creates the temp file 0600; give the final manifest the
+        # normal umask-derived mode so shared-pipeline readers can open it.
+        # (On Windows chmod is mostly a no-op — harmless.)
+        current_umask = os.umask(0)
+        os.umask(current_umask)
+        os.chmod(tmp_name, 0o666 & ~current_umask)
         os.replace(tmp_name, destination)
     except BaseException:
         try:
@@ -162,11 +172,16 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
         splits[split_name] = [{"image": f"images/{name}"} for name in image_names]
         annotations[split_name] = f"annotations/{csv_name}"
 
+    # Resolve to the physical input root so the written sourceRoot and the
+    # check_files validation below agree on the same real location even when
+    # --input/--output are symlinks.
+    resolved_input = Path(input_dir).resolve()
+
     manifest = {
         "datasetName": DATASET_NAME,
         "datasetVersion": DATASET_VERSION,
         "source": "sku-110k",
-        "sourceRoot": _source_root(input_dir, output_dir),
+        "sourceRoot": _source_root(resolved_input, output_dir),
         "licenseNotes": LICENSE_NOTES,
         "annotations": annotations,
         "classes": [{"classId": 0, "label": "product"}],
@@ -177,7 +192,7 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
 
     # Validate BEFORE writing anything: a failed run must never clobber a
     # previously valid manifest.json with a rejected one.
-    errors = validate_manifest(manifest, check_files=True, base_dir=input_dir)
+    errors = validate_manifest(manifest, check_files=True, base_dir=resolved_input)
     if errors:
         print(
             f"ERROR: generated manifest for {manifest_path} failed validation "

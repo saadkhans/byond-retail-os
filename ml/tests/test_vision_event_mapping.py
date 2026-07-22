@@ -237,6 +237,75 @@ class TimestampValidationTests(unittest.TestCase):
         self.assertEqual(payload["occurredAt"], "2026-07-21T13:00:00+03:00")
 
 
+class StrictTimestampShapeTests(unittest.TestCase):
+    """Python's fromisoformat is more permissive than the API's @IsDateString
+    (CPython 3.11+ accepts ANY single character as the date-time separator,
+    plus compact/seconds-bearing offsets), so the mapper gates timestamps on
+    a strict YYYY-MM-DDTHH:MM:SS[.fff](Z|+-HH:MM) shape before parsing."""
+
+    def test_non_t_separator_rejected(self) -> None:
+        # The Codex repro: fromisoformat on 3.11+ parses this fine, but the
+        # emitted string must never reach the API.
+        inference = _base_inference()
+        inference["occurredAt"] = "2025-01-01X00:00:00+00:00"
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        self.assertIn("occurredAt must be a timezone-aware ISO-8601 timestamp", str(ctx.exception))
+
+    def test_space_separator_rejected(self) -> None:
+        inference = _base_inference()
+        inference["occurredAt"] = "2026-07-21 10:00:00+00:00"
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        self.assertIn("occurredAt must be a timezone-aware ISO-8601 timestamp", str(ctx.exception))
+
+    def test_offset_with_seconds_rejected(self) -> None:
+        inference = _base_inference()
+        inference["occurredAt"] = "2026-07-21T10:00:00+01:00:30"
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_compact_offset_rejected(self) -> None:
+        inference = _base_inference()
+        inference["occurredAt"] = "2026-07-21T10:00:00+0300"
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_out_of_range_offset_minutes_rejected(self) -> None:
+        # fromisoformat silently folds offset minutes 60-99 into the
+        # timedelta, but validator.js isISO8601 requires [0-5]\d — the API
+        # would 400, so the mapper must reject these shapes.
+        for bad in ("2026-07-21T10:00:00+05:75", "2026-07-21T10:00:00-00:99"):
+            with self.subTest(value=bad):
+                inference = _base_inference()
+                inference["occurredAt"] = bad
+                with self.assertRaises(ValueError):
+                    to_vision_event(inference)
+
+    def test_strict_shapes_accepted(self) -> None:
+        for good in (
+            "2026-07-21T10:00:00Z",
+            "2026-07-21T10:00:00.000Z",
+            "2026-07-21T10:00:00+03:00",
+        ):
+            with self.subTest(value=good):
+                inference = _base_inference()
+                inference["occurredAt"] = good
+                payload = to_vision_event(inference)
+                self.assertEqual(payload["occurredAt"], good)
+
+    def test_non_t_separator_rejected_across_all_timestamp_fields(self) -> None:
+        for field in ("occurredAt", "captureStartedAt", "captureEndedAt"):
+            with self.subTest(field=field):
+                inference = _base_inference()
+                inference[field] = "2025-01-01X00:00:00+00:00"
+                with self.assertRaises(ValueError) as ctx:
+                    to_vision_event(inference)
+                self.assertIn(
+                    f"{field} must be a timezone-aware ISO-8601 timestamp", str(ctx.exception)
+                )
+
+
 class ForbiddenFieldTests(unittest.TestCase):
     def test_forbidden_fields_never_appear_in_generated_payload(self) -> None:
         payload = to_vision_event(_load_json("sample_model_output.json"))

@@ -44,13 +44,17 @@ def _source_root(input_dir, output_dir) -> str:
 
     Staging writes only the manifest (media is never copied), so the staged
     copy must record where the source data lives relative to its own
-    directory. Falls back to the absolute source root when no relative path
-    exists (e.g. different drives on Windows).
+    directory. Both endpoints are resolved to physical paths first so
+    symlinked input/output dirs record a root that actually resolves. Falls
+    back to the absolute source root when no relative path exists (e.g.
+    different drives on Windows).
     """
+    input_root = Path(input_dir).resolve()
+    output_root = Path(output_dir).resolve()
     try:
-        rel = os.path.relpath(str(input_dir), str(output_dir))
+        rel = os.path.relpath(str(input_root), str(output_root))
     except ValueError:
-        return Path(input_dir).resolve().as_posix()
+        return input_root.as_posix()
     return Path(rel).as_posix()
 
 
@@ -69,6 +73,12 @@ def _write_json_atomically(payload: dict, destination: Path) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, sort_keys=True)
             fh.write("\n")
+        # mkstemp creates the temp file 0600; give the final manifest the
+        # normal umask-derived mode so shared-pipeline readers can open it.
+        # (On Windows chmod is mostly a no-op — harmless.)
+        current_umask = os.umask(0)
+        os.umask(current_umask)
+        os.chmod(tmp_name, 0o666 & ~current_umask)
         os.replace(tmp_name, destination)
     except BaseException:
         try:
@@ -180,6 +190,14 @@ def validate(input_dir: Path, output_dir) -> int:
     # standalone validator's CLI — validating against input_dir directly would
     # wrongly fail manifests whose sourceRoot points elsewhere (e.g. "data").
     effective_source_root = _effective_source_root(manifest if isinstance(manifest, dict) else {}, input_dir)
+    try:
+        # Physical (symlink-resolved) root so validation and the staged
+        # manifest's recomputed sourceRoot agree on the same real location.
+        effective_source_root = effective_source_root.resolve()
+    except (OSError, ValueError):
+        # Left unresolved; the base validator reports an unresolvable root
+        # as a normal validation error below.
+        pass
     errors = validate_manifest(manifest, base_dir=effective_source_root, check_files=True)
     errors.extend(_extra_byond_checks(manifest))
 

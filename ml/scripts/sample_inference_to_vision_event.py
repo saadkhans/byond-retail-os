@@ -349,7 +349,27 @@ def _require_nonempty_string(value, field: str) -> str:
     return value
 
 
+# Strict ISO-8601 shape gate applied BEFORE datetime.fromisoformat, which is
+# far more permissive than the API side: CPython 3.11+ accepts ANY single
+# character as the date-time separator ("2025-01-01X00:00:00+00:00"),
+# space-separated forms, compact +-HHMM offsets, and offsets with seconds —
+# strings that would be emitted verbatim and 400 at POST /vision-events.
+# Only literal-'T' timestamps with a full date, full time, optional
+# fractional seconds, and a mandatory 'Z' or +-HH:MM offset pass. This is a
+# strict SUBSET of what services/api's @IsDateString (validator.js isISO8601
+# in its default, loose mode) accepts — the safe direction: the mapper can
+# never emit a timestamp the API rejects.
+_ISO8601_STRICT = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:[0-5]\d)$"
+)
+
+
 def _parse_iso8601(name: str, value: str) -> datetime.datetime:
+    if not _ISO8601_STRICT.fullmatch(value):
+        raise ValueError(
+            f"{name} must be a timezone-aware ISO-8601 timestamp shaped "
+            f"YYYY-MM-DDTHH:MM:SS[.fff](Z|+HH:MM|-HH:MM), got {value!r}"
+        )
     # .replace keeps trailing-Z inputs parseable on Python < 3.11.
     try:
         parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))

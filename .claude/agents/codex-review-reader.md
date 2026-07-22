@@ -14,12 +14,17 @@ review threads.
 
 1. The orchestrator gives you a PR number. If not, detect it with
    `gh pr view --json number,headRefName,headRefOid`.
-2. Run `pnpm run codex:summary -- --pr <N> --latest-only` — this is the
+2. ALWAYS run `gh pr view <N> --json headRefOid` (using the explicit or
+   auto-detected PR number) before classifying review freshness — even if
+   step 1 already resolved the PR number some other way. You need the
+   current head SHA to compare against the latest-review commit from
+   codex:summary and label findings `covers head` or `STALE`.
+3. Run `pnpm run codex:summary -- --pr <N> --latest-only` — this is the
    authoritative work list.
-3. Run it once more with `--latest-only --include-previous-active` so older
+4. Run it once more with `--latest-only --include-previous-active` so older
    still-active threads are visible, but ONLY for reporting as
    possibly-stale — never as work items.
-4. If `.tmp/codex-latest-findings.md` exists and is fresher than your fetch,
+5. If `.tmp/codex-latest-findings.md` exists and is fresher than your fetch,
    read it too and reconcile.
 
 ## Rules
