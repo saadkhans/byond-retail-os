@@ -38,11 +38,9 @@ ml/**/.cache/
 
 # Real BYOND capture data (customer labels, tenant/store identifiers) must
 # never be committed; only READMEs and synthetic examples under ml/examples/
-# are tracked.
-ml/datasets/byond-custom/annotations/
-ml/datasets/byond-custom/manifest.json
-ml/datasets/byond-custom/**/*.json
-ml/datasets/byond-custom/**/*.csv
+# are tracked. EVERYTHING under byond-custom is ignored except this README:
+# real capture data, labels in any format, and manifests never enter git.
+ml/datasets/byond-custom/**
 !ml/datasets/byond-custom/README.md
 
 # Model weight files — never committed, wherever they appear (global,
@@ -58,6 +56,9 @@ ml/datasets/byond-custom/**/*.csv
 *.tflite
 *.mlmodel
 *.pb
+*.keras
+*.joblib
+*.gguf
 
 # Media files scoped to ml/ only — repo-wide *.png/*.jpg would swallow
 # future web/app image assets, so these patterns are deliberately

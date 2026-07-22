@@ -111,6 +111,18 @@ class FieldRuleTests(unittest.TestCase):
         errors = validate_manifest(manifest)
         self.assertTrue(any("image" in e for e in errors), errors)
 
+    def test_dot_segment_image_path_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["image"] = "images/./a.jpg"
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("image" in e and "images/./a.jpg" in e for e in errors), errors)
+
+    def test_empty_segment_image_path_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["image"] = "images//a.jpg"
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("image" in e and "images//a.jpg" in e for e in errors), errors)
+
     def test_bad_capture_context_rejected(self) -> None:
         manifest = _valid_manifest()
         manifest["splits"]["train"][0]["captureContext"] = "warehouse"
@@ -146,6 +158,18 @@ class CrossSplitDuplicateTests(unittest.TestCase):
         errors = validate_manifest(manifest)
         self.assertTrue(
             any("splits.test[0].image duplicates splits.train[0].image" in e for e in errors),
+            errors,
+        )
+
+    def test_non_canonical_duplicate_across_splits_rejected(self) -> None:
+        # "images/./a.jpg" in val is the same file as "images/a.jpg" in train;
+        # the non-canonical spelling is rejected outright as a bad path, so it
+        # can never bypass the exact-string cross-split overlap check.
+        manifest = _valid_manifest()
+        manifest["splits"]["val"] = [{"image": "images/./a.jpg"}]
+        errors = validate_manifest(manifest)
+        self.assertTrue(
+            any("splits.val[0].image" in e and "images/./a.jpg" in e for e in errors),
             errors,
         )
 
@@ -258,6 +282,16 @@ class CheckFilesTests(unittest.TestCase):
             errors = validate_manifest(manifest, base_dir=base, check_files=True)
             self.assertEqual(errors, [])
 
+    def test_directory_at_image_path_rejected(self) -> None:
+        manifest = _valid_manifest()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "images" / "a.jpg").mkdir(parents=True)
+            errors = validate_manifest(manifest, base_dir=base, check_files=True)
+            self.assertTrue(
+                any("not a regular file: images/a.jpg" in e for e in errors), errors
+            )
+
 
 class PrepareScriptDryRunTests(unittest.TestCase):
     """Dry runs must require nothing on disk and write nothing."""
@@ -297,6 +331,66 @@ class PrepareScriptDryRunTests(unittest.TestCase):
             result = self._run("prepare_rpc.py", ["--input", str(empty_input), "--output", str(output)])
             self.assertEqual(result.returncode, 1)
             self.assertIn("train2019", result.stdout)
+
+
+class PrepareByondStagingTests(unittest.TestCase):
+    """--output staging must keep the staged manifest's sourceRoot resolving
+    to the input dataset's media (a verbatim copy would resolve relative
+    paths against the output dir instead)."""
+
+    def _byond_manifest(self, **overrides) -> dict:
+        manifest = {
+            "datasetName": "byond-store",
+            "datasetVersion": "1.0.0",
+            "source": "byond-custom",
+            "licenseNotes": "Internal BYOND store captures.",
+            "classes": [{"classId": 0, "label": "cola-330", "sku": "SKU-1"}],
+            "splits": {
+                "train": [{"image": "raw/shelves/a.jpg", "annotation": "annotations/a.json"}],
+                "val": [],
+                "test": [],
+            },
+        }
+        manifest.update(overrides)
+        return manifest
+
+    def _write_input(self, input_dir: Path, manifest: dict) -> None:
+        (input_dir / "raw" / "shelves").mkdir(parents=True)
+        (input_dir / "annotations").mkdir()
+        (input_dir / "raw" / "shelves" / "a.jpg").touch()
+        (input_dir / "annotations" / "a.json").write_text("{}", encoding="utf-8")
+        (input_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    def _stage_and_check(self, manifest: dict) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            input_dir = base / "input"
+            input_dir.mkdir()
+            output_dir = base / "out"
+            self._write_input(input_dir, manifest)
+
+            result = _run_script(
+                "prepare_byond_dataset.py",
+                ["--input", str(input_dir), "--output", str(output_dir)],
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            staged = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+            staged_root = Path(staged["sourceRoot"])
+            resolved = staged_root if staged_root.is_absolute() else output_dir / staged_root
+            self.assertEqual(resolved.resolve(), input_dir.resolve())
+
+            check = _run_script(
+                "validate_dataset_manifest.py",
+                [str(output_dir / "manifest.json"), "--check-files"],
+            )
+            self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+
+    def test_staged_manifest_without_source_root_resolves_to_input(self) -> None:
+        self._stage_and_check(self._byond_manifest())
+
+    def test_staged_manifest_with_relative_source_root_resolves_to_input(self) -> None:
+        self._stage_and_check(self._byond_manifest(sourceRoot="."))
 
 
 class PrepareRpcEndToEndTests(unittest.TestCase):

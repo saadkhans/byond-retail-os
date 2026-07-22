@@ -48,12 +48,17 @@ _WINDOWS_DRIVE_PATTERN = re.compile(r"^[a-zA-Z]:")
 
 
 def _is_bad_path(value) -> bool:
-    """Reject anything that is not a clean, portable, relative path.
+    """Reject anything that is not a clean, portable, canonical relative path.
 
     Dataset directories are shipped/mounted across contributor machines and
     CI runners; absolute paths, backslashes, ".." traversal, and URI schemes
     would either break portability or let a manifest escape its dataset
     root, so all are rejected outright rather than "best-effort" resolved.
+    Non-canonical components are rejected too — any "." segment or empty
+    segment (from "//" or a trailing "/") — so two spellings of the same
+    file (e.g. "images/a.jpg" vs "images/./a.jpg") can never slip past the
+    exact-string duplicate/overlap checks: every accepted path is already in
+    canonical form, and the dedupe may safely compare raw strings.
     """
     if not isinstance(value, str) or not value:
         return True
@@ -65,7 +70,7 @@ def _is_bad_path(value) -> bool:
         return True
     if _WINDOWS_DRIVE_PATTERN.match(value):
         return True
-    if ".." in value.split("/"):
+    if any(segment in ("", ".", "..") for segment in value.split("/")):
         return True
     return False
 
@@ -197,8 +202,9 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
             for key in SPLIT_NAMES:
                 if key in annotations and _is_bad_path(annotations[key]):
                     errors.append(
-                        f"annotations.{key} must be a relative path with no '..', "
-                        f"backslashes, absolute prefix, or URI scheme, got {annotations[key]!r}"
+                        f"annotations.{key} must be a canonical relative path with no '..', "
+                        f"'.' or empty segments, backslashes, absolute prefix, or URI scheme, "
+                        f"got {annotations[key]!r}"
                     )
 
     if "splits" not in manifest:
@@ -244,8 +250,9 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                         errors.append(f"{sample_path}: missing required field image")
                     elif _is_bad_path(sample["image"]):
                         errors.append(
-                            f"{sample_path}.image must be a relative path with no '..', "
-                            f"backslashes, absolute prefix, or URI scheme, got {sample['image']!r}"
+                            f"{sample_path}.image must be a canonical relative path with no '..', "
+                            f"'.' or empty segments, backslashes, absolute prefix, or URI scheme, "
+                            f"got {sample['image']!r}"
                         )
                     else:
                         image = sample["image"]
@@ -259,8 +266,9 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
 
                     if "annotation" in sample and _is_bad_path(sample["annotation"]):
                         errors.append(
-                            f"{sample_path}.annotation must be a relative path with no '..', "
-                            f"backslashes, absolute prefix, or URI scheme, got {sample['annotation']!r}"
+                            f"{sample_path}.annotation must be a canonical relative path with no '..', "
+                            f"'.' or empty segments, backslashes, absolute prefix, or URI scheme, "
+                            f"got {sample['annotation']!r}"
                         )
 
                     if "captureContext" in sample:
@@ -286,8 +294,11 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                     for split_name in SPLIT_NAMES:
                         rel = annotations.get(split_name)
                         if isinstance(rel, str) and not _is_bad_path(rel):
-                            if not (root / rel).exists():
+                            target = root / rel
+                            if not target.exists():
                                 missing.append(f"missing file: {rel}")
+                            elif not target.is_file():
+                                missing.append(f"not a regular file: {rel}")
                 for split_name in SPLIT_NAMES:
                     samples = splits.get(split_name)
                     if not isinstance(samples, list):
@@ -298,8 +309,11 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                         for key in ("image", "annotation"):
                             rel = sample.get(key)
                             if isinstance(rel, str) and not _is_bad_path(rel):
-                                if not (root / rel).exists():
+                                target = root / rel
+                                if not target.exists():
                                     missing.append(f"missing file: {rel}")
+                                elif not target.is_file():
+                                    missing.append(f"not a regular file: {rel}")
                 for line in missing[:25]:
                     errors.append(line)
                 if len(missing) > 25:

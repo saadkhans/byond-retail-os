@@ -29,13 +29,28 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
+import os
 import sys
 from pathlib import Path
 
 from validate_dataset_manifest import validate_manifest, CAPTURE_CONTEXT_VALUES, SKU_PATTERN
 
 SPLIT_NAMES = ("train", "val", "test")
+
+
+def _source_root(input_dir, output_dir) -> str:
+    """Relative path (POSIX separators) from the output dir to the source root.
+
+    Staging writes only the manifest (media is never copied), so the staged
+    copy must record where the source data lives relative to its own
+    directory. Falls back to the absolute source root when no relative path
+    exists (e.g. different drives on Windows).
+    """
+    try:
+        rel = os.path.relpath(str(input_dir), str(output_dir))
+    except ValueError:
+        return Path(input_dir).resolve().as_posix()
+    return Path(rel).as_posix()
 
 
 def _print_plan(input_dir: str, output_dir) -> None:
@@ -53,7 +68,9 @@ def _print_plan(input_dir: str, output_dir) -> None:
     print("    4. enforce every class has a sku matching the tenant SKU pattern")
     print("    5. enforce every sample's captureContext (if present) is a known stage")
     print("    6. enforce every image path starts with 'raw/' and annotation with 'annotations/'")
-    print("  if --output is given, the validated manifest is copied to <output>/manifest.json")
+    print("  if --output is given, the validated manifest is staged to <output>/manifest.json")
+    print("  with sourceRoot recomputed so references still resolve to the input dataset")
+    print("  (media is never copied)")
 
 
 def _extra_byond_checks(manifest: dict) -> list:
@@ -130,8 +147,26 @@ def validate(input_dir: Path, output_dir) -> int:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         destination = output_dir / "manifest.json"
-        shutil.copyfile(manifest_path, destination)
-        print(f"  copied validated manifest to {destination}")
+
+        # A verbatim copy would break path resolution: a relative (or absent)
+        # sourceRoot resolves against the manifest's own directory, which is
+        # now the output dir. Recompute sourceRoot so the staged copy still
+        # points at the input dataset's media (never copied/staged).
+        source_root = manifest.get("sourceRoot")
+        if isinstance(source_root, str) and source_root:
+            source_root_path = Path(source_root)
+            effective_source_root = (
+                source_root_path if source_root_path.is_absolute() else input_dir / source_root_path
+            )
+        else:
+            effective_source_root = input_dir
+
+        staged = dict(manifest)
+        staged["sourceRoot"] = _source_root(effective_source_root, output_dir)
+        with destination.open("w", encoding="utf-8") as fh:
+            json.dump(staged, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        print(f"  staged validated manifest to {destination}")
 
     return 0
 

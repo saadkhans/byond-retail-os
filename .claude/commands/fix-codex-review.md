@@ -83,9 +83,15 @@ comments, and every escalation. Workers never commit, push, or comment.
    worker. `security:secrets` failures → `secret-scan-worker`
    (REAL_SECRET_FOUND = immediate stop + escalate). If a failure is
    unrelated and cannot be fixed safely, STOP and report instead of pushing.
-6a. **ML-aware review.** On ML-flagged branches/PRs (title or branch contains
-   `phase8`, `ml`, `training`, `dataset`, or `cv-training`, word-boundary
-   match — `ml` must not fire on `html`/`yaml`), spawn
+6a. **ML-aware review.** Trigger: the PR's changed files (via
+   `gh pr view <n> --json files` or `git diff origin/dev...HEAD --name-only`)
+   touch `ml/**` or one of the ML agent files
+   (`.claude/agents/ml-pipeline-reviewer.md`,
+   `.claude/agents/dataset-safety-worker.md`,
+   `.claude/agents/vision-event-contract-worker.md`) — this is the primary
+   signal. If the file lookup fails, fall back to branch/title keywords
+   (`phase8`, `ml`, `training`, `dataset`, `cv-training`, word-boundary
+   match — `ml` must not fire on `html`/`yaml`). When triggered, spawn
    `dataset-safety-worker`, `ml-pipeline-reviewer`, and
    `vision-event-contract-worker` before `final-reviewer`; their
    BLOCK/UNSAFE/INCOMPATIBLE verdicts are merge blockers.

@@ -283,5 +283,127 @@ class ValidationErrorTests(unittest.TestCase):
             to_vision_event(inference)
 
 
+class SensitiveValueScreeningTests(unittest.TestCase):
+    """Producer-side mirror of the API's assertOpaque/containsSensitiveValue:
+    opaque fields must never carry credential- or payment-bearing content."""
+
+    def test_credentialed_url_idempotency_key_rejected(self) -> None:
+        inference = _base_inference()
+        inference["idempotencyKey"] = "rtsp://user:pass@camera.local/feed"
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_api_key_fragment_idempotency_key_rejected(self) -> None:
+        inference = _base_inference()
+        inference["idempotencyKey"] = "api_key=abc123"
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_luhn_valid_pan_idempotency_key_rejected(self) -> None:
+        inference = _base_inference()
+        inference["idempotencyKey"] = "4111111111111111"
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_normal_opaque_idempotency_key_accepted(self) -> None:
+        inference = _base_inference()
+        inference["idempotencyKey"] = "evt-7f3a2b1c-0009"
+        payload = to_vision_event(inference)
+        self.assertEqual(payload["idempotencyKey"], "evt-7f3a2b1c-0009")
+
+    def test_sensitive_label_rejected(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [
+            {"sku": "cola-330", "confidence": 0.5, "label": "password: hunter2"}
+        ]
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_sensitive_sku_rejected(self) -> None:
+        inference = _base_inference()
+        # Luhn-valid 16-digit test PAN used as a SKU.
+        inference["detections"] = [{"sku": "4242424242424242", "confidence": 0.5}]
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+
+class StringLengthLimitTests(unittest.TestCase):
+    """DTO caps mirrored producer-side: sku MaxLength(100), label MaxLength(200)."""
+
+    def test_101_char_sku_rejected(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [{"sku": "S" * 101, "confidence": 0.5}]
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_100_char_sku_accepted(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [{"sku": "S" * 100, "confidence": 0.5}]
+        payload = to_vision_event(inference)
+        self.assertEqual(payload["candidates"][0]["sku"], "S" * 100)
+
+    def test_201_char_label_rejected(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [{"sku": "cola-330", "confidence": 0.5, "label": "L" * 201}]
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_200_char_label_accepted(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [{"sku": "cola-330", "confidence": 0.5, "label": "L" * 200}]
+        payload = to_vision_event(inference)
+        self.assertEqual(payload["candidates"][0]["label"], "L" * 200)
+
+
+class CaptureWindowOrderingTests(unittest.TestCase):
+    """Mirror of normalizeBundle: strictly reversed capture windows are
+    rejected; equal timestamps are allowed."""
+
+    def test_capture_ended_before_started_rejected(self) -> None:
+        inference = _base_inference()
+        inference["captureStartedAt"] = "2026-07-21T10:00:02.000Z"
+        inference["captureEndedAt"] = "2026-07-21T10:00:00.000Z"
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_equal_capture_timestamps_accepted(self) -> None:
+        inference = _base_inference()
+        inference["captureStartedAt"] = "2026-07-21T10:00:00.000Z"
+        inference["captureEndedAt"] = "2026-07-21T10:00:00.000Z"
+        payload = to_vision_event(inference)
+        self.assertEqual(payload["evidenceBundle"]["captureStartedAt"], "2026-07-21T10:00:00.000Z")
+        self.assertEqual(payload["evidenceBundle"]["captureEndedAt"], "2026-07-21T10:00:00.000Z")
+
+    def test_ordered_capture_window_accepted(self) -> None:
+        inference = _base_inference()
+        inference["captureStartedAt"] = "2026-07-21T09:59:58.000Z"
+        inference["captureEndedAt"] = "2026-07-21T10:00:02.000Z"
+        payload = to_vision_event(inference)
+        self.assertEqual(payload["evidenceBundle"]["captureEndedAt"], "2026-07-21T10:00:02.000Z")
+
+
+class QuantityBoundTests(unittest.TestCase):
+    """Emitted quantity = abs(quantityDelta) must fit the API's PG_INT_MAX."""
+
+    def test_quantity_delta_above_pg_int_max_rejected(self) -> None:
+        inference = _base_inference()
+        inference["quantityDelta"] = 2_147_483_648
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_negative_quantity_delta_below_pg_int_min_rejected(self) -> None:
+        inference = _base_inference()
+        inference["eventType"] = "PRODUCT_RETURN"
+        inference["quantityDelta"] = -2_147_483_648
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_quantity_delta_at_pg_int_max_accepted(self) -> None:
+        inference = _base_inference()
+        inference["quantityDelta"] = 2_147_483_647
+        payload = to_vision_event(inference)
+        self.assertEqual(payload["quantity"], 2_147_483_647)
+
+
 if __name__ == "__main__":
     unittest.main()

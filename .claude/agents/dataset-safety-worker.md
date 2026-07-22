@@ -21,12 +21,12 @@ Cross-reference all three against the block list below.
 ## Block list — flag if any of these appear tracked or staged
 
 - Raw or processed datasets: `ml/datasets/**/raw/`, `ml/datasets/**/processed/`
-- BYOND custom dataset content: `ml/datasets/byond-custom/annotations/`,
-  `ml/datasets/byond-custom/manifest.json`, and any generated label/annotation
-  JSON/CSV under `byond-custom` — only the README is tracked
+- BYOND custom dataset content: everything under `ml/datasets/byond-custom/`
+  is ignored (subtree-wide) — only `ml/datasets/byond-custom/README.md` is
+  tracked
 - Model weights: `*.pt`, `*.pth`, `*.onnx`, `*.engine`, `*.safetensors`,
-  `*.weights`, `*.ckpt`, `*.h5`, `*.tflite`, `*.mlmodel`, `*.pb`, plus
-  `ml/`-scoped `*.bin`
+  `*.weights`, `*.ckpt`, `*.h5`, `*.tflite`, `*.mlmodel`, `*.pb`, `*.keras`,
+  `*.joblib`, `*.gguf`, plus `ml/`-scoped `*.bin`
 - Video/image media: `*.mp4`, `*.mov`, `*.avi`, `*.mkv`, `*.jpg`, `*.jpeg`,
   `*.png`, `*.webp`
 - Binary blobs: `*.npy`, `*.npz`, `*.parquet`, `*.pkl`, `*.pickle`
