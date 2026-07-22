@@ -51,7 +51,7 @@
     "classes": {
       "type": "array",
       "minItems": 1,
-      "description": "Class list. classId and label must each be unique across the array.",
+      "description": "Class list. classId and label must each be unique across the array, and the set of classId values must be exactly the contiguous range 0..N-1.",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -60,7 +60,12 @@
           "classId": {
             "type": "integer",
             "minimum": 0,
-            "description": "Zero-based class index, unique across classes."
+            "description": "Zero-based class index, unique across classes. Across the whole classes array the classId values must form the contiguous range 0..N-1 (list order need not match the id)."
+          },
+          "sourceId": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Original source-dataset category id (e.g. COCO category id) that the annotation files reference; classId remains the contiguous training index. Optional; must be unique across classes when present."
           },
           "label": {
             "type": "string",

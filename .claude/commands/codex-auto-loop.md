@@ -60,19 +60,32 @@ a. Run `pnpm run codex:auto-loop -- --pr <N>` (append `--no-push` or
 b. **STATUS: READY_FOR_HUMAN_MERGE** → stop the loop and report: the PR has
    no active latest-review findings; the human reviews and merges manually.
    (A clean Codex re-review arrives as a "didn't find any major issues" PR
-   comment, not a formal review — the helper detects that too.) For ML PRs
-   the helper never reports this status directly on a plain run — see
-   `ML_SAFETY_GATES_REQUIRED` below; it only appears after a
-   `--ml-gates-passed` re-run.
+   comment, not a formal review — the helper detects that too. It trusts
+   such a comment only when the author login is EXACTLY
+   `chatgpt-codex-connector` / `chatgpt-codex-connector[bot]` — no
+   substring matches — and only when no newer formal Codex review covers
+   the same head: the newest Codex verdict always supersedes an older
+   clean comment.) For ML PRs the helper reports this status only when a
+   valid ML-gates attestation file exists for the current head — see
+   `ML_SAFETY_GATES_REQUIRED` below.
 b1. **STATUS: ML_SAFETY_GATES_REQUIRED** → Codex findings are clean (a clean
    verdict comment or zero latest findings), but this is an ML PR (per the
-   ML-aware trigger below) and the four ML safety gates have not yet been
-   attested. Spawn `dataset-safety-worker`, `ml-pipeline-reviewer`,
-   `vision-event-contract-worker`, and `final-reviewer`; require all four to
-   return SAFE/PASS/COMPATIBLE/PASS. Any failed gate re-enters the fix
-   pipeline as if the status were CLAUDE_FIX_REQUIRED. Only once all four
-   pass, re-run step (a) with `--ml-gates-passed` appended — that re-run is
-   the only way an ML PR can receive READY_FOR_HUMAN_MERGE.
+   ML-aware trigger below) and no valid ML safety-gate attestation exists
+   for the current head. Spawn `dataset-safety-worker`,
+   `ml-pipeline-reviewer`, `vision-event-contract-worker`, and
+   `final-reviewer` against the current head; require all four to return
+   SAFE/PASS/COMPATIBLE/PASS. Any failed gate re-enters the fix pipeline as
+   if the status were CLAUDE_FIX_REQUIRED — never write the attestation
+   with a failed gate. Only once all four pass, write the attestation file
+   `.tmp/codex-ml-gates-pr-<PR>-<HEAD_SHA>.json` (the helper prints the
+   exact path and a filled-in example) with shape
+   `{ "pr": <number>, "headSha": "<full sha>", "createdAt": "<ISO>",
+   "gates": { <each of the four gates>: "PASS" } }` — each gate recorded as
+   the exact string `"PASS"` — then re-run step (a). The helper verifies
+   the file (PR number, exact head SHA, timestamp, all four gates) and only
+   then reports READY_FOR_HUMAN_MERGE; an attestation written for a
+   different head SHA is stale and ignored, so re-run the gates after every
+   push.
 b'. **STATUS: WAITING_FOR_CODEX_REVIEW** → the latest Codex review predates
    the PR head; any reported findings are stale. STOP and tell the user to
    re-run `/codex-auto-loop` after Codex replies — never re-fix them.
@@ -131,9 +144,12 @@ when the changed-file list cannot be fetched — spawn
 `vision-event-contract-worker` before `final-reviewer` in the pre-push
 step. These gates also gate ANY ready-for-merge declaration: on a clean
 Codex verdict for an ML PR, the helper reports `ML_SAFETY_GATES_REQUIRED`
-instead of `READY_FOR_HUMAN_MERGE` (see step b1), and only a subsequent
-`--ml-gates-passed` re-run — after all four gates pass — reports
-READY_FOR_HUMAN_MERGE.
+instead of `READY_FOR_HUMAN_MERGE` (see step b1) until a valid attestation
+file `.tmp/codex-ml-gates-pr-<PR>-<HEAD_SHA>.json` exists — written by the
+orchestrator ONLY after all four gates return clean on the current head.
+The helper verifies the attestation's PR number, exact head SHA, timestamp,
+and all four gates (`"PASS"` each) before reporting READY_FOR_HUMAN_MERGE;
+a new push invalidates the previous attestation.
 
 Phase 8 merge blockers (any one blocks push/merge): (1) datasets/images/videos
 committed; (2) model weights committed; (3) heavy ML dependencies required by

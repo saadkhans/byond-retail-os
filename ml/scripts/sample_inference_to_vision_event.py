@@ -39,6 +39,19 @@ EVENT_TYPES = frozenset(
 
 MAX_CANDIDATES = 20
 
+# Event types whose APPROVAL mutates the linked session's basket — must stay
+# in lockstep with BASKET_AFFECTING_EVENT_TYPES in
+# services/api/src/common/vision-event-policy.ts. Only these require at least
+# one candidate; record-only types (PRODUCT_TRANSFER, EXIT_RECONCILIATION)
+# are accepted by the ingest contract without candidates.
+BASKET_AFFECTING_EVENT_TYPES = frozenset(
+    {
+        "PRODUCT_PICKUP",
+        "PRODUCT_RETURN",
+        "CART_INSERTION",
+    }
+)
+
 # DTO string caps mirrored from
 # services/api/src/vision/dto/ingest-vision-event.dto.ts: the mapper emits
 # the normalized SKU (trimmed, uppercased) and the label verbatim, so those
@@ -439,8 +452,10 @@ def to_vision_event(inference: dict) -> dict:
             candidate["label"] = label
         candidates.append(candidate)
 
-    if not candidates and event_type != "EXIT_RECONCILIATION":
-        raise ValueError("basket-affecting events need >= 1 candidate")
+    if not candidates and event_type in BASKET_AFFECTING_EVENT_TYPES:
+        raise ValueError(
+            f"basket-affecting events ({sorted(BASKET_AFFECTING_EVENT_TYPES)}) need >= 1 candidate"
+        )
 
     # Collapse duplicate SKUs (already uppercase-normalized above): keep the
     # strongest detection per SKU — the Phase 7 API rejects case-insensitive
@@ -469,9 +484,13 @@ def to_vision_event(inference: dict) -> dict:
         "type": event_type,
         "occurredAt": occurred_at,
         "quantity": quantity,
-        "candidates": ranked_candidates,
         "sourceType": source_type,
     }
+
+    # `candidates` is optional in the ingest DTO: omit it entirely for
+    # record-only events with no detections rather than emitting [].
+    if ranked_candidates:
+        payload["candidates"] = ranked_candidates
 
     device_id = inference.get("deviceId")
     if device_id is not None:

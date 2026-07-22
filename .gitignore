@@ -68,22 +68,25 @@ ml/datasets/byond-custom/**
 # *.bin is also scoped to ml/ only (not global): repo-wide *.bin could
 # swallow legitimate non-ML binaries, and Hugging Face-style
 # pytorch_model.bin files would land under ml/.
+# All patterns in this block use character classes so uppercase/mixed-case
+# artifacts (e.g. capture.JPG, clip.MP4) are caught on case-sensitive
+# filesystems, same as the model weight extensions above.
 ml/**/*.[bB][iI][nN]
-ml/**/*.jpg
-ml/**/*.jpeg
-ml/**/*.png
-ml/**/*.webp
-ml/**/*.mp4
-ml/**/*.mov
-ml/**/*.avi
-ml/**/*.mkv
+ml/**/*.[jJ][pP][gG]
+ml/**/*.[jJ][pP][eE][gG]
+ml/**/*.[pP][nN][gG]
+ml/**/*.[wW][eE][bB][pP]
+ml/**/*.[mM][pP]4
+ml/**/*.[mM][oO][vV]
+ml/**/*.[aA][vV][iI]
+ml/**/*.[mM][kK][vV]
 
 # Numeric/tabular dataset blobs scoped to ml/ — same reasoning as media.
-ml/**/*.npy
-ml/**/*.npz
-ml/**/*.parquet
-ml/**/*.pkl
-ml/**/*.pickle
+ml/**/*.[nN][pP][yY]
+ml/**/*.[nN][pP][zZ]
+ml/**/*.[pP][aA][rR][qQ][uU][eE][tT]
+ml/**/*.[pP][kK][lL]
+ml/**/*.[pP][iI][cC][kK][lL][eE]
 
 # Python noise (ml/ workspace)
 __pycache__/

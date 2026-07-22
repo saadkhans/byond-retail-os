@@ -284,11 +284,35 @@ class ValidationErrorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             to_vision_event(inference)
 
-    def test_empty_detections_with_product_pickup_rejected(self) -> None:
+    def test_empty_detections_with_basket_affecting_types_rejected(self) -> None:
+        # The basket-affecting set mirrors
+        # services/api/src/common/vision-event-policy.ts: these types mutate
+        # the basket on approval and therefore need >= 1 candidate.
+        for event_type, quantity_delta in (
+            ("PRODUCT_PICKUP", 1),
+            ("PRODUCT_RETURN", -1),
+            ("CART_INSERTION", 1),
+        ):
+            with self.subTest(event_type=event_type):
+                inference = _base_inference()
+                inference["eventType"] = event_type
+                inference["quantityDelta"] = quantity_delta
+                inference["detections"] = []
+                with self.assertRaises(ValueError) as ctx:
+                    to_vision_event(inference)
+                self.assertIn("basket-affecting events", str(ctx.exception))
+
+    def test_empty_detections_with_product_transfer_ok(self) -> None:
+        # PRODUCT_TRANSFER is record-only (not basket-affecting), so the
+        # ingest contract accepts it without candidates; the optional
+        # `candidates` field is omitted rather than emitted as [].
         inference = _base_inference()
+        inference["eventType"] = "PRODUCT_TRANSFER"
+        inference["quantityDelta"] = 1
         inference["detections"] = []
-        with self.assertRaises(ValueError):
-            to_vision_event(inference)
+        payload = to_vision_event(inference)
+        self.assertNotIn("candidates", payload)
+        self.assertNotIn("evidenceScore", payload)
 
     def test_empty_detections_with_exit_reconciliation_ok(self) -> None:
         inference = _base_inference()
@@ -296,7 +320,7 @@ class ValidationErrorTests(unittest.TestCase):
         inference["quantityDelta"] = 1
         inference["detections"] = []
         payload = to_vision_event(inference)
-        self.assertEqual(payload["candidates"], [])
+        self.assertNotIn("candidates", payload)
         self.assertNotIn("evidenceScore", payload)
 
     def test_confidence_out_of_range_rejected(self) -> None:

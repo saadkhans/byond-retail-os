@@ -15,6 +15,7 @@ them without per-source special casing.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -39,7 +40,7 @@ TOP_LEVEL_KEYS = {
     "labels",
     "splits",
 }
-CLASS_KEYS = {"classId", "label", "sku"}
+CLASS_KEYS = {"classId", "label", "sku", "sourceId"}
 LABELS_KEYS = {"tenantId", "storeId", "planogramZone"}
 SAMPLE_KEYS = {"image", "annotation", "captureContext", "planogramZone", "storeId", "tenantId"}
 
@@ -136,6 +137,7 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
             seen_class_ids: dict = {}
             seen_labels: dict = {}
             seen_skus: dict = {}
+            seen_source_ids: dict = {}
             for idx, cls in enumerate(classes):
                 path = f"classes[{idx}]"
                 if not isinstance(cls, dict):
@@ -180,6 +182,27 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                         seen_skus[sku] = idx
                 elif source == "byond-custom":
                     errors.append(f"{path}: sku is required when source is 'byond-custom'")
+
+                if "sourceId" in cls:
+                    source_id = cls["sourceId"]
+                    # Type-guard before comparisons: bool is an int subclass and
+                    # non-int values must not reach the < or dict-key checks.
+                    if not isinstance(source_id, int) or isinstance(source_id, bool) or source_id < 0:
+                        errors.append(f"{path}.sourceId must be an integer >= 0, got {source_id!r}")
+                    elif source_id in seen_source_ids:
+                        errors.append(
+                            f"{path}.sourceId {source_id} duplicates classes[{seen_source_ids[source_id]}]"
+                        )
+                    else:
+                        seen_source_ids[source_id] = idx
+
+            # classIds must be exactly the set {0..N-1}: downstream training
+            # tooling maps model output indices straight onto classId, so a
+            # gap or offset silently mislabels every prediction.
+            if seen_class_ids and set(seen_class_ids) != set(range(len(classes))):
+                errors.append(
+                    "classes must use contiguous zero-based classId values 0..N-1"
+                )
 
     if "labels" in manifest:
         labels = manifest["labels"]
@@ -290,6 +313,30 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
 
             if check_files and base_dir is not None:
                 root = Path(base_dir)
+                try:
+                    resolved_root = root.resolve()
+                except OSError:
+                    resolved_root = None
+
+                def _resolve(target: Path):
+                    """Resolved target, or None when resolution fails (broken
+                    symlink loops, permission errors, ...)."""
+                    try:
+                        return target.resolve()
+                    except OSError:
+                        return None
+
+                def _escapes_root(resolved) -> bool:
+                    # A lexically clean relative path can still point outside
+                    # the dataset root via a symlink; a manifest must never
+                    # reference data it does not own.
+                    if resolved is None or resolved_root is None:
+                        return False
+                    try:
+                        return not resolved.is_relative_to(resolved_root)
+                    except (ValueError, TypeError):
+                        return True
+
                 missing = []
                 annotations = manifest.get("annotations")
                 if isinstance(annotations, dict):
@@ -301,7 +348,10 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                                 missing.append(f"missing file: {rel}")
                             elif not target.is_file():
                                 missing.append(f"not a regular file: {rel}")
+                            elif _escapes_root(_resolve(target)):
+                                missing.append(f"escapes the source root: {rel}")
                 seen_image_identities: dict = {}
+                seen_image_digests: dict = {}
                 for split_name in SPLIT_NAMES:
                     samples = splits.get(split_name)
                     if not isinstance(samples, list):
@@ -320,11 +370,16 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                             if not target.is_file():
                                 missing.append(f"not a regular file: {rel}")
                                 continue
+                            resolved = _resolve(target)
+                            if _escapes_root(resolved):
+                                missing.append(f"escapes the source root: {rel}")
+                                continue
                             if key != "image":
                                 # Annotations may legitimately be shared across
                                 # splits (split-level files); only images get
-                                # alias dedup.
+                                # alias/copy dedup.
                                 continue
+                            ref = f"splits.{split_name}[{idx}].image"
                             # Two lexically distinct image refs can still be
                             # one underlying file via symlinks/hardlinks,
                             # silently leaking samples across splits past the
@@ -333,25 +388,54 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                             # resolved path; if identity cannot be determined,
                             # skip aliasing detection for this entry (the
                             # existence checks above still applied).
+                            identity = None
+                            if resolved is not None:
+                                try:
+                                    stat_result = resolved.stat()
+                                except OSError:
+                                    stat_result = None
+                                if stat_result is not None and stat_result.st_ino != 0:
+                                    # st_ino == 0: filesystem does not report
+                                    # inodes; identity would be meaningless and
+                                    # every file would "alias" every other.
+                                    identity = (stat_result.st_dev, stat_result.st_ino)
+                            identity_seen = False
+                            if identity is not None:
+                                prior = seen_image_identities.get(identity)
+                                if prior is None:
+                                    seen_image_identities[identity] = (ref, rel)
+                                else:
+                                    identity_seen = True
+                                    if prior[1] != rel:
+                                        # Same-string duplicates are already
+                                        # reported by the exact-string check
+                                        # above.
+                                        errors.append(
+                                            f"{ref} aliases {prior[0]} (same underlying file)"
+                                        )
+                            if identity_seen:
+                                # An inode-alias pair necessarily shares a
+                                # content digest; reporting only the alias
+                                # error avoids double-reporting the pair.
+                                continue
+                            # Inode identity misses byte-for-byte copies of an
+                            # image across splits — an equally real train/eval
+                            # leak. Stream a content digest (1 MiB chunks; image
+                            # files can be large) and reject digest collisions.
                             try:
-                                stat_result = target.resolve().stat()
+                                hasher = hashlib.sha256()
+                                with target.open("rb") as fh:
+                                    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                                        hasher.update(chunk)
                             except OSError:
                                 continue
-                            if stat_result.st_ino == 0:
-                                # Filesystem does not report inodes; identity
-                                # would be meaningless and every file would
-                                # "alias" every other.
-                                continue
-                            identity = (stat_result.st_dev, stat_result.st_ino)
-                            ref = f"splits.{split_name}[{idx}].image"
-                            prior = seen_image_identities.get(identity)
-                            if prior is None:
-                                seen_image_identities[identity] = (ref, rel)
-                            elif prior[1] != rel:
-                                # Same-string duplicates are already reported
-                                # by the exact-string check above.
+                            digest = hasher.digest()
+                            prior_ref = seen_image_digests.get(digest)
+                            if prior_ref is None:
+                                seen_image_digests[digest] = ref
+                            else:
                                 errors.append(
-                                    f"{ref} aliases {prior[0]} (same underlying file)"
+                                    f"{ref} duplicates content of {prior_ref}"
                                 )
                 for line in missing[:25]:
                     errors.append(line)

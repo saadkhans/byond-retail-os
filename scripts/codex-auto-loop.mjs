@@ -10,16 +10,20 @@
  *   - fetches the latest-review findings via codex:summary --latest-only
  *   - decides the cycle status:
  *       STATUS: READY_FOR_HUMAN_MERGE     (no latest-review findings; for ML
- *                                          PRs, only with --ml-gates-passed)
- *       STATUS: ML_SAFETY_GATES_REQUIRED  (ML PR is Codex-clean but the ML
- *                                          safety gates have not been attested
- *                                          via --ml-gates-passed)
+ *                                          PRs, only with a valid ML-gates
+ *                                          attestation file for the head)
+ *       STATUS: ML_SAFETY_GATES_REQUIRED  (ML PR is Codex-clean but no valid
+ *                                          attestation file exists at
+ *                                          .tmp/codex-ml-gates-pr-<PR>-<HEAD>.json)
  *       STATUS: CLAUDE_FIX_REQUIRED       (findings saved for Claude to fix)
  *       STATUS: WAITING_FOR_CODEX_REVIEW  (latest Codex review predates the
  *                                          PR head — stop, wait for Codex)
  *     A clean Codex re-review arrives as a "didn't find any major issues"
  *     PR comment (no formal review is created), so the freshness check also
- *     accepts a clean-verdict comment that names the current head commit.
+ *     accepts a clean-verdict comment that names the current head commit —
+ *     but only from an exact Codex bot login (no substring matching), and
+ *     only when no newer formal Codex review covers the same head (the
+ *     newest Codex verdict always wins).
  *   - writes findings to .tmp/codex-latest-findings.md and prints precise
  *     instructions for Claude Code
  *
@@ -46,18 +50,29 @@
  *   --wait-seconds <number>  suggested wait before rechecking Codex (default 90)
  *   --allow-dirty            proceed despite uncommitted changes (default:
  *                            a dirty tree is a hard stop)
- *   --ml-gates-passed        attestation from the orchestrator that the ML
- *                            safety gates (dataset-safety-worker,
- *                            ml-pipeline-reviewer, vision-event-contract-worker,
- *                            final-reviewer) ALL returned clean on the current
- *                            head — required for READY_FOR_HUMAN_MERGE on ML PRs
+ *
+ * ML PRs and READY_FOR_HUMAN_MERGE: instead of a trust-me flag, the
+ * orchestrator must run the four ML safety gates (dataset-safety-worker,
+ * ml-pipeline-reviewer, vision-event-contract-worker, final-reviewer)
+ * against the current head and, only if ALL pass, write an attestation file
+ * .tmp/codex-ml-gates-pr-<PR>-<HEAD_SHA>.json recording each gate as "PASS".
+ * This script verifies the file (PR number, exact head SHA, timestamp, all
+ * four gates) before reporting READY_FOR_HUMAN_MERGE; an attestation for a
+ * different SHA is ignored.
  */
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const PROTECTED_BRANCHES = new Set(['main', 'dev']);
 const FINDINGS_FILE = path.join('.tmp', 'codex-latest-findings.md');
+// Exact allow-list of Codex review bot logins. A clean-verdict PR comment
+// counts ONLY if its author login is strictly equal to one of these —
+// substring matches (e.g. 'codex-reviewer-user') are untrusted and ignored.
+const CODEX_BOT_LOGINS = new Set([
+  'chatgpt-codex-connector',
+  'chatgpt-codex-connector[bot]',
+]);
 const ML_KEYWORDS =
   /(^|[^a-z0-9])(phase8|ml|training|dataset|cv-training)(?=[^a-z0-9]|$)/i;
 // Paths whose presence in the PR diff marks it as an ML PR: the ml/
@@ -101,34 +116,105 @@ const ML_MERGE_GATES = [
   'final-reviewer',
 ];
 
-function printMlGatesRequired() {
+// Attestation file the orchestrator writes AFTER actually running the four
+// ML safety gates against the current head. Bound to PR number AND head SHA,
+// so a stale attestation (older push) can never green-light a newer head.
+function mlGatesAttestationFile(prNumber, headSha) {
+  return path.join('.tmp', `codex-ml-gates-pr-${prNumber}-${headSha}.json`);
+}
+
+// Returns { file, createdAt } when a valid attestation exists for exactly
+// this PR and head SHA, otherwise null. Valid means: parseable JSON with
+// pr === prNumber, headSha === headSha (exact), a parseable createdAt
+// timestamp, and every ML_MERGE_GATES entry strictly equal to "PASS"
+// (synonyms like "SAFE"/"COMPATIBLE" are NOT accepted — the orchestrator
+// records the gate outcome as "PASS").
+function readMlGatesAttestation(prNumber, headSha) {
+  if (headSha === '') return null;
+  let data;
+  try {
+    data = JSON.parse(readFileSync(mlGatesAttestationFile(prNumber, headSha), 'utf8'));
+  } catch {
+    return null; // missing file or invalid JSON — no attestation
+  }
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+    return null;
+  }
+  if (data.pr !== prNumber) return null;
+  if (data.headSha !== headSha) return null;
+  if (
+    typeof data.createdAt !== 'string' ||
+    Number.isNaN(Date.parse(data.createdAt))
+  ) {
+    return null;
+  }
+  const gates = data.gates;
+  if (typeof gates !== 'object' || gates === null || Array.isArray(gates)) {
+    return null;
+  }
+  for (const gate of ML_MERGE_GATES) {
+    if (gates[gate] !== 'PASS') return null;
+  }
+  return {
+    file: mlGatesAttestationFile(prNumber, headSha),
+    createdAt: data.createdAt,
+  };
+}
+
+function printMlGatesRequired(prNumber, headSha) {
   console.log('');
+  if (headSha === '') {
+    console.log(
+      'ML PR — Codex is clean, but the PR head SHA could not be read, so an ' +
+        'ML safety-gate attestation cannot be verified. Fix gh output ' +
+        '(gh pr view --json headRefOid) first; READY_FOR_HUMAN_MERGE is withheld.',
+    );
+    return;
+  }
+  const file = mlGatesAttestationFile(prNumber, headSha);
   console.log(
-    'ML PR — Codex is clean on the current head, but the ML safety gates ' +
-      'have not been attested via --ml-gates-passed, so ' +
-      'READY_FOR_HUMAN_MERGE is withheld.',
+    'ML PR — Codex is clean on the current head, but no valid ML safety-gate ' +
+      `attestation exists for it, so READY_FOR_HUMAN_MERGE is withheld. ` +
+      `(Expected attestation file: ${file}; an attestation written for a ` +
+      'different head SHA is stale and ignored.)',
   );
   console.log('');
   console.log('Instructions for Claude Code (orchestrator):');
   console.log(
-    '  1. Run ALL four ML safety gates against the current head: ' +
+    `  1. Run ALL four ML safety gates against the current head ${headSha}: ` +
       `${ML_MERGE_GATES.join(', ')}.`,
   );
   console.log(
-    '  2. If every gate returns clean, re-run this command with ' +
-      '--ml-gates-passed to obtain READY_FOR_HUMAN_MERGE.',
+    '  2. Only if EVERY gate returns clean, write the attestation file at ' +
+      'exactly this path, then re-run this command:',
+  );
+  console.log(`     ${file}`);
+  console.log('     with exactly this shape (each gate must be the string "PASS"):');
+  const example = {
+    pr: prNumber,
+    headSha,
+    createdAt: new Date().toISOString(),
+    gates: Object.fromEntries(ML_MERGE_GATES.map((gate) => [gate, 'PASS'])),
+  };
+  for (const line of JSON.stringify(example, null, 2).split('\n')) {
+    console.log(`     ${line}`);
+  }
+  console.log(
+    '  3. If ANY gate fails (UNSAFE/BLOCK/INCOMPATIBLE), do NOT write the ' +
+      'attestation — treat it as CLAUDE_FIX_REQUIRED: fix, push, and request ' +
+      'a Codex re-review. NEVER hand a PR to human merge with a failed gate.',
   );
   console.log(
-    '  3. If ANY gate fails (UNSAFE/BLOCK/INCOMPATIBLE), treat it as ' +
-      'CLAUDE_FIX_REQUIRED: fix, push, and request a Codex re-review. ' +
-      'NEVER hand a PR to human merge with a failed gate.',
+    '  Note: after any new push the head SHA changes, the old attestation ' +
+      'is ignored, and the gates must be re-run against the new head.',
   );
 }
 
-function printMlGatesAttested() {
+function printMlGatesAttested(attestation) {
   console.log(
-    `ML PR: the ML safety gates (${ML_MERGE_GATES.join(', ')}) were ` +
-      'attested passed by the caller via --ml-gates-passed.',
+    `ML PR: the ML safety gates (${ML_MERGE_GATES.join(', ')}) are attested ` +
+      `PASS for this head by ${attestation.file} ` +
+      `(created ${attestation.createdAt}).`,
   );
 }
 
@@ -140,11 +226,11 @@ const USAGE =
   '  --no-push            tell Claude to stop before push/comment\n' +
   '  --wait-seconds <n>   suggested Codex recheck wait (default 90)\n' +
   '  --allow-dirty        proceed despite uncommitted changes\n' +
-  '  --ml-gates-passed    attestation from the orchestrator that\n' +
-  '                       dataset-safety-worker, ml-pipeline-reviewer,\n' +
-  '                       vision-event-contract-worker, and final-reviewer\n' +
-  '                       ALL returned clean on the current head (required\n' +
-  '                       for READY_FOR_HUMAN_MERGE on ML PRs)';
+  '\n' +
+  'ML PRs: READY_FOR_HUMAN_MERGE additionally requires a valid attestation\n' +
+  'file at .tmp/codex-ml-gates-pr-<PR>-<HEAD_SHA>.json, written by the\n' +
+  'orchestrator only after all four ML safety gates pass on the current\n' +
+  'head (the script prints the exact path and shape when it is missing).';
 
 function parseArgs(argv) {
   const args = {
@@ -154,7 +240,6 @@ function parseArgs(argv) {
     noPush: false,
     waitSeconds: 90,
     allowDirty: false,
-    mlGatesPassed: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -176,8 +261,6 @@ function parseArgs(argv) {
       args.noPush = true;
     } else if (arg === '--allow-dirty') {
       args.allowDirty = true;
-    } else if (arg === '--ml-gates-passed') {
-      args.mlGatesPassed = true;
     } else if (arg === '--help' || arg === '-h') {
       console.log(USAGE);
       process.exit(0);
@@ -370,10 +453,16 @@ function main() {
   // `latest-review` until Codex reviews the new head. Comparing the PR head
   // SHA to the review's commit prevents re-fixing stale findings (or a
   // false READY) in that window.
-  const reviewShaMatch = /Latest Codex review: commit `([0-9a-f]{4,40})`/.exec(
-    summary,
-  );
+  // The summary prints: Latest Codex review: commit `sha` · submitted <ISO>
+  // Capture the submitted timestamp too (optionally — older formats without
+  // it fall back to "review wins", see the precedence rule below).
+  const reviewShaMatch =
+    /Latest Codex review: commit `([0-9a-f]{4,40})`(?:[^\n]*submitted (\S+))?/.exec(
+      summary,
+    );
   const reviewSha = reviewShaMatch ? reviewShaMatch[1] : null;
+  const reviewSubmittedAtMs =
+    reviewShaMatch && reviewShaMatch[2] ? Date.parse(reviewShaMatch[2]) : NaN;
   const headSha = typeof pr.headRefOid === 'string' ? pr.headRefOid : '';
   const reviewCoversHead =
     headSha === ''
@@ -383,25 +472,72 @@ function main() {
   // A CLEAN Codex re-review does not create a formal review at all — Codex
   // posts a "Didn't find any major issues" PR comment naming the reviewed
   // commit (and reacts 👍). Without reading those comments, the loop would
-  // report WAITING_FOR_CODEX_REVIEW forever after every clean verdict. A
-  // comment explicitly naming the head SHA is authoritative for that head,
-  // so no timestamp comparison with formal reviews is needed.
+  // report WAITING_FOR_CODEX_REVIEW forever after every clean verdict.
+  // Trust model:
+  //   - only comments whose author login is EXACTLY one of CODEX_BOT_LOGINS
+  //     count — no substring matching ('codex-reviewer-user' is ignored);
+  //   - the NEWEST Codex verdict wins: a clean comment is authoritative only
+  //     if no formal Codex review covers the same head, or the comment is
+  //     strictly newer than that review. A later formal review — with or
+  //     without findings — supersedes an older clean comment, so an old
+  //     clean verdict can never override newer active findings. If the
+  //     review's submitted time cannot be parsed, the review is treated as
+  //     newer (findings win).
   let cleanVerdictCoversHead = false;
-  if (!reviewCoversHead && headSha !== '') {
+  let supersededCleanVerdict = false;
+  if (headSha !== '') {
     const commentsJson = runOrFail(
       'gh',
       ['pr', 'view', String(pr.number), '--json', 'comments'],
       `Could not load PR #${pr.number} comments`,
     );
     const comments = JSON.parse(commentsJson).comments ?? [];
-    cleanVerdictCoversHead = comments.some((comment) => {
-      const login = (comment.author?.login ?? '').toLowerCase();
-      if (!login.includes('codex')) return false;
+    let hasCleanComment = false;
+    let newestCleanCommentMs = null;
+    for (const comment of comments) {
       const body = comment.body ?? '';
-      if (!/didn.{0,3}t find any major issues/i.test(body)) return false;
+      if (!/didn.{0,3}t find any major issues/i.test(body)) continue;
       const sha = /Reviewed commit:[^`]*`([0-9a-f]{7,40})`/i.exec(body);
-      return sha !== null && headSha.startsWith(sha[1]);
-    });
+      if (sha === null || !headSha.startsWith(sha[1])) continue;
+      const login = comment.author?.login ?? '';
+      if (!CODEX_BOT_LOGINS.has(login)) {
+        if (login.toLowerCase().includes('codex')) {
+          console.error(
+            `note: ignoring clean-verdict comment from '${login}' — not an ` +
+              'exact Codex bot login.',
+          );
+        }
+        continue;
+      }
+      hasCleanComment = true;
+      const createdAtMs = Date.parse(comment.createdAt ?? '');
+      if (
+        !Number.isNaN(createdAtMs) &&
+        (newestCleanCommentMs === null || createdAtMs > newestCleanCommentMs)
+      ) {
+        newestCleanCommentMs = createdAtMs;
+      }
+    }
+    if (hasCleanComment) {
+      if (!reviewCoversHead) {
+        // No formal review covers this head — the clean comment is the only
+        // Codex verdict for the current head and is authoritative.
+        cleanVerdictCoversHead = true;
+      } else if (
+        newestCleanCommentMs !== null &&
+        !Number.isNaN(reviewSubmittedAtMs) &&
+        newestCleanCommentMs > reviewSubmittedAtMs
+      ) {
+        // The clean comment is strictly newer than the formal review that
+        // covers the same head — the newest verdict wins.
+        cleanVerdictCoversHead = true;
+      } else {
+        // The formal review covering this head is newer, or timestamps
+        // could not be compared — the review supersedes the clean comment;
+        // its findings (or zero-findings status) decide below.
+        supersededCleanVerdict = true;
+      }
+    }
   }
 
   // --- Report ----------------------------------------------------------
@@ -422,10 +558,22 @@ function main() {
         'freshness check.',
     );
   }
+  if (supersededCleanVerdict) {
+    console.log('');
+    console.log(
+      'Note: a Codex clean-verdict comment names the current head, but the ' +
+        'latest formal Codex review covering the same head is newer (or ' +
+        'timestamps could not be compared) — the review is authoritative, ' +
+        'not the older clean comment.',
+    );
+  }
   console.log('');
 
   if (cleanVerdictCoversHead) {
-    const mlGatesPending = isMlPr && !args.mlGatesPassed;
+    const attestation = isMlPr
+      ? readMlGatesAttestation(pr.number, headSha)
+      : null;
+    const mlGatesPending = isMlPr && attestation === null;
     console.log(
       mlGatesPending
         ? 'STATUS: ML_SAFETY_GATES_REQUIRED'
@@ -445,11 +593,11 @@ function main() {
       );
     }
     if (mlGatesPending) {
-      printMlGatesRequired();
+      printMlGatesRequired(pr.number, headSha);
       return;
     }
     if (isMlPr) {
-      printMlGatesAttested();
+      printMlGatesAttested(attestation);
     }
     console.log(
       'Next step is HUMAN-ONLY: review the PR and merge it manually. ' +
@@ -477,7 +625,10 @@ function main() {
   }
 
   if (latestCount === 0) {
-    const mlGatesPending = isMlPr && !args.mlGatesPassed;
+    const attestation = isMlPr
+      ? readMlGatesAttestation(pr.number, headSha)
+      : null;
+    const mlGatesPending = isMlPr && attestation === null;
     console.log(
       mlGatesPending
         ? 'STATUS: ML_SAFETY_GATES_REQUIRED'
@@ -492,11 +643,11 @@ function main() {
           : ''),
     );
     if (mlGatesPending) {
-      printMlGatesRequired();
+      printMlGatesRequired(pr.number, headSha);
       return;
     }
     if (isMlPr) {
-      printMlGatesAttested();
+      printMlGatesAttested(attestation);
     }
     console.log(
       'Next step is HUMAN-ONLY: review the PR and merge it manually. ' +

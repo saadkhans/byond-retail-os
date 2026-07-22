@@ -31,6 +31,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 from validate_dataset_manifest import validate_manifest, CAPTURE_CONTEXT_VALUES, SKU_PATTERN
@@ -51,6 +52,30 @@ def _source_root(input_dir, output_dir) -> str:
     except ValueError:
         return Path(input_dir).resolve().as_posix()
     return Path(rel).as_posix()
+
+
+def _write_json_atomically(payload: dict, destination: Path) -> None:
+    """Write JSON via a same-directory temp file + os.replace.
+
+    A crash mid-write can therefore never leave a truncated/partial
+    manifest.json behind — the destination either keeps its previous
+    content or receives the complete new one. (Local copy of the same
+    helper in prepare_rpc.py — scripts stay import-independent.)
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(destination.parent), prefix=destination.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp_name, destination)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _effective_source_root(manifest: dict, input_dir: Path) -> Path:
@@ -178,9 +203,7 @@ def validate(input_dir: Path, output_dir) -> int:
         # the input dataset's media (never copied/staged).
         staged = dict(manifest)
         staged["sourceRoot"] = _source_root(effective_source_root, output_dir)
-        with destination.open("w", encoding="utf-8") as fh:
-            json.dump(staged, fh, indent=2, sort_keys=True)
-            fh.write("\n")
+        _write_json_atomically(staged, destination)
         print(f"  staged validated manifest to {destination}")
 
     return 0

@@ -11,8 +11,11 @@ Phase 8 ML change is pushed, you check that no unsafe artifact slipped past
 
 ## What to inspect
 
-1. `git diff origin/dev...HEAD --name-only` — files added/changed on this
-   branch.
+1. Resolve the PR base first — `gh pr view --json baseRefName` (or the base
+   ref given in the spawning prompt); fall back to `origin/dev` only if no
+   PR/base can be resolved. Then `git fetch origin <base>` if the ref is
+   missing locally, and run `git diff origin/<base>...HEAD --name-only` —
+   files added/changed on this branch.
 2. `git status --short` — anything staged or untracked right now.
 3. `git ls-files ml/` — everything already tracked under `ml/`.
 
@@ -30,8 +33,12 @@ Cross-reference all three against the block list below.
   (e.g. `*.pt`/`*.PT`, any case), so treat extension matches on these as
   case-insensitive when scanning diffs
 - Video/image media: `*.mp4`, `*.mov`, `*.avi`, `*.mkv`, `*.jpg`, `*.jpeg`,
-  `*.png`, `*.webp`
-- Binary blobs: `*.npy`, `*.npz`, `*.parquet`, `*.pkl`, `*.pickle`
+  `*.png`, `*.webp` — matched case-insensitively (e.g. `*.jpg`/`*.JPG`, any
+  case), so treat extension matches on these as case-insensitive when
+  scanning diffs
+- Binary blobs: `*.npy`, `*.npz`, `*.parquet`, `*.pkl`, `*.pickle` — matched
+  case-insensitively (e.g. `*.pkl`/`*.PKL`, any case), so treat extension
+  matches on these as case-insensitive when scanning diffs
 - Training runs / outputs / checkpoints: `ml/runs/`, `ml/outputs/`,
   `ml/checkpoints/`, `ml/models/`
 - Customer media of any kind

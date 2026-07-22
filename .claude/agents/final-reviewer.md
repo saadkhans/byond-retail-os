@@ -12,9 +12,12 @@ You never edit files.
 
 ## What to review
 
-Run `git diff origin/dev...HEAD` plus `git diff` / `git status --porcelain`
-for anything uncommitted, and read enough surrounding code to judge each
-change in context. Check every item:
+Resolve the PR base first — `gh pr view --json baseRefName` (or the base ref
+given in the spawning prompt); fall back to `origin/dev` only if no PR/base
+can be resolved. Then (after `git fetch origin <base>` if the ref is missing
+locally) run `git diff origin/<base>...HEAD` plus `git diff` /
+`git status --porcelain` for anything uncommitted, and read enough
+surrounding code to judge each change in context. Check every item:
 
 1. **Tenant isolation** — every new/changed query, endpoint, and service
    path stays scoped to the caller's tenant; no cross-tenant reads/writes;

@@ -22,9 +22,10 @@ expected layout:
 Given that layout, this script builds a BYOND dataset manifest
 (ml/configs/dataset.schema.json) at `<output>/manifest.json`: classes come
 from the COCO `categories` list (label = slugified category name, classId =
-list index; no `sku` — RPC classes are not mapped to any tenant catalog),
-and each split's samples are the image paths recorded in that split's COCO
-`images` list.
+list index, sourceId = the original COCO category id that the annotation
+files reference; no `sku` — RPC classes are not mapped to any tenant
+catalog), and each split's samples are the image paths recorded in that
+split's COCO `images` list.
 """
 
 from __future__ import annotations
@@ -151,7 +152,15 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
         if label in seen_labels:
             label = f"{label}-{idx}"
         seen_labels.add(label)
-        classes.append({"classId": idx, "label": label})
+        entry = {"classId": idx, "label": label}
+        # The COCO annotation files reference categories by their original
+        # `id`, which need not match the contiguous training index. Preserve
+        # it as sourceId so consumers joining annotations by category id do
+        # not mislabel classes.
+        source_id = category.get("id")
+        if isinstance(source_id, int) and not isinstance(source_id, bool) and source_id >= 0:
+            entry["sourceId"] = source_id
+        classes.append(entry)
 
     splits = {}
     annotations = {}

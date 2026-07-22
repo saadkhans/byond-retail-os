@@ -61,22 +61,36 @@ pnpm run codex:auto-loop -- --pr 2                 # status + findings file
 pnpm run codex:auto-loop -- --pr 2 --dry-run       # status only, writes nothing
 pnpm run codex:auto-loop -- --pr 2 --max-cycles 5  # echoed into loop budget
 pnpm run codex:auto-loop -- --pr 2 --no-push       # stop before push/comment
-pnpm run codex:auto-loop -- --pr 2 --ml-gates-passed  # ML PR: attest gates, get READY_FOR_HUMAN_MERGE
+# ML PR: READY_FOR_HUMAN_MERGE additionally requires the attestation file
+# .tmp/codex-ml-gates-pr-<PR>-<HEAD_SHA>.json, written by the orchestrator
+# only after all four ML safety gates pass on the current head.
 ```
 
 STATUS meanings:
 - `READY_FOR_HUMAN_MERGE` — no active latest-review findings; the human
   reviews the PR and merges manually. Nothing ever merges automatically.
-  For ML PRs this status only appears after a `--ml-gates-passed` re-run
-  (see `ML_SAFETY_GATES_REQUIRED` below).
+  For ML PRs this status only appears when a valid ML-gates attestation
+  file exists for the current head (see `ML_SAFETY_GATES_REQUIRED` below).
+  Clean-verdict comments count only from the exact Codex bot login
+  (`chatgpt-codex-connector` / `chatgpt-codex-connector[bot]` — no
+  substring matching), and the newest Codex verdict always wins: a formal
+  review that is newer than a clean comment on the same head supersedes it,
+  so an older clean comment can never override newer active findings.
 - `ML_SAFETY_GATES_REQUIRED` — Codex findings are clean (clean-verdict
-  comment or zero latest findings) on an ML PR, but the four ML safety
-  gates (`dataset-safety-worker`, `ml-pipeline-reviewer`,
-  `vision-event-contract-worker`, `final-reviewer`) have not yet been
-  attested. Run the gates; any failed gate is treated as
-  `CLAUDE_FIX_REQUIRED`. Once all four return
-  SAFE/PASS/COMPATIBLE/PASS, re-run the helper with `--ml-gates-passed` to
-  receive `READY_FOR_HUMAN_MERGE`.
+  comment or zero latest findings) on an ML PR, but no valid ML safety-gate
+  attestation exists for the current head. Run the four gates
+  (`dataset-safety-worker`, `ml-pipeline-reviewer`,
+  `vision-event-contract-worker`, `final-reviewer`) against the current
+  head; any failed gate is treated as `CLAUDE_FIX_REQUIRED`. Only once all
+  four return SAFE/PASS/COMPATIBLE/PASS, write
+  `.tmp/codex-ml-gates-pr-<PR>-<HEAD_SHA>.json` (the helper prints the
+  exact path and a filled-in example) with
+  `{ "pr": <number>, "headSha": "<full sha>", "createdAt": "<ISO>",
+  "gates": { <each gate>: "PASS" } }` — each gate recorded as the exact
+  string `"PASS"` — and re-run the helper to receive
+  `READY_FOR_HUMAN_MERGE`. The helper verifies PR number, exact head SHA,
+  timestamp, and all four gates; an attestation for a different head SHA
+  is stale and ignored (re-run the gates after every push).
 - `CLAUDE_FIX_REQUIRED (n)` — findings saved for Claude Code to fix inside
   a `/codex-auto-loop` or `/fix-codex-review` session.
 - `WAITING_FOR_CODEX_REVIEW` — the latest Codex review predates the PR
@@ -88,9 +102,13 @@ STATUS meanings:
 Note on clean re-reviews: when Codex finds nothing, it does NOT submit a
 formal review — it posts a "Didn't find any major issues" PR comment naming
 the reviewed commit. The helper accepts such a comment on the current head
-as a clean verdict (`READY_FOR_HUMAN_MERGE`); threads left over from older
-reviews then need manual resolution, since no re-review ran to mark them
-outdated.
+as a clean verdict (`READY_FOR_HUMAN_MERGE`) only if (a) the comment author
+login is exactly `chatgpt-codex-connector` or
+`chatgpt-codex-connector[bot]` — lookalike logins that merely contain
+"codex" are ignored — and (b) no newer formal Codex review covers the same
+head (the newest verdict wins; if timestamps cannot be compared, the formal
+review wins). Threads left over from older reviews then need manual
+resolution, since no re-review ran to mark them outdated.
 
 The helper also refuses to run on a dirty working tree (it would otherwise
 instruct a fix cycle that commits unrelated edits); pass `--allow-dirty`
@@ -131,14 +149,17 @@ and `vision-event-contract-worker` before `final-reviewer` (step I').
 These gates gate ANY `READY_FOR_HUMAN_MERGE` declaration: when Codex
 findings are clean on an ML PR (including zero latest findings), the
 helper reports `ML_SAFETY_GATES_REQUIRED` instead of
-`READY_FOR_HUMAN_MERGE`, and the orchestrator must run all four gates. An
-UNSAFE/BLOCK/INCOMPATIBLE verdict re-enters the fix pipeline as if the
-status were `CLAUDE_FIX_REQUIRED`; only once all four gates return
-SAFE/PASS/COMPATIBLE/PASS does the orchestrator re-run the helper with
-`--ml-gates-passed`, which is the only way `READY_FOR_HUMAN_MERGE` is
-reported for an ML PR. `ml/` is a stdlib-only Python workspace outside the
-pnpm workspace; datasets and model weights are external artifacts and must
-never be committed.
+`READY_FOR_HUMAN_MERGE`, and the orchestrator must run all four gates
+against the current head. An UNSAFE/BLOCK/INCOMPATIBLE verdict re-enters
+the fix pipeline as if the status were `CLAUDE_FIX_REQUIRED`; only once
+all four gates return SAFE/PASS/COMPATIBLE/PASS does the orchestrator
+write the attestation file `.tmp/codex-ml-gates-pr-<PR>-<HEAD_SHA>.json`
+(each gate recorded as `"PASS"`) and re-run the helper — a verified
+attestation for the exact current head is the only way
+`READY_FOR_HUMAN_MERGE` is reported for an ML PR, and any new push makes
+the previous attestation stale. `ml/` is a stdlib-only Python workspace
+outside the pnpm workspace; datasets and model weights are external
+artifacts and must never be committed.
 
 Merge-blockers specific to Phase 8:
 1. Datasets/images/videos committed to the repo

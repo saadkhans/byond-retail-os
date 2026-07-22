@@ -92,6 +92,54 @@ class FieldRuleTests(unittest.TestCase):
         errors = validate_manifest(manifest)
         self.assertTrue(any("sku" in e for e in errors), errors)
 
+    def test_non_contiguous_class_ids_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["classes"][1]["classId"] = 2
+        errors = validate_manifest(manifest)
+        self.assertTrue(
+            any("contiguous zero-based classId" in e for e in errors), errors
+        )
+
+    def test_single_class_with_high_class_id_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["classes"] = [{"classId": 999, "label": "cola-330"}]
+        errors = validate_manifest(manifest)
+        self.assertTrue(
+            any("contiguous zero-based classId" in e for e in errors), errors
+        )
+
+    def test_contiguous_class_ids_accepted(self) -> None:
+        manifest = _valid_manifest()
+        self.assertEqual(
+            sorted(cls["classId"] for cls in manifest["classes"]), [0, 1]
+        )
+        self.assertEqual(validate_manifest(manifest), [])
+
+    def test_valid_source_ids_accepted(self) -> None:
+        manifest = _valid_manifest()
+        manifest["classes"][0]["sourceId"] = 7
+        manifest["classes"][1]["sourceId"] = 3
+        self.assertEqual(validate_manifest(manifest), [])
+
+    def test_duplicate_source_id_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["classes"][0]["sourceId"] = 5
+        manifest["classes"][1]["sourceId"] = 5
+        errors = validate_manifest(manifest)
+        self.assertTrue(
+            any("sourceId" in e and "duplicates" in e for e in errors), errors
+        )
+
+    def test_non_int_source_id_rejected(self) -> None:
+        for bad in ("7", True, -1, 1.5, None):
+            with self.subTest(bad=bad):
+                manifest = _valid_manifest()
+                manifest["classes"][0]["sourceId"] = bad
+                errors = validate_manifest(manifest)
+                self.assertTrue(
+                    any("sourceId must be an integer >= 0" in e for e in errors), errors
+                )
+
     def test_byond_custom_class_missing_sku_rejected(self) -> None:
         manifest = _valid_manifest()
         manifest["source"] = "byond-custom"
@@ -338,7 +386,7 @@ class FilesystemAliasTests(unittest.TestCase):
             base = Path(tmp)
             (base / "images").mkdir()
             original = base / "images" / "a.jpg"
-            original.touch()
+            original.write_text("pixels-a", encoding="utf-8")
             try:
                 os.link(str(original), str(base / "images" / "b.jpg"))
             except (OSError, NotImplementedError) as exc:
@@ -354,13 +402,16 @@ class FilesystemAliasTests(unittest.TestCase):
                 ),
                 errors,
             )
+            # The inode-alias pair must be reported once (as an alias), not a
+            # second time by the content-digest check.
+            self.assertFalse(any("duplicates content" in e for e in errors), errors)
 
     def test_symlinked_image_across_splits_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             (base / "images").mkdir()
             original = base / "images" / "a.jpg"
-            original.touch()
+            original.write_text("pixels-a", encoding="utf-8")
             try:
                 os.symlink(str(original), str(base / "images" / "b.jpg"))
             except (OSError, NotImplementedError) as exc:
@@ -377,13 +428,127 @@ class FilesystemAliasTests(unittest.TestCase):
                 ),
                 errors,
             )
+            # An in-root symlink is a split-overlap alias, not an escape.
+            self.assertFalse(any("escapes the source root" in e for e in errors), errors)
+            self.assertFalse(any("duplicates content" in e for e in errors), errors)
 
     def test_distinct_files_across_splits_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             (base / "images").mkdir()
-            (base / "images" / "a.jpg").touch()
-            (base / "images" / "b.jpg").touch()
+            (base / "images" / "a.jpg").write_text("pixels-a", encoding="utf-8")
+            (base / "images" / "b.jpg").write_text("pixels-b", encoding="utf-8")
+            errors = validate_manifest(
+                self._manifest_two_images(), base_dir=base, check_files=True
+            )
+            self.assertEqual(errors, [])
+
+
+class SymlinkEscapeTests(unittest.TestCase):
+    """check_files must reject a reference that resolves (via symlink) to a
+    file outside the dataset source root."""
+
+    def test_image_symlink_escaping_source_root_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "dataset"
+            outside = Path(tmp) / "outside"
+            (base / "images").mkdir(parents=True)
+            outside.mkdir()
+            target = outside / "secret.jpg"
+            target.write_text("outside-bytes", encoding="utf-8")
+            try:
+                os.symlink(str(target), str(base / "images" / "a.jpg"))
+            except (OSError, NotImplementedError) as exc:
+                # Windows may lack the symlink privilege.
+                self.skipTest(f"symlinks unsupported on this platform/filesystem: {exc}")
+            errors = validate_manifest(
+                _valid_manifest(), base_dir=base, check_files=True
+            )
+            self.assertTrue(
+                any("escapes the source root: images/a.jpg" in e for e in errors),
+                errors,
+            )
+
+    def test_annotation_symlink_escaping_source_root_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "dataset"
+            outside = Path(tmp) / "outside"
+            (base / "images").mkdir(parents=True)
+            (base / "annotations").mkdir()
+            outside.mkdir()
+            (base / "images" / "a.jpg").write_text("pixels-a", encoding="utf-8")
+            target = outside / "secret.json"
+            target.write_text("{}", encoding="utf-8")
+            try:
+                os.symlink(str(target), str(base / "annotations" / "a.json"))
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlinks unsupported on this platform/filesystem: {exc}")
+            manifest = _valid_manifest()
+            manifest["splits"]["train"][0]["annotation"] = "annotations/a.json"
+            errors = validate_manifest(manifest, base_dir=base, check_files=True)
+            self.assertTrue(
+                any("escapes the source root: annotations/a.json" in e for e in errors),
+                errors,
+            )
+
+    def test_split_level_annotation_symlink_escaping_source_root_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "dataset"
+            outside = Path(tmp) / "outside"
+            (base / "images").mkdir(parents=True)
+            outside.mkdir()
+            (base / "images" / "a.jpg").write_text("pixels-a", encoding="utf-8")
+            target = outside / "instances.json"
+            target.write_text("{}", encoding="utf-8")
+            try:
+                os.symlink(str(target), str(base / "instances_train2019.json"))
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlinks unsupported on this platform/filesystem: {exc}")
+            manifest = _valid_manifest()
+            manifest["annotations"] = {"train": "instances_train2019.json"}
+            errors = validate_manifest(manifest, base_dir=base, check_files=True)
+            self.assertTrue(
+                any(
+                    "escapes the source root: instances_train2019.json" in e
+                    for e in errors
+                ),
+                errors,
+            )
+
+
+class ContentDigestTests(unittest.TestCase):
+    """check_files must reject byte-for-byte copies of one image across (or
+    within) splits — a train/eval leak the inode identity check cannot see."""
+
+    def _manifest_two_images(self) -> dict:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"] = [{"image": "images/a.jpg"}]
+        manifest["splits"]["val"] = [{"image": "images/b.jpg"}]
+        return manifest
+
+    def test_copied_image_across_splits_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "images").mkdir()
+            (base / "images" / "a.jpg").write_text("same-pixels", encoding="utf-8")
+            (base / "images" / "b.jpg").write_text("same-pixels", encoding="utf-8")
+            errors = validate_manifest(
+                self._manifest_two_images(), base_dir=base, check_files=True
+            )
+            self.assertTrue(
+                any(
+                    "splits.val[0].image duplicates content of splits.train[0].image" in e
+                    for e in errors
+                ),
+                errors,
+            )
+
+    def test_different_content_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "images").mkdir()
+            (base / "images" / "a.jpg").write_text("pixels-one", encoding="utf-8")
+            (base / "images" / "b.jpg").write_text("pixels-two", encoding="utf-8")
             errors = validate_manifest(
                 self._manifest_two_images(), base_dir=base, check_files=True
             )
@@ -472,7 +637,10 @@ class PrepareByondStagingTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+            # The staged write must be atomic: valid JSON at the destination
+            # and no leftover temp file from the mkstemp+replace pattern.
             staged = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(list(output_dir.glob("*.tmp")), [])
             staged_root = Path(staged["sourceRoot"])
             resolved = staged_root if staged_root.is_absolute() else output_dir / staged_root
             self.assertEqual(resolved.resolve(), input_dir.resolve())
@@ -512,6 +680,7 @@ class PrepareByondStagingTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
             staged = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(list(output_dir.glob("*.tmp")), [])
             staged_root = Path(staged["sourceRoot"])
             resolved = staged_root if staged_root.is_absolute() else output_dir / staged_root
             self.assertEqual(resolved.resolve(), data_dir.resolve())
@@ -534,12 +703,19 @@ class PrepareRpcEndToEndTests(unittest.TestCase):
             image_dir.mkdir(parents=True, exist_ok=True)
             coco: dict = {"images": [{"file_name": image_name}]}
             if split == "train":
-                coco["categories"] = [{"id": 1, "name": "Cola 330"}]
+                # Non-contiguous COCO category ids on purpose: classId must be
+                # remapped to 0..N-1 while sourceId preserves these originals.
+                coco["categories"] = [
+                    {"id": 7, "name": "Cola 330"},
+                    {"id": 3, "name": "Chips 50"},
+                ]
             (raw / f"instances_{split}2019.json").write_text(
                 json.dumps(coco), encoding="utf-8"
             )
             if split != omit_split_image:
-                open(image_dir / image_name, "w").close()
+                # Unique bytes per placeholder: identical (e.g. empty) files
+                # across splits would trip the content-digest duplicate check.
+                (image_dir / image_name).write_text(f"pixels-{image_name}", encoding="utf-8")
 
     def test_prepared_manifest_has_source_root_and_annotation_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -561,6 +737,24 @@ class PrepareRpcEndToEndTests(unittest.TestCase):
                 },
             )
             self.assertEqual(manifest["splits"]["train"], [{"image": "train2019/t1.jpg"}])
+
+    def test_prepared_manifest_preserves_coco_category_ids_as_source_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            out = Path(tmp) / "out"
+            self._write_raw(raw)
+            result = _run_script(
+                "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest["classes"],
+                [
+                    {"classId": 0, "label": "cola-330", "sourceId": 7},
+                    {"classId": 1, "label": "chips-50", "sourceId": 3},
+                ],
+            )
 
     def test_missing_referenced_image_fails_loudly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -612,7 +806,9 @@ class PrepareSku110kEndToEndTests(unittest.TestCase):
                 f"{image_name},10,10,20,20,object,100,100\n", encoding="utf-8"
             )
             if split != omit_split_image:
-                open(images_dir / image_name, "w").close()
+                # Unique bytes per placeholder: identical (e.g. empty) files
+                # across splits would trip the content-digest duplicate check.
+                (images_dir / image_name).write_text(f"pixels-{image_name}", encoding="utf-8")
 
     def test_prepared_manifest_has_source_root_and_annotation_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
