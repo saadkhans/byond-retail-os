@@ -191,13 +191,29 @@ def validate(input_dir: Path, output_dir) -> int:
     # wrongly fail manifests whose sourceRoot points elsewhere (e.g. "data").
     effective_source_root = _effective_source_root(manifest if isinstance(manifest, dict) else {}, input_dir)
     try:
-        # Physical (symlink-resolved) root so validation and the staged
+        # Physical (symlink-resolved) roots so validation and the staged
         # manifest's recomputed sourceRoot agree on the same real location.
+        resolved_input_dir = input_dir.resolve()
         effective_source_root = effective_source_root.resolve()
     except (OSError, ValueError):
         # Left unresolved; the base validator reports an unresolvable root
         # as a normal validation error below.
         pass
+    else:
+        # A manifest-supplied sourceRoot must never leave the dataset
+        # directory: "../other-tenant", an absolute outside path, or an
+        # in-dir symlink resolving elsewhere would let a manifest reference
+        # (and later stage) another tenant's captures while being reported
+        # valid. Enforced BEFORE validation and BEFORE staging.
+        if not effective_source_root.is_relative_to(resolved_input_dir):
+            source_root_value = manifest.get("sourceRoot") if isinstance(manifest, dict) else None
+            print(
+                f"ERROR: sourceRoot {source_root_value!r} resolves to "
+                f"{effective_source_root}, which is outside the dataset "
+                f"directory {resolved_input_dir}; custom source roots must "
+                "stay inside the dataset directory"
+            )
+            return 1
     errors = validate_manifest(manifest, base_dir=effective_source_root, check_files=True)
     errors.extend(_extra_byond_checks(manifest))
 

@@ -58,14 +58,19 @@ a. Run `pnpm run codex:auto-loop -- --pr <N>` (append `--no-push` or
    `--wait-seconds` if the user passed them). It re-checks guardrails,
    fetches findings, and prints a STATUS line.
 b. **STATUS: READY_FOR_HUMAN_MERGE** → stop the loop and report: the PR has
-   no active latest-review findings; the human reviews and merges manually.
+   no active latest-review findings AND the helper verified local HEAD ==
+   PR head, all GitHub checks green, and the PR mergeable; the human
+   reviews and merges manually.
    (A clean Codex re-review arrives as a "didn't find any major issues" PR
    comment, not a formal review — the helper detects that too. It trusts
    such a comment only when the author login is EXACTLY
-   `chatgpt-codex-connector` / `chatgpt-codex-connector[bot]` — no
-   substring matches — and only when no newer formal Codex review covers
-   the same head: the newest Codex verdict always supersedes an older
-   clean comment.) For ML PRs the helper reports this status only when a
+   `chatgpt-codex-connector` / `chatgpt-codex-connector[bot]` — the shared
+   exact allowlist in `scripts/codex-bot-logins.mjs`, no substring
+   matches — and only when no newer formal Codex review covers the same
+   head: the newest Codex verdict always supersedes an older clean
+   comment.) READY now means: Codex clean + (ML PR ⇒ valid attestation AND
+   local HEAD == PR head) + CI success + secret scanning success +
+   mergeable. For ML PRs the helper reports this status only when a
    valid ML-gates attestation file exists for the current head — see
    `ML_SAFETY_GATES_REQUIRED` below.
 b1. **STATUS: ML_SAFETY_GATES_REQUIRED** → Codex findings are clean (a clean
@@ -89,6 +94,25 @@ b1. **STATUS: ML_SAFETY_GATES_REQUIRED** → Codex findings are clean (a clean
 b'. **STATUS: WAITING_FOR_CODEX_REVIEW** → the latest Codex review predates
    the PR head; any reported findings are stale. STOP and tell the user to
    re-run `/codex-auto-loop` after Codex replies — never re-fix them.
+b2. **STATUS: LOCAL_HEAD_MISMATCH** → the local checkout's HEAD is not the
+   PR head (`headRefOid`), so safety gates and ML attestations would run
+   against the wrong commit. Sync the local branch to the PR head
+   (`git fetch origin` then a fast-forward pull of the PR branch — or, if
+   the local branch is AHEAD with unpushed commits, push it so the PR head
+   advances), then re-run step (a). The helper never resets the branch
+   itself, and an ML attestation must only ever be written while local
+   HEAD equals the PR head.
+b3. **STATUS: PR_NOT_MERGEABLE** → GitHub reports merge conflicts
+   (`mergeable: CONFLICTING`). Resolve the conflicts (merge/rebase the
+   base branch into the feature branch and push), then re-run step (a).
+b4. **STATUS: GITHUB_CHECKS_FAILED** → one or more GitHub checks
+   (CI, secret scanning, ...) failed on the PR head; the helper lists the
+   failing check names. Fix the failures and push — never bypass a failing
+   check — then re-run step (a).
+b5. **STATUS: GITHUB_CHECKS_REQUIRED** → GitHub checks are pending or not
+   reporting on the PR head, or GitHub is still computing mergeability
+   (`mergeable: UNKNOWN`). Absence of checks is never treated as success —
+   wait for them to complete, then re-run step (a).
 c. **STATUS: CLAUDE_FIX_REQUIRED** → run the delegation pipeline:
    1. **Read** — spawn `codex-review-reader` for PR <N> (it reads
       `.tmp/codex-latest-findings.md` and the live summary) and take its
@@ -164,8 +188,12 @@ failure; (8) failing CI/build/tests.
 
 The loop is DONE only when all of these hold (otherwise repeat or stop per
 the rules above): CI checks pass, secret scanning passes, Codex has no
-active latest-review findings, and the PR is mergeable
-(`gh pr view --json mergeable,mergeStateStatus`). Then report
+active latest-review findings, the local HEAD equals the PR head, and the
+PR is mergeable. The helper now verifies all of this itself — it fetches
+`mergeable,mergeStateStatus,statusCheckRollup` fresh immediately before
+any ready decision and only then prints READY_FOR_HUMAN_MERGE (otherwise
+it prints `LOCAL_HEAD_MISMATCH`, `PR_NOT_MERGEABLE`,
+`GITHUB_CHECKS_FAILED`, or `GITHUB_CHECKS_REQUIRED`). Then report
 READY_FOR_HUMAN_MERGE — the human merges.
 
 ## Stop conditions (any of these ends the loop immediately)

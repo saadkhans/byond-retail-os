@@ -14,10 +14,13 @@ You never edit files.
 
 Resolve the PR base first — `gh pr view --json baseRefName` (or the base ref
 given in the spawning prompt); fall back to `origin/dev` only if no PR/base
-can be resolved. Then (after `git fetch origin <base>` if the ref is missing
-locally) run `git diff origin/<base>...HEAD` plus `git diff` /
-`git status --porcelain` for anything uncommitted, and read enough
-surrounding code to judge each change in context. Check every item:
+can be resolved. Then always run `git fetch origin <base>` (unconditional
+refresh, not just when missing), verify the remote-tracking ref exists
+afterward (`git rev-parse --verify origin/<base>`), and run
+`git diff origin/<base>...HEAD` against that freshly fetched `origin/<base>`
+plus `git diff` / `git status --porcelain` for anything uncommitted, and
+read enough surrounding code to judge each change in context. Check every
+item:
 
 1. **Tenant isolation** — every new/changed query, endpoint, and service
    path stays scoped to the caller's tenant; no cross-tenant reads/writes;

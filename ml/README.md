@@ -94,6 +94,43 @@ Two invariants apply regardless of which models are plugged in:
   external artifacts behind the `VisionEvent` contract; core logic never
   hardcodes a specific vendor or model family.
 
+## Future runtime direction (documentation only — nothing here is implemented in Phase 8)
+
+This section records the agreed direction for a *future* camera/inference
+runtime, so later phases build on a shared plan rather than re-deriving one.
+
+- **Event-driven, not always-on.** BYOND CV runs lightweight continuous
+  tracking (people/hand/shelf-zone geofences) on a low-res/downscaled
+  stream. Heavy inference never runs on every frame.
+- **Trigger layer.** A hand/wrist entering a shelf zone, or a suspected
+  shelf change / pickup / return, triggers analysis — the lightweight
+  tracker decides *when* to look closer, not *what* was taken.
+- **Heavy inference layer.** High-resolution crops from the 6MP/8MP camera
+  feed product recognition / SKU classification, with OCR when useful. A
+  VLM is used only as a fallback verifier for uncertain crops — it is
+  never the main engine. (Research direction: downscale for YOLO-style
+  tracking while keeping full sensor resolution for triggered shelf/
+  product crops.)
+- **Inference queue.** A future Inference Queue Manager abstraction
+  batches simultaneous crop-recognition jobs. Triton-style model serving
+  is a suitable future backend for the sub-second retail decision path;
+  Celery/Redis-style queues are acceptable only for offline/background
+  jobs.
+- **Video pipeline.** The default direction is a GStreamer-style camera
+  pipeline; FFmpeg serves as a utility/debug/transcoding layer; DeepStream
+  is an optional premium NVIDIA adapter, never a core dependency.
+- **Neutrality invariant.** No hard dependency on NVIDIA, Hailo,
+  Ambarella, DeepStream, or any single VLM/provider — every layer stays
+  provider- and hardware-neutral, per the same principle as the model
+  strategy above.
+- **Output contract unchanged.** Model output still feeds the Phase 7
+  `VisionEvent` JSON contract (`POST /vision-events`) — this direction
+  changes nothing about how results reach the API.
+
+Phase 8 ships none of this — no camera runtime, no inference service, no
+GStreamer/DeepStream/Triton/Redis/Celery dependencies, no VLM integration;
+this section records the agreed direction only.
+
 ## Manifest format
 
 Every prepared dataset is described by a manifest JSON file validated

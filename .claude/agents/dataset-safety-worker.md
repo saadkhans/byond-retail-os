@@ -13,10 +13,13 @@ Phase 8 ML change is pushed, you check that no unsafe artifact slipped past
 
 1. Resolve the PR base first — `gh pr view --json baseRefName` (or the base
    ref given in the spawning prompt); fall back to `origin/dev` only if no
-   PR/base can be resolved. Then `git fetch origin <base>` if the ref is
-   missing locally, and run
-   `git diff origin/<base>...HEAD --name-status --diff-filter=ACMR` to get
-   block-list candidates — added/copied/modified/renamed files only.
+   PR/base can be resolved. Then always run `git fetch origin <base>`
+   (unconditional refresh, not just when missing), verify the
+   remote-tracking ref exists afterward (`git rev-parse --verify
+   origin/<base>`), and run
+   `git diff origin/<base>...HEAD --name-status --diff-filter=ACMR` against
+   that freshly fetched `origin/<base>` to get block-list candidates —
+   added/copied/modified/renamed files only.
    Deletions are intentionally excluded from the block-list scan: a cleanup
    PR that DELETES a previously committed artifact is SAFE (removing an
    offending file is desirable), not UNSAFE. If you notice a blocked
@@ -40,9 +43,10 @@ Cross-reference all three against the block list below.
   (e.g. `*.pt`/`*.PT`, any case), so treat extension matches on these as
   case-insensitive when scanning diffs
 - Video/image media: `*.mp4`, `*.mov`, `*.avi`, `*.mkv`, `*.jpg`, `*.jpeg`,
-  `*.png`, `*.webp`, `*.bmp`, `*.tif`, `*.tiff`, `*.gif`, `*.webm` — matched
-  case-insensitively (e.g. `*.jpg`/`*.JPG`, any case), so treat extension
-  matches on these as case-insensitive when scanning diffs
+  `*.png`, `*.webp`, `*.bmp`, `*.tif`, `*.tiff`, `*.gif`, `*.webm`, `*.heic`,
+  `*.heif`, `*.avif`, `*.mpeg`, `*.mpg` — matched case-insensitively (e.g.
+  `*.jpg`/`*.JPG`, any case), so treat extension matches on these as
+  case-insensitive when scanning diffs
 - Binary blobs: `*.npy`, `*.npz`, `*.parquet`, `*.pkl`, `*.pickle` — matched
   case-insensitively (e.g. `*.pkl`/`*.PKL`, any case), so treat extension
   matches on these as case-insensitive when scanning diffs

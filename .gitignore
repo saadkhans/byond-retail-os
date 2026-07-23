@@ -85,6 +85,11 @@ ml/**/*.[tT][iI][fF]
 ml/**/*.[tT][iI][fF][fF]
 ml/**/*.[gG][iI][fF]
 ml/**/*.[wW][eE][bB][mM]
+ml/**/*.[hH][eE][iI][cC]
+ml/**/*.[hH][eE][iI][fF]
+ml/**/*.[aA][vV][iI][fF]
+ml/**/*.[mM][pP][eE][gG]
+ml/**/*.[mM][pP][gG]
 
 # Numeric/tabular dataset blobs scoped to ml/ — same reasoning as media.
 ml/**/*.[nN][pP][yY]

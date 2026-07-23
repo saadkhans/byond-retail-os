@@ -697,6 +697,108 @@ class PrepareByondStagingTests(unittest.TestCase):
             self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
 
 
+class PrepareByondSourceRootContainmentTests(unittest.TestCase):
+    """A manifest-supplied sourceRoot must resolve inside the dataset
+    directory — a root escaping via '..', an absolute path, or an in-dir
+    symlink could reference (and stage) another tenant's captures while
+    being reported valid."""
+
+    ERROR_TEXT = "custom source roots must stay inside the dataset directory"
+
+    def _byond_manifest(self, source_root: str) -> dict:
+        return {
+            "datasetName": "byond-store",
+            "datasetVersion": "1.0.0",
+            "source": "byond-custom",
+            "sourceRoot": source_root,
+            "licenseNotes": "Internal BYOND store captures.",
+            "classes": [{"classId": 0, "label": "cola-330", "sku": "SKU-1"}],
+            "splits": {
+                "train": [{"image": "raw/shelves/a.jpg", "annotation": "annotations/a.json"}],
+                "val": [],
+                "test": [],
+            },
+        }
+
+    def _write_media(self, root: Path) -> None:
+        (root / "raw" / "shelves").mkdir(parents=True)
+        (root / "annotations").mkdir()
+        (root / "raw" / "shelves" / "a.jpg").write_text("pixels-a", encoding="utf-8")
+        (root / "annotations" / "a.json").write_text("{}", encoding="utf-8")
+
+    def _run(self, input_dir: Path, output_dir: Path) -> subprocess.CompletedProcess:
+        return _run_script(
+            "prepare_byond_dataset.py",
+            ["--input", str(input_dir), "--output", str(output_dir)],
+        )
+
+    def _assert_rejected_nothing_staged(self, result, output_dir: Path) -> None:
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(self.ERROR_TEXT, result.stdout)
+        self.assertFalse((output_dir / "manifest.json").exists())
+
+    def test_source_root_inside_dataset_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            input_dir = base / "input"
+            input_dir.mkdir()
+            self._write_media(input_dir / "data")
+            (input_dir / "manifest.json").write_text(
+                json.dumps(self._byond_manifest("data")), encoding="utf-8"
+            )
+            output_dir = base / "out"
+            result = self._run(input_dir, output_dir)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((output_dir / "manifest.json").exists())
+
+    def test_absolute_source_root_outside_dataset_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            input_dir = base / "input"
+            input_dir.mkdir()
+            outside = base / "other-tenant"
+            # Perfectly valid media outside the dataset dir — still rejected.
+            self._write_media(outside)
+            (input_dir / "manifest.json").write_text(
+                json.dumps(self._byond_manifest(str(outside))), encoding="utf-8"
+            )
+            output_dir = base / "out"
+            result = self._run(input_dir, output_dir)
+            self._assert_rejected_nothing_staged(result, output_dir)
+
+    def test_parent_traversal_source_root_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            input_dir = base / "input"
+            input_dir.mkdir()
+            self._write_media(base / "outside")
+            (input_dir / "manifest.json").write_text(
+                json.dumps(self._byond_manifest("../outside")), encoding="utf-8"
+            )
+            output_dir = base / "out"
+            result = self._run(input_dir, output_dir)
+            self._assert_rejected_nothing_staged(result, output_dir)
+
+    def test_symlinked_source_root_escaping_dataset_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            input_dir = base / "input"
+            input_dir.mkdir()
+            outside = base / "outside"
+            self._write_media(outside)
+            try:
+                os.symlink(str(outside), str(input_dir / "data"), target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                # Windows may lack the symlink privilege for directories.
+                self.skipTest(f"directory symlinks unsupported: {exc}")
+            (input_dir / "manifest.json").write_text(
+                json.dumps(self._byond_manifest("data")), encoding="utf-8"
+            )
+            output_dir = base / "out"
+            result = self._run(input_dir, output_dir)
+            self._assert_rejected_nothing_staged(result, output_dir)
+
+
 class PrepareRpcEndToEndTests(unittest.TestCase):
     """Non-dry-run prepare_rpc.py against a tiny synthetic raw layout."""
 
@@ -934,6 +1036,92 @@ class RpcCategoryConsistencyTests(unittest.TestCase):
             result, out = self._run_prepare(Path(tmp), list(self.CATEGORIES))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertTrue((out / "manifest.json").exists())
+
+
+class RpcCocoShapeGuardTests(unittest.TestCase):
+    """prepare_rpc must reject null/non-object entries (or missing typed
+    fields) in a COCO file's `categories` / `images` arrays with a
+    controlled ERROR, never an AttributeError traceback."""
+
+    CATEGORIES = [{"id": 7, "name": "Cola 330"}, {"id": 3, "name": "Chips 50"}]
+    IMAGE_NAMES = {"train": "t1.jpg", "val": "v1.jpg", "test": "e1.jpg"}
+
+    def _run_prepare(
+        self,
+        tmp: Path,
+        *,
+        train_categories: list = None,
+        train_images: list = None,
+        val_categories: list = None,
+    ) -> tuple:
+        raw = tmp / "raw"
+        out = tmp / "out"
+        for split, image_name in self.IMAGE_NAMES.items():
+            image_dir = raw / f"{split}2019"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            categories = list(self.CATEGORIES)
+            images = [{"file_name": image_name}]
+            if split == "train":
+                if train_categories is not None:
+                    categories = train_categories
+                if train_images is not None:
+                    images = train_images
+            elif split == "val" and val_categories is not None:
+                categories = val_categories
+            coco = {"images": images, "categories": categories}
+            (raw / f"instances_{split}2019.json").write_text(
+                json.dumps(coco), encoding="utf-8"
+            )
+            (image_dir / image_name).write_text(f"pixels-{image_name}", encoding="utf-8")
+        result = _run_script(
+            "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+        )
+        return result, out
+
+    def _assert_controlled_error(self, result, out: Path, *fragments: str) -> None:
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ERROR", result.stdout)
+        for fragment in fragments:
+            self.assertIn(fragment, result.stdout)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertFalse((out / "manifest.json").exists())
+
+    def test_null_category_entry_reports_error_not_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), train_categories=self.CATEGORIES + [None]
+            )
+            self._assert_controlled_error(
+                result, out, "instances_train2019.json", "categories[2] must be an object"
+            )
+
+    def test_null_category_entry_in_val_reports_error_not_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), val_categories=[None] + self.CATEGORIES
+            )
+            self._assert_controlled_error(
+                result, out, "instances_val2019.json", "categories[0] must be an object"
+            )
+
+    def test_null_image_entry_reports_error_not_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), train_images=[{"file_name": "t1.jpg"}, None]
+            )
+            self._assert_controlled_error(
+                result, out, "instances_train2019.json", "images[1] must be an object"
+            )
+
+    def test_image_missing_file_name_reports_error_not_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(Path(tmp), train_images=[{"id": 1}])
+            self._assert_controlled_error(
+                result,
+                out,
+                "instances_train2019.json",
+                "images[0].file_name must be a non-empty string",
+            )
 
 
 class SourceRootHelperTests(unittest.TestCase):

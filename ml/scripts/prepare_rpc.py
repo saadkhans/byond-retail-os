@@ -112,6 +112,54 @@ def _category_map_mismatches(train_map: dict, split_map: dict) -> list:
     return mismatches
 
 
+def _coco_shape_errors(coco) -> list:
+    """Controlled shape errors for the COCO fields this script dereferences.
+
+    Every `categories` / `images` entry the preparation below calls .get()
+    on must already be a dict with correctly-typed fields (`id` a non-bool
+    int and `name` a non-empty string for categories; `file_name` a
+    non-empty string for images), so a malformed annotation file produces
+    named errors instead of AttributeError tracebacks.
+    """
+    if not isinstance(coco, dict):
+        return [f"top-level payload must be a JSON object, got {type(coco).__name__}"]
+    errors = []
+    categories = coco.get("categories", [])
+    if not isinstance(categories, list):
+        errors.append(f"categories must be a list, got {type(categories).__name__}")
+    else:
+        for idx, category in enumerate(categories):
+            if not isinstance(category, dict):
+                errors.append(f"categories[{idx}] must be an object, got {category!r}")
+                continue
+            category_id = category.get("id")
+            if isinstance(category_id, bool) or not isinstance(category_id, int):
+                errors.append(f"categories[{idx}].id must be an integer, got {category_id!r}")
+            name = category.get("name")
+            if not isinstance(name, str) or not name:
+                errors.append(f"categories[{idx}].name must be a non-empty string, got {name!r}")
+    images = coco.get("images", [])
+    if not isinstance(images, list):
+        errors.append(f"images must be a list, got {type(images).__name__}")
+    else:
+        for idx, image in enumerate(images):
+            if not isinstance(image, dict):
+                errors.append(f"images[{idx}] must be an object, got {image!r}")
+                continue
+            file_name = image.get("file_name")
+            if not isinstance(file_name, str) or not file_name:
+                errors.append(
+                    f"images[{idx}].file_name must be a non-empty string, got {file_name!r}"
+                )
+    return errors
+
+
+def _report_coco_shape_errors(annotation_file: str, errors: list) -> None:
+    print(f"ERROR: {annotation_file} has malformed COCO entries:")
+    for error in errors:
+        print(f"  - {error}")
+
+
 def _write_json_atomically(payload: dict, destination: Path) -> None:
     """Write JSON via a same-directory temp file + os.replace.
 
@@ -187,6 +235,13 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
     with train_annotations_path.open("r", encoding="utf-8") as fh:
         train_annotations = json.load(fh)
 
+    # Validate container shapes before any .get() chains dereference them —
+    # a null/non-object entry must fail with a named error, not a traceback.
+    shape_errors = _coco_shape_errors(train_annotations)
+    if shape_errors:
+        _report_coco_shape_errors(SPLIT_MARKERS["train"][1], shape_errors)
+        return 1
+
     categories = train_annotations.get("categories", [])
     classes = []
     seen_labels = set()
@@ -215,6 +270,13 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
     for split_name, (image_dir, annotation_file) in SPLIT_MARKERS.items():
         with (input_dir / annotation_file).open("r", encoding="utf-8") as fh:
             coco = json.load(fh)
+        # Same shape guard for every split's file (train's re-load included)
+        # BEFORE the category-map comparison and sample building below
+        # iterate/dereference its categories and images entries.
+        shape_errors = _coco_shape_errors(coco)
+        if shape_errors:
+            _report_coco_shape_errors(annotation_file, shape_errors)
+            return 1
         if split_name != "train":
             mismatches = _category_map_mismatches(train_categories, _category_id_names(coco))
             if mismatches:
@@ -228,10 +290,8 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
                 return 1
         samples = []
         for image in coco.get("images", []):
-            file_name = image.get("file_name")
-            if not file_name:
-                continue
-            samples.append({"image": f"{image_dir}/{file_name}"})
+            # _coco_shape_errors above guarantees a non-empty file_name string.
+            samples.append({"image": f"{image_dir}/{image.get('file_name')}"})
         splits[split_name] = samples
         annotations[split_name] = annotation_file
 

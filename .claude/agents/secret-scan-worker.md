@@ -13,9 +13,11 @@ tripped it and produce a safe remediation plan.
 
 1. Resolve the PR base first — `gh pr view --json baseRefName` (or accept
    the base ref given directly in the spawning prompt); fall back to
-   `origin/dev` only if no PR/base can be resolved. Fetch it
-   (`git fetch origin <base>`) if missing locally, and use `origin/<base>`
-   consistently for every diff/log-opts scoping below.
+   `origin/dev` only if no PR/base can be resolved. Always run
+   `git fetch origin <base>` (unconditional refresh, not just when missing),
+   verify the remote-tracking ref exists afterward (`git rev-parse --verify
+   origin/<base>`), and use that freshly fetched `origin/<base>` consistently
+   for every diff/log-opts scoping below.
 2. Reproduce/inspect: read the CI log the orchestrator gives you, or run
    `gitleaks detect --source . -v` (working tree) and
    `gitleaks detect --log-opts="origin/<base>..HEAD" -v` (branch history) if

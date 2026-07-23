@@ -9,15 +9,26 @@
  *   - guardrail checks (branch, gh auth, PR ↔ branch match)
  *   - fetches the latest-review findings via codex:summary --latest-only
  *   - decides the cycle status:
- *       STATUS: READY_FOR_HUMAN_MERGE     (no latest-review findings; for ML
- *                                          PRs, only with a valid ML-gates
- *                                          attestation file for the head)
+ *       STATUS: READY_FOR_HUMAN_MERGE     (Codex is clean on the head AND
+ *                                          GitHub checks all pass AND the PR
+ *                                          is mergeable; for ML PRs, also a
+ *                                          valid ML-gates attestation file
+ *                                          for the head)
  *       STATUS: ML_SAFETY_GATES_REQUIRED  (ML PR is Codex-clean but no valid
  *                                          attestation file exists at
  *                                          .tmp/codex-ml-gates-pr-<PR>-<HEAD>.json)
  *       STATUS: CLAUDE_FIX_REQUIRED       (findings saved for Claude to fix)
  *       STATUS: WAITING_FOR_CODEX_REVIEW  (latest Codex review predates the
  *                                          PR head — stop, wait for Codex)
+ *       STATUS: LOCAL_HEAD_MISMATCH       (local HEAD is not the PR head —
+ *                                          sync the branch before any gates
+ *                                          or attestations run)
+ *       STATUS: PR_NOT_MERGEABLE          (GitHub reports merge conflicts —
+ *                                          resolve them first)
+ *       STATUS: GITHUB_CHECKS_FAILED      (a GitHub check run/context failed)
+ *       STATUS: GITHUB_CHECKS_REQUIRED    (GitHub checks pending or not
+ *                                          reporting — absence of checks is
+ *                                          never treated as success)
  *     A clean Codex re-review arrives as a "didn't find any major issues"
  *     PR comment (no formal review is created), so the freshness check also
  *     accepts a clean-verdict comment that names the current head commit —
@@ -51,6 +62,11 @@
  *   --allow-dirty            proceed despite uncommitted changes (default:
  *                            a dirty tree is a hard stop)
  *
+ * READY_FOR_HUMAN_MERGE therefore means ALL of: Codex is clean on the
+ * current head, the local HEAD equals the PR head, every GitHub check
+ * (CI, secret scanning, ...) reports success, the PR is mergeable, and —
+ * for ML PRs — a valid ML-gates attestation exists for the head.
+ *
  * ML PRs and READY_FOR_HUMAN_MERGE: instead of a trust-me flag, the
  * orchestrator must run the four ML safety gates (dataset-safety-worker,
  * ml-pipeline-reviewer, vision-event-contract-worker, final-reviewer)
@@ -58,21 +74,21 @@
  * .tmp/codex-ml-gates-pr-<PR>-<HEAD_SHA>.json recording each gate as "PASS".
  * This script verifies the file (PR number, exact head SHA, timestamp, all
  * four gates) before reporting READY_FOR_HUMAN_MERGE; an attestation for a
- * different SHA is ignored.
+ * different SHA is ignored. Attestations must only ever be created while
+ * the local HEAD equals the PR head — the script hard-stops with
+ * LOCAL_HEAD_MISMATCH before any gate/attestation logic otherwise.
  */
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+// Exact allow-list of Codex review bot logins (shared with
+// codex-review-summary.mjs). A clean-verdict PR comment counts ONLY if its
+// author login is strictly equal to one of these — substring matches
+// (e.g. 'codex-reviewer-user') are untrusted and ignored.
+import { CODEX_BOT_LOGINS } from './codex-bot-logins.mjs';
 
 const PROTECTED_BRANCHES = new Set(['main', 'dev']);
 const FINDINGS_FILE = path.join('.tmp', 'codex-latest-findings.md');
-// Exact allow-list of Codex review bot logins. A clean-verdict PR comment
-// counts ONLY if its author login is strictly equal to one of these —
-// substring matches (e.g. 'codex-reviewer-user') are untrusted and ignored.
-const CODEX_BOT_LOGINS = new Set([
-  'chatgpt-codex-connector',
-  'chatgpt-codex-connector[bot]',
-]);
 const ML_KEYWORDS =
   /(^|[^a-z0-9])(phase8|ml|training|dataset|cv-training)(?=[^a-z0-9]|$)/i;
 // Paths whose presence in the PR diff marks it as an ML PR: the ml/
@@ -225,6 +241,11 @@ function printMlGatesRequired(prNumber, headSha) {
     '  Note: after any new push the head SHA changes, the old attestation ' +
       'is ignored, and the gates must be re-run against the new head.',
   );
+  console.log(
+    '  Note: gates inspect the LOCAL checkout, so an attestation may only ' +
+      'be created while the local HEAD equals the PR head — this script ' +
+      'verifies that and stops with LOCAL_HEAD_MISMATCH otherwise.',
+  );
 }
 
 function printMlGatesAttested(attestation) {
@@ -233,6 +254,145 @@ function printMlGatesAttested(attestation) {
       `PASS for this head by ${attestation.file} ` +
       `(created ${attestation.createdAt}).`,
   );
+}
+
+// --- GitHub merge-readiness gate ---------------------------------------
+// READY_FOR_HUMAN_MERGE must never be reported while GitHub itself says the
+// PR cannot merge cleanly: conflicts, failed checks, or checks that have
+// not (yet) reported. Absence of checks is never treated as success.
+
+// Outcomes that mean a check failed outright. CheckRun entries report a
+// `conclusion`; classic StatusContext entries report a `state`.
+const CHECK_FAILURE_OUTCOMES = new Set([
+  'FAILURE',
+  'ERROR',
+  'CANCELLED',
+  'TIMED_OUT',
+  'ACTION_REQUIRED',
+]);
+// Outcomes that count as a completed, passing check.
+const CHECK_SUCCESS_OUTCOMES = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED']);
+
+function checkNameOf(entry) {
+  return entry?.name || entry?.context || '(unnamed check)';
+}
+
+// Evaluates a `gh pr view --json statusCheckRollup` array. Returns
+// { failed: [...names], pending: [...names] }; both empty means every
+// check completed successfully. A missing/empty rollup is reported as
+// pending — checks that are not reporting are NOT a pass.
+function evaluateStatusCheckRollup(rollup) {
+  const failed = [];
+  const pending = [];
+  if (!Array.isArray(rollup) || rollup.length === 0) {
+    pending.push('(no GitHub checks reported on the PR head)');
+    return { failed, pending };
+  }
+  for (const entry of rollup) {
+    const outcome = String(entry?.conclusion ?? entry?.state ?? '')
+      .trim()
+      .toUpperCase();
+    if (CHECK_SUCCESS_OUTCOMES.has(outcome)) continue;
+    if (CHECK_FAILURE_OUTCOMES.has(outcome)) {
+      failed.push(checkNameOf(entry));
+    } else {
+      // PENDING/QUEUED/IN_PROGRESS/EXPECTED, an empty conclusion (still
+      // running), or anything unrecognized — treated as not-yet-passing.
+      pending.push(checkNameOf(entry));
+    }
+  }
+  return { failed, pending };
+}
+
+// Fetches FRESH mergeability + check data (a dedicated call right before
+// the ready decision, so earlier fetches cannot go stale) and returns null
+// when GitHub agrees the PR is merge-ready, otherwise { status, lines }
+// describing the blocking condition.
+function githubMergeGate(prNumber) {
+  const stateJson = runOrFail(
+    'gh',
+    [
+      'pr',
+      'view',
+      String(prNumber),
+      '--json',
+      'mergeable,mergeStateStatus,statusCheckRollup',
+    ],
+    `Could not read GitHub merge state for PR #${prNumber}`,
+  );
+  let state;
+  try {
+    state = JSON.parse(stateJson);
+  } catch {
+    fail(
+      `Could not parse GitHub merge state for PR #${prNumber} — refusing ` +
+        'to report READY_FOR_HUMAN_MERGE without it.',
+    );
+  }
+  const mergeable = String(state.mergeable ?? '').trim().toUpperCase();
+  if (mergeable === 'CONFLICTING') {
+    return {
+      status: 'PR_NOT_MERGEABLE',
+      lines: [
+        `GitHub reports merge conflicts on PR #${prNumber} ` +
+          `(mergeable: CONFLICTING, mergeStateStatus: ` +
+          `${state.mergeStateStatus ?? 'unknown'}).`,
+        'Resolve the conflicts (merge/rebase the base branch into this ' +
+          'feature branch and push), wait for checks, then re-run this ' +
+          'script. READY_FOR_HUMAN_MERGE is withheld until the PR is ' +
+          'mergeable.',
+      ],
+    };
+  }
+  const { failed, pending } = evaluateStatusCheckRollup(
+    state.statusCheckRollup,
+  );
+  if (failed.length > 0) {
+    return {
+      status: 'GITHUB_CHECKS_FAILED',
+      lines: [
+        'GitHub checks FAILED on the PR head:',
+        ...failed.map((name) => `  - ${name}`),
+        'Fix the failing checks (CI, secret scanning, ...) and push before ' +
+          'this PR can be handed to human merge. Never bypass a failing ' +
+          'check.',
+      ],
+    };
+  }
+  if (pending.length > 0) {
+    return {
+      status: 'GITHUB_CHECKS_REQUIRED',
+      lines: [
+        'GitHub checks are pending or not reporting on the PR head ' +
+          '(absence of checks is never treated as success):',
+        ...pending.map((name) => `  - ${name}`),
+        'Wait for the checks to complete, then re-run this script.',
+      ],
+    };
+  }
+  if (mergeable !== 'MERGEABLE') {
+    // UNKNOWN (or anything unexpected): GitHub is still computing
+    // mergeability — treat like pending checks and re-check shortly.
+    return {
+      status: 'GITHUB_CHECKS_REQUIRED',
+      lines: [
+        `GitHub has not finished computing mergeability for PR ` +
+          `#${prNumber} (mergeable: ${mergeable || 'UNKNOWN'}).`,
+        'This usually resolves within seconds — re-run this script shortly.',
+      ],
+    };
+  }
+  return null;
+}
+
+function printMergeGateBlocked(gate) {
+  console.log(`STATUS: ${gate.status}`);
+  console.log('');
+  console.log(
+    'Codex is clean on the current head, but GitHub does not agree the PR ' +
+      'is merge-ready:',
+  );
+  for (const line of gate.lines) console.log(line);
 }
 
 const USAGE =
@@ -244,10 +404,16 @@ const USAGE =
   '  --wait-seconds <n>   suggested Codex recheck wait (default 90)\n' +
   '  --allow-dirty        proceed despite uncommitted changes\n' +
   '\n' +
+  'READY_FOR_HUMAN_MERGE requires ALL of: Codex clean on the current head,\n' +
+  'local HEAD equal to the PR head (else LOCAL_HEAD_MISMATCH), all GitHub\n' +
+  'checks green (else GITHUB_CHECKS_FAILED / GITHUB_CHECKS_REQUIRED), and\n' +
+  'a mergeable PR (else PR_NOT_MERGEABLE).\n' +
+  '\n' +
   'ML PRs: READY_FOR_HUMAN_MERGE additionally requires a valid attestation\n' +
   'file at .tmp/codex-ml-gates-pr-<PR>-<HEAD_SHA>.json, written by the\n' +
   'orchestrator only after all four ML safety gates pass on the current\n' +
-  'head (the script prints the exact path and shape when it is missing).';
+  'head with local HEAD == PR head (the script prints the exact path and\n' +
+  'shape when it is missing).';
 
 function parseArgs(argv) {
   const args = {
@@ -444,6 +610,48 @@ function main() {
     );
   }
 
+  // --- Local HEAD ↔ PR head guard --------------------------------------
+  // Safety gates and ML attestations inspect the LOCAL checkout, but every
+  // attestation (and READY decision) is bound to the PR head SHA
+  // (pr.headRefOid). If the local branch is ahead of or behind the PR head,
+  // the gates would run against a commit that is not what GitHub merges —
+  // hard stop before ANY findings/ready/attestation logic. Attestations
+  // must only ever be created when local HEAD equals the PR head.
+  const headSha = typeof pr.headRefOid === 'string' ? pr.headRefOid : '';
+  const localHead = runOrFail(
+    'git',
+    ['rev-parse', 'HEAD'],
+    'Could not read the local HEAD SHA',
+  ).trim();
+  if (headSha !== '' && localHead !== headSha) {
+    console.log(`Branch: ${branch}`);
+    console.log(`PR: #${pr.number} (${pr.url})`);
+    console.log('');
+    console.log('STATUS: LOCAL_HEAD_MISMATCH');
+    console.log('');
+    console.log(`Local HEAD: ${localHead}`);
+    console.log(`PR head:    ${headSha}`);
+    console.log(
+      'The local checkout does not match the PR head, so safety gates and ' +
+        'attestations would run against the wrong commit. Nothing was ' +
+        'checked and no status decision was made.',
+    );
+    console.log(
+      'Sync your local branch to the PR head before running gates:',
+    );
+    console.log('  git fetch origin');
+    console.log(
+      `  git pull --ff-only origin ${branch}   ` +
+        `(or: git reset --hard ${headSha} if the remote is authoritative)`,
+    );
+    console.log(
+      'This script never resets your branch automatically. If the local ' +
+        'branch is AHEAD (unpushed commits), push it instead so the PR head ' +
+        'advances, then re-run this script.',
+    );
+    return;
+  }
+
   // --- Fetch latest-review findings ------------------------------------
   const summaryResult = run('node', [
     path.join('scripts', 'codex-review-summary.mjs'),
@@ -485,7 +693,6 @@ function main() {
   const reviewSha = reviewShaMatch ? reviewShaMatch[1] : null;
   const reviewSubmittedAtMs =
     reviewShaMatch && reviewShaMatch[2] ? Date.parse(reviewShaMatch[2]) : NaN;
-  const headSha = typeof pr.headRefOid === 'string' ? pr.headRefOid : '';
   const reviewCoversHead =
     headSha === ''
       ? true // cannot compare — do not block, but say so below
@@ -596,6 +803,14 @@ function main() {
       ? readMlGatesAttestation(pr.number, headSha)
       : null;
     const mlGatesPending = isMlPr && attestation === null;
+    // Fresh GitHub mergeability/check gate — evaluated immediately before
+    // READY can be printed. ML_SAFETY_GATES_REQUIRED prints first and is
+    // unaffected by it.
+    const mergeGate = mlGatesPending ? null : githubMergeGate(pr.number);
+    if (mergeGate) {
+      printMergeGateBlocked(mergeGate);
+      return;
+    }
     console.log(
       mlGatesPending
         ? 'STATUS: ML_SAFETY_GATES_REQUIRED'
@@ -621,6 +836,9 @@ function main() {
     if (isMlPr) {
       printMlGatesAttested(attestation);
     }
+    console.log(
+      'GitHub agrees: all checks green and the PR is mergeable.',
+    );
     console.log(
       'Next step is HUMAN-ONLY: review the PR and merge it manually. ' +
         'Nothing here merges automatically.',
@@ -651,6 +869,14 @@ function main() {
       ? readMlGatesAttestation(pr.number, headSha)
       : null;
     const mlGatesPending = isMlPr && attestation === null;
+    // Fresh GitHub mergeability/check gate — evaluated immediately before
+    // READY can be printed. ML_SAFETY_GATES_REQUIRED prints first and is
+    // unaffected by it.
+    const mergeGate = mlGatesPending ? null : githubMergeGate(pr.number);
+    if (mergeGate) {
+      printMergeGateBlocked(mergeGate);
+      return;
+    }
     console.log(
       mlGatesPending
         ? 'STATUS: ML_SAFETY_GATES_REQUIRED'
@@ -671,6 +897,9 @@ function main() {
     if (isMlPr) {
       printMlGatesAttested(attestation);
     }
+    console.log(
+      'GitHub agrees: all checks green and the PR is mergeable.',
+    );
     console.log(
       'Next step is HUMAN-ONLY: review the PR and merge it manually. ' +
         'Nothing here merges automatically.',

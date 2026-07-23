@@ -67,13 +67,19 @@ pnpm run codex:auto-loop -- --pr 2 --no-push       # stop before push/comment
 ```
 
 STATUS meanings:
-- `READY_FOR_HUMAN_MERGE` — no active latest-review findings; the human
+- `READY_FOR_HUMAN_MERGE` — Codex is clean on the current head AND the
+  helper verified, fresh from GitHub immediately before the decision, that
+  the local HEAD equals the PR head, every GitHub check (CI, secret
+  scanning, ...) reports success, and the PR is mergeable. READY therefore
+  means: Codex clean + (ML PR ⇒ valid attestation AND local HEAD == PR
+  head) + CI success + secret scanning success + mergeable. The human
   reviews the PR and merges manually. Nothing ever merges automatically.
   For ML PRs this status only appears when a valid ML-gates attestation
   file exists for the current head (see `ML_SAFETY_GATES_REQUIRED` below).
   Clean-verdict comments count only from the exact Codex bot login
-  (`chatgpt-codex-connector` / `chatgpt-codex-connector[bot]` — no
-  substring matching), and the newest Codex verdict always wins: a formal
+  (`chatgpt-codex-connector` / `chatgpt-codex-connector[bot]`, the shared
+  exact allowlist in `scripts/codex-bot-logins.mjs` — no substring
+  matching), and the newest Codex verdict always wins: a formal
   review that is newer than a clean comment on the same head supersedes it,
   so an older clean comment can never override newer active findings.
 - `ML_SAFETY_GATES_REQUIRED` — Codex findings are clean (clean-verdict
@@ -98,6 +104,23 @@ STATUS meanings:
   an older commit. Nothing is written; wait for Codex to re-review, then
   re-run. This is what a re-run prints in the window right after a fix
   cycle pushes.
+- `LOCAL_HEAD_MISMATCH` — the local checkout's HEAD is not the PR head
+  (`headRefOid`). Safety gates and ML attestations inspect the local
+  checkout, so they must only run — and an attestation must only be
+  written — while local HEAD equals the PR head. Sync your local branch to
+  the PR head before running gates (`git fetch origin` + fast-forward
+  pull, or push local commits so the PR head advances); the helper never
+  resets the branch automatically and makes no other status decision.
+- `PR_NOT_MERGEABLE` — GitHub reports merge conflicts
+  (`mergeable: CONFLICTING`). Resolve the conflicts on the feature branch
+  and push before the PR can be handed to human merge.
+- `GITHUB_CHECKS_FAILED` — one or more GitHub checks (CI, secret
+  scanning, ...) failed on the PR head; the helper lists the failing
+  checks. Fix and push — never bypass a failing check.
+- `GITHUB_CHECKS_REQUIRED` — GitHub checks are pending or not reporting on
+  the PR head, or GitHub is still computing mergeability
+  (`mergeable: UNKNOWN`). Absence of checks is never treated as success;
+  wait for them to complete and re-run shortly.
 
 Note on clean re-reviews: when Codex finds nothing, it does NOT submit a
 formal review — it posts a "Didn't find any major issues" PR comment naming
@@ -303,8 +326,12 @@ review + green CI) enforces the last step regardless of tooling.
 `scripts/codex-review-summary.mjs` queries the GitHub GraphQL
 `reviewThreads` API through `gh api graphql` and:
 
-- keeps only threads whose **first comment author login contains `codex`**
-  (e.g. `chatgpt-codex-connector`);
+- keeps only threads whose **first comment author login is exactly one of
+  the allowlisted Codex bot logins** (`chatgpt-codex-connector` /
+  `chatgpt-codex-connector[bot]`, shared with the auto-loop helper via
+  `scripts/codex-bot-logins.mjs`) — never substring matching, so a
+  lookalike login cannot inject findings or become the "latest Codex
+  review";
 - treats threads that are **unresolved and not outdated** as active, and
   groups them by `P1`/`P2`/`P3` markers found in the comment body
   (unmarked findings land in an "Unprioritized" bucket);
