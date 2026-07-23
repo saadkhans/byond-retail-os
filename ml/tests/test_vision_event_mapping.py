@@ -419,6 +419,66 @@ class ValidationErrorTests(unittest.TestCase):
         self.assertIn("eventType is required and must be a non-empty string", str(ctx.exception))
 
 
+class ErrorMessageRedactionTests(unittest.TestCase):
+    """Validation errors must never echo user-supplied string values: a
+    malformed input may carry credential- or payment-bearing content, and
+    callers may log str(exception) verbatim. Messages name only the field
+    and the expected shape/constraint."""
+
+    def test_malformed_timestamp_error_does_not_echo_value(self) -> None:
+        marker = "SECRETMARKER-not-a-timestamp"
+        for field in ("occurredAt", "captureStartedAt", "captureEndedAt"):
+            with self.subTest(field=field):
+                inference = _base_inference()
+                inference[field] = marker
+                with self.assertRaises(ValueError) as ctx:
+                    to_vision_event(inference)
+                message = str(ctx.exception)
+                self.assertIn(f"{field} must be a timezone-aware ISO-8601 timestamp", message)
+                self.assertNotIn(marker, message)
+                self.assertNotIn("SECRETMARKER", message)
+
+    def test_sensitive_idempotency_key_rejection_does_not_echo_pan(self) -> None:
+        inference = _base_inference()
+        inference["idempotencyKey"] = "4111111111111111"
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertIn("idempotencyKey", message)
+        self.assertNotIn("4111111111111111", message)
+        self.assertNotIn("4111", message)
+
+    def test_invalid_event_type_error_does_not_echo_value(self) -> None:
+        inference = _base_inference()
+        inference["eventType"] = "BOGUS_EVENT_MARKER_ZZZ"
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertIn("eventType must be one of", message)
+        self.assertNotIn("BOGUS_EVENT_MARKER_ZZZ", message)
+
+    def test_non_string_event_type_error_does_not_echo_value(self) -> None:
+        inference = _base_inference()
+        inference["eventType"] = ["LISTMARKER_QQQ"]
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertIn("eventType is required and must be a non-empty string", message)
+        self.assertNotIn("LISTMARKER_QQQ", message)
+
+    def test_overlong_sku_error_does_not_echo_sku(self) -> None:
+        marker = "QQSKUMARKERQQ"
+        overlong_sku = marker + "S" * 100  # 113 chars > MaxLength(100)
+        inference = _base_inference()
+        inference["detections"] = [{"sku": overlong_sku, "confidence": 0.5}]
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertIn("detections[0].sku", message)
+        self.assertIn("100", message)
+        self.assertNotIn(marker, message)
+
+
 class SensitiveValueScreeningTests(unittest.TestCase):
     """Producer-side mirror of the API's assertOpaque/containsSensitiveValue:
     opaque fields must never carry credential- or payment-bearing content."""

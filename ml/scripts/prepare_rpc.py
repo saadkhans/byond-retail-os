@@ -116,10 +116,12 @@ def _coco_shape_errors(coco) -> list:
     """Controlled shape errors for the COCO fields this script dereferences.
 
     Every `categories` / `images` entry the preparation below calls .get()
-    on must already be a dict with correctly-typed fields (`id` a non-bool
-    int and `name` a non-empty string for categories; `file_name` a
-    non-empty string for images), so a malformed annotation file produces
-    named errors instead of AttributeError tracebacks.
+    on must already be a dict with correctly-typed fields (`id` a
+    non-negative non-bool int and `name` a non-empty string for categories;
+    `file_name` a non-empty string for images), so a malformed annotation
+    file produces named errors instead of AttributeError tracebacks. A
+    negative `id` is rejected here because sourceId must be >= 0 in the
+    manifest — letting it through would drop the class's source mapping.
     """
     if not isinstance(coco, dict):
         return [f"top-level payload must be a JSON object, got {type(coco).__name__}"]
@@ -133,8 +135,14 @@ def _coco_shape_errors(coco) -> list:
                 errors.append(f"categories[{idx}] must be an object, got {category!r}")
                 continue
             category_id = category.get("id")
-            if isinstance(category_id, bool) or not isinstance(category_id, int):
-                errors.append(f"categories[{idx}].id must be an integer, got {category_id!r}")
+            if (
+                isinstance(category_id, bool)
+                or not isinstance(category_id, int)
+                or category_id < 0
+            ):
+                errors.append(
+                    f"categories[{idx}].id must be a non-negative integer, got {category_id!r}"
+                )
             name = category.get("name")
             if not isinstance(name, str) or not name:
                 errors.append(f"categories[{idx}].name must be a non-empty string, got {name!r}")
@@ -250,15 +258,12 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
         if label in seen_labels:
             label = f"{label}-{idx}"
         seen_labels.add(label)
-        entry = {"classId": idx, "label": label}
         # The COCO annotation files reference categories by their original
         # `id`, which need not match the contiguous training index. Preserve
         # it as sourceId so consumers joining annotations by category id do
-        # not mislabel classes.
-        source_id = category.get("id")
-        if isinstance(source_id, int) and not isinstance(source_id, bool) and source_id >= 0:
-            entry["sourceId"] = source_id
-        classes.append(entry)
+        # not mislabel classes. _coco_shape_errors above already guarantees
+        # a non-negative non-bool int id, so it is always emitted.
+        classes.append({"classId": idx, "label": label, "sourceId": category["id"]})
 
     # The annotation files reference categories by id; a val/test file whose
     # id -> name mapping differs from training's would silently mislabel

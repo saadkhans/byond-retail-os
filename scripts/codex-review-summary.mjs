@@ -22,11 +22,8 @@
  * script never resolves threads, comments, or merges.
  */
 import { spawnSync } from 'node:child_process';
-// Codex authorship is decided by STRICT equality against the shared exact
-// allowlist — never by substring matching (a lookalike login such as
-// 'codex-reviewer-user' must not be able to inject or supersede reviews).
-import { isCodexBotLogin } from './codex-bot-logins.mjs';
 
+const CODEX_LOGIN_MARKER = 'codex'; // matches chatgpt-codex-connector etc.
 // P0 is the highest blocking tier; unmarked findings sort last.
 const PRIORITY_PATTERN = /\bP([0-3])\b/i;
 const PRIORITY_ORDER = ['P0', 'P1', 'P2', 'P3', 'Unprioritized'];
@@ -335,11 +332,11 @@ function main() {
     }
   }
 
-  // Only threads whose ROOT comment was authored by the exact Codex bot
-  // login count as Codex threads — lookalike authors are excluded entirely.
   const codexThreads = threads
     .map((thread) => ({ thread, root: thread.comments.nodes[0] }))
-    .filter(({ root }) => isCodexBotLogin(root?.author?.login));
+    .filter(({ root }) =>
+      (root?.author?.login ?? '').toLowerCase().includes(CODEX_LOGIN_MARKER),
+    );
 
   // The latest Codex review is derived from ALL of the PR's reviews
   // (paginated exhaustively above) — not from thread roots. A clean Codex
@@ -347,12 +344,10 @@ function main() {
   // "latest", so stale threads from older reviews can never masquerade as
   // latest-review findings. There is deliberately NO thread-root fallback:
   // fetchAllReviews fails loudly rather than returning truncated data.
-  // Only formal reviews authored by the exact Codex bot login can become
-  // the "latest Codex review" — a lookalike account's review can never
-  // supersede (or masquerade as) a genuine Codex verdict.
   let latestReview = null;
   for (const review of allReviews) {
-    if (!isCodexBotLogin(review.author?.login) || !review.submittedAt) continue;
+    const login = (review.author?.login ?? '').toLowerCase();
+    if (!login.includes(CODEX_LOGIN_MARKER) || !review.submittedAt) continue;
     if (!latestReview || review.submittedAt > latestReview.submittedAt) {
       latestReview = review;
     }

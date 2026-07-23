@@ -365,22 +365,25 @@ _ISO8601_STRICT = re.compile(
 
 
 def _parse_iso8601(name: str, value: str) -> datetime.datetime:
+    # Timestamp errors never echo the supplied value: a malformed "timestamp"
+    # may be an arbitrary string (even a secret pasted into the wrong field),
+    # and the raised message may end up in caller logs.
     if not _ISO8601_STRICT.fullmatch(value):
         raise ValueError(
             f"{name} must be a timezone-aware ISO-8601 timestamp shaped "
-            f"YYYY-MM-DDTHH:MM:SS[.fff](Z|+HH:MM|-HH:MM), got {value!r}"
+            "YYYY-MM-DDTHH:MM:SS[.fff](Z|+HH:MM|-HH:MM)"
         )
     # .replace keeps trailing-Z inputs parseable on Python < 3.11.
     try:
         parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
-        raise ValueError(f"{name} must be an ISO-8601 timestamp string, got {value!r}") from None
+        raise ValueError(f"{name} must be an ISO-8601 timestamp string") from None
     if parsed.tzinfo is None:
         # An offset-less stamp would be emitted verbatim and the API's
         # `new Date()` would interpret it in server-local time, silently
         # shifting stored event times — so reject rather than normalize.
         raise ValueError(
-            f"{name} must be a timezone-aware ISO-8601 timestamp (include an offset or 'Z'), got {value!r}"
+            f"{name} must be a timezone-aware ISO-8601 timestamp (include an offset or 'Z')"
         )
     return parsed
 
@@ -402,29 +405,32 @@ def to_vision_event(inference: dict) -> dict:
     if not isinstance(inference, dict):
         raise ValueError("inference output must be an object")
 
+    # Error messages below never echo user-supplied string values: malformed
+    # input can carry credential-/payment-bearing content, and callers may log
+    # the raised message verbatim. Errors name the field and the expected
+    # shape/constraint only.
     source_type = inference.get("sourceType", "VISION")
     if source_type != "VISION":
-        raise ValueError(f"sourceType must be 'VISION' for vision model inference, got {source_type!r}")
+        raise ValueError("sourceType must be 'VISION' for vision model inference")
 
     event_type = inference.get("eventType")
     # isinstance guard first: a non-string (list/dict/...) must be a clear
     # ValueError, not a TypeError from the frozenset membership test below.
     if not isinstance(event_type, str) or not event_type:
-        raise ValueError(f"eventType is required and must be a non-empty string, got {event_type!r}")
+        raise ValueError("eventType is required and must be a non-empty string")
     if event_type not in EVENT_TYPES:
-        raise ValueError(f"eventType must be one of {sorted(EVENT_TYPES)}, got {event_type!r}")
+        raise ValueError(f"eventType must be one of {sorted(EVENT_TYPES)}")
 
     if "quantityDelta" not in inference:
         raise ValueError("quantityDelta is required")
     quantity_delta = inference["quantityDelta"]
     if not isinstance(quantity_delta, int) or isinstance(quantity_delta, bool):
-        raise ValueError(f"quantityDelta must be an integer, got {quantity_delta!r}")
+        # No value echo: the supplied object may be an arbitrary string/list.
+        raise ValueError("quantityDelta must be an integer")
     if quantity_delta == 0:
         raise ValueError("quantityDelta must not be zero")
     if quantity_delta < 0 and event_type != "PRODUCT_RETURN":
-        raise ValueError(
-            f"negative quantityDelta is only valid with eventType PRODUCT_RETURN, got eventType {event_type!r}"
-        )
+        raise ValueError("negative quantityDelta is only valid with eventType PRODUCT_RETURN")
     if quantity_delta > 0 and event_type == "PRODUCT_RETURN":
         raise ValueError("PRODUCT_RETURN requires a negative quantityDelta, got a positive value")
     quantity = abs(quantity_delta)

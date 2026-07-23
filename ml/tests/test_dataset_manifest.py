@@ -697,6 +697,67 @@ class PrepareByondStagingTests(unittest.TestCase):
             self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
 
 
+class PrepareByondSplitAnnotationTests(unittest.TestCase):
+    """Top-level annotations.train/val/test refs in a byond-custom manifest
+    must live under 'annotations/', exactly like per-sample annotation
+    paths — otherwise a manifest could point a whole split's annotations
+    outside the annotations/ subtree."""
+
+    def _byond_manifest(self, **overrides) -> dict:
+        manifest = {
+            "datasetName": "byond-store",
+            "datasetVersion": "1.0.0",
+            "source": "byond-custom",
+            "licenseNotes": "Internal BYOND store captures.",
+            "classes": [{"classId": 0, "label": "cola-330", "sku": "SKU-1"}],
+            "splits": {
+                "train": [{"image": "raw/shelves/a.jpg", "annotation": "annotations/a.json"}],
+                "val": [],
+                "test": [],
+            },
+        }
+        manifest.update(overrides)
+        return manifest
+
+    def _run(self, manifest: dict, extra_files: tuple = ()) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_dir = Path(tmp) / "input"
+            (input_dir / "raw" / "shelves").mkdir(parents=True)
+            (input_dir / "annotations").mkdir()
+            (input_dir / "raw" / "shelves" / "a.jpg").touch()
+            (input_dir / "annotations" / "a.json").write_text("{}", encoding="utf-8")
+            for rel in extra_files:
+                extra = input_dir / rel
+                extra.parent.mkdir(parents=True, exist_ok=True)
+                extra.write_text("{}", encoding="utf-8")
+            (input_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            return _run_script("prepare_byond_dataset.py", ["--input", str(input_dir)])
+
+    def test_split_annotation_under_annotations_accepted(self) -> None:
+        manifest = self._byond_manifest(annotations={"train": "annotations/train.json"})
+        result = self._run(manifest, extra_files=("annotations/train.json",))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_split_annotation_outside_annotations_rejected(self) -> None:
+        # The referenced file exists (so check_files stays quiet) — the BYOND
+        # layout constraint alone must reject it.
+        manifest = self._byond_manifest(annotations={"val": "raw/labels.json"})
+        result = self._run(manifest, extra_files=("raw/labels.json",))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("annotations.val must live under 'annotations/'", result.stdout)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+    def test_split_annotation_parent_traversal_rejected(self) -> None:
+        # The base validator's path rules already reject '..' traversal; the
+        # guarantee here is a controlled validation error, never a traceback.
+        manifest = self._byond_manifest(annotations={"test": "../outside.json"})
+        result = self._run(manifest)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ERROR", result.stdout)
+        self.assertIn("annotations.test", result.stdout)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+
 class PrepareByondSourceRootContainmentTests(unittest.TestCase):
     """A manifest-supplied sourceRoot must resolve inside the dataset
     directory — a root escaping via '..', an absolute path, or an in-dir
@@ -1112,6 +1173,45 @@ class RpcCocoShapeGuardTests(unittest.TestCase):
             self._assert_controlled_error(
                 result, out, "instances_train2019.json", "images[1] must be an object"
             )
+
+    def test_negative_category_id_reports_error_not_traceback(self) -> None:
+        # A negative COCO category id would fail the manifest's sourceId >= 0
+        # rule (or, previously, silently drop the class's source mapping), so
+        # the shape guard must reject it up front with a named error.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp),
+                train_categories=[
+                    {"id": -1, "name": "Cola 330"},
+                    {"id": 3, "name": "Chips 50"},
+                ],
+            )
+            self._assert_controlled_error(
+                result,
+                out,
+                "instances_train2019.json",
+                "categories[0].id must be a non-negative integer",
+            )
+
+    def test_negative_category_id_in_val_reports_error_not_traceback(self) -> None:
+        # Shape errors must be checked BEFORE the category-map comparison —
+        # the unvalidated val entry must produce the named shape error, not
+        # reach the map-mismatch path (or a traceback).
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp),
+                val_categories=[
+                    {"id": -1, "name": "Cola 330"},
+                    {"id": 3, "name": "Chips 50"},
+                ],
+            )
+            self._assert_controlled_error(
+                result,
+                out,
+                "instances_val2019.json",
+                "categories[0].id must be a non-negative integer",
+            )
+            self.assertNotIn("categories do not match", result.stdout)
 
     def test_image_missing_file_name_reports_error_not_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

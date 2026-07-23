@@ -119,6 +119,7 @@ def _print_plan(input_dir: str, output_dir) -> None:
     print("    4. enforce every class has a sku matching the tenant SKU pattern")
     print("    5. enforce every sample's captureContext (if present) is a known stage")
     print("    6. enforce every image path starts with 'raw/' and annotation with 'annotations/'")
+    print("       (split-level annotations.train/val/test refs included)")
     print("  if --output is given, the validated manifest is staged to <output>/manifest.json")
     print("  with sourceRoot recomputed so references still resolve to the input dataset")
     print("  (media is never copied)")
@@ -139,6 +140,19 @@ def _extra_byond_checks(manifest: dict) -> list:
             sku = cls.get("sku")
             if not isinstance(sku, str) or not SKU_PATTERN.match(sku):
                 errors.append(f"classes[{idx}]: sku is required and must match the tenant SKU pattern, got {sku!r}")
+
+    # Split-level annotation refs (annotations.train/val/test) must obey the
+    # same BYOND layout constraint as per-sample annotation paths — without
+    # this, a byond-custom manifest could point a whole split's annotations
+    # outside the annotations/ subtree.
+    annotations = manifest.get("annotations")
+    if isinstance(annotations, dict):
+        for split_name in SPLIT_NAMES:
+            annotation = annotations.get(split_name)
+            if isinstance(annotation, str) and not annotation.startswith("annotations/"):
+                errors.append(
+                    f"annotations.{split_name} must live under 'annotations/', got {annotation!r}"
+                )
 
     splits = manifest.get("splits")
     if isinstance(splits, dict):
