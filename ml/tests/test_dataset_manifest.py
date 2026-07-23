@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -194,6 +196,50 @@ class FieldRuleTests(unittest.TestCase):
         manifest["splits"]["train"][0]["unexpected"] = True
         errors = validate_manifest(manifest)
         self.assertTrue(any("unexpected" in e for e in errors), errors)
+
+
+class SensitiveSkuScreeningTests(unittest.TestCase):
+    """A Luhn-valid payment-card number (or a known credential-token format)
+    matches SKU_PATTERN, but the VisionEvent mapper would reject it at
+    emission time — the manifest validator must reject it up front, and its
+    error must never echo the value."""
+
+    PAN_SKU = "4111111111111111"  # Luhn-valid test PAN; matches SKU_PATTERN.
+
+    def test_luhn_valid_pan_sku_rejected_without_echo(self) -> None:
+        self.assertIsNotNone(validate_dataset_manifest.SKU_PATTERN.match(self.PAN_SKU))
+        manifest = _valid_manifest()
+        manifest["classes"][0]["sku"] = self.PAN_SKU
+        errors = validate_manifest(manifest)
+        self.assertIn("classes[0].sku contains a sensitive-looking value", errors)
+        self.assertFalse(any(self.PAN_SKU in e for e in errors), errors)
+
+    def test_credential_token_sku_rejected_without_echo(self) -> None:
+        # AWS access-key-id format is uppercase alphanumeric, so it passes
+        # SKU_PATTERN and must be caught by the sensitive-value screen.
+        sku = "AKIAABCDEFGHIJKLMNOP"
+        self.assertIsNotNone(validate_dataset_manifest.SKU_PATTERN.match(sku))
+        manifest = _valid_manifest()
+        manifest["classes"][0]["sku"] = sku
+        errors = validate_manifest(manifest)
+        self.assertIn("classes[0].sku contains a sensitive-looking value", errors)
+        self.assertFalse(any(sku in e for e in errors), errors)
+
+    def test_normal_retail_sku_accepted(self) -> None:
+        manifest = _valid_manifest()
+        manifest["classes"][0]["sku"] = "COLA-330"
+        self.assertEqual(validate_manifest(manifest), [])
+
+    def test_cli_rejects_pan_sku_without_echoing_it(self) -> None:
+        manifest = _valid_manifest()
+        manifest["classes"][0]["sku"] = self.PAN_SKU
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = _run_script("validate_dataset_manifest.py", [str(manifest_path)])
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("contains a sensitive-looking value", result.stdout)
+            self.assertNotIn(self.PAN_SKU, result.stdout + result.stderr)
 
 
 class EnumTypeGuardTests(unittest.TestCase):
@@ -697,6 +743,105 @@ class PrepareByondStagingTests(unittest.TestCase):
             self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
 
 
+class PrepareByondStagingPolicyTests(unittest.TestCase):
+    """--output must never land a customer manifest (tenant/store ids, SKU
+    maps, capture labels) in a git-trackable path: outside the repository or
+    a gitignored in-repo location only."""
+
+    POLICY_TEXT = (
+        "staged custom manifests must go to a gitignored location or outside the repository"
+    )
+    # Strings from the fixture manifest that a rejection must never echo.
+    TENANT_STRINGS = ("byond-store", "cola-330", "SKU-1")
+
+    def _byond_manifest(self) -> dict:
+        return {
+            "datasetName": "byond-store",
+            "datasetVersion": "1.0.0",
+            "source": "byond-custom",
+            "licenseNotes": "Internal BYOND store captures.",
+            "classes": [{"classId": 0, "label": "cola-330", "sku": "SKU-1"}],
+            "splits": {
+                "train": [{"image": "raw/shelves/a.jpg", "annotation": "annotations/a.json"}],
+                "val": [],
+                "test": [],
+            },
+        }
+
+    def _write_input(self, input_dir: Path) -> None:
+        (input_dir / "raw" / "shelves").mkdir(parents=True)
+        (input_dir / "annotations").mkdir()
+        (input_dir / "raw" / "shelves" / "a.jpg").touch()
+        (input_dir / "annotations" / "a.json").write_text("{}", encoding="utf-8")
+        (input_dir / "manifest.json").write_text(
+            json.dumps(self._byond_manifest()), encoding="utf-8"
+        )
+
+    def _run_with_output(self, output_dir: Path) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_dir = Path(tmp) / "input"
+            input_dir.mkdir()
+            self._write_input(input_dir)
+            return _run_script(
+                "prepare_byond_dataset.py",
+                ["--input", str(input_dir), "--output", str(output_dir)],
+            )
+
+    def _require_repo_checkout(self) -> None:
+        if not (REPO_ROOT / ".git").exists():
+            self.skipTest("not running from a git checkout; staging policy is inert")
+
+    def test_output_outside_repository_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "out"
+            result = self._run_with_output(output_dir)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((output_dir / "manifest.json").exists())
+
+    def test_gitignored_in_repo_output_accepted(self) -> None:
+        self._require_repo_checkout()
+        output_dir = (
+            REPO_ROOT
+            / "ml"
+            / "datasets"
+            / "byond-custom"
+            / "processed"
+            / f"staging-policy-test-{uuid.uuid4().hex}"
+        )
+        # Record which ancestors we may create, so cleanup leaves the repo
+        # exactly as it was even when processed/ did not exist beforehand.
+        ancestors = (output_dir.parent, output_dir.parent.parent)
+        preexisting = {ancestor: ancestor.exists() for ancestor in ancestors}
+        try:
+            result = self._run_with_output(output_dir)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((output_dir / "manifest.json").exists())
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            for ancestor in ancestors:
+                if not preexisting[ancestor]:
+                    try:
+                        ancestor.rmdir()
+                    except OSError:
+                        pass
+
+    def test_tracked_in_repo_output_rejected_without_echoing_manifest(self) -> None:
+        self._require_repo_checkout()
+        unique = f"staged-test-{uuid.uuid4().hex}"
+        output_dir = REPO_ROOT / "ml" / unique
+        try:
+            result = self._run_with_output(output_dir)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(self.POLICY_TEXT, result.stdout)
+            self.assertIn(unique, result.stdout)
+            self.assertFalse(output_dir.exists())
+            combined = result.stdout + result.stderr
+            for tenant_string in self.TENANT_STRINGS:
+                self.assertNotIn(tenant_string, combined)
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+
 class PrepareByondSplitAnnotationTests(unittest.TestCase):
     """Top-level annotations.train/val/test refs in a byond-custom manifest
     must live under 'annotations/', exactly like per-sample annotation
@@ -870,7 +1015,7 @@ class PrepareRpcEndToEndTests(unittest.TestCase):
             image_dir = raw / f"{split}2019"
             image_dir.mkdir(parents=True, exist_ok=True)
             coco: dict = {
-                "images": [{"file_name": image_name}],
+                "images": [{"id": 1, "file_name": image_name}],
                 # Every split carries the same category map (as real RPC
                 # files do); prepare_rpc rejects any val/test drift from
                 # train. Non-contiguous COCO category ids on purpose: classId
@@ -879,6 +1024,13 @@ class PrepareRpcEndToEndTests(unittest.TestCase):
                 "categories": [
                     {"id": 7, "name": "Cola 330"},
                     {"id": 3, "name": "Chips 50"},
+                ],
+                # A small valid annotations array, like real RPC files carry:
+                # references must resolve against this file's image/category
+                # ids and the bbox must be 4 finite positive-size numbers.
+                "annotations": [
+                    {"image_id": 1, "category_id": 7, "bbox": [10, 20, 30, 40]},
+                    {"image_id": 1, "category_id": 3, "bbox": [5.5, 6.5, 7.5, 8.5]},
                 ],
             }
             (raw / f"instances_{split}2019.json").write_text(
@@ -1222,6 +1374,101 @@ class RpcCocoShapeGuardTests(unittest.TestCase):
                 "instances_train2019.json",
                 "images[0].file_name must be a non-empty string",
             )
+
+
+class RpcCocoAnnotationValidationTests(unittest.TestCase):
+    """prepare_rpc must validate each COCO file's `annotations` array (when
+    present) before writing the manifest: image_id/category_id must reference
+    known ids and bbox must be 4 finite numbers with positive width/height."""
+
+    CATEGORIES = [{"id": 7, "name": "Cola 330"}, {"id": 3, "name": "Chips 50"}]
+    IMAGE_NAMES = {"train": "t1.jpg", "val": "v1.jpg", "test": "e1.jpg"}
+
+    def _run_prepare(self, tmp: Path, train_annotations: list) -> tuple:
+        raw = tmp / "raw"
+        out = tmp / "out"
+        for split, image_name in self.IMAGE_NAMES.items():
+            image_dir = raw / f"{split}2019"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            coco: dict = {
+                "images": [{"id": 1, "file_name": image_name}],
+                "categories": list(self.CATEGORIES),
+            }
+            if split == "train":
+                coco["annotations"] = train_annotations
+            (raw / f"instances_{split}2019.json").write_text(
+                json.dumps(coco), encoding="utf-8"
+            )
+            (image_dir / image_name).write_text(f"pixels-{image_name}", encoding="utf-8")
+        result = _run_script(
+            "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+        )
+        return result, out
+
+    def _assert_rejected(self, result, out: Path, fragment: str) -> None:
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("instances_train2019.json", result.stdout)
+        self.assertIn(fragment, result.stdout)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertFalse((out / "manifest.json").exists())
+
+    def test_unknown_category_id_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), [{"image_id": 1, "category_id": 99, "bbox": [1, 2, 3, 4]}]
+            )
+            self._assert_rejected(
+                result, out, "annotations[0].category_id references an unknown category"
+            )
+
+    def test_unknown_image_id_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), [{"image_id": 42, "category_id": 7, "bbox": [1, 2, 3, 4]}]
+            )
+            self._assert_rejected(
+                result, out, "annotations[0].image_id references an unknown image"
+            )
+
+    def test_negative_bbox_width_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), [{"image_id": 1, "category_id": 7, "bbox": [1, 2, -3, 4]}]
+            )
+            self._assert_rejected(
+                result, out, "annotations[0].bbox must have positive width and height"
+            )
+
+    def test_nan_bbox_value_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp),
+                [{"image_id": 1, "category_id": 7, "bbox": [1, 2, float("nan"), 4]}],
+            )
+            self._assert_rejected(
+                result, out, "annotations[0].bbox values must be finite numbers"
+            )
+
+    def test_wrong_arity_bbox_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), [{"image_id": 1, "category_id": 7, "bbox": [1, 2, 3]}]
+            )
+            self._assert_rejected(
+                result, out, "annotations[0].bbox must be a list of exactly 4 numbers"
+            )
+
+    def test_valid_annotations_accepted_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp),
+                [
+                    {"image_id": 1, "category_id": 7, "bbox": [10, 20, 30, 40]},
+                    {"image_id": 1, "category_id": 3, "bbox": [5.5, 6.5, 7.5, 8.5]},
+                ],
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((out / "manifest.json").exists())
 
 
 class SourceRootHelperTests(unittest.TestCase):

@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -37,6 +38,73 @@ from pathlib import Path
 from validate_dataset_manifest import validate_manifest, CAPTURE_CONTEXT_VALUES, SKU_PATTERN
 
 SPLIT_NAMES = ("train", "val", "test")
+
+# Repository root this script lives in (ml/scripts/<this file> -> repo root).
+# Used by the staging-destination policy below to keep customer manifests
+# (tenant/store ids, SKU maps, capture labels) out of committable paths.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+STAGING_POLICY = (
+    "staged custom manifests must go to a gitignored location or outside the repository"
+)
+
+# Conservative fallback used only when git itself cannot answer: the two
+# in-repo locations .gitignore is known to cover for generated ML outputs.
+FALLBACK_ALLOWED_SUBTREES = (
+    Path("ml") / "datasets" / "byond-custom" / "processed",
+    Path("ml") / "outputs",
+)
+
+
+def _staging_destination_error(output_dir) -> "str | None":
+    """Policy check for --output: returns an error string when staging there
+    would put a customer manifest into git-trackable territory, else None.
+
+    Allowed: any resolved path outside the repository, or an in-repo path git
+    confirms is ignored (`git check-ignore`). If git is unavailable or errors,
+    only the known-gitignored subtrees in FALLBACK_ALLOWED_SUBTREES are
+    allowed. The returned message names only the offending path — never any
+    manifest content.
+    """
+    try:
+        resolved_output = Path(output_dir).resolve()
+    except (OSError, ValueError):
+        return f"output path {str(output_dir)!r} cannot be resolved; {STAGING_POLICY}"
+
+    if not (REPO_ROOT / ".git").exists():
+        # Not running from a repo checkout — nothing here is trackable.
+        return None
+
+    try:
+        if not resolved_output.is_relative_to(REPO_ROOT):
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    # Probe with a contained file path rather than the directory itself: the
+    # directory may not exist yet, and subtree patterns like
+    # ml/datasets/byond-custom/** match contained files.
+    probe = resolved_output / "manifest.json"
+    try:
+        returncode = subprocess.run(
+            ["git", "check-ignore", "-q", "--", str(probe)],
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        ).returncode
+    except (OSError, subprocess.SubprocessError):
+        returncode = None
+
+    if returncode == 0:
+        return None  # git confirms the destination is ignored.
+    if returncode != 1:
+        # git unavailable or errored (not a clean yes/no): conservative
+        # allowlist of known-gitignored subtrees only.
+        for subtree in FALLBACK_ALLOWED_SUBTREES:
+            if resolved_output.is_relative_to(REPO_ROOT / subtree):
+                return None
+    return f"refusing to stage into {resolved_output}: {STAGING_POLICY}"
 
 
 def _source_root(input_dir, output_dir) -> str:
@@ -123,6 +191,8 @@ def _print_plan(input_dir: str, output_dir) -> None:
     print("  if --output is given, the validated manifest is staged to <output>/manifest.json")
     print("  with sourceRoot recomputed so references still resolve to the input dataset")
     print("  (media is never copied)")
+    print("  staging policy: an in-repo --output is accepted only when gitignored")
+    print("  (e.g. ml/datasets/byond-custom/processed/); otherwise the run is rejected")
 
 
 def _extra_byond_checks(manifest: dict) -> list:
@@ -187,6 +257,15 @@ def _extra_byond_checks(manifest: dict) -> list:
 
 
 def validate(input_dir: Path, output_dir) -> int:
+    # Enforce the staging-destination policy BEFORE the manifest is even
+    # read: a rejected run must never echo tenant/SKU/capture content, and
+    # must leave nothing behind at the rejected destination.
+    if output_dir is not None:
+        policy_error = _staging_destination_error(output_dir)
+        if policy_error:
+            print(f"ERROR: {policy_error}")
+            return 1
+
     manifest_path = input_dir / "manifest.json"
     try:
         raw = manifest_path.read_text(encoding="utf-8")

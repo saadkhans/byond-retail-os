@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -122,6 +123,12 @@ def _coco_shape_errors(coco) -> list:
     file produces named errors instead of AttributeError tracebacks. A
     negative `id` is rejected here because sourceId must be >= 0 in the
     manifest — letting it through would drop the class's source mapping.
+
+    When an `annotations` array is present it is cross-checked too: every
+    entry must be an object whose `image_id` / `category_id` reference ids
+    that exist in this file's `images` / `categories` lists, with a `bbox`
+    of exactly 4 finite numbers and positive width/height. When the key is
+    absent the check is skipped (reference-only fixtures stay valid).
     """
     if not isinstance(coco, dict):
         return [f"top-level payload must be a JSON object, got {type(coco).__name__}"]
@@ -159,6 +166,64 @@ def _coco_shape_errors(coco) -> list:
                 errors.append(
                     f"images[{idx}].file_name must be a non-empty string, got {file_name!r}"
                 )
+    annotations = coco.get("annotations")
+    if annotations is not None:
+        # Reference ids are collected only from well-formed entries; bool is
+        # excluded because True/False hash-equal 1/0 and would silently
+        # satisfy an integer id reference.
+        image_ids = set()
+        if isinstance(images, list):
+            for image in images:
+                if isinstance(image, dict):
+                    image_id = image.get("id")
+                    if isinstance(image_id, int) and not isinstance(image_id, bool):
+                        image_ids.add(image_id)
+        category_ids = set()
+        if isinstance(categories, list):
+            for category in categories:
+                if isinstance(category, dict):
+                    category_id = category.get("id")
+                    if isinstance(category_id, int) and not isinstance(category_id, bool):
+                        category_ids.add(category_id)
+        if not isinstance(annotations, list):
+            errors.append(f"annotations must be a list, got {type(annotations).__name__}")
+        else:
+            for idx, annotation in enumerate(annotations):
+                if not isinstance(annotation, dict):
+                    errors.append(f"annotations[{idx}] must be an object, got {annotation!r}")
+                    continue
+                image_id = annotation.get("image_id")
+                if (
+                    isinstance(image_id, bool)
+                    or not isinstance(image_id, int)
+                    or image_id not in image_ids
+                ):
+                    errors.append(f"annotations[{idx}].image_id references an unknown image")
+                category_id = annotation.get("category_id")
+                if (
+                    isinstance(category_id, bool)
+                    or not isinstance(category_id, int)
+                    or category_id not in category_ids
+                ):
+                    errors.append(
+                        f"annotations[{idx}].category_id references an unknown category"
+                    )
+                bbox = annotation.get("bbox")
+                if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                    errors.append(
+                        f"annotations[{idx}].bbox must be a list of exactly 4 numbers"
+                    )
+                elif any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    for value in bbox
+                ):
+                    errors.append(f"annotations[{idx}].bbox values must be finite numbers")
+                elif bbox[2] <= 0 or bbox[3] <= 0:
+                    errors.append(
+                        f"annotations[{idx}].bbox must have positive width and height"
+                    )
     return errors
 
 
@@ -222,6 +287,9 @@ def _print_plan(input_dir, output_dir: str) -> None:
     print("    via sourceRoot; nothing copied), per-split annotation refs, and")
     print("    validated — including file existence under the input root —")
     print("    against ml/configs/dataset.schema.json before reporting OK.")
+    print("    Each COCO file's `annotations` array (when present) is cross-checked")
+    print("    first: image_id/category_id references and 4-number positive bboxes;")
+    print("    files without an annotations array skip that check.")
 
 
 def prepare(input_dir: Path, output_dir: Path) -> int:

@@ -36,12 +36,19 @@ ml/outputs/
 ml/checkpoints/
 ml/**/.cache/
 
-# Real BYOND capture data (customer labels, tenant/store identifiers) must
-# never be committed; only READMEs and synthetic examples under ml/examples/
-# are tracked. EVERYTHING under byond-custom is ignored except this README:
-# real capture data, labels in any format, and manifests never enter git.
+# Each dataset directory is ignored wholesale: misplaced extracted
+# annotations, manifests, labels, and CSV/JSON/XML files can never be
+# staged even when archives are extracted one level too high (outside
+# raw/ or processed/). Only each dataset's README.md is tracked. Real
+# BYOND capture data (customer labels, tenant/store identifiers) must
+# never be committed. Synthetic examples live in ml/examples/, which
+# stays trackable — no pattern here touches it.
 ml/datasets/byond-custom/**
 !ml/datasets/byond-custom/README.md
+ml/datasets/rpc/**
+!ml/datasets/rpc/README.md
+ml/datasets/sku-110k/**
+!ml/datasets/sku-110k/README.md
 
 # Model weight files — never committed, wherever they appear (global,
 # not scoped to ml/, since a model artifact could land anywhere by mistake).

@@ -330,6 +330,15 @@ def _contains_sensitive_value(text: str) -> bool:
     )
 
 
+def contains_sensitive_value(value: str) -> bool:
+    """Public alias of the sensitive-value screen (credential URLs,
+    api-key/token fragments, known secret-token formats, Luhn-valid card
+    numbers). Exposed so other Phase 8 tooling (the dataset-manifest
+    validator) can apply the exact same screening; identical behavior to the
+    internal check."""
+    return _contains_sensitive_value(value)
+
+
 def _assert_opaque(name: str, value: str) -> None:
     """Mirror of the API's `assertOpaque`: reject credential- or payment-
     bearing content in fields persisted verbatim. Never echoes the value —

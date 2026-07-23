@@ -25,6 +25,40 @@ SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
 VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 SKU_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,99}$")
 
+# Sensitive-value screening for classes[n].sku: the VisionEvent mapper
+# (sample_inference_to_vision_event.py) rejects credential- or payment-
+# bearing SKUs at emission time, so a manifest carrying one (e.g. a
+# Luhn-valid card number that happens to match SKU_PATTERN) must already
+# fail here instead of passing validation and blowing up downstream. The
+# script may run standalone, so its own directory is added to sys.path
+# before importing; if the mapper module is unavailable, a minimal local
+# Luhn-PAN check keeps the validator from ever hard-crashing.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+try:
+    from sample_inference_to_vision_event import contains_sensitive_value as _contains_sensitive_value
+except ImportError:  # pragma: no cover - fallback when the mapper is absent
+    _PAN_CANDIDATE = re.compile(r"\d(?:[ \-]?\d){11,}")
+
+    def _passes_luhn(digits: str) -> bool:
+        total = 0
+        for index, char in enumerate(reversed(digits)):
+            digit = ord(char) - 48
+            if index % 2 == 1:
+                digit *= 2
+                if digit > 9:
+                    digit -= 9
+            total += digit
+        return total % 10 == 0
+
+    def _contains_sensitive_value(text: str) -> bool:
+        for candidate in _PAN_CANDIDATE.findall(text):
+            digits = candidate.replace(" ", "").replace("-", "")
+            if 13 <= len(digits) <= 19 and _passes_luhn(digits):
+                return True
+        return False
+
 SOURCE_VALUES = {"rpc", "sku-110k", "byond-custom"}
 CAPTURE_CONTEXT_VALUES = {"shelf", "pickup", "return", "cart_insertion", "exit"}
 SPLIT_NAMES = ("train", "val", "test")
@@ -189,11 +223,19 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                 if "sku" in cls:
                     sku = cls["sku"]
                     if not isinstance(sku, str) or not SKU_PATTERN.match(sku):
-                        errors.append(f"{path}.sku must match {SKU_PATTERN.pattern!r}, got {sku!r}")
+                        # Never echo the rejected value: a malformed SKU can be a
+                        # spaced/formatted PAN or other sensitive string.
+                        errors.append(f"{path}.sku must match {SKU_PATTERN.pattern!r}")
                     elif sku in seen_skus:
                         errors.append(f"{path}.sku {sku!r} duplicates classes[{seen_skus[sku]}]")
                     else:
                         seen_skus[sku] = idx
+                    # Same screening the VisionEvent mapper applies at emission
+                    # time (payment-card numbers, credential fragments): a SKU
+                    # it would reject must not validate here. The error NEVER
+                    # echoes the value — it may be a card number or secret.
+                    if isinstance(sku, str) and _contains_sensitive_value(sku):
+                        errors.append(f"{path}.sku contains a sensitive-looking value")
                 elif source == "byond-custom":
                     errors.append(f"{path}: sku is required when source is 'byond-custom'")
 
