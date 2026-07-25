@@ -315,10 +315,23 @@ def _passes_luhn(digits: str) -> bool:
 
 
 def _contains_payment_card_value(text: str) -> bool:
+    # For every digit run of length >= 13 (no upper cutoff), Luhn-test ALL
+    # contiguous sub-runs of PAN length (13-19): a card number padded or
+    # prefixed with extra digits ("4111111111111111" + "0000" = 20 digits)
+    # must still flag. For a run of exactly 13-19 digits the windows include
+    # the whole run, so this is a strict superset of the old whole-run check.
+    # Deliberately stricter than the Phase 7 service's greedy-run check:
+    # producer-side over-strictness is safe — the mapper may reject what the
+    # API would accept, never the reverse. Work is bounded at
+    # O(run_length x 7) windows per run.
     for candidate in _PAN_CANDIDATE.findall(text):
         digits = candidate.replace(" ", "").replace("-", "")
-        if 13 <= len(digits) <= 19 and _passes_luhn(digits):
-            return True
+        if len(digits) < 13:
+            continue
+        for length in range(13, 20):
+            for start in range(len(digits) - length + 1):
+                if _passes_luhn(digits[start : start + length]):
+                    return True
     return False
 
 

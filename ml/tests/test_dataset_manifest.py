@@ -905,6 +905,77 @@ class PrepareByondSplitAnnotationTests(unittest.TestCase):
         self.assertNotIn("Traceback", result.stdout + result.stderr)
 
 
+class PrepareByondSkuRedactionTests(unittest.TestCase):
+    """The BYOND-specific checks in _extra_byond_checks must never echo
+    sku/label-like manifest values: a malformed classes[].sku can be a
+    mistyped PAN or credential that must not reach terminal/CI logs.
+    (Sensitive fixtures are assembled at runtime so no PAN-shaped literal
+    appears in source.)"""
+
+    # A space-formatted PAN fails SKU_PATTERN, so it exercises the
+    # byond-specific format error (a bare PAN passes the pattern and is
+    # caught by the base validator's already-redacted sensitive screen).
+    FORMATTED_PAN = " ".join(["4111"] * 4)
+
+    def _byond_manifest(self, sku) -> dict:
+        return {
+            "datasetName": "byond-store",
+            "datasetVersion": "1.0.0",
+            "source": "byond-custom",
+            "licenseNotes": "Internal BYOND store captures.",
+            "classes": [{"classId": 0, "label": "cola-330", "sku": sku}],
+            "splits": {
+                "train": [{"image": "raw/shelves/a.jpg", "annotation": "annotations/a.json"}],
+                "val": [],
+                "test": [],
+            },
+        }
+
+    def test_formatted_pan_sku_error_is_redacted(self) -> None:
+        errors = prepare_byond_dataset._extra_byond_checks(
+            self._byond_manifest(self.FORMATTED_PAN)
+        )
+        self.assertTrue(
+            any("classes[0].sku" in e and "must match" in e for e in errors), errors
+        )
+        self.assertFalse(any("4111" in e for e in errors), errors)
+
+    def test_invalid_capture_context_value_not_echoed(self) -> None:
+        manifest = self._byond_manifest("SKU-1")
+        secret_like = "AKI" + "A" + "ABCDEFGHIJKLMNOP"
+        manifest["splits"]["train"][0]["captureContext"] = secret_like
+        errors = prepare_byond_dataset._extra_byond_checks(manifest)
+        self.assertTrue(
+            any("captureContext must be one of" in e for e in errors), errors
+        )
+        self.assertFalse(any(secret_like in e for e in errors), errors)
+
+    def test_wrong_source_value_not_echoed(self) -> None:
+        manifest = self._byond_manifest("SKU-1")
+        manifest["source"] = "not-the-expected-source"
+        errors = prepare_byond_dataset._extra_byond_checks(manifest)
+        self.assertTrue(
+            any("source must be 'byond-custom'" in e for e in errors), errors
+        )
+        self.assertFalse(any("not-the-expected-source" in e for e in errors), errors)
+
+    def test_cli_rejects_formatted_pan_sku_without_echoing_digits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_dir = Path(tmp) / "input"
+            (input_dir / "raw" / "shelves").mkdir(parents=True)
+            (input_dir / "annotations").mkdir()
+            (input_dir / "raw" / "shelves" / "a.jpg").touch()
+            (input_dir / "annotations" / "a.json").write_text("{}", encoding="utf-8")
+            (input_dir / "manifest.json").write_text(
+                json.dumps(self._byond_manifest(self.FORMATTED_PAN)), encoding="utf-8"
+            )
+            result = _run_script("prepare_byond_dataset.py", ["--input", str(input_dir)])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("classes[0].sku", result.stdout)
+            self.assertNotIn("4111", result.stdout + result.stderr)
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+
 class PrepareByondSourceRootContainmentTests(unittest.TestCase):
     """A manifest-supplied sourceRoot must resolve inside the dataset
     directory — a root escaping via '..', an absolute path, or an in-dir
@@ -1011,8 +1082,14 @@ class PrepareRpcEndToEndTests(unittest.TestCase):
     """Non-dry-run prepare_rpc.py against a tiny synthetic raw layout."""
 
     IMAGE_NAMES = {"train": "t1.jpg", "val": "v1.jpg", "test": "e1.jpg"}
+    CATEGORIES = [
+        {"id": 7, "name": "Cola 330"},
+        {"id": 3, "name": "Chips 50"},
+    ]
 
-    def _write_raw(self, raw: Path, *, omit_split_image: str = "") -> None:
+    def _write_raw(
+        self, raw: Path, *, omit_split_image: str = "", categories: list = None
+    ) -> None:
         for split, image_name in self.IMAGE_NAMES.items():
             image_dir = raw / f"{split}2019"
             image_dir.mkdir(parents=True, exist_ok=True)
@@ -1021,12 +1098,9 @@ class PrepareRpcEndToEndTests(unittest.TestCase):
                 # Every split carries the same category map (as real RPC
                 # files do); prepare_rpc rejects any val/test drift from
                 # train. Non-contiguous COCO category ids on purpose: classId
-                # must be remapped to 0..N-1 while sourceId preserves these
-                # originals.
-                "categories": [
-                    {"id": 7, "name": "Cola 330"},
-                    {"id": 3, "name": "Chips 50"},
-                ],
+                # must be assigned deterministically (sorted by source id)
+                # while sourceId preserves these originals.
+                "categories": list(categories if categories is not None else self.CATEGORIES),
                 # A small valid annotations array, like real RPC files carry:
                 # references must resolve against this file's image/category
                 # ids and the bbox must be 4 finite positive-size numbers.
@@ -1065,6 +1139,9 @@ class PrepareRpcEndToEndTests(unittest.TestCase):
             self.assertEqual(manifest["splits"]["train"], [{"image": "train2019/t1.jpg"}])
 
     def test_prepared_manifest_preserves_coco_category_ids_as_source_ids(self) -> None:
+        # Categories arrive in on-disk order [7, 3] but classIds are assigned
+        # after sorting by source id, so sourceId 3 -> classId 0 and
+        # sourceId 7 -> classId 1.
         with tempfile.TemporaryDirectory() as tmp:
             raw = Path(tmp) / "raw"
             out = Path(tmp) / "out"
@@ -1077,10 +1154,29 @@ class PrepareRpcEndToEndTests(unittest.TestCase):
             self.assertEqual(
                 manifest["classes"],
                 [
-                    {"classId": 0, "label": "cola-330", "sourceId": 7},
-                    {"classId": 1, "label": "chips-50", "sourceId": 3},
+                    {"classId": 0, "label": "chips-50", "sourceId": 3},
+                    {"classId": 1, "label": "cola-330", "sourceId": 7},
                 ],
             )
+
+    def test_class_ids_deterministic_across_category_array_order(self) -> None:
+        # Two exports with the same id -> name map in different array orders
+        # must produce identical classes lists under the same datasetVersion.
+        classes_per_order = []
+        for categories in (list(self.CATEGORIES), list(reversed(self.CATEGORIES))):
+            with tempfile.TemporaryDirectory() as tmp:
+                raw = Path(tmp) / "raw"
+                out = Path(tmp) / "out"
+                self._write_raw(raw, categories=categories)
+                result = _run_script(
+                    "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                manifest = json.loads(
+                    (out / "manifest.json").read_text(encoding="utf-8")
+                )
+                classes_per_order.append(manifest["classes"])
+        self.assertEqual(classes_per_order[0], classes_per_order[1])
 
     def test_missing_referenced_image_fails_loudly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1190,6 +1286,100 @@ class PrepareSku110kEndToEndTests(unittest.TestCase):
                 (out / "manifest.json").read_text(encoding="utf-8"), original
             )
             self.assertEqual(list(out.glob("*.tmp")), [])
+
+
+class Sku110kCsvRowValidationTests(unittest.TestCase):
+    """prepare_sku110k must reject truncated rows, non-numeric coordinates,
+    and degenerate/invalid boxes with controlled errors naming the file,
+    the 1-based row number, and the violated rule (never the raw row), and
+    must write no manifest."""
+
+    IMAGE_NAMES = {"train": "a.jpg", "val": "b.jpg", "test": "c.jpg"}
+
+    def _valid_row(self, image_name: str) -> str:
+        return f"{image_name},10,10,20,20,object,100,100\n"
+
+    def _run_prepare(self, tmp: Path, train_csv_content: str) -> tuple:
+        raw = tmp / "raw"
+        out = tmp / "out"
+        images_dir = raw / "images"
+        images_dir.mkdir(parents=True)
+        annotations_dir = raw / "annotations"
+        annotations_dir.mkdir(parents=True)
+        for split, image_name in self.IMAGE_NAMES.items():
+            content = (
+                train_csv_content if split == "train" else self._valid_row(image_name)
+            )
+            (annotations_dir / f"annotations_{split}.csv").write_text(
+                content, encoding="utf-8"
+            )
+            (images_dir / image_name).write_text(f"pixels-{image_name}", encoding="utf-8")
+        result = _run_script(
+            "prepare_sku110k.py", ["--input", str(raw), "--output", str(out)]
+        )
+        return result, out
+
+    def _assert_rejected(self, result, out: Path, *fragments: str) -> None:
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ERROR", result.stdout)
+        self.assertIn("annotations/annotations_train.csv", result.stdout)
+        for fragment in fragments:
+            self.assertIn(fragment, result.stdout)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertFalse((out / "manifest.json").exists())
+
+    def test_truncated_row_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(Path(tmp), "a.jpg,10,10\n")
+            self._assert_rejected(result, out, "row 1", "expected 8 columns, got 3")
+
+    def test_non_numeric_coordinate_rejected_without_raw_row_dump(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp),
+                self._valid_row("a.jpg") + "a.jpg,10,NOTNUM77,20,20,object,100,100\n",
+            )
+            self._assert_rejected(result, out, "row 2", "y1 must be a finite number")
+            self.assertNotIn("NOTNUM77", result.stdout)
+
+    def test_x2_not_greater_than_x1_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), "a.jpg,20,10,20,20,object,100,100\n"
+            )
+            self._assert_rejected(result, out, "row 1", "x2 must be greater than x1")
+
+    def test_y2_not_greater_than_y1_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), "a.jpg,10,20,20,20,object,100,100\n"
+            )
+            self._assert_rejected(result, out, "row 1", "y2 must be greater than y1")
+
+    def test_non_positive_image_dimension_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), "a.jpg,10,10,20,20,object,0,100\n"
+            )
+            self._assert_rejected(
+                result, out, "row 1", "image_width must be greater than 0"
+            )
+
+    def test_row_error_collection_is_capped(self) -> None:
+        bad_rows = "".join("a.jpg,10,10\n" for _ in range(40))
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(Path(tmp), bad_rows)
+            self._assert_rejected(result, out, "row-error limit (25) reached")
+            self.assertNotIn("row 40", result.stdout)
+
+    def test_valid_eight_column_rows_accepted_end_to_end(self) -> None:
+        # Two boxes for the same image: still one deduped sample per split.
+        train_csv = self._valid_row("a.jpg") + "a.jpg,30,30,40,40.5,object,100,100\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(Path(tmp), train_csv)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["splits"]["train"], [{"image": "images/a.jpg"}])
 
 
 class RpcCategoryConsistencyTests(unittest.TestCase):
@@ -1375,6 +1565,92 @@ class RpcCocoShapeGuardTests(unittest.TestCase):
                 out,
                 "instances_train2019.json",
                 "images[0].file_name must be a non-empty string",
+            )
+
+
+class RpcRequiredCocoKeysTests(unittest.TestCase):
+    """A COCO file omitting its `images` or `categories` array must produce
+    a controlled ERROR naming the file — never a silently empty split (or
+    empty class list) and an OK manifest."""
+
+    CATEGORIES = [{"id": 7, "name": "Cola 330"}, {"id": 3, "name": "Chips 50"}]
+    IMAGE_NAMES = {"train": "t1.jpg", "val": "v1.jpg", "test": "e1.jpg"}
+
+    def _run_prepare(self, tmp: Path, *, drop_key: str, from_split: str) -> tuple:
+        raw = tmp / "raw"
+        out = tmp / "out"
+        for split, image_name in self.IMAGE_NAMES.items():
+            image_dir = raw / f"{split}2019"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            coco = {
+                "images": [{"id": 1, "file_name": image_name}],
+                "categories": list(self.CATEGORIES),
+            }
+            if split == from_split:
+                del coco[drop_key]
+            (raw / f"instances_{split}2019.json").write_text(
+                json.dumps(coco), encoding="utf-8"
+            )
+            (image_dir / image_name).write_text(f"pixels-{image_name}", encoding="utf-8")
+        result = _run_script(
+            "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+        )
+        return result, out
+
+    def _assert_controlled_error(self, result, out: Path, *fragments: str) -> None:
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ERROR", result.stdout)
+        for fragment in fragments:
+            self.assertIn(fragment, result.stdout)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertFalse((out / "manifest.json").exists())
+
+    def test_missing_images_key_in_val_is_controlled_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), drop_key="images", from_split="val"
+            )
+            self._assert_controlled_error(
+                result,
+                out,
+                "instances_val2019.json",
+                "images is a required key",
+            )
+
+    def test_missing_images_key_in_train_is_controlled_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), drop_key="images", from_split="train"
+            )
+            self._assert_controlled_error(
+                result,
+                out,
+                "instances_train2019.json",
+                "images is a required key",
+            )
+
+    def test_missing_categories_key_in_train_is_controlled_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), drop_key="categories", from_split="train"
+            )
+            self._assert_controlled_error(
+                result,
+                out,
+                "instances_train2019.json",
+                "categories is a required key",
+            )
+
+    def test_missing_categories_key_in_test_is_controlled_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), drop_key="categories", from_split="test"
+            )
+            self._assert_controlled_error(
+                result,
+                out,
+                "instances_test2019.json",
+                "categories is a required key",
             )
 
 

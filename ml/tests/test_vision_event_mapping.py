@@ -19,7 +19,9 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from sample_inference_to_vision_event import (  # noqa: E402
     FORBIDDEN_FIELDS,
+    _passes_luhn,
     assert_payload_safe,
+    contains_sensitive_value,
     to_vision_event,
 )
 
@@ -521,6 +523,96 @@ class SensitiveValueScreeningTests(unittest.TestCase):
         inference["detections"] = [{"sku": "4242424242424242", "confidence": 0.5}]
         with self.assertRaises(ValueError):
             to_vision_event(inference)
+
+
+def _twenty_digit_run_with_no_luhn_window() -> str:
+    """Deterministically construct a 20-digit string none of whose contiguous
+    13-19 digit sub-runs passes Luhn (so it must NOT flag as a PAN). Searches
+    a seeded-PRNG candidate space; each candidate fails all 35 windows with
+    probability ~0.9^35, so a hit is expected within a few dozen tries."""
+    import random
+
+    rng = random.Random(0)
+    for _ in range(10_000):
+        candidate = "".join(rng.choice("0123456789") for _ in range(20))
+        windows = (
+            candidate[start : start + length]
+            for length in range(13, 20)
+            for start in range(20 - length + 1)
+        )
+        if not any(_passes_luhn(window) for window in windows):
+            return candidate
+    raise AssertionError("could not construct a Luhn-window-free 20-digit run")
+
+
+class EmbeddedPanScreeningTests(unittest.TestCase):
+    """Codex P1: a PAN hidden inside a LONGER digit run (>= 20 digits) must
+    still be rejected — the screen scans every contiguous 13-19 digit sub-run
+    with Luhn, instead of discarding long runs wholesale."""
+
+    def test_pan_with_trailing_digits_in_idempotency_key_rejected(self) -> None:
+        # 16-digit Luhn PAN + 4 trailing digits = 20-digit run: previously
+        # evaded the 13-19 whole-run length gate.
+        inference = _base_inference()
+        inference["idempotencyKey"] = "41111111111111110000"
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_pan_with_trailing_digits_and_separators_rejected(self) -> None:
+        inference = _base_inference()
+        inference["idempotencyKey"] = "4111 1111 1111 1111 0000"
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_pan_embedded_mid_run_with_leading_digits_rejected(self) -> None:
+        # 2 leading + 16-digit PAN + 2 trailing digits = 20-digit run.
+        inference = _base_inference()
+        inference["idempotencyKey"] = "12" + "4111111111111111" + "34"
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_pan_embedded_in_long_run_in_sku_and_label_rejected(self) -> None:
+        embedded = "41111111111111110000"
+        for field_patch in (
+            {"detections": [{"sku": embedded, "confidence": 0.5}]},
+            {"detections": [{"sku": "cola-330", "confidence": 0.5, "label": embedded}]},
+        ):
+            with self.subTest(patch=field_patch):
+                inference = _base_inference()
+                inference.update(field_patch)
+                with self.assertRaises(ValueError):
+                    to_vision_event(inference)
+
+    def test_20_digit_run_without_any_luhn_window_accepted(self) -> None:
+        clean_run = _twenty_digit_run_with_no_luhn_window()
+        self.assertFalse(contains_sensitive_value(clean_run))
+        inference = _base_inference()
+        inference["idempotencyKey"] = clean_run
+        payload = to_vision_event(inference)
+        self.assertEqual(payload["idempotencyKey"], clean_run)
+
+    def test_short_non_luhn_digit_run_still_accepted(self) -> None:
+        # 13-digit run whose only window (itself) fails Luhn: behavior of
+        # exact 13-19 runs is unchanged by the sliding-window unification.
+        self.assertFalse(contains_sensitive_value("1234567890123"))
+        inference = _base_inference()
+        inference["idempotencyKey"] = "order-1234567890123"
+        payload = to_vision_event(inference)
+        self.assertEqual(payload["idempotencyKey"], "order-1234567890123")
+
+    def test_whole_run_pan_rejections_still_fire(self) -> None:
+        for pan in ("4111111111111111", "4242 4242 4242 4242"):
+            with self.subTest(pan=pan):
+                self.assertTrue(contains_sensitive_value(pan))
+
+    def test_normal_opaque_values_still_accepted(self) -> None:
+        # Note: date-and-serial values whose separated digit runs reach 13+
+        # digits (e.g. "sku-2026-07-21-000123") CAN now flag when a window
+        # happens to pass Luhn — accepted over-strictness in the safe
+        # direction. Normal opaque keys keep digit runs under 13.
+        for value in ("evt-7f3a2b1c-0009", "sku-2026-07-21-0001", "cam42-frame-8891"):
+            with self.subTest(value=value):
+                self.assertFalse(contains_sensitive_value(value))
 
 
 class StringLengthLimitTests(unittest.TestCase):

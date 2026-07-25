@@ -198,9 +198,14 @@ def _print_plan(input_dir: str, output_dir) -> None:
 def _extra_byond_checks(manifest: dict) -> list:
     errors = []
 
+    # Redaction policy (mirrors the base validator's SKU messages): errors
+    # here may name fields and interpolate path values (needed for
+    # remediation, not secret-bearing), but must never echo sku/label-like
+    # manifest values — a malformed SKU can be a mistyped PAN or credential
+    # that must not reach terminal/CI logs.
     source = manifest.get("source")
     if source != "byond-custom":
-        errors.append(f"source must be 'byond-custom' for a BYOND custom dataset, got {source!r}")
+        errors.append("source must be 'byond-custom' for a BYOND custom dataset")
 
     classes = manifest.get("classes")
     if isinstance(classes, list):
@@ -209,7 +214,9 @@ def _extra_byond_checks(manifest: dict) -> list:
                 continue
             sku = cls.get("sku")
             if not isinstance(sku, str) or not SKU_PATTERN.match(sku):
-                errors.append(f"classes[{idx}]: sku is required and must match the tenant SKU pattern, got {sku!r}")
+                errors.append(
+                    f"classes[{idx}].sku is required and must match {SKU_PATTERN.pattern!r}"
+                )
 
     # Split-level annotation refs (annotations.train/val/test) must obey the
     # same BYOND layout constraint as per-sample annotation paths — without
@@ -241,8 +248,7 @@ def _extra_byond_checks(manifest: dict) -> list:
                     or capture_context not in CAPTURE_CONTEXT_VALUES
                 ):
                     errors.append(
-                        f"{path}.captureContext must be one of {sorted(CAPTURE_CONTEXT_VALUES)}, "
-                        f"got {capture_context!r}"
+                        f"{path}.captureContext must be one of {sorted(CAPTURE_CONTEXT_VALUES)}"
                     )
 
                 image = sample.get("image")

@@ -21,11 +21,13 @@ expected layout:
 
 Given that layout, this script builds a BYOND dataset manifest
 (ml/configs/dataset.schema.json) at `<output>/manifest.json`: classes come
-from the COCO `categories` list (label = slugified category name, classId =
-list index, sourceId = the original COCO category id that the annotation
-files reference; no `sku` — RPC classes are not mapped to any tenant
-catalog), and each split's samples are the image paths recorded in that
-split's COCO `images` list.
+from the COCO `categories` list sorted by original category id (label =
+slugified category name, classId = contiguous 0..N-1 index in that sorted
+order — deterministic regardless of the categories array's on-disk order,
+sourceId = the original COCO category id that the annotation files
+reference; no `sku` — RPC classes are not mapped to any tenant catalog),
+and each split's samples are the image paths recorded in that split's COCO
+`images` list.
 """
 
 from __future__ import annotations
@@ -116,13 +118,17 @@ def _category_map_mismatches(train_map: dict, split_map: dict) -> list:
 def _coco_shape_errors(coco) -> list:
     """Controlled shape errors for the COCO fields this script dereferences.
 
-    Every `categories` / `images` entry the preparation below calls .get()
-    on must already be a dict with correctly-typed fields (`id` a
-    non-negative non-bool int and `name` a non-empty string for categories;
-    `file_name` a non-empty string for images), so a malformed annotation
-    file produces named errors instead of AttributeError tracebacks. A
-    negative `id` is rejected here because sourceId must be >= 0 in the
-    manifest — letting it through would drop the class's source mapping.
+    The `categories` and `images` keys are REQUIRED: a file omitting either
+    must be a named error, never a silent default to an empty list (a
+    missing `images` would otherwise produce an empty split and an OK
+    manifest; a missing `categories` in train would silently drop every
+    class). Every entry the preparation below dereferences must already be
+    a dict with correctly-typed fields (`id` a non-negative non-bool int
+    and `name` a non-empty string for categories; `file_name` a non-empty
+    string for images), so a malformed annotation file produces named
+    errors instead of AttributeError tracebacks. A negative `id` is
+    rejected here because sourceId must be >= 0 in the manifest — letting
+    it through would drop the class's source mapping.
 
     When an `annotations` array is present it is cross-checked too: every
     entry must be an object whose `image_id` / `category_id` reference ids
@@ -133,8 +139,10 @@ def _coco_shape_errors(coco) -> list:
     if not isinstance(coco, dict):
         return [f"top-level payload must be a JSON object, got {type(coco).__name__}"]
     errors = []
-    categories = coco.get("categories", [])
-    if not isinstance(categories, list):
+    categories = coco.get("categories")
+    if "categories" not in coco:
+        errors.append("categories is a required key and must be a list of objects")
+    elif not isinstance(categories, list):
         errors.append(f"categories must be a list, got {type(categories).__name__}")
     else:
         for idx, category in enumerate(categories):
@@ -153,8 +161,10 @@ def _coco_shape_errors(coco) -> list:
             name = category.get("name")
             if not isinstance(name, str) or not name:
                 errors.append(f"categories[{idx}].name must be a non-empty string, got {name!r}")
-    images = coco.get("images", [])
-    if not isinstance(images, list):
+    images = coco.get("images")
+    if "images" not in coco:
+        errors.append("images is a required key and must be a list of objects")
+    elif not isinstance(images, list):
         errors.append(f"images must be a list, got {type(images).__name__}")
     else:
         for idx, image in enumerate(images):
@@ -282,7 +292,8 @@ def _print_plan(input_dir, output_dir: str) -> None:
     for split, (image_dir, annotation_file) in SPLIT_MARKERS.items():
         print(f"    {split}: {image_dir}/  and  {annotation_file}")
     print("  would generate:")
-    print(f"    {output_dir}/manifest.json — classes from COCO categories,")
+    print(f"    {output_dir}/manifest.json — classes from COCO categories")
+    print("    (sorted by source category id for deterministic classIds),")
     print("    samples from each split's COCO images list (referenced in place")
     print("    via sourceRoot; nothing copied), per-split annotation refs, and")
     print("    validated — including file existence under the input root —")
@@ -318,7 +329,12 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
         _report_coco_shape_errors(SPLIT_MARKERS["train"][1], shape_errors)
         return 1
 
-    categories = train_annotations.get("categories", [])
+    # Sort categories by their source `id` before assigning contiguous
+    # 0..N-1 classIds: two exports carrying the same id -> name map in
+    # different array orders must produce identical classes under the same
+    # datasetVersion. _coco_shape_errors above already guarantees every id
+    # is a non-negative non-bool int, so the sort key is always well-typed.
+    categories = sorted(train_annotations["categories"], key=lambda category: category["id"])
     classes = []
     seen_labels = set()
     for idx, category in enumerate(categories):
@@ -329,8 +345,7 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
         # The COCO annotation files reference categories by their original
         # `id`, which need not match the contiguous training index. Preserve
         # it as sourceId so consumers joining annotations by category id do
-        # not mislabel classes. _coco_shape_errors above already guarantees
-        # a non-negative non-bool int id, so it is always emitted.
+        # not mislabel classes.
         classes.append({"classId": idx, "label": label, "sourceId": category["id"]})
 
     # The annotation files reference categories by id; a val/test file whose
@@ -362,8 +377,9 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
                     print(f"  - {mismatch}")
                 return 1
         samples = []
-        for image in coco.get("images", []):
-            # _coco_shape_errors above guarantees a non-empty file_name string.
+        # _coco_shape_errors above guarantees the images key is present, a
+        # list of dicts, each with a non-empty file_name string.
+        for image in coco["images"]:
             samples.append({"image": f"{image_dir}/{image.get('file_name')}"})
         splits[split_name] = samples
         annotations[split_name] = annotation_file
