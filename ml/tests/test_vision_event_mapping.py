@@ -168,6 +168,57 @@ class NonFiniteConfidenceTests(unittest.TestCase):
             to_vision_event(inference)
 
 
+class OversizedIntegerConfidenceTests(unittest.TestCase):
+    """Codex P2: a JSON integer like 10**309 passes the numeric isinstance
+    check but overflows float conversion, so math.isfinite raised
+    OverflowError — which main() (catching only ValueError) turned into a raw
+    CLI traceback. Overflow must be treated as non-finite and raise the same
+    redacted ValueError, never echoing the value."""
+
+    def test_huge_positive_integer_confidence_rejected_as_value_error(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [{"sku": "x", "confidence": 10**309}]
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        # Exact redacted message: names the field and constraint only, so no
+        # digits of the oversized value can leak into caller logs.
+        self.assertEqual(
+            str(ctx.exception), "detections[0].confidence must be a finite number"
+        )
+
+    def test_huge_negative_integer_confidence_rejected_as_value_error(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [{"sku": "x", "confidence": -(10**309)}]
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        self.assertEqual(
+            str(ctx.exception), "detections[0].confidence must be a finite number"
+        )
+
+    def test_cli_huge_integer_confidence_prints_error_line_not_traceback(self) -> None:
+        # json.dump serializes Python big ints as full-precision JSON integers,
+        # so this exercises the real CLI path with a 1e999-equivalent literal.
+        inference = _base_inference()
+        inference["detections"] = [{"sku": "x", "confidence": 10**309}]
+        with tempfile.TemporaryDirectory() as tmp:
+            model_output = Path(tmp) / "model_output.json"
+            with model_output.open("w", encoding="utf-8") as handle:
+                json.dump(inference, handle)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "sample_inference_to_vision_event.py"),
+                    str(model_output),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ERROR: detections[0].confidence must be a finite number", result.stdout)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+
 class TimestampValidationTests(unittest.TestCase):
     def test_trailing_z_timestamp_accepted(self) -> None:
         inference = _base_inference()

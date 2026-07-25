@@ -28,6 +28,12 @@ sourceId = the original COCO category id that the annotation files
 reference; no `sku` — RPC classes are not mapped to any tenant catalog),
 and each split's samples are the image paths recorded in that split's COCO
 `images` list.
+
+Annotation-label policy: the TRAIN split's COCO file must carry a present,
+non-empty `annotations` list — there is nothing to train on without labels.
+The val/test files MAY omit the key entirely (unlabeled evaluation sets
+exist); when any file does carry an `annotations` array it is fully
+cross-checked regardless of split.
 """
 
 from __future__ import annotations
@@ -125,10 +131,14 @@ def _coco_shape_errors(coco) -> list:
     class). Every entry the preparation below dereferences must already be
     a dict with correctly-typed fields (`id` a non-negative non-bool int
     and `name` a non-empty string for categories; `file_name` a non-empty
-    string for images), so a malformed annotation file produces named
-    errors instead of AttributeError tracebacks. A negative `id` is
-    rejected here because sourceId must be >= 0 in the manifest — letting
-    it through would drop the class's source mapping. Duplicate `images[].id`
+    string and `id` a present non-bool int for images), so a malformed
+    annotation file produces named errors instead of AttributeError
+    tracebacks. A negative category `id` is rejected here because sourceId
+    must be >= 0 in the manifest — letting it through would drop the
+    class's source mapping. An image with a missing/bool/non-int `id` is
+    rejected even when nothing references it yet: annotation joins go
+    through that id, so an unusable one must never slip past just because
+    the entry happens to carry no annotations. Duplicate `images[].id`
     values are rejected too: they would collapse in the annotation-join
     reference set and silently corrupt image_id joins.
 
@@ -183,13 +193,14 @@ def _coco_shape_errors(coco) -> list:
                     f"images[{idx}].file_name must be a non-empty string, got {file_name!r}"
                 )
             image_id = image.get("id")
-            if isinstance(image_id, int) and not isinstance(image_id, bool):
-                if image_id in seen_image_ids:
-                    errors.append(
-                        f"images[{idx}].id duplicates images[{seen_image_ids[image_id]}].id"
-                    )
-                else:
-                    seen_image_ids[image_id] = idx
+            if isinstance(image_id, bool) or not isinstance(image_id, int):
+                errors.append(f"images[{idx}].id must be an integer, got {image_id!r}")
+            elif image_id in seen_image_ids:
+                errors.append(
+                    f"images[{idx}].id duplicates images[{seen_image_ids[image_id]}].id"
+                )
+            else:
+                seen_image_ids[image_id] = idx
     annotations = coco.get("annotations")
     if annotations is not None:
         # Reference ids are collected only from well-formed entries; bool is
@@ -249,6 +260,27 @@ def _coco_shape_errors(coco) -> list:
                         f"annotations[{idx}].bbox must have positive width and height"
                     )
     return errors
+
+
+# Sentinel distinguishing "file failed to load" from any legitimate JSON
+# payload (including null, which _coco_shape_errors rejects with its own
+# named error).
+_COCO_LOAD_ERROR = object()
+
+
+def _load_coco(path: Path):
+    """Parsed JSON payload of a COCO annotation file, or _COCO_LOAD_ERROR
+    after printing a controlled ERROR line.
+
+    A truncated/corrupt/unreadable file must produce the script's normal
+    error style — the exception class name only, never file content or a
+    raw traceback."""
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        print(f"ERROR: {path.name}: not valid JSON ({type(exc).__name__})")
+        return _COCO_LOAD_ERROR
 
 
 def _report_coco_shape_errors(annotation_file: str, errors: list) -> None:
@@ -313,8 +345,9 @@ def _print_plan(input_dir, output_dir: str) -> None:
     print("    validated — including file existence under the input root —")
     print("    against ml/configs/dataset.schema.json before reporting OK.")
     print("    Each COCO file's `annotations` array (when present) is cross-checked")
-    print("    first: image_id/category_id references and 4-number positive bboxes;")
-    print("    files without an annotations array skip that check.")
+    print("    first: image_id/category_id references and 4-number positive bboxes.")
+    print("    The train file must carry a non-empty annotations list; val/test")
+    print("    files may omit the key (unlabeled evaluation sets).")
 
 
 def prepare(input_dir: Path, output_dir: Path) -> int:
@@ -333,14 +366,28 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
         return 1
 
     train_annotations_path = input_dir / SPLIT_MARKERS["train"][1]
-    with train_annotations_path.open("r", encoding="utf-8") as fh:
-        train_annotations = json.load(fh)
+    train_annotations = _load_coco(train_annotations_path)
+    if train_annotations is _COCO_LOAD_ERROR:
+        return 1
 
     # Validate container shapes before any .get() chains dereference them —
     # a null/non-object entry must fail with a named error, not a traceback.
     shape_errors = _coco_shape_errors(train_annotations)
     if shape_errors:
         _report_coco_shape_errors(SPLIT_MARKERS["train"][1], shape_errors)
+        return 1
+
+    # The training split is what the model learns from: a train COCO file
+    # with no (or an empty) `annotations` list has nothing to train on and
+    # must be a named error, never an OK manifest. val/test may omit the
+    # key — unlabeled evaluation sets exist (see module docstring). The
+    # shape guard above already rejected a present-but-non-list value.
+    if not train_annotations.get("annotations"):
+        print(
+            f"ERROR: {SPLIT_MARKERS['train'][1]} must contain a non-empty "
+            "annotations list — the training split needs labels (val/test "
+            "files may omit the annotations key)"
+        )
         return 1
 
     # Sort categories by their source `id` before assigning contiguous
@@ -379,8 +426,9 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
     splits = {}
     annotations = {}
     for split_name, (image_dir, annotation_file) in SPLIT_MARKERS.items():
-        with (input_dir / annotation_file).open("r", encoding="utf-8") as fh:
-            coco = json.load(fh)
+        coco = _load_coco(input_dir / annotation_file)
+        if coco is _COCO_LOAD_ERROR:
+            return 1
         # Same shape guard for every split's file (train's re-load included)
         # BEFORE the category-map comparison and sample building below
         # iterate/dereference its categories and images entries.

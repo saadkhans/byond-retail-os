@@ -506,7 +506,17 @@ def to_vision_event(inference: dict) -> dict:
             raise ValueError(f"detections[{idx}].confidence is required and must be a number")
         # No value echo (see the redaction note above): a "confidence" can be
         # an arbitrary number — even a card number typed as a JSON number.
-        if not math.isfinite(confidence):
+        # Overflow guard: a JSON integer of arbitrary precision (e.g. 10**309)
+        # passes the isinstance check but overflows float conversion, so
+        # math.isfinite raises OverflowError ("int too large to convert to
+        # float"). main() catches only ValueError, so an uncaught OverflowError
+        # would traceback the CLI — treat overflow as non-finite and raise the
+        # same redacted error.
+        try:
+            confidence_is_finite = math.isfinite(confidence)
+        except OverflowError:
+            confidence_is_finite = False
+        if not confidence_is_finite:
             raise ValueError(f"detections[{idx}].confidence must be a finite number")
         if confidence < 0 or confidence > 1:
             raise ValueError(f"detections[{idx}].confidence must be within [0, 1]")

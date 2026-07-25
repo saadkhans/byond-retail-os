@@ -33,7 +33,9 @@ The generated `processed/manifest.json` references the source images and
 per-split COCO annotation files in place via its `sourceRoot` field
 (`../raw` in the layout above) — nothing is copied out of `raw/`. The
 non-dry-run also verifies every referenced file exists under the input
-root and fails otherwise.
+root and fails otherwise. The train COCO file must carry a non-empty
+`annotations` array; the val/test files may omit it (unlabeled evaluation
+sets are allowed).
 
 Use `--dry-run` to check the script's plan without requiring anything on
 disk (useful for CI and for reviewing the intended output layout before

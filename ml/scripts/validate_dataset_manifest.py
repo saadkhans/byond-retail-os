@@ -94,8 +94,14 @@ def _is_bad_path(value) -> bool:
     file (e.g. "images/a.jpg" vs "images/./a.jpg") can never slip past the
     exact-string duplicate/overlap checks: every accepted path is already in
     canonical form, and the dedupe may safely compare raw strings.
+    An embedded NUL is rejected here too: it is not a valid filesystem
+    string, so every path field (image, annotation, split-level annotation
+    ref) gets the same guard sourceRoot has — without it a NUL-bearing path
+    would pass shape validation whenever --check-files is off.
     """
     if not isinstance(value, str) or not value:
+        return True
+    if "\x00" in value:
         return True
     if "\\" in value:
         return True
@@ -142,14 +148,17 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
     else:
         name = manifest["datasetName"]
         if not isinstance(name, str) or not SLUG_PATTERN.match(name):
-            errors.append(f"datasetName must match {SLUG_PATTERN.pattern!r}, got {name!r}")
+            # An arbitrary string reaches this check before any pattern
+            # constraint holds, so the value is never echoed.
+            errors.append(f"datasetName must match {SLUG_PATTERN.pattern!r}")
 
     if "datasetVersion" not in manifest:
         errors.append("missing required field: datasetVersion")
     else:
         version = manifest["datasetVersion"]
         if not isinstance(version, str) or not VERSION_PATTERN.match(version):
-            errors.append(f"datasetVersion must match {VERSION_PATTERN.pattern!r}, got {version!r}")
+            # Same redaction rationale as datasetName: unconstrained input.
+            errors.append(f"datasetVersion must match {VERSION_PATTERN.pattern!r}")
 
     source = manifest.get("source")
     if "source" not in manifest:
@@ -200,11 +209,16 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                     errors.append(f"{path}: missing required field classId")
                 else:
                     class_id = cls["classId"]
+                    # classId errors report field + expected shape only: a
+                    # malformed classId can be an arbitrary (PAN-bearing)
+                    # string, and even a valid duplicate could be a mistyped
+                    # sensitive number — so neither is ever echoed and the
+                    # duplicate error is index-based.
                     if not isinstance(class_id, int) or isinstance(class_id, bool) or class_id < 0:
-                        errors.append(f"{path}.classId must be an integer >= 0, got {class_id!r}")
+                        errors.append(f"{path}.classId must be an integer >= 0")
                     elif class_id in seen_class_ids:
                         errors.append(
-                            f"{path}.classId {class_id} duplicates classes[{seen_class_ids[class_id]}]"
+                            f"{path}.classId duplicates classes[{seen_class_ids[class_id]}].classId"
                         )
                     else:
                         seen_class_ids[class_id] = idx
@@ -222,6 +236,11 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                         errors.append(f"{path}.label duplicates classes[{seen_labels[label]}].label")
                     else:
                         seen_labels[label] = idx
+                    # Same screening SKUs get: an all-digit Luhn PAN satisfies
+                    # SLUG_PATTERN, so a label can carry raw card data. The
+                    # error NEVER echoes the value.
+                    if isinstance(label, str) and _contains_sensitive_value(label):
+                        errors.append(f"{path}.label contains a sensitive-looking value")
 
                 if "sku" in cls:
                     sku = cls["sku"]
@@ -248,11 +267,13 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                     source_id = cls["sourceId"]
                     # Type-guard before comparisons: bool is an int subclass and
                     # non-int values must not reach the < or dict-key checks.
+                    # Redacted like classId: field + expected shape only, and
+                    # index-based duplicate reporting — never the value.
                     if not isinstance(source_id, int) or isinstance(source_id, bool) or source_id < 0:
-                        errors.append(f"{path}.sourceId must be an integer >= 0, got {source_id!r}")
+                        errors.append(f"{path}.sourceId must be an integer >= 0")
                     elif source_id in seen_source_ids:
                         errors.append(
-                            f"{path}.sourceId {source_id} duplicates classes[{seen_source_ids[source_id]}]"
+                            f"{path}.sourceId duplicates classes[{seen_source_ids[source_id]}].sourceId"
                         )
                     else:
                         seen_source_ids[source_id] = idx

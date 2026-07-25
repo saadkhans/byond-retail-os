@@ -256,6 +256,76 @@ class SensitiveSkuScreeningTests(unittest.TestCase):
             self.assertNotIn(self.PAN_SKU, result.stdout + result.stderr)
 
 
+class SensitiveClassValueRedactionTests(unittest.TestCase):
+    """classes[].label gets the same sensitive-value screening as SKUs (an
+    all-digit Luhn PAN satisfies SLUG_PATTERN), and classId/sourceId errors
+    must report field + expected shape only — never a manifest-supplied
+    value. Sensitive fixtures are assembled at runtime so no PAN-shaped
+    literal appears in source."""
+
+    def test_pan_shaped_label_rejected_without_echo(self) -> None:
+        pan = "4111" * 4  # all-digit, satisfies SLUG_PATTERN
+        self.assertIsNotNone(validate_dataset_manifest.SLUG_PATTERN.match(pan))
+        manifest = _valid_manifest()
+        manifest["classes"][0]["label"] = pan
+        errors = validate_manifest(manifest)
+        self.assertIn("classes[0].label contains a sensitive-looking value", errors)
+        self.assertFalse(any("4111" in e for e in errors), errors)
+
+    def test_normal_slug_label_accepted(self) -> None:
+        manifest = _valid_manifest()
+        manifest["classes"][0]["label"] = "cola-classic-330"
+        self.assertEqual(validate_manifest(manifest), [])
+
+    def test_string_class_id_with_pan_digits_rejected_without_echo(self) -> None:
+        manifest = _valid_manifest()
+        manifest["classes"][0]["classId"] = "4111" * 4
+        errors = validate_manifest(manifest)
+        self.assertIn("classes[0].classId must be an integer >= 0", errors)
+        self.assertFalse(any("4111" in e for e in errors), errors)
+
+    def test_duplicate_class_id_error_is_index_based_without_value(self) -> None:
+        pan_like = int("4111" * 4)
+        manifest = _valid_manifest()
+        manifest["classes"][0]["classId"] = pan_like
+        manifest["classes"][1]["classId"] = pan_like
+        errors = validate_manifest(manifest)
+        self.assertIn("classes[1].classId duplicates classes[0].classId", errors)
+        self.assertFalse(any("4111" in e for e in errors), errors)
+
+    def test_duplicate_source_id_error_is_index_based_without_value(self) -> None:
+        pan_like = int("4111" * 4)
+        manifest = _valid_manifest()
+        manifest["classes"][0]["sourceId"] = pan_like
+        manifest["classes"][1]["sourceId"] = pan_like
+        errors = validate_manifest(manifest)
+        self.assertIn("classes[1].sourceId duplicates classes[0].sourceId", errors)
+        self.assertFalse(any("4111" in e for e in errors), errors)
+
+
+class NulPathRejectionTests(unittest.TestCase):
+    """A path with an embedded NUL must fail shape validation even without
+    --check-files (previously only sourceRoot carried a NUL guard)."""
+
+    def test_nul_in_image_path_rejected_without_check_files(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["image"] = "images/a\x00.jpg"
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("splits.train[0].image" in e for e in errors), errors)
+
+    def test_nul_in_sample_annotation_path_rejected_without_check_files(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["annotation"] = "ann\x00.json"
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("splits.train[0].annotation" in e for e in errors), errors)
+
+    def test_nul_in_split_level_annotation_ref_rejected_without_check_files(self) -> None:
+        manifest = _valid_manifest()
+        manifest["annotations"] = {"train": "instances\x00.json"}
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("annotations.train" in e for e in errors), errors)
+
+
 class EnumTypeGuardTests(unittest.TestCase):
     """Unhashable enum values (list/dict) must yield validation errors, not
     TypeError from set-membership tests."""
@@ -1527,7 +1597,15 @@ class RpcCategoryConsistencyTests(unittest.TestCase):
             image_dir = raw / f"{split}2019"
             image_dir.mkdir(parents=True, exist_ok=True)
             categories = val_categories if split == "val" else self.CATEGORIES
-            coco = {"images": [{"file_name": image_name}], "categories": categories}
+            coco: dict = {
+                "images": [{"id": 1, "file_name": image_name}],
+                "categories": categories,
+            }
+            if split == "train":
+                # Train files must carry labels; val/test may omit the key.
+                coco["annotations"] = [
+                    {"image_id": 1, "category_id": 3, "bbox": [1, 2, 3, 4]}
+                ]
             (raw / f"instances_{split}2019.json").write_text(
                 json.dumps(coco), encoding="utf-8"
             )
@@ -1595,7 +1673,7 @@ class RpcCocoShapeGuardTests(unittest.TestCase):
             image_dir = raw / f"{split}2019"
             image_dir.mkdir(parents=True, exist_ok=True)
             categories = list(self.CATEGORIES)
-            images = [{"file_name": image_name}]
+            images = [{"id": 1, "file_name": image_name}]
             if split == "train":
                 if train_categories is not None:
                     categories = train_categories
@@ -1603,7 +1681,15 @@ class RpcCocoShapeGuardTests(unittest.TestCase):
                     images = train_images
             elif split == "val" and val_categories is not None:
                 categories = val_categories
-            coco = {"images": images, "categories": categories}
+            coco: dict = {"images": images, "categories": categories}
+            if split == "train":
+                # Train files must carry labels; the join references may not
+                # resolve in fixtures that deliberately break images or
+                # categories, which only adds errors alongside the targeted
+                # one — assertions here check fragments, not exact output.
+                coco["annotations"] = [
+                    {"image_id": 1, "category_id": 3, "bbox": [1, 2, 3, 4]}
+                ]
             (raw / f"instances_{split}2019.json").write_text(
                 json.dumps(coco), encoding="utf-8"
             )
@@ -1642,7 +1728,7 @@ class RpcCocoShapeGuardTests(unittest.TestCase):
     def test_null_image_entry_reports_error_not_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result, out = self._run_prepare(
-                Path(tmp), train_images=[{"file_name": "t1.jpg"}, None]
+                Path(tmp), train_images=[{"id": 1, "file_name": "t1.jpg"}, None]
             )
             self._assert_controlled_error(
                 result, out, "instances_train2019.json", "images[1] must be an object"
@@ -1697,6 +1783,32 @@ class RpcCocoShapeGuardTests(unittest.TestCase):
                 "images[0].file_name must be a non-empty string",
             )
 
+    def test_image_missing_id_reports_error_not_traceback(self) -> None:
+        # An image entry without an id used to slip through whenever no
+        # annotation referenced it — every entry must carry a usable id.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), train_images=[{"file_name": "t1.jpg"}]
+            )
+            self._assert_controlled_error(
+                result,
+                out,
+                "instances_train2019.json",
+                "images[0].id must be an integer",
+            )
+
+    def test_boolean_image_id_reports_error_not_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), train_images=[{"id": True, "file_name": "t1.jpg"}]
+            )
+            self._assert_controlled_error(
+                result,
+                out,
+                "instances_train2019.json",
+                "images[0].id must be an integer",
+            )
+
     def test_duplicate_image_id_reports_error_naming_both_indexes(self) -> None:
         # Two images entries sharing an id would collapse in the reference
         # set used for annotation joins — must be rejected up front.
@@ -1731,10 +1843,17 @@ class RpcRequiredCocoKeysTests(unittest.TestCase):
         for split, image_name in self.IMAGE_NAMES.items():
             image_dir = raw / f"{split}2019"
             image_dir.mkdir(parents=True, exist_ok=True)
-            coco = {
+            coco: dict = {
                 "images": [{"id": 1, "file_name": image_name}],
                 "categories": list(self.CATEGORIES),
             }
+            if split == "train":
+                # Train files must carry labels; when this test drops the
+                # images or categories key from train, the dangling join
+                # references only add errors alongside the targeted one.
+                coco["annotations"] = [
+                    {"image_id": 1, "category_id": 3, "bbox": [1, 2, 3, 4]}
+                ]
             if split == from_split:
                 del coco[drop_key]
             (raw / f"instances_{split}2019.json").write_text(
@@ -1898,6 +2017,131 @@ class RpcCocoAnnotationValidationTests(unittest.TestCase):
             self.assertTrue((out / "manifest.json").exists())
 
 
+class RpcTrainAnnotationsRequiredTests(unittest.TestCase):
+    """The train COCO file must carry a present, non-empty `annotations`
+    list — a categories+images-only train file has nothing to train on and
+    must be a named error, never an OK manifest. val/test files may omit
+    the key entirely (unlabeled evaluation sets exist)."""
+
+    CATEGORIES = [{"id": 7, "name": "Cola 330"}, {"id": 3, "name": "Chips 50"}]
+    IMAGE_NAMES = {"train": "t1.jpg", "val": "v1.jpg", "test": "e1.jpg"}
+
+    def _run_prepare(
+        self, tmp: Path, *, drop_annotations: tuple = (), empty_annotations: tuple = ()
+    ) -> tuple:
+        raw = tmp / "raw"
+        out = tmp / "out"
+        for split, image_name in self.IMAGE_NAMES.items():
+            image_dir = raw / f"{split}2019"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            coco: dict = {
+                "images": [{"id": 1, "file_name": image_name}],
+                "categories": list(self.CATEGORIES),
+                "annotations": [
+                    {"image_id": 1, "category_id": 7, "bbox": [1, 2, 3, 4]}
+                ],
+            }
+            if split in drop_annotations:
+                del coco["annotations"]
+            if split in empty_annotations:
+                coco["annotations"] = []
+            (raw / f"instances_{split}2019.json").write_text(
+                json.dumps(coco), encoding="utf-8"
+            )
+            (image_dir / image_name).write_text(f"pixels-{image_name}", encoding="utf-8")
+        result = _run_script(
+            "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+        )
+        return result, out
+
+    def _assert_train_labels_required(self, result, out: Path) -> None:
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ERROR", result.stdout)
+        self.assertIn("instances_train2019.json", result.stdout)
+        self.assertIn("non-empty", result.stdout)
+        self.assertIn("annotations", result.stdout)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertFalse((out / "manifest.json").exists())
+
+    def test_train_without_annotations_key_rejected_naming_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(Path(tmp), drop_annotations=("train",))
+            self._assert_train_labels_required(result, out)
+
+    def test_train_with_empty_annotations_list_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(Path(tmp), empty_annotations=("train",))
+            self._assert_train_labels_required(result, out)
+
+    def test_val_and_test_without_annotations_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), drop_annotations=("val", "test")
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((out / "manifest.json").exists())
+
+
+class RpcMalformedJsonTests(unittest.TestCase):
+    """Truncated/corrupt COCO files must produce a controlled ERROR naming
+    the file (reason class only, never file content) — never a raw
+    JSONDecodeError traceback — from both the initial train load and the
+    per-split loads."""
+
+    CATEGORIES = [{"id": 7, "name": "Cola 330"}, {"id": 3, "name": "Chips 50"}]
+    IMAGE_NAMES = {"train": "t1.jpg", "val": "v1.jpg", "test": "e1.jpg"}
+
+    def _write_valid_raw(self, raw: Path) -> None:
+        for split, image_name in self.IMAGE_NAMES.items():
+            image_dir = raw / f"{split}2019"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            coco: dict = {
+                "images": [{"id": 1, "file_name": image_name}],
+                "categories": list(self.CATEGORIES),
+                "annotations": [
+                    {"image_id": 1, "category_id": 7, "bbox": [1, 2, 3, 4]}
+                ],
+            }
+            (raw / f"instances_{split}2019.json").write_text(
+                json.dumps(coco), encoding="utf-8"
+            )
+            (image_dir / image_name).write_text(f"pixels-{image_name}", encoding="utf-8")
+
+    def _assert_controlled_json_error(self, result, out: Path, file_name: str) -> None:
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ERROR", result.stdout)
+        self.assertIn(file_name, result.stdout)
+        self.assertIn("not valid JSON", result.stdout)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertFalse((out / "manifest.json").exists())
+
+    def test_truncated_train_json_is_controlled_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            out = Path(tmp) / "out"
+            self._write_valid_raw(raw)
+            (raw / "instances_train2019.json").write_text(
+                '{"images": [', encoding="utf-8"
+            )
+            result = _run_script(
+                "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+            )
+            self._assert_controlled_json_error(result, out, "instances_train2019.json")
+
+    def test_corrupt_val_json_is_controlled_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            out = Path(tmp) / "out"
+            self._write_valid_raw(raw)
+            (raw / "instances_val2019.json").write_text(
+                '{"categories": [{', encoding="utf-8"
+            )
+            result = _run_script(
+                "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+            )
+            self._assert_controlled_json_error(result, out, "instances_val2019.json")
+
+
 class RpcLabelCollisionTests(unittest.TestCase):
     """Slug collisions among COCO category names must resolve to labels that
     are actually unique — a one-shot index suffix can itself collide (e.g.
@@ -1917,10 +2161,15 @@ class RpcLabelCollisionTests(unittest.TestCase):
             for split, image_name in self.IMAGE_NAMES.items():
                 image_dir = raw / f"{split}2019"
                 image_dir.mkdir(parents=True, exist_ok=True)
-                coco = {
+                coco: dict = {
                     "images": [{"id": 1, "file_name": image_name}],
                     "categories": list(self.CATEGORIES),
                 }
+                if split == "train":
+                    # Train files must carry labels; val/test may omit them.
+                    coco["annotations"] = [
+                        {"image_id": 1, "category_id": 1, "bbox": [1, 2, 3, 4]}
+                    ]
                 (raw / f"instances_{split}2019.json").write_text(
                     json.dumps(coco), encoding="utf-8"
                 )
