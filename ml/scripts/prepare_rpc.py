@@ -49,6 +49,42 @@ from pathlib import Path
 
 from validate_dataset_manifest import validate_manifest
 
+# Sensitive-value screening for COCO-supplied values that persist into the
+# generated manifest or get echoed in diagnostics (category names BEFORE
+# slugification, category/image ids in decimal-string form, image
+# file_names): reuse the exact same screen as the VisionEvent mapper and
+# the manifest validator. Slugification destroys detection syntax
+# ("cvv=123" -> "cvv-123", AKIA... lowercased), so the ORIGINAL values must
+# be screened before any normalization. The script may run standalone, so
+# its own directory is added to sys.path before importing; if the mapper
+# module is unavailable, a minimal local Luhn-PAN check keeps the preparer
+# from ever hard-crashing.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+try:
+    from sample_inference_to_vision_event import contains_sensitive_value as _contains_sensitive_value
+except ImportError:  # pragma: no cover - fallback when the mapper is absent
+    _PAN_CANDIDATE = re.compile(r"\d(?:[ \-]?\d){11,}")
+
+    def _passes_luhn(digits: str) -> bool:
+        total = 0
+        for index, char in enumerate(reversed(digits)):
+            digit = ord(char) - 48
+            if index % 2 == 1:
+                digit *= 2
+                if digit > 9:
+                    digit -= 9
+            total += digit
+        return total % 10 == 0
+
+    def _contains_sensitive_value(text: str) -> bool:
+        for candidate in _PAN_CANDIDATE.findall(text):
+            digits = candidate.replace(" ", "").replace("-", "")
+            if 13 <= len(digits) <= 19 and _passes_luhn(digits):
+                return True
+        return False
+
 SPLIT_MARKERS = {
     "train": ("train2019", "instances_train2019.json"),
     "val": ("val2019", "instances_val2019.json"),
@@ -103,7 +139,9 @@ def _category_map_mismatches(train_map: dict, split_map: dict) -> list:
     Empty list means the maps are exactly equal (same id set, same names).
 
     Redaction policy: both maps have already passed _coco_shape_errors, so
-    every id here is a validated non-negative non-bool int — echoing the
+    every id here is a validated non-negative non-bool int whose decimal
+    form additionally passed the sensitive-value screen (a PAN-like id is
+    rejected there before it can reach these messages) — echoing the
     integer id is safe and needed for remediation. Category NAMES are
     arbitrary COCO-supplied strings (a hostile or mangled export can carry
     credentials or PII in a name) and are never echoed — only the fact that
@@ -169,7 +207,12 @@ def _coco_shape_errors(coco) -> list:
     whole entries) are never echoed — an annotation file is untrusted input
     whose values can carry credentials, PANs, or PII that must not reach
     terminal/CI logs. (Python type names of wrong-typed containers are not
-    input values and remain safe to name.)
+    input values and remain safe to name.) On top of the type checks, every
+    category name, image file_name, and the decimal form of every
+    category/image id is screened with the shared sensitive-value check
+    (credential fragments, known token formats, Luhn-valid PANs) BEFORE any
+    slugification or manifest write, because those values persist into the
+    generated manifest or get echoed in later diagnostics.
     """
     if not isinstance(coco, dict):
         return [f"top-level payload must be a JSON object, got {type(coco).__name__}"]
@@ -193,9 +236,26 @@ def _coco_shape_errors(coco) -> list:
                 errors.append(
                     f"categories[{idx}].id must be a non-negative integer"
                 )
+            elif _contains_sensitive_value(str(category_id)):
+                # A PAN-like integer (e.g. a Luhn-valid 16-digit number)
+                # passes the non-negative-int check but would persist as
+                # sourceId and be echoed in map-mismatch diagnostics —
+                # reject it here so only screened ids ever reach those
+                # echoes. The value itself is never printed.
+                errors.append(
+                    f"categories[{idx}].id contains a sensitive-looking value"
+                )
             name = category.get("name")
             if not isinstance(name, str) or not name:
                 errors.append(f"categories[{idx}].name must be a non-empty string")
+            elif _contains_sensitive_value(name):
+                # Screen the ORIGINAL name before prepare()'s slugification
+                # can mangle credential/PAN syntax into an innocuous-looking
+                # label ("cvv=123" -> "cvv-123") that would persist in the
+                # manifest. The name itself is never printed.
+                errors.append(
+                    f"categories[{idx}].name contains a sensitive-looking value"
+                )
     images = coco.get("images")
     if "images" not in coco:
         errors.append("images is a required key and must be a list of objects")
@@ -215,9 +275,25 @@ def _coco_shape_errors(coco) -> list:
                 errors.append(
                     f"images[{idx}].file_name must be a non-empty string"
                 )
+            elif _contains_sensitive_value(file_name):
+                # file_name persists verbatim into the manifest's split
+                # samples and referenced-file errors downstream echo it —
+                # screen it before any manifest write. The value itself is
+                # never printed.
+                errors.append(
+                    f"images[{idx}].file_name contains a sensitive-looking value"
+                )
             image_id = image.get("id")
             if isinstance(image_id, bool) or not isinstance(image_id, int):
                 errors.append(f"images[{idx}].id must be an integer")
+            elif _contains_sensitive_value(str(image_id)):
+                # Same PAN-like-integer screen as categories[].id: image ids
+                # are echoed in duplicate/unknown-reference errors, so only
+                # screened ids may reach them. The value itself is never
+                # printed.
+                errors.append(
+                    f"images[{idx}].id contains a sensitive-looking value"
+                )
             elif image_id in seen_image_ids:
                 errors.append(
                     f"images[{idx}].id duplicates images[{seen_image_ids[image_id]}].id"

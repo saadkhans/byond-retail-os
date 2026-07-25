@@ -37,11 +37,46 @@ import csv
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
 
 from validate_dataset_manifest import validate_manifest
+
+# Sensitive-value screening for CSV-supplied image names: column 1 persists
+# verbatim into the generated manifest's split samples and referenced-file
+# errors downstream echo it, so a credential- or PAN-shaped name must be a
+# controlled error before any manifest write. Reuses the exact same screen
+# as the VisionEvent mapper and the manifest validator. The script may run
+# standalone, so its own directory is added to sys.path before importing;
+# if the mapper module is unavailable, a minimal local Luhn-PAN check keeps
+# the preparer from ever hard-crashing.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+try:
+    from sample_inference_to_vision_event import contains_sensitive_value as _contains_sensitive_value
+except ImportError:  # pragma: no cover - fallback when the mapper is absent
+    _PAN_CANDIDATE = re.compile(r"\d(?:[ \-]?\d){11,}")
+
+    def _passes_luhn(digits: str) -> bool:
+        total = 0
+        for index, char in enumerate(reversed(digits)):
+            digit = ord(char) - 48
+            if index % 2 == 1:
+                digit *= 2
+                if digit > 9:
+                    digit -= 9
+            total += digit
+        return total % 10 == 0
+
+    def _contains_sensitive_value(text: str) -> bool:
+        for candidate in _PAN_CANDIDATE.findall(text):
+            digits = candidate.replace(" ", "").replace("-", "")
+            if 13 <= len(digits) <= 19 and _passes_luhn(digits):
+                return True
+        return False
 
 SPLIT_CSV_NAMES = {
     "train": "annotations_train.csv",
@@ -178,6 +213,12 @@ def _row_errors(row: list) -> list:
     errors = []
     if not row[0].strip():
         errors.append("image_name must be non-empty")
+    elif _contains_sensitive_value(row[0]):
+        # The image name persists verbatim into the manifest and is echoed
+        # by downstream referenced-file errors — reject a sensitive-looking
+        # one (credential fragment, known token format, Luhn-valid PAN)
+        # before any manifest write. The value itself is never printed.
+        errors.append("image name contains a sensitive-looking value")
     numbers = {}
     for column_index, column_name in NUMERIC_CSV_COLUMNS:
         value = _finite_number(row[column_index])

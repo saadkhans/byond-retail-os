@@ -291,7 +291,10 @@ def validate(input_dir: Path, output_dir) -> int:
     manifest_path = input_dir / "manifest.json"
     try:
         raw = manifest_path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # UnicodeDecodeError (invalid UTF-8 bytes) is not an OSError: without
+        # this guard a binary/mis-encoded manifest would traceback instead of
+        # producing the same controlled exit-1 error malformed JSON gets.
         print(f"ERROR: could not read {manifest_path}: {exc}")
         return 1
 

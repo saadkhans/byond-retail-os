@@ -67,6 +67,7 @@ class _RpcRawMixin:
         train_categories: list = None,
         val_categories: list = None,
         train_annotations: list = None,
+        train_images: list = None,
     ) -> None:
         for split, image_name in self.IMAGE_NAMES.items():
             image_dir = raw / f"{split}2019"
@@ -76,8 +77,11 @@ class _RpcRawMixin:
                 categories = train_categories
             if split == "val" and val_categories is not None:
                 categories = val_categories
+            images = [{"id": 1, "file_name": image_name}]
+            if split == "train" and train_images is not None:
+                images = train_images
             coco: dict = {
-                "images": [{"id": 1, "file_name": image_name}],
+                "images": images,
                 "categories": categories,
             }
             if split == "train":
@@ -171,6 +175,162 @@ class RpcHostileCocoValueTests(_RpcRawMixin, unittest.TestCase):
             self.assertNotIn(secret_name, combined)
             self.assertNotIn("Traceback", combined)
             self.assertFalse((out / "manifest.json").exists())
+
+
+def _luhn_pan() -> str:
+    """Runtime-assembled Luhn-valid 16-digit PAN (never a source literal)."""
+    return "4111" + "1111" * 3
+
+
+class PreparerSensitiveValueScreenTests(_RpcRawMixin, unittest.TestCase):
+    """Values that would persist into a generated manifest or be echoed by
+    downstream diagnostics — category names (before slugification mangles
+    credential syntax), category/image ids in decimal form, image
+    file_names, and SKU-110K CSV image names — are screened with the shared
+    sensitive-value check. A hit is a controlled ERROR naming file, index,
+    and field only; the value never reaches stdout/stderr and no manifest
+    is written. Clean synthetic fixtures must still pass end-to-end."""
+
+    def _run_rpc(self, tmp: Path, **overrides) -> tuple:
+        raw = Path(tmp) / "raw"
+        out = Path(tmp) / "out"
+        self._write_raw(raw, **overrides)
+        result = _run_script(
+            "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+        )
+        return result, out
+
+    def _write_sku110k_raw(self, raw: Path, train_image_name: str) -> None:
+        images_dir = raw / "images"
+        images_dir.mkdir(parents=True)
+        annotations_dir = raw / "annotations"
+        annotations_dir.mkdir(parents=True)
+        for split, image_name in (
+            ("train", train_image_name),
+            ("val", "b.jpg"),
+            ("test", "c.jpg"),
+        ):
+            (annotations_dir / f"annotations_{split}.csv").write_text(
+                f"{image_name},10,10,20,20,object,100,100\n", encoding="utf-8"
+            )
+            (images_dir / image_name).write_text(
+                f"pixels-{split}", encoding="utf-8"
+            )
+
+    def test_sensitive_category_name_rejected_without_echo(self) -> None:
+        # Slugification would turn "cvv=NNNN" into "cvv-nnnn" and hide the
+        # credential syntax — the ORIGINAL name must be screened first.
+        sensitive_name = "cv" + "v=" + "4242"
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_rpc(
+                Path(tmp),
+                train_categories=[
+                    {"id": 7, "name": sensitive_name},
+                    {"id": 3, "name": "Chips 50"},
+                ],
+            )
+            combined = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("instances_train2019.json", result.stdout)
+            self.assertIn(
+                "categories[0].name contains a sensitive-looking value",
+                result.stdout,
+            )
+            self.assertNotIn(sensitive_name, combined)
+            self.assertNotIn("Traceback", combined)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_pan_integer_category_id_rejected_without_digits(self) -> None:
+        pan = _luhn_pan()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_rpc(
+                Path(tmp),
+                train_categories=[
+                    {"id": int(pan), "name": "Cola 330"},
+                    {"id": 3, "name": "Chips 50"},
+                ],
+            )
+            combined = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "categories[0].id contains a sensitive-looking value",
+                result.stdout,
+            )
+            self.assertNotIn(pan, combined)
+            self.assertNotIn("Traceback", combined)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_pan_integer_image_id_rejected_without_digits(self) -> None:
+        pan = _luhn_pan()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_rpc(
+                Path(tmp),
+                train_images=[{"id": int(pan), "file_name": "t1.jpg"}],
+            )
+            combined = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "images[0].id contains a sensitive-looking value", result.stdout
+            )
+            self.assertNotIn(pan, combined)
+            self.assertNotIn("Traceback", combined)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_pan_named_rpc_file_name_rejected_without_digits(self) -> None:
+        pan = _luhn_pan()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_rpc(
+                Path(tmp),
+                train_images=[{"id": 1, "file_name": f"{pan}.jpg"}],
+            )
+            combined = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "images[0].file_name contains a sensitive-looking value",
+                result.stdout,
+            )
+            self.assertNotIn(pan, combined)
+            self.assertNotIn("Traceback", combined)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_pan_named_sku110k_csv_image_rejected_without_digits(self) -> None:
+        pan = _luhn_pan()
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            out = Path(tmp) / "out"
+            self._write_sku110k_raw(raw, train_image_name=f"{pan}.jpg")
+            result = _run_script(
+                "prepare_sku110k.py", ["--input", str(raw), "--output", str(out)]
+            )
+            combined = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("annotations/annotations_train.csv", result.stdout)
+            self.assertIn(
+                "row 1: image name contains a sensitive-looking value",
+                result.stdout,
+            )
+            self.assertNotIn(pan, combined)
+            self.assertNotIn("Traceback", combined)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_valid_rpc_fixture_still_accepted_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_rpc(Path(tmp))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("OK: wrote", result.stdout)
+            self.assertTrue((out / "manifest.json").exists())
+
+    def test_valid_sku110k_fixture_still_accepted_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            out = Path(tmp) / "out"
+            self._write_sku110k_raw(raw, train_image_name="a.jpg")
+            result = _run_script(
+                "prepare_sku110k.py", ["--input", str(raw), "--output", str(out)]
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("OK: wrote", result.stdout)
+            self.assertTrue((out / "manifest.json").exists())
 
 
 class Sku110kCorruptCsvTests(unittest.TestCase):

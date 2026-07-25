@@ -119,12 +119,28 @@ def _iter_dicts(obj):
             yield from _iter_dicts(item)
 
 
+def _safe_field(key) -> str:
+    """Render an unexpected payload key for an error message WITHOUT leaking
+    sensitive content: unlisted keys are adapter-chosen strings, and a key
+    literally named with a PAN or credential fragment must never reach
+    adapter/CI logs verbatim. Mirrors validate_dataset_manifest.py's
+    _safe_field. (`_contains_sensitive_value` is defined further down the
+    module; the name is resolved at call time, so this forward reference is
+    fine.)"""
+    if isinstance(key, str) and not _contains_sensitive_value(key):
+        return repr(key)
+    return "<redacted>"
+
+
 def _check_whitelist(node, allowed: frozenset, label: str) -> None:
     if not isinstance(node, dict):
         raise ValueError(f"{label} must be an object")
     unexpected = set(node.keys()) - allowed
     if unexpected:
-        raise ValueError(f"{label} contains fields outside the allowed shape: {sorted(unexpected)}")
+        # Each unexpected key is screened before being echoed: a key named
+        # with credential- or payment-bearing content prints as <redacted>.
+        rendered = ", ".join(_safe_field(key) for key in sorted(unexpected, key=str))
+        raise ValueError(f"{label} contains fields outside the allowed shape: [{rendered}]")
 
 
 def assert_payload_safe(payload: dict) -> None:
@@ -140,6 +156,9 @@ def assert_payload_safe(payload: dict) -> None:
     for node in _iter_dicts(payload):
         forbidden = set(node.keys()) & FORBIDDEN_FIELDS
         if forbidden:
+            # Safe to echo verbatim: `forbidden` is an intersection with our
+            # own FORBIDDEN_FIELDS constants, so only those fixed names can
+            # ever appear here — never an adapter-chosen key.
             raise ValueError(f"forbidden field(s) may not appear in a vision-event payload: {sorted(forbidden)}")
 
     _check_whitelist(payload, TOP_LEVEL_ALLOWED_FIELDS, "payload")
@@ -479,8 +498,17 @@ def to_vision_event(inference: dict) -> dict:
     if quantity > PG_INT_MAX:
         raise ValueError(f"quantityDelta magnitude must not exceed {PG_INT_MAX} (the API integer bound)")
 
+    # Reference IDs (locationId/unitId here; deviceId/checkoutSessionId
+    # below) are emitted verbatim to stdout/--out, so they get the same
+    # sensitive-value screen as idempotencyKey/sku/label. The Phase 7 service
+    # does NOT screen these fields server-side — this is deliberately
+    # stricter on the producer side, which is the safe direction: the mapper
+    # may reject what the API would accept, never the reverse. Errors name
+    # the field only, never the value.
     location_id = _require_nonempty_string(inference.get("locationId"), "locationId")
+    _assert_opaque("locationId", location_id)
     unit_id = _require_nonempty_string(inference.get("unitId"), "unitId")
+    _assert_opaque("unitId", unit_id)
     occurred_at = _require_iso8601("occurredAt", inference.get("occurredAt"))
 
     detections = inference.get("detections")
@@ -572,13 +600,18 @@ def to_vision_event(inference: dict) -> dict:
     if ranked_candidates:
         payload["candidates"] = ranked_candidates
 
+    # Same producer-side reference-ID screen as locationId/unitId above.
     device_id = inference.get("deviceId")
     if device_id is not None:
-        payload["deviceId"] = _require_nonempty_string(device_id, "deviceId")
+        _require_nonempty_string(device_id, "deviceId")
+        _assert_opaque("deviceId", device_id)
+        payload["deviceId"] = device_id
 
     session_id = inference.get("checkoutSessionId")
     if session_id is not None:
-        payload["sessionId"] = _require_nonempty_string(session_id, "checkoutSessionId")
+        _require_nonempty_string(session_id, "checkoutSessionId")
+        _assert_opaque("checkoutSessionId", session_id)
+        payload["sessionId"] = session_id
 
     if ranked_candidates:
         payload["evidenceScore"] = ranked_candidates[0]["score"]
@@ -624,6 +657,13 @@ def main(argv=None) -> int:
         inference = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
         print(f"ERROR: could not read {path}: {exc}")
+        return 1
+    except UnicodeDecodeError:
+        # read_text raises UnicodeDecodeError (neither OSError nor
+        # JSONDecodeError) on non-UTF-8 bytes — without this clause the CLI
+        # would traceback. The message names the path only: the exception
+        # text would echo raw byte values from the file.
+        print(f"ERROR: {path} is not valid UTF-8 text")
         return 1
     except json.JSONDecodeError as exc:
         print(f"ERROR: {path} is not valid JSON: {exc}")

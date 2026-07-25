@@ -610,6 +610,126 @@ class SensitiveValueScreeningTests(unittest.TestCase):
             to_vision_event(inference)
 
 
+def _test_pan() -> str:
+    # Runtime-assembled Luhn-valid test PAN (4111-1111-1111-1111) — no
+    # contiguous PAN literal ever appears in source (Gitleaks-safe).
+    return "4111" + "1" * 12
+
+
+class ReferenceIdScreeningTests(unittest.TestCase):
+    """Codex P1: locationId/unitId (required) and deviceId/checkoutSessionId
+    (optional) were emitted verbatim after only a non-empty-string check — a
+    PAN or credential fragment in them reached stdout/--out. All four now get
+    the same _assert_opaque screen as idempotencyKey/sku/label. Deliberately
+    stricter than the Phase 7 service (which does not screen these fields
+    server-side): producer-side over-rejection is the safe direction."""
+
+    def test_pan_location_id_rejected_without_echoing_digits(self) -> None:
+        inference = _base_inference()
+        inference["locationId"] = _test_pan()
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertIn("locationId", message)
+        # The error must contain NO digits at all — not the PAN, not any
+        # fragment of it.
+        self.assertFalse(any(char.isdigit() for char in message))
+
+    def test_credential_fragment_unit_id_rejected(self) -> None:
+        inference = _base_inference()
+        # Runtime-assembled credential fragment (api_key=...).
+        inference["unitId"] = "api" + "_key=" + "abc123"
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertIn("unitId", message)
+        self.assertNotIn("abc123", message)
+
+    def test_pan_device_id_rejected(self) -> None:
+        inference = _base_inference()
+        inference["deviceId"] = _test_pan()
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertIn("deviceId", message)
+        self.assertFalse(any(char.isdigit() for char in message))
+
+    def test_pan_checkout_session_id_rejected(self) -> None:
+        inference = _base_inference()
+        inference["checkoutSessionId"] = _test_pan()
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertIn("checkoutSessionId", message)
+        self.assertFalse(any(char.isdigit() for char in message))
+
+    def test_committed_fixture_reference_ids_still_accepted(self) -> None:
+        # The demo IDs in ml/examples (loc-demo-001, unit-demo-001,
+        # cam-demo-001, sess-demo-001) carry only 3-digit runs and no
+        # credential shapes — they must pass the new screen unchanged.
+        payload = to_vision_event(_load_json("sample_model_output.json"))
+        self.assertEqual(payload["locationId"], "loc-demo-001")
+        self.assertEqual(payload["unitId"], "unit-demo-001")
+        self.assertEqual(payload["deviceId"], "cam-demo-001")
+        self.assertEqual(payload["sessionId"], "sess-demo-001")
+
+
+class WhitelistErrorRedactionTests(unittest.TestCase):
+    """Codex P1: _check_whitelist serialized unlisted keys verbatim, so a key
+    NAMED with a PAN reached adapter/CI logs. Unexpected keys are now screened
+    with _safe_field and print as <redacted> when sensitive-looking."""
+
+    def _valid_payload(self) -> dict:
+        return to_vision_event(_base_inference())
+
+    def test_pan_named_unexpected_top_level_key_redacted(self) -> None:
+        payload = self._valid_payload()
+        payload[_test_pan()] = "x"
+        with self.assertRaises(ValueError) as ctx:
+            assert_payload_safe(payload)
+        message = str(ctx.exception)
+        self.assertIn("<redacted>", message)
+        self.assertFalse(any(char.isdigit() for char in message))
+
+    def test_pan_named_unexpected_candidate_key_redacted(self) -> None:
+        payload = self._valid_payload()
+        payload["candidates"][0][_test_pan()] = "x"
+        with self.assertRaises(ValueError) as ctx:
+            assert_payload_safe(payload)
+        message = str(ctx.exception)
+        self.assertIn("<redacted>", message)
+        self.assertFalse(any(char.isdigit() for char in message))
+
+    def test_pan_named_unexpected_evidence_bundle_key_redacted(self) -> None:
+        inference = _base_inference()
+        inference["captureStartedAt"] = "2026-07-21T09:59:58.000Z"
+        payload = to_vision_event(inference)
+        payload["evidenceBundle"][_test_pan()] = "x"
+        with self.assertRaises(ValueError) as ctx:
+            assert_payload_safe(payload)
+        message = str(ctx.exception)
+        self.assertIn("<redacted>", message)
+        self.assertFalse(any(char.isdigit() for char in message))
+
+    def test_credential_fragment_named_key_redacted(self) -> None:
+        payload = self._valid_payload()
+        payload["api" + "_key=" + "abc123"] = "x"
+        with self.assertRaises(ValueError) as ctx:
+            assert_payload_safe(payload)
+        message = str(ctx.exception)
+        self.assertIn("<redacted>", message)
+        self.assertNotIn("abc123", message)
+
+    def test_benign_unexpected_key_still_named(self) -> None:
+        payload = self._valid_payload()
+        payload["bogusExtraField"] = "x"
+        with self.assertRaises(ValueError) as ctx:
+            assert_payload_safe(payload)
+        message = str(ctx.exception)
+        self.assertIn("'bogusExtraField'", message)
+        self.assertNotIn("<redacted>", message)
+
+
 class AsciiBoundarySecretTokenTests(unittest.TestCase):
     """Codex P2: Python's \\b is Unicode-aware, so a secret token glued to an
     accented letter carried no Python word boundary and slipped past the old
@@ -864,6 +984,36 @@ class CliErrorHandlingTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ERROR: eventType is required and must be a non-empty string", result.stdout)
         self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+
+class CliInvalidUtf8Tests(unittest.TestCase):
+    """Codex P2: Path.read_text raises UnicodeDecodeError on non-UTF-8 bytes
+    — neither OSError nor JSONDecodeError, so the CLI tracebacked. Now the
+    documented ERROR: line + exit 1; the message names the path only and
+    never echoes byte values."""
+
+    def test_non_utf8_model_file_prints_error_line_not_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_output = Path(tmp) / "model_output.json"
+            # 0xff is an invalid UTF-8 start byte.
+            model_output.write_bytes(b"\xff\xfe\x00garbage")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "sample_inference_to_vision_event.py"),
+                    str(model_output),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ERROR", result.stdout)
+        self.assertIn("is not valid UTF-8 text", result.stdout)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        # The message must not echo raw byte values (the exception text
+        # would contain "0xff").
+        self.assertNotIn("0xff", result.stdout + result.stderr)
 
 
 class CliOutWriteTests(unittest.TestCase):

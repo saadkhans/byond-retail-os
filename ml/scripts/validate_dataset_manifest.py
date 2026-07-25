@@ -85,8 +85,10 @@ _WINDOWS_DRIVE_PATTERN = re.compile(r"^[a-zA-Z]:")
 # unconstrained input — it can be a credentialed rtsp://user:secret@... URL,
 # an absolute path leaking directory layout, or non-string junk — so these
 # errors name the field and the rule only, never the supplied value. (Paths
-# that PASSED the gate are clean canonical relative strings and may still be
-# echoed by missing-file/duplicate/alias reports.)
+# that PASSED the gate are clean canonical relative strings, but canonical
+# syntax does not imply non-sensitive content — e.g. images/<PAN>.jpg — so
+# missing-file/duplicate/alias reports echo an accepted path only when the
+# sensitive-value screen passes, via _safe_path below.)
 _BAD_PATH_RULE = (
     "must be a canonical relative path (no absolute paths, URI schemes, "
     "backslashes, '..', '.', empty segments, or NUL)"
@@ -125,6 +127,21 @@ def _is_bad_path(value) -> bool:
     if any(segment in ("", ".", "..") for segment in value.split("/")):
         return True
     return False
+
+
+def _safe_path(value: str) -> str:
+    """Screen an ACCEPTED path before echoing it in an error message.
+
+    A value that passed _is_bad_path is a clean canonical relative path, but
+    canonical syntax says nothing about content: a filename can embed a PAN
+    or credential fragment (e.g. "images/<card-number>.jpg") that must not
+    reach terminal/CI logs. Echo the path only when the sensitive-value
+    screen passes; otherwise substitute a fixed placeholder — the field path
+    in the surrounding message still identifies the offending entry.
+    """
+    if not _contains_sensitive_value(value):
+        return value
+    return "<redacted path>"
 
 
 def _digest_file(path: Path) -> bytes:
@@ -395,7 +412,7 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                         if image in seen_images:
                             errors.append(
                                 f"{sample_path}.image duplicates "
-                                f"splits.{seen_images[image]}.image ({image!r})"
+                                f"splits.{seen_images[image]}.image ({_safe_path(image)!r})"
                             )
                         else:
                             seen_images[image] = f"{split_name}[{idx}]"
@@ -468,11 +485,11 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                         if isinstance(rel, str) and not _is_bad_path(rel):
                             target = root / rel
                             if not target.exists():
-                                missing.append(f"missing file: {rel}")
+                                missing.append(f"missing file: {_safe_path(rel)}")
                             elif not target.is_file():
-                                missing.append(f"not a regular file: {rel}")
+                                missing.append(f"not a regular file: {_safe_path(rel)}")
                             elif _escapes_root(_resolve(target)):
-                                missing.append(f"escapes the source root: {rel}")
+                                missing.append(f"escapes the source root: {_safe_path(rel)}")
                 seen_image_identities: dict = {}
                 seen_image_digests: dict = {}
                 for split_name in SPLIT_NAMES:
@@ -488,14 +505,14 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                                 continue
                             target = root / rel
                             if not target.exists():
-                                missing.append(f"missing file: {rel}")
+                                missing.append(f"missing file: {_safe_path(rel)}")
                                 continue
                             if not target.is_file():
-                                missing.append(f"not a regular file: {rel}")
+                                missing.append(f"not a regular file: {_safe_path(rel)}")
                                 continue
                             resolved = _resolve(target)
                             if _escapes_root(resolved):
-                                missing.append(f"escapes the source root: {rel}")
+                                missing.append(f"escapes the source root: {_safe_path(rel)}")
                                 continue
                             if key != "image":
                                 # Annotations may legitimately be shared across
@@ -550,7 +567,7 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                             try:
                                 digest = _digest_file(target)
                             except OSError:
-                                missing.append(f"unreadable file: {rel}")
+                                missing.append(f"unreadable file: {_safe_path(rel)}")
                                 continue
                             prior_ref = seen_image_digests.get(digest)
                             if prior_ref is None:
@@ -598,7 +615,10 @@ def main(argv=None) -> int:
     manifest_path = Path(args.manifest)
     try:
         raw = manifest_path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # UnicodeDecodeError (invalid UTF-8 bytes) is not an OSError: without
+        # this guard a binary/mis-encoded manifest would traceback instead of
+        # producing the same controlled exit-1 error malformed JSON gets.
         print(f"ERROR: could not read manifest {manifest_path}: {exc}")
         return 1
 

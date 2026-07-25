@@ -2513,6 +2513,79 @@ class UnknownFieldKeyRedactionTests(unittest.TestCase):
         self.assertTrue(any("unknown top-level field: 'extraField'" in e for e in errors), errors)
 
 
+class AcceptedPathRedactionTests(unittest.TestCase):
+    """A path can pass the canonical-relative-path gate while still carrying
+    sensitive content in a filename (e.g. images/<PAN>.jpg) — accepted-path
+    echoes (missing-file, cross-split duplicate, ...) must screen the value
+    and redact sensitive-looking ones. Benign accepted paths stay echoed:
+    the policy is echo-only-when-non-sensitive. (PAN fixtures are assembled
+    at runtime so no card-shaped literal appears in source.)"""
+
+    @staticmethod
+    def _pan_image() -> str:
+        return "images/" + "4111" * 4 + ".jpg"
+
+    def test_missing_pan_named_image_error_redacted(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["image"] = self._pan_image()
+        with tempfile.TemporaryDirectory() as tmp:
+            errors = validate_manifest(manifest, base_dir=Path(tmp), check_files=True)
+        self.assertTrue(any("missing file:" in e for e in errors), errors)
+        self.assertFalse(any("4111" in e for e in errors), errors)
+
+    def test_cross_split_duplicate_pan_named_path_redacted(self) -> None:
+        pan_image = self._pan_image()
+        manifest = _valid_manifest()
+        manifest["splits"]["train"] = [{"image": pan_image}]
+        manifest["splits"]["test"] = [{"image": pan_image}]
+        errors = validate_manifest(manifest)
+        self.assertTrue(
+            any(
+                "splits.test[0].image duplicates splits.train[0].image" in e
+                for e in errors
+            ),
+            errors,
+        )
+        self.assertFalse(any("4111" in e for e in errors), errors)
+
+    def test_benign_missing_path_still_echoed(self) -> None:
+        manifest = _valid_manifest()
+        with tempfile.TemporaryDirectory() as tmp:
+            errors = validate_manifest(manifest, base_dir=Path(tmp), check_files=True)
+        self.assertTrue(
+            any("missing file: images/a.jpg" in e for e in errors), errors
+        )
+
+
+class InvalidUtf8ManifestTests(unittest.TestCase):
+    """A manifest whose bytes are not valid UTF-8 must produce the same
+    controlled exit-1 ERROR malformed JSON gets — never a UnicodeDecodeError
+    traceback — from both the standalone validator CLI and the BYOND
+    preparer's manifest read."""
+
+    INVALID_UTF8 = b"\xff\xfe{not json}"
+
+    def test_validator_cli_invalid_utf8_exits_1_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_bytes(self.INVALID_UTF8)
+            result = _run_script("validate_dataset_manifest.py", [str(manifest_path)])
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("ERROR", result.stdout)
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+    def test_byond_cli_invalid_utf8_manifest_exits_1_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_dir = Path(tmp) / "input"
+            (input_dir / "raw" / "shelves").mkdir(parents=True)
+            (input_dir / "annotations").mkdir()
+            (input_dir / "manifest.json").write_bytes(self.INVALID_UTF8)
+            result = _run_script("prepare_byond_dataset.py", ["--input", str(input_dir)])
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("ERROR", result.stdout)
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+
 class ByondSourceRootRedactionTests(unittest.TestCase):
     """The containment error must not echo the manifest-supplied sourceRoot
     (or the resolved path, whose components derive from it)."""
