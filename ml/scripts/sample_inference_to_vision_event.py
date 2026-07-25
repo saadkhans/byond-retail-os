@@ -188,21 +188,40 @@ _KEY_COLON_CREDENTIAL = re.compile(
 # Bare well-known secret tokens (no key=/key: label, not inside a URL): a
 # fixed allow-list of provider formats, NOT an entropy heuristic — opaque
 # fields are legitimately random-looking. Case-sensitive like the service.
+#
+# JS-parity boundaries: the API's patterns (KNOWN_SECRET_TOKENS in
+# services/api/src/common/sensitive-keys.ts) use JavaScript \b, whose word
+# chars are ASCII-only ([A-Za-z0-9_]). Python's \b is Unicode-aware, so a
+# token glued to an accented letter ("é" + "ghp_" + body) has NO Python word
+# boundary and would slip past this screen while the API still 400s it.
+# Every boundary is therefore an explicit ASCII lookaround — leading
+# (?<![A-Za-z0-9_]), trailing (?![A-Za-z0-9_]) — matching JS \b semantics at
+# each token's edges. All token edges here abut ASCII word chars (leading
+# edges are alnum; trailing classes are alnum or alnum plus '-'/'_', where
+# backtracking preserves the same accept set as \b), so the substitution is
+# exact where it matters and never looser than the service.
+_ASCII_BOUNDARY_START = r"(?<![A-Za-z0-9_])"
+_ASCII_BOUNDARY_END = r"(?![A-Za-z0-9_])"
 _KNOWN_SECRET_TOKENS = (
     # Stripe-style keys: sk_live_/pk_live_/rk_live_/sk_test_/...
-    re.compile(r"\b[sprk]k_(?:live|test)_[A-Za-z0-9]{8,}\b"),
+    re.compile(_ASCII_BOUNDARY_START + r"[sprk]k_(?:live|test)_[A-Za-z0-9]{8,}" + _ASCII_BOUNDARY_END),
     # JSON Web Tokens: three base64url segments, header begins `eyJ`.
-    re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b"),
+    re.compile(
+        _ASCII_BOUNDARY_START
+        + r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"
+        + _ASCII_BOUNDARY_END
+    ),
     # AWS access-key ids: AKIA/ASIA/AKID + uppercase-alphanumeric body.
-    re.compile(r"\b(?:AKIA|ASIA|AKID)[0-9A-Z]{12,}\b"),
+    re.compile(_ASCII_BOUNDARY_START + r"(?:AKIA|ASIA|AKID)[0-9A-Z]{12,}" + _ASCII_BOUNDARY_END),
     # GitHub tokens: ghp_/gho_/ghs_/ghr_/ghu_ + body.
-    re.compile(r"\bgh[posru]_[A-Za-z0-9]{20,}\b"),
+    re.compile(_ASCII_BOUNDARY_START + r"gh[posru]_[A-Za-z0-9]{20,}" + _ASCII_BOUNDARY_END),
     # GitHub fine-grained PATs: github_pat_ + body.
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(_ASCII_BOUNDARY_START + r"github_pat_[A-Za-z0-9_]{20,}" + _ASCII_BOUNDARY_END),
     # Google API keys: AIza + body.
-    re.compile(r"\bAIza[0-9A-Za-z_\-]{20,}\b"),
-    # Slack tokens: xoxb-/xoxa-/xoxp-/xoxr-/xoxs- + body.
-    re.compile(r"\bxox[baprs]-[0-9A-Za-z\-]{10,}\b"),
+    re.compile(_ASCII_BOUNDARY_START + r"AIza[0-9A-Za-z_\-]{20,}" + _ASCII_BOUNDARY_END),
+    # Slack tokens: xoxb-/xoxa-/xoxp-/xoxr-/xoxs- + body (trailing boundary
+    # sits after an alnum/'-' body char, exactly like the JS pattern).
+    re.compile(_ASCII_BOUNDARY_START + r"xox[baprs]-[0-9A-Za-z\-]{10,}" + _ASCII_BOUNDARY_END),
 )
 
 # Payment-card numbers: 13-19 digit runs, optionally space/dash separated,
@@ -427,10 +446,11 @@ def to_vision_event(inference: dict) -> dict:
     if not isinstance(inference, dict):
         raise ValueError("inference output must be an object")
 
-    # Error messages below never echo user-supplied string values: malformed
-    # input can carry credential-/payment-bearing content, and callers may log
-    # the raised message verbatim. Errors name the field and the expected
-    # shape/constraint only.
+    # Error messages below never echo inference-supplied values — string OR
+    # numeric: malformed input can carry credential-/payment-bearing content
+    # (a PAN can arrive as a JSON number in any numeric field), and callers
+    # may log the raised message verbatim. Errors name the field and the
+    # expected shape/constraint only.
     source_type = inference.get("sourceType", "VISION")
     if source_type != "VISION":
         raise ValueError("sourceType must be 'VISION' for vision model inference")
@@ -484,10 +504,12 @@ def to_vision_event(inference: dict) -> dict:
         confidence = detection.get("confidence")
         if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
             raise ValueError(f"detections[{idx}].confidence is required and must be a number")
+        # No value echo (see the redaction note above): a "confidence" can be
+        # an arbitrary number — even a card number typed as a JSON number.
         if not math.isfinite(confidence):
-            raise ValueError(f"detections[{idx}].confidence must be a finite number, got {confidence!r}")
+            raise ValueError(f"detections[{idx}].confidence must be a finite number")
         if confidence < 0 or confidence > 1:
-            raise ValueError(f"detections[{idx}].confidence must be within [0, 1], got {confidence!r}")
+            raise ValueError(f"detections[{idx}].confidence must be within [0, 1]")
 
         candidate = {"sku": normalized_sku, "confidence": float(confidence)}
         label = detection.get("label")

@@ -422,7 +422,8 @@ class ValidationErrorTests(unittest.TestCase):
 
 
 class ErrorMessageRedactionTests(unittest.TestCase):
-    """Validation errors must never echo user-supplied string values: a
+    """Validation errors must never echo inference-supplied values — string
+    OR numeric (a PAN can arrive as a JSON number in any numeric field): a
     malformed input may carry credential- or payment-bearing content, and
     callers may log str(exception) verbatim. Messages name only the field
     and the expected shape/constraint."""
@@ -467,6 +468,39 @@ class ErrorMessageRedactionTests(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("eventType is required and must be a non-empty string", message)
         self.assertNotIn("LISTMARKER_QQQ", message)
+
+    def test_numeric_pan_confidence_error_does_not_echo_value(self) -> None:
+        # Codex P1: a PAN emitted as a JSON number in `confidence` trips the
+        # [0, 1] range check — the error must not print the number.
+        inference = _base_inference()
+        inference["detections"] = [{"sku": "x", "confidence": 4111111111111111}]
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertIn("detections[0].confidence must be within [0, 1]", message)
+        self.assertNotIn("4111111111111111", message)
+        self.assertNotIn("4111", message)
+
+    def test_nan_confidence_error_does_not_echo_value(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [{"sku": "x", "confidence": float("nan")}]
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertIn("detections[0].confidence must be a finite number", message)
+        self.assertNotIn("nan", message.lower())
+
+    def test_oversized_quantity_delta_error_does_not_echo_value(self) -> None:
+        # A PAN-as-JSON-number in quantityDelta exceeds PG_INT_MAX; the error
+        # may name the constant bound (2147483647) but never the value.
+        inference = _base_inference()
+        inference["quantityDelta"] = 4111111111111111
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertIn("quantityDelta", message)
+        self.assertNotIn("4111111111111111", message)
+        self.assertNotIn("4111", message)
 
     def test_overlong_sku_error_does_not_echo_sku(self) -> None:
         marker = "QQSKUMARKERQQ"
@@ -523,6 +557,69 @@ class SensitiveValueScreeningTests(unittest.TestCase):
         inference["detections"] = [{"sku": "4242424242424242", "confidence": 0.5}]
         with self.assertRaises(ValueError):
             to_vision_event(inference)
+
+
+class AsciiBoundarySecretTokenTests(unittest.TestCase):
+    """Codex P2: Python's \\b is Unicode-aware, so a secret token glued to an
+    accented letter carried no Python word boundary and slipped past the old
+    producer screen, while the API's JavaScript patterns (ASCII \\b, word
+    chars [A-Za-z0-9_]) still 400 the payload. The patterns now use explicit
+    ASCII lookarounds matching the JS semantics.
+
+    Every token-shaped fixture is assembled at RUNTIME from short pieces so
+    no contiguous secret-shaped literal ever appears in source (Gitleaks)."""
+
+    @staticmethod
+    def _github_style_token(prefix: str = "") -> str:
+        # "égh" + "p_" + 24 body chars -> é-adjacent GitHub-classic shape.
+        return prefix + "gh" + "p_" + "A" * 24
+
+    @staticmethod
+    def _stripe_style_token(prefix: str = "") -> str:
+        return prefix + "s" + "k_" + "li" + "ve_" + "B" * 12
+
+    def test_accented_adjacent_github_style_token_rejected(self) -> None:
+        token = self._github_style_token("é")
+        self.assertTrue(contains_sensitive_value(token))
+        inference = _base_inference()
+        inference["idempotencyKey"] = token
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_accented_adjacent_stripe_style_token_rejected(self) -> None:
+        token = self._stripe_style_token("é")
+        self.assertTrue(contains_sensitive_value(token))
+        inference = _base_inference()
+        inference["idempotencyKey"] = token
+        with self.assertRaises(ValueError):
+            to_vision_event(inference)
+
+    def test_bare_tokens_still_rejected(self) -> None:
+        # Plain (boundary-at-start-of-string) forms: unchanged behavior.
+        for name, token in (
+            ("github", self._github_style_token()),
+            ("stripe", self._stripe_style_token()),
+        ):
+            with self.subTest(shape=name):
+                self.assertTrue(contains_sensitive_value(token))
+
+    def test_space_delimited_tokens_still_rejected(self) -> None:
+        for name, token in (
+            ("github", self._github_style_token("evt ")),
+            ("stripe", self._stripe_style_token("evt ")),
+        ):
+            with self.subTest(shape=name):
+                self.assertTrue(contains_sensitive_value(token))
+
+    def test_ascii_word_char_adjacent_forms_still_not_matched(self) -> None:
+        # An ASCII word char glued to the prefix suppresses the match in the
+        # JS patterns and here alike — plain-ASCII behavior is unchanged.
+        for name, token in (
+            ("github", self._github_style_token("X")),
+            ("stripe", self._stripe_style_token("X")),
+        ):
+            with self.subTest(shape=name):
+                self.assertFalse(contains_sensitive_value(token))
 
 
 def _twenty_digit_run_with_no_luhn_window() -> str:

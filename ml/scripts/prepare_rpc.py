@@ -128,7 +128,9 @@ def _coco_shape_errors(coco) -> list:
     string for images), so a malformed annotation file produces named
     errors instead of AttributeError tracebacks. A negative `id` is
     rejected here because sourceId must be >= 0 in the manifest — letting
-    it through would drop the class's source mapping.
+    it through would drop the class's source mapping. Duplicate `images[].id`
+    values are rejected too: they would collapse in the annotation-join
+    reference set and silently corrupt image_id joins.
 
     When an `annotations` array is present it is cross-checked too: every
     entry must be an object whose `image_id` / `category_id` reference ids
@@ -167,6 +169,10 @@ def _coco_shape_errors(coco) -> list:
     elif not isinstance(images, list):
         errors.append(f"images must be a list, got {type(images).__name__}")
     else:
+        # Two images entries sharing an id would collapse into one entry in
+        # the reference set below, corrupting every annotation join against
+        # that id — reject duplicates outright.
+        seen_image_ids = {}
         for idx, image in enumerate(images):
             if not isinstance(image, dict):
                 errors.append(f"images[{idx}] must be an object, got {image!r}")
@@ -176,6 +182,14 @@ def _coco_shape_errors(coco) -> list:
                 errors.append(
                     f"images[{idx}].file_name must be a non-empty string, got {file_name!r}"
                 )
+            image_id = image.get("id")
+            if isinstance(image_id, int) and not isinstance(image_id, bool):
+                if image_id in seen_image_ids:
+                    errors.append(
+                        f"images[{idx}].id duplicates images[{seen_image_ids[image_id]}].id"
+                    )
+                else:
+                    seen_image_ids[image_id] = idx
     annotations = coco.get("annotations")
     if annotations is not None:
         # Reference ids are collected only from well-formed entries; bool is
@@ -340,7 +354,16 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
     for idx, category in enumerate(categories):
         label = _slugify(category.get("name", ""), fallback=f"class-{idx}")
         if label in seen_labels:
-            label = f"{label}-{idx}"
+            # Keep incrementing the suffix until the label is actually unique:
+            # a one-shot suffix can itself collide (e.g. "foo", "foo 3",
+            # "foo!" -> "foo", "foo-3", "foo-3"). Deterministic because
+            # categories are iterated in sorted source-id order.
+            base = label
+            suffix = idx
+            label = f"{base}-{suffix}"
+            while label in seen_labels:
+                suffix += 1
+                label = f"{base}-{suffix}"
         seen_labels.add(label)
         # The COCO annotation files reference categories by their original
         # `id`, which need not match the contiguous training index. Preserve

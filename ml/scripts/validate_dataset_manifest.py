@@ -213,10 +213,13 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                     errors.append(f"{path}: missing required field label")
                 else:
                     label = cls["label"]
+                    # Never echo the label value: like SKUs, a label can be a
+                    # mistyped PAN or credential (all-digit strings satisfy
+                    # SLUG_PATTERN), so errors name only the field paths.
                     if not isinstance(label, str) or not SLUG_PATTERN.match(label):
-                        errors.append(f"{path}.label must match {SLUG_PATTERN.pattern!r}, got {label!r}")
+                        errors.append(f"{path}.label must match {SLUG_PATTERN.pattern!r}")
                     elif label in seen_labels:
-                        errors.append(f"{path}.label {label!r} duplicates classes[{seen_labels[label]}]")
+                        errors.append(f"{path}.label duplicates classes[{seen_labels[label]}].label")
                     else:
                         seen_labels[label] = idx
 
@@ -227,7 +230,9 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                         # spaced/formatted PAN or other sensitive string.
                         errors.append(f"{path}.sku must match {SKU_PATTERN.pattern!r}")
                     elif sku in seen_skus:
-                        errors.append(f"{path}.sku {sku!r} duplicates classes[{seen_skus[sku]}]")
+                        # Redacted like every other sku error: a duplicated SKU
+                        # can still be a PAN/credential-shaped value.
+                        errors.append(f"{path}.sku duplicates classes[{seen_skus[sku]}].sku")
                     else:
                         seen_skus[sku] = idx
                     # Same screening the VisionEvent mapper applies at emission

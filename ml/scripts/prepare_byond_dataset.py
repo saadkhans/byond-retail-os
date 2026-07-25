@@ -188,6 +188,8 @@ def _print_plan(input_dir: str, output_dir) -> None:
     print("    5. enforce every sample's captureContext (if present) is a known stage")
     print("    6. enforce every image path starts with 'raw/' and annotation with 'annotations/'")
     print("       (split-level annotations.train/val/test refs included)")
+    print("    7. enforce every sample is annotation-covered: a per-sample 'annotation'")
+    print("       or a top-level annotations.<split> entry for its split")
     print("  if --output is given, the validated manifest is staged to <output>/manifest.json")
     print("  with sourceRoot recomputed so references still resolve to the input dataset")
     print("  (media is never copied)")
@@ -237,10 +239,21 @@ def _extra_byond_checks(manifest: dict) -> list:
             samples = splits.get(split_name)
             if not isinstance(samples, list):
                 continue
+            # Annotation coverage: a nonempty split whose samples carry no
+            # `annotation` and that has no top-level annotations.<split>
+            # entry would validate but be untrainable — every sample must be
+            # covered one way or the other.
+            split_covered = isinstance(annotations, dict) and split_name in annotations
             for idx, sample in enumerate(samples):
                 if not isinstance(sample, dict):
                     continue
                 path = f"splits.{split_name}[{idx}]"
+
+                if not split_covered and "annotation" not in sample:
+                    errors.append(
+                        f"{path} has no annotation coverage: add a per-sample "
+                        f"'annotation' or a top-level annotations.{split_name} entry"
+                    )
 
                 capture_context = sample.get("captureContext")
                 if capture_context is not None and (
@@ -314,7 +327,11 @@ def validate(input_dir: Path, output_dir) -> int:
             )
             return 1
     errors = validate_manifest(manifest, base_dir=effective_source_root, check_files=True)
-    errors.extend(_extra_byond_checks(manifest))
+    # The extra checks dereference dict fields; a manifest whose top level is
+    # a list/scalar/null already failed shape validation above and must not
+    # crash them with an AttributeError.
+    if isinstance(manifest, dict):
+        errors.extend(_extra_byond_checks(manifest))
 
     if errors:
         print(f"ERROR: {manifest_path} failed validation:")

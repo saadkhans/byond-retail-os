@@ -227,6 +227,18 @@ class SensitiveSkuScreeningTests(unittest.TestCase):
         self.assertIn("classes[0].sku contains a sensitive-looking value", errors)
         self.assertFalse(any(sku in e for e in errors), errors)
 
+    def test_duplicate_pan_shaped_skus_rejected_without_echo(self) -> None:
+        # Runtime-assembled Luhn-valid PAN shared by two classes: the
+        # duplicate error must name only the field paths — no digits from
+        # the SKU may appear in ANY reported error.
+        pan = "4111" * 4
+        manifest = _valid_manifest()
+        manifest["classes"][0]["sku"] = pan
+        manifest["classes"][1]["sku"] = pan
+        errors = validate_manifest(manifest)
+        self.assertIn("classes[1].sku duplicates classes[0].sku", errors)
+        self.assertFalse(any("4111" in e for e in errors), errors)
+
     def test_normal_retail_sku_accepted(self) -> None:
         manifest = _valid_manifest()
         manifest["classes"][0]["sku"] = "COLA-330"
@@ -976,6 +988,101 @@ class PrepareByondSkuRedactionTests(unittest.TestCase):
             self.assertNotIn("Traceback", result.stdout + result.stderr)
 
 
+class PrepareByondNonObjectManifestTests(unittest.TestCase):
+    """A manifest whose top level is not a JSON object must produce the base
+    validator's controlled shape error — never an AttributeError traceback
+    from the BYOND-specific extra checks."""
+
+    def _run_with_payload(self, payload_text: str) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_dir = Path(tmp) / "input"
+            (input_dir / "raw" / "shelves").mkdir(parents=True)
+            (input_dir / "annotations").mkdir()
+            (input_dir / "manifest.json").write_text(payload_text, encoding="utf-8")
+            return _run_script("prepare_byond_dataset.py", ["--input", str(input_dir)])
+
+    def _assert_controlled_error(self, result: subprocess.CompletedProcess) -> None:
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ERROR", result.stdout)
+        self.assertIn("manifest must be a JSON object", result.stdout)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+    def test_list_manifest_reports_error_not_traceback(self) -> None:
+        self._assert_controlled_error(self._run_with_payload("[]"))
+
+    def test_scalar_manifest_reports_error_not_traceback(self) -> None:
+        self._assert_controlled_error(self._run_with_payload('"x"'))
+
+
+class PrepareByondAnnotationCoverageTests(unittest.TestCase):
+    """Every sample in a nonempty BYOND split must be annotation-covered —
+    either the manifest's top-level annotations object has an entry for that
+    split, or the sample carries its own `annotation` field. A split with
+    neither would validate but be untrainable."""
+
+    def _byond_manifest(self, **overrides) -> dict:
+        manifest = {
+            "datasetName": "byond-store",
+            "datasetVersion": "1.0.0",
+            "source": "byond-custom",
+            "licenseNotes": "Internal BYOND store captures.",
+            "classes": [{"classId": 0, "label": "cola-330", "sku": "SKU-1"}],
+            "splits": {
+                "train": [{"image": "raw/shelves/a.jpg"}],
+                "val": [],
+                "test": [],
+            },
+        }
+        manifest.update(overrides)
+        return manifest
+
+    def test_uncovered_sample_rejected_naming_split_and_index(self) -> None:
+        errors = prepare_byond_dataset._extra_byond_checks(self._byond_manifest())
+        self.assertTrue(
+            any(
+                "splits.train[0] has no annotation coverage" in e
+                and "annotations.train" in e
+                for e in errors
+            ),
+            errors,
+        )
+
+    def test_covered_via_top_level_annotations_accepted(self) -> None:
+        manifest = self._byond_manifest(
+            annotations={"train": "annotations/train.json"}
+        )
+        errors = prepare_byond_dataset._extra_byond_checks(manifest)
+        self.assertEqual(errors, [])
+
+    def test_covered_via_per_sample_annotation_accepted(self) -> None:
+        manifest = self._byond_manifest(
+            splits={
+                "train": [
+                    {"image": "raw/shelves/a.jpg", "annotation": "annotations/a.json"}
+                ],
+                "val": [],
+                "test": [],
+            }
+        )
+        errors = prepare_byond_dataset._extra_byond_checks(manifest)
+        self.assertEqual(errors, [])
+
+    def test_cli_rejects_uncovered_split(self) -> None:
+        # The referenced image exists, so only the coverage rule can reject.
+        with tempfile.TemporaryDirectory() as tmp:
+            input_dir = Path(tmp) / "input"
+            (input_dir / "raw" / "shelves").mkdir(parents=True)
+            (input_dir / "annotations").mkdir()
+            (input_dir / "raw" / "shelves" / "a.jpg").touch()
+            (input_dir / "manifest.json").write_text(
+                json.dumps(self._byond_manifest()), encoding="utf-8"
+            )
+            result = _run_script("prepare_byond_dataset.py", ["--input", str(input_dir)])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("splits.train[0] has no annotation coverage", result.stdout)
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+
 class PrepareByondSourceRootContainmentTests(unittest.TestCase):
     """A manifest-supplied sourceRoot must resolve inside the dataset
     directory — a root escaping via '..', an absolute path, or an in-dir
@@ -1365,6 +1472,29 @@ class Sku110kCsvRowValidationTests(unittest.TestCase):
                 result, out, "row 1", "image_width must be greater than 0"
             )
 
+    def test_negative_x1_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), "a.jpg,-5,10,20,20,object,100,100\n"
+            )
+            self._assert_rejected(result, out, "row 1", "x1 must not be negative")
+
+    def test_x2_beyond_image_width_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), "a.jpg,10,10,120,20,object,100,100\n"
+            )
+            self._assert_rejected(result, out, "row 1", "x2 must not exceed image_width")
+
+    def test_full_image_bounds_row_accepted(self) -> None:
+        # x1 = 0 and x2 == image_width (same for y) are in-bounds.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), "a.jpg,0,0,100,100,object,100,100\n"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((out / "manifest.json").exists())
+
     def test_row_error_collection_is_capped(self) -> None:
         bad_rows = "".join("a.jpg,10,10\n" for _ in range(40))
         with tempfile.TemporaryDirectory() as tmp:
@@ -1567,6 +1697,25 @@ class RpcCocoShapeGuardTests(unittest.TestCase):
                 "images[0].file_name must be a non-empty string",
             )
 
+    def test_duplicate_image_id_reports_error_naming_both_indexes(self) -> None:
+        # Two images entries sharing an id would collapse in the reference
+        # set used for annotation joins — must be rejected up front.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp),
+                train_images=[
+                    {"id": 2, "file_name": "t1.jpg"},
+                    {"id": 3, "file_name": "t2.jpg"},
+                    {"id": 2, "file_name": "t3.jpg"},
+                ],
+            )
+            self._assert_controlled_error(
+                result,
+                out,
+                "instances_train2019.json",
+                "images[2].id duplicates images[0].id",
+            )
+
 
 class RpcRequiredCocoKeysTests(unittest.TestCase):
     """A COCO file omitting its `images` or `categories` array must produce
@@ -1747,6 +1896,47 @@ class RpcCocoAnnotationValidationTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertTrue((out / "manifest.json").exists())
+
+
+class RpcLabelCollisionTests(unittest.TestCase):
+    """Slug collisions among COCO category names must resolve to labels that
+    are actually unique — a one-shot index suffix can itself collide (e.g.
+    "foo", "foo 2", "foo!" -> "foo", "foo-2", "foo-2")."""
+
+    CATEGORIES = [
+        {"id": 1, "name": "foo"},
+        {"id": 2, "name": "foo 2"},
+        {"id": 3, "name": "foo!"},
+    ]
+    IMAGE_NAMES = {"train": "t1.jpg", "val": "v1.jpg", "test": "e1.jpg"}
+
+    def test_double_colliding_category_names_produce_unique_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            out = Path(tmp) / "out"
+            for split, image_name in self.IMAGE_NAMES.items():
+                image_dir = raw / f"{split}2019"
+                image_dir.mkdir(parents=True, exist_ok=True)
+                coco = {
+                    "images": [{"id": 1, "file_name": image_name}],
+                    "categories": list(self.CATEGORIES),
+                }
+                (raw / f"instances_{split}2019.json").write_text(
+                    json.dumps(coco), encoding="utf-8"
+                )
+                (image_dir / image_name).write_text(
+                    f"pixels-{image_name}", encoding="utf-8"
+                )
+            result = _run_script(
+                "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+            )
+            # rc 0 means the manifest also passed full validation (which
+            # rejects duplicate labels).
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            labels = [cls["label"] for cls in manifest["classes"]]
+            self.assertEqual(labels, ["foo", "foo-2", "foo-3"])
+            self.assertEqual(len(labels), len(set(labels)), labels)
 
 
 class SourceRootHelperTests(unittest.TestCase):

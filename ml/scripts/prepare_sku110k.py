@@ -19,7 +19,8 @@ Each annotations CSV row follows SKU-110K's published 8-column format:
     image_name,x1,y1,x2,y2,class,image_width,image_height
 
 Rows are validated (column count, finite numeric coordinates/dimensions,
-x2 > x1, y2 > y1, positive dimensions) before any manifest is written.
+x2 > x1, y2 > y1, positive dimensions, boxes inside the declared image
+bounds) before any manifest is written.
 Because SKU-110K only labels "product present", it maps to a single
 generic BYOND class rather than per-SKU classes.
 
@@ -191,6 +192,15 @@ def _row_errors(row: list) -> list:
     for dimension in ("image_width", "image_height"):
         if dimension in numbers and numbers[dimension] <= 0:
             errors.append(f"{dimension} must be greater than 0")
+    # Boxes must stay inside the row's declared image bounds: a negative
+    # origin or an endpoint beyond image_width/height is a corrupt export.
+    for coordinate in ("x1", "y1"):
+        if coordinate in numbers and numbers[coordinate] < 0:
+            errors.append(f"{coordinate} must not be negative")
+    if "x2" in numbers and "image_width" in numbers and numbers["x2"] > numbers["image_width"]:
+        errors.append("x2 must not exceed image_width")
+    if "y2" in numbers and "image_height" in numbers and numbers["y2"] > numbers["image_height"]:
+        errors.append("y2 must not exceed image_height")
     return errors
 
 
