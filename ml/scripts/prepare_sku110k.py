@@ -212,33 +212,49 @@ def _image_names_from_csv(csv_path: Path) -> tuple:
     rule only. Collection stops after MAX_ROW_ERRORS_PER_CSV errors with an
     explicit truncation note. Truly empty rows (blank lines) are skipped
     silently, matching the previous parser's behavior.
+
+    A file the csv module cannot parse (e.g. a cell beyond the field-size
+    limit raises csv.Error mid-iteration) or cannot even decode/read
+    (corrupt non-UTF-8 bytes, I/O failure) must also be a controlled error
+    naming the exception class only — never the raw bytes/cell content and
+    never a traceback (mirrors prepare_rpc's _load_coco style).
     """
     names = []
     seen = set()
     errors = []
-    with csv_path.open("r", encoding="utf-8", newline="") as fh:
-        reader = csv.reader(fh)
-        for row_number, row in enumerate(reader, start=1):
-            if not row:
-                continue
-            violations = _row_errors(row)
-            if violations:
-                remaining = MAX_ROW_ERRORS_PER_CSV - len(errors)
-                errors.extend(
-                    f"row {row_number}: {violation}" for violation in violations[:remaining]
-                )
-                if len(errors) >= MAX_ROW_ERRORS_PER_CSV:
-                    errors.append(
-                        f"row-error limit ({MAX_ROW_ERRORS_PER_CSV}) reached; "
-                        "remaining rows not checked"
+    row_number = 0
+    try:
+        with csv_path.open("r", encoding="utf-8", newline="") as fh:
+            reader = csv.reader(fh)
+            for row_number, row in enumerate(reader, start=1):
+                if not row:
+                    continue
+                violations = _row_errors(row)
+                if violations:
+                    remaining = MAX_ROW_ERRORS_PER_CSV - len(errors)
+                    errors.extend(
+                        f"row {row_number}: {violation}" for violation in violations[:remaining]
                     )
-                    break
-                continue
-            image_name = row[0].strip()
-            if image_name in seen:
-                continue
-            seen.add(image_name)
-            names.append(image_name)
+                    if len(errors) >= MAX_ROW_ERRORS_PER_CSV:
+                        errors.append(
+                            f"row-error limit ({MAX_ROW_ERRORS_PER_CSV}) reached; "
+                            "remaining rows not checked"
+                        )
+                        break
+                    continue
+                image_name = row[0].strip()
+                if image_name in seen:
+                    continue
+                seen.add(image_name)
+                names.append(image_name)
+    except csv.Error as exc:
+        # The failing row is the one after the last successfully yielded
+        # row_number (0 when the very first row fails).
+        errors.append(
+            f"row {row_number + 1}: could not be parsed ({type(exc).__name__})"
+        )
+    except (UnicodeDecodeError, OSError) as exc:
+        errors.append(f"could not be read ({type(exc).__name__})")
     return names, errors
 
 
@@ -308,8 +324,16 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
             print(f"  - {error}")
         return 1
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _write_json_atomically(manifest, manifest_path)
+    # A write-side failure — --output naming an existing file (mkdir raises
+    # FileExistsError, an OSError subclass), a read-only destination, a full
+    # disk — must be a controlled ERROR naming the destination and exception
+    # class only: never a traceback, never file/manifest content.
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        _write_json_atomically(manifest, manifest_path)
+    except OSError as exc:
+        print(f"ERROR: could not write {manifest_path} ({type(exc).__name__})")
+        return 1
 
     train_n = len(splits["train"])
     val_n = len(splits["val"])

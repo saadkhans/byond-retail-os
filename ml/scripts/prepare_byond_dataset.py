@@ -201,10 +201,13 @@ def _extra_byond_checks(manifest: dict) -> list:
     errors = []
 
     # Redaction policy (mirrors the base validator's SKU messages): errors
-    # here may name fields and interpolate path values (needed for
-    # remediation, not secret-bearing), but must never echo sku/label-like
-    # manifest values — a malformed SKU can be a mistyped PAN or credential
-    # that must not reach terminal/CI logs.
+    # here name field paths and rules only, never manifest-supplied values.
+    # That includes the layout (raw/, annotations/) checks below: they run
+    # on arbitrary manifest strings — only values that passed the base
+    # validator's bad-path gate would be known-benign relative paths, and
+    # these checks make no such guarantee, so a rejected "path" can be a
+    # credentialed URL, a mistyped PAN, or a pasted secret that must not
+    # reach terminal/CI logs.
     source = manifest.get("source")
     if source != "byond-custom":
         errors.append("source must be 'byond-custom' for a BYOND custom dataset")
@@ -230,7 +233,7 @@ def _extra_byond_checks(manifest: dict) -> list:
             annotation = annotations.get(split_name)
             if isinstance(annotation, str) and not annotation.startswith("annotations/"):
                 errors.append(
-                    f"annotations.{split_name} must live under 'annotations/', got {annotation!r}"
+                    f"annotations.{split_name} must live under 'annotations/'"
                 )
 
     splits = manifest.get("splits")
@@ -266,11 +269,11 @@ def _extra_byond_checks(manifest: dict) -> list:
 
                 image = sample.get("image")
                 if isinstance(image, str) and not image.startswith("raw/"):
-                    errors.append(f"{path}.image must live under 'raw/', got {image!r}")
+                    errors.append(f"{path}.image must live under 'raw/'")
 
                 annotation = sample.get("annotation")
                 if isinstance(annotation, str) and not annotation.startswith("annotations/"):
-                    errors.append(f"{path}.annotation must live under 'annotations/', got {annotation!r}")
+                    errors.append(f"{path}.annotation must live under 'annotations/'")
 
     return errors
 
@@ -320,10 +323,13 @@ def validate(input_dir: Path, output_dir) -> int:
         if not effective_source_root.is_relative_to(resolved_input_dir):
             source_root_value = manifest.get("sourceRoot") if isinstance(manifest, dict) else None
             print(
-                f"ERROR: sourceRoot {source_root_value!r} resolves to "
-                f"{effective_source_root}, which is outside the dataset "
-                f"directory {resolved_input_dir}; custom source roots must "
-                "stay inside the dataset directory"
+                # The manifest-supplied sourceRoot (and the path it resolves
+                # to, whose components derive from it) is never echoed — it
+                # is unconstrained input. Only the operator's own CLI input
+                # directory is named.
+                f"ERROR: sourceRoot resolves outside the dataset directory "
+                f"{resolved_input_dir}; custom source roots must stay inside "
+                "the dataset directory"
             )
             return 1
     errors = validate_manifest(manifest, base_dir=effective_source_root, check_files=True)
@@ -343,7 +349,6 @@ def validate(input_dir: Path, output_dir) -> int:
 
     if output_dir is not None:
         output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
         destination = output_dir / "manifest.json"
 
         # A verbatim copy would break path resolution: a relative (or absent)
@@ -353,7 +358,18 @@ def validate(input_dir: Path, output_dir) -> int:
         # the input dataset's media (never copied/staged).
         staged = dict(manifest)
         staged["sourceRoot"] = _source_root(effective_source_root, output_dir)
-        _write_json_atomically(staged, destination)
+
+        # A write-side failure — --output naming an existing file (mkdir
+        # raises FileExistsError, an OSError subclass), a read-only
+        # destination, a full disk — must be a controlled ERROR naming the
+        # destination and exception class only: never a traceback, never
+        # manifest content.
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            _write_json_atomically(staged, destination)
+        except OSError as exc:
+            print(f"ERROR: could not write {destination} ({type(exc).__name__})")
+            return 1
         print(f"  staged validated manifest to {destination}")
 
     return 0

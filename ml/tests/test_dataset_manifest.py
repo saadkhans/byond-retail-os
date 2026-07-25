@@ -171,13 +171,16 @@ class FieldRuleTests(unittest.TestCase):
         manifest = _valid_manifest()
         manifest["splits"]["train"][0]["image"] = "images/./a.jpg"
         errors = validate_manifest(manifest)
-        self.assertTrue(any("image" in e and "images/./a.jpg" in e for e in errors), errors)
+        self.assertTrue(any("splits.train[0].image" in e for e in errors), errors)
+        # Rejected path values are never echoed — only field + rule.
+        self.assertFalse(any("images/./a.jpg" in e for e in errors), errors)
 
     def test_empty_segment_image_path_rejected(self) -> None:
         manifest = _valid_manifest()
         manifest["splits"]["train"][0]["image"] = "images//a.jpg"
         errors = validate_manifest(manifest)
-        self.assertTrue(any("image" in e and "images//a.jpg" in e for e in errors), errors)
+        self.assertTrue(any("splits.train[0].image" in e for e in errors), errors)
+        self.assertFalse(any("images//a.jpg" in e for e in errors), errors)
 
     def test_bad_capture_context_rejected(self) -> None:
         manifest = _valid_manifest()
@@ -303,6 +306,182 @@ class SensitiveClassValueRedactionTests(unittest.TestCase):
         self.assertFalse(any("4111" in e for e in errors), errors)
 
 
+class RejectedValueRedactionTests(unittest.TestCase):
+    """Errors for REJECTED enum values, REJECTED paths, and non-string path
+    junk must name the field + rule only — never the supplied value. A bad
+    `source` or path can be a credentialed camera/CDN URL and a bad
+    captureContext can be a pasted secret token. (Sensitive fixtures are
+    assembled at runtime so no credential-shaped literal appears in source.)"""
+
+    @staticmethod
+    def _credentialed_url() -> str:
+        password = "hun" + "ter2"
+        return f"rtsp://svc-user:{password}@camera.internal/stream1"
+
+    @staticmethod
+    def _secret_token() -> str:
+        return "sk_" + "live_" + "Abc123Def456Ghi789"
+
+    @staticmethod
+    def _token_image_url() -> str:
+        return "https://cdn.example.com/images/a.jpg?access_" + "token=deadbeef42cafe"
+
+    def _assert_absent(self, needle: str, errors: list) -> None:
+        self.assertFalse(any(needle in e for e in errors), errors)
+
+    def test_credentialed_url_source_rejected_without_echo(self) -> None:
+        url = self._credentialed_url()
+        manifest = _valid_manifest()
+        manifest["source"] = url
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("source must be one of" in e for e in errors), errors)
+        self._assert_absent(url, errors)
+        self._assert_absent("hunter2", errors)
+
+    def test_secret_token_capture_context_rejected_without_echo(self) -> None:
+        token = self._secret_token()
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["captureContext"] = token
+        errors = validate_manifest(manifest)
+        self.assertTrue(
+            any("captureContext must be one of" in e for e in errors), errors
+        )
+        self._assert_absent(token, errors)
+
+    def test_credentialed_url_split_annotation_rejected_without_echo(self) -> None:
+        url = self._credentialed_url()
+        manifest = _valid_manifest()
+        manifest["annotations"] = {"train": url}
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("annotations.train" in e for e in errors), errors)
+        self._assert_absent(url, errors)
+        self._assert_absent("hunter2", errors)
+
+    def test_token_url_sample_image_rejected_without_echo(self) -> None:
+        url = self._token_image_url()
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["image"] = url
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("splits.train[0].image" in e for e in errors), errors)
+        self._assert_absent(url, errors)
+        self._assert_absent("deadbeef42cafe", errors)
+
+    def test_credentialed_url_sample_annotation_rejected_without_echo(self) -> None:
+        url = self._credentialed_url()
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["annotation"] = url
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("splits.train[0].annotation" in e for e in errors), errors)
+        self._assert_absent(url, errors)
+        self._assert_absent("hunter2", errors)
+
+    def test_non_string_source_root_error_has_no_repr(self) -> None:
+        manifest = _valid_manifest()
+        manifest["sourceRoot"] = ["../secret-dir"]
+        errors = validate_manifest(manifest)
+        self.assertIn("sourceRoot must be a non-empty string", errors)
+        self._assert_absent("secret-dir", errors)
+        self._assert_absent("[", errors)
+
+    def test_normal_enum_and_path_values_still_accepted(self) -> None:
+        manifest = _valid_manifest()
+        manifest["source"] = "byond-custom"
+        manifest["classes"][0]["sku"] = "COLA-330"
+        manifest["classes"][1]["sku"] = "CHIPS-50"
+        manifest["sourceRoot"] = "../raw"
+        manifest["annotations"] = {"train": "annotations/train.json"}
+        manifest["splits"]["train"][0]["annotation"] = "annotations/a.json"
+        manifest["splits"]["train"][0]["captureContext"] = "shelf"
+        self.assertEqual(validate_manifest(manifest), [])
+
+
+class SensitiveMetadataScreeningTests(unittest.TestCase):
+    """datasetName and the tenant metadata fields (labels.* and per-sample
+    tenantId/storeId/planogramZone) are free-form strings a Luhn-valid PAN or
+    credential token would silently satisfy — each must fail validation with
+    a redacted error that never carries the value. (PAN fixtures are
+    assembled at runtime so no card-shaped literal appears in source.)"""
+
+    @staticmethod
+    def _pan() -> str:
+        return "4111" * 4  # Luhn-valid test PAN, also a valid slug.
+
+    def _assert_no_digits(self, errors: list) -> None:
+        self.assertFalse(any("4111" in e for e in errors), errors)
+
+    def test_pan_dataset_name_rejected_without_echo(self) -> None:
+        pan = self._pan()
+        self.assertIsNotNone(validate_dataset_manifest.SLUG_PATTERN.match(pan))
+        manifest = _valid_manifest()
+        manifest["datasetName"] = pan
+        errors = validate_manifest(manifest)
+        self.assertIn("datasetName contains a sensitive-looking value", errors)
+        self._assert_no_digits(errors)
+
+    def test_cli_rejects_pan_dataset_name_without_echoing_digits(self) -> None:
+        manifest = _valid_manifest()
+        manifest["datasetName"] = self._pan()
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = _run_script("validate_dataset_manifest.py", [str(manifest_path)])
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "datasetName contains a sensitive-looking value", result.stdout
+            )
+            self.assertNotIn("4111", result.stdout + result.stderr)
+
+    def test_pan_labels_store_id_rejected_without_echo(self) -> None:
+        manifest = _valid_manifest()
+        manifest["labels"] = {"storeId": self._pan()}
+        errors = validate_manifest(manifest)
+        self.assertIn("labels.storeId contains a sensitive-looking value", errors)
+        self._assert_no_digits(errors)
+
+    def test_pan_labels_tenant_id_and_zone_rejected_without_echo(self) -> None:
+        manifest = _valid_manifest()
+        manifest["labels"] = {
+            "tenantId": self._pan(),
+            "planogramZone": "zone-" + self._pan(),
+        }
+        errors = validate_manifest(manifest)
+        self.assertIn("labels.tenantId contains a sensitive-looking value", errors)
+        self.assertIn(
+            "labels.planogramZone contains a sensitive-looking value", errors
+        )
+        self._assert_no_digits(errors)
+
+    def test_pan_sample_tenant_id_rejected_without_echo(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["tenantId"] = self._pan()
+        errors = validate_manifest(manifest)
+        self.assertIn(
+            "splits.train[0].tenantId contains a sensitive-looking value", errors
+        )
+        self._assert_no_digits(errors)
+
+    def test_pan_sample_store_id_rejected_without_echo(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["storeId"] = self._pan()
+        errors = validate_manifest(manifest)
+        self.assertIn(
+            "splits.train[0].storeId contains a sensitive-looking value", errors
+        )
+        self._assert_no_digits(errors)
+
+    def test_normal_metadata_values_accepted(self) -> None:
+        manifest = _valid_manifest()
+        manifest["labels"] = {
+            "tenantId": "tenant-042",
+            "storeId": "store-berlin-7",
+            "planogramZone": "aisle-3-shelf-2",
+        }
+        manifest["splits"]["train"][0]["tenantId"] = "tenant-042"
+        manifest["splits"]["train"][0]["storeId"] = "store-berlin-7"
+        manifest["splits"]["train"][0]["planogramZone"] = "aisle-3-shelf-2"
+        self.assertEqual(validate_manifest(manifest), [])
+
+
 class NulPathRejectionTests(unittest.TestCase):
     """A path with an embedded NUL must fail shape validation even without
     --check-files (previously only sourceRoot carried a NUL guard)."""
@@ -382,9 +561,11 @@ class CrossSplitDuplicateTests(unittest.TestCase):
         manifest["splits"]["val"] = [{"image": "images/./a.jpg"}]
         errors = validate_manifest(manifest)
         self.assertTrue(
-            any("splits.val[0].image" in e and "images/./a.jpg" in e for e in errors),
+            any("splits.val[0].image" in e for e in errors),
             errors,
         )
+        # Rejected (non-canonical) path values are never echoed.
+        self.assertFalse(any("images/./a.jpg" in e for e in errors), errors)
 
     def test_unique_images_across_splits_accepted(self) -> None:
         manifest = _valid_manifest()
@@ -1628,7 +1809,10 @@ class RpcCategoryConsistencyTests(unittest.TestCase):
                 Path(tmp),
                 [{"id": 7, "name": "Soap"}, {"id": 3, "name": "Chips 50"}],
             )
-            self._assert_rejected(result, out, "category id 7 is named 'Soap'")
+            self._assert_rejected(result, out, "category id 7: name differs")
+            # Category names are redacted from mismatch errors — a name can
+            # carry credential-bearing content.
+            self.assertNotIn("Soap", result.stdout + result.stderr)
 
     def test_missing_category_id_in_val_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2308,6 +2492,66 @@ class SourceRootResolutionTests(unittest.TestCase):
             self.assertTrue(
                 any("sourceRoot cannot be resolved" in e for e in errors), errors
             )
+
+
+class UnknownFieldKeyRedactionTests(unittest.TestCase):
+    """Unknown-field KEYS are attacker-chosen strings too: a PAN or token
+    used as a field name must not reach terminal/CI logs."""
+
+    def test_sensitive_unknown_key_redacted(self) -> None:
+        pan = "4111" * 4
+        manifest = _valid_manifest()
+        manifest[pan] = "x"
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("unknown top-level field: <redacted>" in e for e in errors), errors)
+        self.assertFalse(any(pan in e for e in errors), errors)
+
+    def test_benign_unknown_key_still_named(self) -> None:
+        manifest = _valid_manifest()
+        manifest["extraField"] = "x"
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("unknown top-level field: 'extraField'" in e for e in errors), errors)
+
+
+class ByondSourceRootRedactionTests(unittest.TestCase):
+    """The containment error must not echo the manifest-supplied sourceRoot
+    (or the resolved path, whose components derive from it)."""
+
+    def test_containment_error_does_not_echo_source_root(self) -> None:
+        marker = "sneaky-" + "sk" + "_live_" + "MARKER99999999"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "dataset"
+            (dataset / "raw").mkdir(parents=True)
+            (dataset / "annotations").mkdir()
+            outside = root / marker
+            outside.mkdir()
+            manifest = {
+                "datasetName": "byond-demo",
+                "datasetVersion": "1.0.0",
+                "source": "byond-custom",
+                "sourceRoot": f"../{marker}",
+                "licenseNotes": "synthetic",
+                "classes": [{"classId": 0, "label": "cola", "sku": "COLA-330"}],
+                "splits": {
+                    "train": [{"image": "raw/a.jpg", "annotation": "annotations/a.json"}],
+                    "val": [],
+                    "test": [],
+                },
+            }
+            (dataset / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(REPO_ROOT / "ml" / "scripts" / "prepare_byond_dataset.py"),
+                 "--input", str(dataset)],
+                capture_output=True,
+                text=True,
+                cwd=REPO_ROOT,
+            )
+            combined = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("sourceRoot resolves outside the dataset directory", combined)
+            self.assertNotIn(marker, combined)
+            self.assertNotIn("Traceback", combined)
 
 
 if __name__ == "__main__":

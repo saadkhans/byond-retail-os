@@ -81,6 +81,17 @@ SAMPLE_KEYS = {"image", "annotation", "captureContext", "planogramZone", "storeI
 _URI_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 _WINDOWS_DRIVE_PATTERN = re.compile(r"^[a-zA-Z]:")
 
+# Shared error tail for every value _is_bad_path rejects. A REJECTED path is
+# unconstrained input — it can be a credentialed rtsp://user:secret@... URL,
+# an absolute path leaking directory layout, or non-string junk — so these
+# errors name the field and the rule only, never the supplied value. (Paths
+# that PASSED the gate are clean canonical relative strings and may still be
+# echoed by missing-file/duplicate/alias reports.)
+_BAD_PATH_RULE = (
+    "must be a canonical relative path (no absolute paths, URI schemes, "
+    "backslashes, '..', '.', empty segments, or NUL)"
+)
+
 
 def _is_bad_path(value) -> bool:
     """Reject anything that is not a clean, portable, canonical relative path.
@@ -139,9 +150,17 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
     if not isinstance(manifest, dict):
         return ["manifest must be a JSON object"]
 
+    def _safe_field(key) -> str:
+        # Unknown-field keys are attacker-chosen strings: echo them only when
+        # they carry no sensitive-looking content (a PAN or token used as a
+        # key must not reach terminal/CI logs).
+        if isinstance(key, str) and not _contains_sensitive_value(key):
+            return repr(key)
+        return "<redacted>"
+
     unknown_top = set(manifest.keys()) - TOP_LEVEL_KEYS
     for key in sorted(unknown_top):
-        errors.append(f"unknown top-level field: {key!r}")
+        errors.append(f"unknown top-level field: {_safe_field(key)}")
 
     if "datasetName" not in manifest:
         errors.append("missing required field: datasetName")
@@ -151,6 +170,13 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
             # An arbitrary string reaches this check before any pattern
             # constraint holds, so the value is never echoed.
             errors.append(f"datasetName must match {SLUG_PATTERN.pattern!r}")
+        # An all-digit Luhn PAN is a perfectly valid slug, and datasetName is
+        # the one screened field the CLI later echoes (in the OK summary), so
+        # it gets the same sensitive-value screen as labels/SKUs. The error
+        # never echoes the value; the OK line stays safe because it is only
+        # reachable when this screen passed.
+        if isinstance(name, str) and _contains_sensitive_value(name):
+            errors.append("datasetName contains a sensitive-looking value")
 
     if "datasetVersion" not in manifest:
         errors.append("missing required field: datasetVersion")
@@ -166,12 +192,17 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
     elif not isinstance(source, str) or source not in SOURCE_VALUES:
         # isinstance guard first: unhashable values (list/dict) would raise
         # TypeError from the set membership test instead of validating.
-        errors.append(f"source must be one of {sorted(SOURCE_VALUES)}, got {source!r}")
+        # The allowed values are constants and may be listed; the supplied
+        # value is unconstrained (it can be a credentialed URL) and is never
+        # echoed.
+        errors.append(f"source must be one of {sorted(SOURCE_VALUES)}")
 
     if "sourceRoot" in manifest:
         source_root = manifest["sourceRoot"]
         if not isinstance(source_root, str) or not source_root:
-            errors.append(f"sourceRoot must be a non-empty string, got {source_root!r}")
+            # Never echo the rejected value: non-string junk (or a would-be
+            # path) is unconstrained manifest input.
+            errors.append("sourceRoot must be a non-empty string")
         elif "\x00" in source_root:
             # An embedded NUL is not a valid filesystem string and would make
             # every later Path operation raise instead of validate.
@@ -203,7 +234,7 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
 
                 unknown_cls = set(cls.keys()) - CLASS_KEYS
                 for key in sorted(unknown_cls):
-                    errors.append(f"{path}: unknown field {key!r}")
+                    errors.append(f"{path}: unknown field {_safe_field(key)}")
 
                 if "classId" not in cls:
                     errors.append(f"{path}: missing required field classId")
@@ -293,10 +324,16 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
         else:
             unknown_labels = set(labels.keys()) - LABELS_KEYS
             for key in sorted(unknown_labels):
-                errors.append(f"labels: unknown field {key!r}")
+                errors.append(f"labels: unknown field {_safe_field(key)}")
             for key in LABELS_KEYS:
                 if key in labels and not isinstance(labels[key], str):
                     errors.append(f"labels.{key} must be a string")
+                elif key in labels and _contains_sensitive_value(labels[key]):
+                    # tenantId/storeId/planogramZone are free-form strings a
+                    # PAN or credential token would silently satisfy — and the
+                    # staged manifest would carry it downstream. Screen like
+                    # SKUs/labels; the error never echoes the value.
+                    errors.append(f"labels.{key} contains a sensitive-looking value")
 
     if "annotations" in manifest:
         annotations = manifest["annotations"]
@@ -305,14 +342,10 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
         else:
             unknown_annotations = set(annotations.keys()) - set(SPLIT_NAMES)
             for key in sorted(unknown_annotations):
-                errors.append(f"annotations: unknown field {key!r}")
+                errors.append(f"annotations: unknown field {_safe_field(key)}")
             for key in SPLIT_NAMES:
                 if key in annotations and _is_bad_path(annotations[key]):
-                    errors.append(
-                        f"annotations.{key} must be a canonical relative path with no '..', "
-                        f"'.' or empty segments, backslashes, absolute prefix, or URI scheme, "
-                        f"got {annotations[key]!r}"
-                    )
+                    errors.append(f"annotations.{key} {_BAD_PATH_RULE}")
 
     if "splits" not in manifest:
         errors.append("missing required field: splits")
@@ -323,7 +356,7 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
         else:
             unknown_splits = set(splits.keys()) - set(SPLIT_NAMES)
             for key in sorted(unknown_splits):
-                errors.append(f"splits: unknown field {key!r}")
+                errors.append(f"splits: unknown field {_safe_field(key)}")
 
             structurally_ok = True
             for split_name in SPLIT_NAMES:
@@ -351,16 +384,12 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
 
                     unknown_sample = set(sample.keys()) - SAMPLE_KEYS
                     for key in sorted(unknown_sample):
-                        errors.append(f"{sample_path}: unknown field {key!r}")
+                        errors.append(f"{sample_path}: unknown field {_safe_field(key)}")
 
                     if "image" not in sample:
                         errors.append(f"{sample_path}: missing required field image")
                     elif _is_bad_path(sample["image"]):
-                        errors.append(
-                            f"{sample_path}.image must be a canonical relative path with no '..', "
-                            f"'.' or empty segments, backslashes, absolute prefix, or URI scheme, "
-                            f"got {sample['image']!r}"
-                        )
+                        errors.append(f"{sample_path}.image {_BAD_PATH_RULE}")
                     else:
                         image = sample["image"]
                         if image in seen_images:
@@ -372,23 +401,29 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                             seen_images[image] = f"{split_name}[{idx}]"
 
                     if "annotation" in sample and _is_bad_path(sample["annotation"]):
-                        errors.append(
-                            f"{sample_path}.annotation must be a canonical relative path with no '..', "
-                            f"'.' or empty segments, backslashes, absolute prefix, or URI scheme, "
-                            f"got {sample['annotation']!r}"
-                        )
+                        errors.append(f"{sample_path}.annotation {_BAD_PATH_RULE}")
 
                     if "captureContext" in sample:
                         capture_context = sample["captureContext"]
                         if not isinstance(capture_context, str) or capture_context not in CAPTURE_CONTEXT_VALUES:
+                            # Enum constants may be listed; the supplied value
+                            # is unconstrained (it can be a secret token) and
+                            # is never echoed.
                             errors.append(
                                 f"{sample_path}.captureContext must be one of "
-                                f"{sorted(CAPTURE_CONTEXT_VALUES)}, got {capture_context!r}"
+                                f"{sorted(CAPTURE_CONTEXT_VALUES)}"
                             )
 
                     for key in ("planogramZone", "storeId", "tenantId"):
                         if key in sample and not isinstance(sample[key], str):
                             errors.append(f"{sample_path}.{key} must be a string")
+                        elif key in sample and _contains_sensitive_value(sample[key]):
+                            # Same screen the top-level labels fields get: a
+                            # PAN or credential token must fail validation, and
+                            # the error never echoes the value.
+                            errors.append(
+                                f"{sample_path}.{key} contains a sensitive-looking value"
+                            )
 
             if structurally_ok and not any_non_empty:
                 errors.append("splits: at least one of train/val/test must be non-empty")
@@ -402,7 +437,7 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                     # embedded NUL) must surface as a validation error, never
                     # a traceback; file checks are skipped because no
                     # reference could resolve against such a root anyway.
-                    errors.append(f"sourceRoot cannot be resolved: {str(base_dir)!r}")
+                    errors.append("sourceRoot cannot be resolved")
                     root = None
                     resolved_root = None
 
@@ -585,7 +620,7 @@ def main(argv=None) -> int:
         except (OSError, ValueError):
             # e.g. a sourceRoot with an embedded NUL: report a normal ERROR
             # line instead of crashing with a traceback.
-            print(f"ERROR: sourceRoot cannot be resolved: {source_root!r}")
+            print("ERROR: sourceRoot cannot be resolved")
             return 1
     errors = validate_manifest(manifest, base_dir=base_dir, check_files=args.check_files)
 

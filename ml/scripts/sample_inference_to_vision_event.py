@@ -637,7 +637,15 @@ def main(argv=None) -> int:
 
     rendered = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
     if args.out:
-        Path(args.out).write_text(rendered + "\n", encoding="utf-8")
+        # Guarded like the read side: a bad --out destination (nonexistent
+        # directory, permission denial, path-is-a-directory) must be the
+        # documented ERROR: line + exit 1, never a raw traceback. The message
+        # names the path and exception class only — no payload content.
+        try:
+            Path(args.out).write_text(rendered + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"ERROR: cannot write output file: {args.out} ({type(exc).__name__})")
+            return 1
     else:
         print(rendered)
     return 0

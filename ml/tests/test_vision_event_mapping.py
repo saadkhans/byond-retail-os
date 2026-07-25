@@ -866,5 +866,47 @@ class CliErrorHandlingTests(unittest.TestCase):
         self.assertNotIn("Traceback", result.stdout + result.stderr)
 
 
+class CliOutWriteTests(unittest.TestCase):
+    """The --out write path must be guarded like the read path: an unwritable
+    destination is the documented ERROR: line + exit 1, never a traceback."""
+
+    def _run_cli(self, *extra_args: str, inference: dict) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_output = Path(tmp) / "model_output.json"
+            model_output.write_text(json.dumps(inference), encoding="utf-8")
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "sample_inference_to_vision_event.py"),
+                    str(model_output),
+                    *extra_args,
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+            )
+
+    def test_out_into_nonexistent_directory_prints_error_line_not_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as out_tmp:
+            missing_out = Path(out_tmp) / "no" / "such" / "dir" / "payload.json"
+            result = self._run_cli("--out", str(missing_out), inference=_base_inference())
+            self.assertFalse(missing_out.exists())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"ERROR: cannot write output file: {missing_out}", result.stdout)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        # The error names the path and exception class only — never payload
+        # content.
+        self.assertNotIn("locationId", result.stdout + result.stderr)
+
+    def test_out_to_valid_path_writes_payload_and_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as out_tmp:
+            out_path = Path(out_tmp) / "payload.json"
+            result = self._run_cli("--out", str(out_path), inference=_base_inference())
+            self.assertEqual(result.returncode, 0)
+            self.assertNotIn("ERROR", result.stdout + result.stderr)
+            written = json.loads(out_path.read_text(encoding="utf-8"))
+        self.assertEqual(written, to_vision_event(_base_inference()))
+
+
 if __name__ == "__main__":
     unittest.main()

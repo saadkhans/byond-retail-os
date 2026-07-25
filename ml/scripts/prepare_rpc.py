@@ -101,24 +101,40 @@ def _category_map_mismatches(train_map: dict, split_map: dict) -> list:
     """Human-readable differences between a split's category map and train's.
 
     Empty list means the maps are exactly equal (same id set, same names).
+
+    Redaction policy: both maps have already passed _coco_shape_errors, so
+    every id here is a validated non-negative non-bool int — echoing the
+    integer id is safe and needed for remediation. Category NAMES are
+    arbitrary COCO-supplied strings (a hostile or mangled export can carry
+    credentials or PII in a name) and are never echoed — only the fact that
+    the name differs.
     """
     mismatches = []
-    for cid in sorted(set(train_map) - set(split_map), key=repr):
-        mismatches.append(
-            f"category id {cid!r} is missing (train names it {train_map[cid]!r})"
-        )
-    for cid in sorted(set(split_map) - set(train_map), key=repr):
-        mismatches.append(
-            f"category id {cid!r} is not in the training categories "
-            f"(named {split_map[cid]!r})"
-        )
-    for cid in sorted(set(train_map) & set(split_map), key=repr):
+    for cid in sorted(set(train_map) - set(split_map)):
+        mismatches.append(f"category id {cid} is missing from this split's categories")
+    for cid in sorted(set(split_map) - set(train_map)):
+        mismatches.append(f"category id {cid} is not in the training categories")
+    for cid in sorted(set(train_map) & set(split_map)):
         if train_map[cid] != split_map[cid]:
-            mismatches.append(
-                f"category id {cid!r} is named {split_map[cid]!r} but train "
-                f"names it {train_map[cid]!r}"
-            )
+            mismatches.append(f"category id {cid}: name differs from the training split")
     return mismatches
+
+
+def _bbox_value_is_finite(value) -> bool:
+    """True when value is a non-bool int/float that is finite.
+
+    math.isfinite converts an int argument to float first, so a huge COCO-
+    supplied integer (e.g. 10**309) raises OverflowError instead of
+    returning False — treat that as non-finite (same guard style as the
+    VisionEvent mapper's confidence checks) so a hostile annotation file
+    yields the normal bbox shape error, never a traceback.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, ValueError):
+        return False
 
 
 def _coco_shape_errors(coco) -> list:
@@ -147,6 +163,13 @@ def _coco_shape_errors(coco) -> list:
     that exist in this file's `images` / `categories` lists, with a `bbox`
     of exactly 4 finite numbers and positive width/height. When the key is
     absent the check is skipped (reference-only fixtures stay valid).
+
+    Redaction policy: every error names the file's array, index, field, and
+    the violated rule only. COCO-supplied values (ids, names, file_names,
+    whole entries) are never echoed — an annotation file is untrusted input
+    whose values can carry credentials, PANs, or PII that must not reach
+    terminal/CI logs. (Python type names of wrong-typed containers are not
+    input values and remain safe to name.)
     """
     if not isinstance(coco, dict):
         return [f"top-level payload must be a JSON object, got {type(coco).__name__}"]
@@ -159,7 +182,7 @@ def _coco_shape_errors(coco) -> list:
     else:
         for idx, category in enumerate(categories):
             if not isinstance(category, dict):
-                errors.append(f"categories[{idx}] must be an object, got {category!r}")
+                errors.append(f"categories[{idx}] must be an object")
                 continue
             category_id = category.get("id")
             if (
@@ -168,11 +191,11 @@ def _coco_shape_errors(coco) -> list:
                 or category_id < 0
             ):
                 errors.append(
-                    f"categories[{idx}].id must be a non-negative integer, got {category_id!r}"
+                    f"categories[{idx}].id must be a non-negative integer"
                 )
             name = category.get("name")
             if not isinstance(name, str) or not name:
-                errors.append(f"categories[{idx}].name must be a non-empty string, got {name!r}")
+                errors.append(f"categories[{idx}].name must be a non-empty string")
     images = coco.get("images")
     if "images" not in coco:
         errors.append("images is a required key and must be a list of objects")
@@ -185,16 +208,16 @@ def _coco_shape_errors(coco) -> list:
         seen_image_ids = {}
         for idx, image in enumerate(images):
             if not isinstance(image, dict):
-                errors.append(f"images[{idx}] must be an object, got {image!r}")
+                errors.append(f"images[{idx}] must be an object")
                 continue
             file_name = image.get("file_name")
             if not isinstance(file_name, str) or not file_name:
                 errors.append(
-                    f"images[{idx}].file_name must be a non-empty string, got {file_name!r}"
+                    f"images[{idx}].file_name must be a non-empty string"
                 )
             image_id = image.get("id")
             if isinstance(image_id, bool) or not isinstance(image_id, int):
-                errors.append(f"images[{idx}].id must be an integer, got {image_id!r}")
+                errors.append(f"images[{idx}].id must be an integer")
             elif image_id in seen_image_ids:
                 errors.append(
                     f"images[{idx}].id duplicates images[{seen_image_ids[image_id]}].id"
@@ -225,7 +248,7 @@ def _coco_shape_errors(coco) -> list:
         else:
             for idx, annotation in enumerate(annotations):
                 if not isinstance(annotation, dict):
-                    errors.append(f"annotations[{idx}] must be an object, got {annotation!r}")
+                    errors.append(f"annotations[{idx}] must be an object")
                     continue
                 image_id = annotation.get("image_id")
                 if (
@@ -248,12 +271,7 @@ def _coco_shape_errors(coco) -> list:
                     errors.append(
                         f"annotations[{idx}].bbox must be a list of exactly 4 numbers"
                     )
-                elif any(
-                    isinstance(value, bool)
-                    or not isinstance(value, (int, float))
-                    or not math.isfinite(value)
-                    for value in bbox
-                ):
+                elif not all(_bbox_value_is_finite(value) for value in bbox):
                     errors.append(f"annotations[{idx}].bbox values must be finite numbers")
                 elif bbox[2] <= 0 or bbox[3] <= 0:
                     errors.append(
@@ -485,8 +503,16 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
             print(f"  - {error}")
         return 1
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _write_json_atomically(manifest, manifest_path)
+    # A write-side failure — --output naming an existing file (mkdir raises
+    # FileExistsError, an OSError subclass), a read-only destination, a full
+    # disk — must be a controlled ERROR naming the destination and exception
+    # class only: never a traceback, never file/manifest content.
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        _write_json_atomically(manifest, manifest_path)
+    except OSError as exc:
+        print(f"ERROR: could not write {manifest_path} ({type(exc).__name__})")
+        return 1
 
     train_n = len(splits["train"])
     val_n = len(splits["val"])
