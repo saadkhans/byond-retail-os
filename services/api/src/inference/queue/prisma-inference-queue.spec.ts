@@ -72,6 +72,7 @@ describe('PrismaInferenceQueue', () => {
     retailUnit: { findFirst: jest.Mock };
     device: { findFirst: jest.Mock };
     checkoutSession: { findFirst: jest.Mock };
+    user: { findFirst: jest.Mock };
   };
   let auditLog: { record: jest.Mock };
   let prismaFindFirst: jest.Mock;
@@ -113,6 +114,7 @@ describe('PrismaInferenceQueue', () => {
           .fn()
           .mockResolvedValue({ id: 'sess-1', unitId: 'unit-a1' }),
       },
+      user: { findFirst: jest.fn().mockResolvedValue({ id: 'user-1' }) },
     };
     auditLog = { record: jest.fn().mockResolvedValue(undefined) };
     prismaFindFirst = jest.fn().mockResolvedValue(null);
@@ -221,6 +223,37 @@ describe('PrismaInferenceQueue', () => {
           enqueueAudit,
         ),
       ).resolves.toBe('session-unit-mismatch');
+    });
+
+    it('validates the creator under the scoped tenant inside the transaction', async () => {
+      await queue.enqueue(
+        'tenant-a',
+        { ...baseEnqueue, createdById: 'user-1' },
+        enqueueAudit,
+      );
+      expect(tx.user.findFirst).toHaveBeenCalledWith({
+        where: { id: 'user-1', tenantId: 'tenant-a' },
+        select: { id: true },
+      });
+    });
+
+    it('rejects a creator from another tenant before any write', async () => {
+      // The scoped lookup misses: the id exists only under another tenant.
+      tx.user.findFirst.mockResolvedValue(null);
+      await expect(
+        queue.enqueue(
+          'tenant-a',
+          { ...baseEnqueue, createdById: 'user-of-tenant-b' },
+          enqueueAudit,
+        ),
+      ).resolves.toBe('creator-not-found');
+      expect(tx.inferenceJob.create).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
+    });
+
+    it('skips the creator lookup for system flows (no createdById)', async () => {
+      await queue.enqueue('tenant-a', baseEnqueue, enqueueAudit);
+      expect(tx.user.findFirst).not.toHaveBeenCalled();
     });
   });
 

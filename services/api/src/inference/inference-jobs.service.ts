@@ -55,8 +55,23 @@ function prismaErrorCode(error: unknown): string | undefined {
  * content. Secrets belong in a secret store; payment data must never be
  * stored (AGENTS.md payments invariant).
  */
+// C0 control characters and DEL. PostgreSQL text/jsonb cannot store NUL at
+// all — without this guard a NUL reaches Prisma and surfaces as an
+// uncontrolled 500 (and a mid-lifecycle failure leaves the job RUNNING);
+// the rest of the range has no business in opaque single-line ids either.
+// eslint-disable-next-line no-control-regex -- matching control chars IS the guard
+const CONTROL_CHARACTERS = /[\x00-\x1f\x7f]/;
+
 function assertOpaque(field: string, value: string | undefined): void {
-  if (value !== undefined && containsSensitiveValue(value)) {
+  if (value === undefined) {
+    return;
+  }
+  if (CONTROL_CHARACTERS.test(value)) {
+    throw new BadRequestException(
+      `${field} must not contain control characters`,
+    );
+  }
+  if (containsSensitiveValue(value)) {
     throw new BadRequestException(
       `${field} must be an opaque value and must not contain credential- ` +
         `or payment-bearing content. Secrets belong in a dedicated secret ` +
@@ -64,6 +79,35 @@ function assertOpaque(field: string, value: string | undefined): void {
         `stored.`,
     );
   }
+}
+
+/** Dotted path of the first key or string value carrying a control char. */
+function findControlCharacterPath(value: unknown, path = ''): string | null {
+  if (typeof value === 'string') {
+    return CONTROL_CHARACTERS.test(value) ? path || '(value)' : null;
+  }
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const found = findControlCharacterPath(value[index], `${path}[${index}]`);
+      if (found) {
+        return found;
+      }
+    }
+    return null;
+  }
+  if (value !== null && typeof value === 'object') {
+    for (const [key, nested] of Object.entries(value)) {
+      const keyPath = path ? `${path}.${key}` : key;
+      if (CONTROL_CHARACTERS.test(key)) {
+        return keyPath;
+      }
+      const found = findControlCharacterPath(nested, keyPath);
+      if (found) {
+        return found;
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -78,6 +122,12 @@ function assertSafeInputDescriptor(
 ): void {
   if (descriptor === undefined) {
     return;
+  }
+  const controlPath = findControlCharacterPath(descriptor);
+  if (controlPath) {
+    throw new BadRequestException(
+      `inputDescriptor.${controlPath} must not contain control characters`,
+    );
   }
   const mediaPath = findForbiddenMediaPath(descriptor);
   if (mediaPath) {
@@ -190,6 +240,11 @@ export class InferenceJobsService {
     if (result === 'session-unit-mismatch') {
       throw new BadRequestException(
         `Checkout session "${dto.sessionId}" is not at unit "${dto.unitId}"`,
+      );
+    }
+    if (result === 'creator-not-found') {
+      throw new BadRequestException(
+        'The acting user does not belong to this tenant',
       );
     }
     return result.job;
@@ -540,18 +595,41 @@ export class InferenceJobsService {
 
   /**
    * A replayed ingest under the job's derived idempotency key must BE this
-   * job's event: same type, magnitude, binding, and source. On any mismatch
-   * the conversion aborts (409) without linking — only the foreign event's
-   * id is disclosed, never its contents.
+   * job's event: same type, magnitude, binding, source, occurrence time,
+   * evidence, and ranked candidate list. On any mismatch the conversion
+   * aborts (409) without linking — only the foreign event's id is
+   * disclosed, never its contents. (Labels are NOT compared: they are
+   * display-only snapshots, not decision inputs — rank/sku/score are what
+   * a review would apply.)
    */
   private assertReplayedEventMatches(
     job: InferenceJobDetail,
     result: NonNullable<InferenceJobDetail['result']>,
     event: VisionEventDetail,
   ): void {
+    const eventCandidates = [...event.candidates].sort(
+      (a, b) => a.rank - b.rank,
+    );
+    const resultCandidates = [...result.candidates].sort(
+      (a, b) => a.rank - b.rank,
+    );
+    const candidatesMatch =
+      eventCandidates.length === resultCandidates.length &&
+      eventCandidates.every((candidate, index) => {
+        const expected = resultCandidates[index];
+        return (
+          candidate.rank === expected.rank &&
+          candidate.sku === expected.sku &&
+          (candidate.score ?? null) === expected.score
+        );
+      });
     const matches =
+      candidatesMatch &&
       event.type === result.eventType &&
       event.quantity === Math.abs(result.quantityDelta) &&
+      event.occurredAt.getTime() === result.occurredAt.getTime() &&
+      (event.evidenceScore ?? null) === (result.evidenceScore ?? null) &&
+      (event.evidenceQuality ?? null) === (result.evidenceQuality ?? null) &&
       event.locationId === job.locationId &&
       event.unitId === job.unitId &&
       (event.deviceId ?? null) === (job.deviceId ?? null) &&

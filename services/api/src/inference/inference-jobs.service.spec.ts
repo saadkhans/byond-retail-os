@@ -72,16 +72,24 @@ describe('InferenceJobsService', () => {
   } as unknown as InferenceJobDetail;
 
   // Shaped like the event the conversion itself creates: the replay-
-  // verification guard compares it against the job/result before linking.
+  // verification guard compares it against the job/result before linking —
+  // including occurrence time, evidence fields, and the ranked candidates.
   const visionEvent = {
     id: 'event-1',
     tenantId: 'tenant-a',
     type: VisionEventType.PRODUCT_PICKUP,
     quantity: 2,
+    occurredAt: new Date('2026-07-26T10:00:30.000Z'),
+    evidenceScore: 0.92,
+    evidenceQuality: 'HIGH',
     locationId: 'loc-a1',
     unitId: 'unit-a1',
     sessionId: 'sess-1',
     sourceType: 'VISION',
+    candidates: [
+      { id: 'vec-1', rank: 1, sku: 'COLA-330', score: 0.92, label: 'red can' },
+      { id: 'vec-2', rank: 2, sku: 'CHIPS-50', score: 0.41, label: null },
+    ],
   };
 
   let repository: {
@@ -207,11 +215,39 @@ describe('InferenceJobsService', () => {
       'device-unit-mismatch',
       'session-not-found',
       'session-unit-mismatch',
+      'creator-not-found',
     ])('maps %s to a 400', async (rejection) => {
       queue.enqueue.mockResolvedValue(rejection);
       await expect(
         service.create('tenant-a', baseCreate, actor),
       ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it.each([
+      ['sourceId', { sourceId: 'zone\t7' }],
+      ['idempotencyKey', { idempotencyKey: 'key-' + String.fromCharCode(0) }],
+    ])(
+      'rejects a control-character-bearing %s before any write',
+      async (_field, overrides) => {
+        await expect(
+          service.create('tenant-a', { ...baseCreate, ...overrides }, actor),
+        ).rejects.toThrow(/control characters/);
+        expect(queue.enqueue).not.toHaveBeenCalled();
+      },
+    );
+
+    it('rejects a NUL in an inputDescriptor value before any write', async () => {
+      await expect(
+        service.create(
+          'tenant-a',
+          {
+            ...baseCreate,
+            inputDescriptor: { cropId: 'crop-' + String.fromCharCode(0) + '1' },
+          },
+          actor,
+        ),
+      ).rejects.toThrow(/control characters/);
+      expect(queue.enqueue).not.toHaveBeenCalled();
     });
 
     it.each([
@@ -545,7 +581,9 @@ describe('InferenceJobsService', () => {
     });
 
     it.each([
-      ['sku', { sku: 'sk_live_0a1b2c3d4e5f6g7h', confidence: 0.5 }],
+      // FAKE Stripe-shaped fixture (screening test), split so the literal
+      // never matches a secret-scanner rule in a commit diff.
+      ['sku', { sku: 'sk_live_' + '0a1b2c3d4e5f6g7h', confidence: 0.5 }],
       [
         'label',
         {
@@ -569,12 +607,35 @@ describe('InferenceJobsService', () => {
       },
     );
 
+    it('rejects a control-character-bearing label before any write', async () => {
+      await expect(
+        service.complete(
+          'tenant-a',
+          'job-1',
+          {
+            ...baseComplete,
+            detections: [
+              {
+                sku: 'COLA-330',
+                confidence: 0.5,
+                label: 'red' + String.fromCharCode(0) + 'can',
+              },
+            ],
+          },
+          actor,
+        ),
+      ).rejects.toThrow(/control characters/);
+      expect(queue.complete).not.toHaveBeenCalled();
+    });
+
     it('rejects a credential-bearing modelKey before any write', async () => {
       await expect(
         service.complete(
           'tenant-a',
           'job-1',
-          { ...baseComplete, modelKey: 'api_key=abc123' },
+          // FAKE key=value fixture (screening test), split so the literal
+          // never matches a secret-scanner rule in a commit diff.
+          { ...baseComplete, modelKey: 'api_' + 'key=abc123' },
           actor,
         ),
       ).rejects.toBeInstanceOf(BadRequestException);
@@ -642,6 +703,21 @@ describe('InferenceJobsService', () => {
           actor,
         ),
       ).rejects.toBeInstanceOf(BadRequestException);
+      expect(queue.fail).not.toHaveBeenCalled();
+    });
+
+    it('rejects a control-character-bearing errorMessage before any write', async () => {
+      await expect(
+        service.fail(
+          'tenant-a',
+          'job-1',
+          {
+            errorCode: 'X_Y',
+            errorMessage: 'line1' + String.fromCharCode(0) + 'line2',
+          },
+          actor,
+        ),
+      ).rejects.toThrow(/control characters/);
       expect(queue.fail).not.toHaveBeenCalled();
     });
 
@@ -865,6 +941,50 @@ describe('InferenceJobsService', () => {
       expect(repository.linkVisionEvent).not.toHaveBeenCalled();
     });
 
+    it('409s and does NOT link when the replayed event occurredAt mismatches', async () => {
+      visionEvents.ingest.mockResolvedValue({
+        ...visionEvent,
+        id: 'foreign-event',
+        occurredAt: new Date('2026-07-26T09:59:00.000Z'),
+      });
+      await expect(
+        service.toVisionEvent('tenant-a', 'job-1', actor),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(repository.linkVisionEvent).not.toHaveBeenCalled();
+    });
+
+    it('409s and does NOT link when the replayed candidate list mismatches', async () => {
+      // Same type/quantity/bindings, different ranked SKUs: approving the
+      // squatted event would apply a product the inference never proposed.
+      visionEvents.ingest.mockResolvedValue({
+        ...visionEvent,
+        id: 'foreign-event',
+        candidates: [
+          { id: 'vec-x', rank: 1, sku: 'SODA-999', score: 0.92, label: null },
+          { id: 'vec-2', rank: 2, sku: 'CHIPS-50', score: 0.41, label: null },
+        ],
+      });
+      await expect(
+        service.toVisionEvent('tenant-a', 'job-1', actor),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(repository.linkVisionEvent).not.toHaveBeenCalled();
+    });
+
+    it('409s and does NOT link when the replayed candidate scores mismatch', async () => {
+      visionEvents.ingest.mockResolvedValue({
+        ...visionEvent,
+        id: 'foreign-event',
+        candidates: [
+          { id: 'vec-1', rank: 1, sku: 'COLA-330', score: 0.51, label: null },
+          { id: 'vec-2', rank: 2, sku: 'CHIPS-50', score: 0.41, label: null },
+        ],
+      });
+      await expect(
+        service.toVisionEvent('tenant-a', 'job-1', actor),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(repository.linkVisionEvent).not.toHaveBeenCalled();
+    });
+
     it('links normally when the replayed event matches the result', async () => {
       const outcome = await service.toVisionEvent('tenant-a', 'job-1', actor);
       expect(outcome.replayed).toBe(false);
@@ -886,6 +1006,8 @@ describe('InferenceJobsService', () => {
         ...visionEvent,
         type: VisionEventType.EXIT_RECONCILIATION,
         quantity: 1,
+        evidenceScore: null,
+        candidates: [],
       });
       await service.toVisionEvent('tenant-a', 'job-1', actor);
       const payload = visionEvents.ingest.mock.calls[0][1] as {

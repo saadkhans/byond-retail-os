@@ -41,6 +41,12 @@ export function InferenceJobsPage() {
   const [newSessionId, setNewSessionId] = useState('');
   const [newLocationId, setNewLocationId] = useState('');
   const [newUnitId, setNewUnitId] = useState('');
+  // One key per LOGICAL submission, held across retries: if the server
+  // committed but the response was lost, resubmitting replays the same job
+  // instead of enqueueing a duplicate. Rotated only after confirmed success.
+  const [idempotencyKey, setIdempotencyKey] = useState(() =>
+    crypto.randomUUID(),
+  );
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
@@ -72,9 +78,10 @@ export function InferenceJobsPage() {
           ...(newSessionId ? { sessionId: newSessionId } : {}),
           ...(newLocationId ? { locationId: newLocationId } : {}),
           ...(newUnitId ? { unitId: newUnitId } : {}),
-          idempotencyKey: crypto.randomUUID(),
+          idempotencyKey,
         },
       });
+      setIdempotencyKey(crypto.randomUUID());
       navigate(`/inference/${job.id}`);
     } catch (err) {
       setCreateError(errorMessage(err));
@@ -257,7 +264,9 @@ export function InferenceJobDetailPage() {
     );
   }
 
-  async function act(path: string, body?: unknown) {
+  /** Returns true only on a confirmed success — callers must not reset
+   *  their form state on failure, or a rejected action wipes the input. */
+  async function act(path: string, body?: unknown): Promise<boolean> {
     setBusy(true);
     setActionError(null);
     try {
@@ -266,8 +275,10 @@ export function InferenceJobDetailPage() {
         ...(body !== undefined ? { body } : {}),
       });
       setReload((n) => n + 1);
+      return true;
     } catch (err) {
       setActionError(errorMessage(err));
+      return false;
     } finally {
       setBusy(false);
     }
@@ -297,6 +308,12 @@ export function InferenceJobDetailPage() {
       );
       return;
     }
+    // Number('') is 0, which would silently pass the range check below — a
+    // blank confidence must ask the operator, never fabricate a zero score.
+    if (rows.some((row) => !row.confidence.trim())) {
+      setActionError('Confidence is required for each detection.');
+      return;
+    }
     const parsed = rows.map((row) => ({
       sku: row.sku.trim(),
       confidence: Number(row.confidence),
@@ -306,14 +323,16 @@ export function InferenceJobDetailPage() {
       setActionError('Each confidence must be a number between 0 and 1.');
       return;
     }
-    await act('/complete', {
+    const succeeded = await act('/complete', {
       eventType,
       quantityDelta: delta,
       occurredAt,
       detections: parsed,
       ...(evidenceQuality ? { evidenceQuality } : {}),
     });
-    setDetections(EMPTY_DETECTIONS);
+    if (succeeded) {
+      setDetections(EMPTY_DETECTIONS);
+    }
   }
 
   async function fail(event: FormEvent) {
@@ -322,8 +341,12 @@ export function InferenceJobDetailPage() {
       setActionError('Enter an error code (e.g. LOW_CONFIDENCE).');
       return;
     }
-    await act('/fail', { errorCode: errorCode.trim().toUpperCase() });
-    setErrorCode('');
+    const succeeded = await act('/fail', {
+      errorCode: errorCode.trim().toUpperCase(),
+    });
+    if (succeeded) {
+      setErrorCode('');
+    }
   }
 
   const queued = data?.status === 'QUEUED';

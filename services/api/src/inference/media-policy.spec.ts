@@ -112,6 +112,21 @@ describe('inference media policy', () => {
         { ref: 's3%3A%2F%2Fbucket%2Fframe' },
         'ref',
       ],
+      [
+        'a DOUBLY percent-encoded scheme',
+        { ref: 's3%253A%252F%252Fbucket%252Fframe' },
+        'ref',
+      ],
+      [
+        'a TRIPLY percent-encoded scheme',
+        { ref: 's3%25253A%25252F%25252Fbucket%25252Fframe' },
+        'ref',
+      ],
+      [
+        'a doubly percent-encoded media extension',
+        { name: 'frame%252Ejpg' },
+        'name',
+      ],
     ])('rejects %s by VALUE', (_label, descriptor, path) => {
       expect(findForbiddenMediaPath(descriptor)).toBe(path);
     });
@@ -123,6 +138,7 @@ describe('inference media policy', () => {
       ['a version-style dotted value', { contract: 'v2.1.0' }],
       ['a namespaced id with one slash', { ref: 'v2:zone/7' }],
       ['a bare percent sign', { discount: '15% off shelf 3' }],
+      ['an encoded literal percent', { discount: '100%25' }],
     ])('keeps %s', (_label, descriptor) => {
       expect(findForbiddenMediaPath(descriptor)).toBeNull();
     });

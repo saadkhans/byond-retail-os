@@ -117,17 +117,33 @@ function matchesForbiddenMediaShape(value: string): boolean {
   );
 }
 
+// Percent-encoding must not hide a media shape — including REPEATED
+// encoding ("s3%253A%252F%252F..." → "s3%3A%2F%2F..." → "s3://..."), so the
+// value is re-decoded until it stops changing (bounded: legitimate ids are
+// never encodings this deep).
+const MAX_PERCENT_DECODE_DEPTH = 5;
+
 function isForbiddenMediaValue(value: string): boolean {
-  if (matchesForbiddenMediaShape(value)) {
-    return true;
-  }
-  // Percent-encoding must not hide a media shape ("frame%2Ejpg").
-  if (value.includes('%')) {
-    try {
-      return matchesForbiddenMediaShape(decodeURIComponent(value));
-    } catch {
-      // Not valid percent-encoding; the raw-value checks above stand.
+  let current = value;
+  for (let depth = 0; depth <= MAX_PERCENT_DECODE_DEPTH; depth += 1) {
+    if (matchesForbiddenMediaShape(current)) {
+      return true;
     }
+    if (!current.includes('%')) {
+      return false;
+    }
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(current);
+    } catch {
+      // Not valid percent-encoding; the checks already run on this stage
+      // stand.
+      return false;
+    }
+    if (decoded === current) {
+      return false;
+    }
+    current = decoded;
   }
   return false;
 }

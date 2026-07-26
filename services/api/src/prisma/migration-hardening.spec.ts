@@ -366,11 +366,16 @@ describe('inference migration hardening', () => {
       'InferenceJob_device_same_tenant_fkey',
       'InferenceJob_session_same_tenant_fkey',
       'InferenceJob_visionEvent_same_tenant_fkey',
+      'InferenceJob_creator_same_tenant_fkey',
       'InferenceResult_job_same_tenant_fkey',
       'InferenceCandidate_result_same_tenant_fkey',
     ]) {
       expect(sql).toContain(constraint);
     }
+    // The creator FK needs its composite anchor on User.
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "User_id_tenantId_key" ON "User"("id", "tenantId")',
+    );
   });
 
   it('keeps idempotency keys unique per tenant and the claim ordering indexed', () => {

@@ -258,6 +258,9 @@ model User {
 
   inferenceJobsCreated InferenceJob[] @relation("InferenceJobActor")
 
+  // Composite FK target for same-tenant creator constraints (id alone is
+  // already unique; this adds nothing semantically, only an FK anchor).
+  @@unique([id, tenantId])
   @@index([tenantId, status])
 }
 

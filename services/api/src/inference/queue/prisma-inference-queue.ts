@@ -137,6 +137,18 @@ export class PrismaInferenceQueue
           return 'session-unit-mismatch' as const;
         }
       }
+      if (input.createdById) {
+        // The creator must belong to THIS tenant, like every other job
+        // reference (backstopped by the composite same-tenant FK): an actor
+        // from another tenant must never persist as a cross-tenant relation.
+        const creator = await tx.user.findFirst({
+          where: { id: input.createdById, tenantId: scopedTenantId },
+          select: { id: true },
+        });
+        if (!creator) {
+          return 'creator-not-found' as const;
+        }
+      }
       const job = await tx.inferenceJob.create({
         data: {
           tenantId: scopedTenantId,

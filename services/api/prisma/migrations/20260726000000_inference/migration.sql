@@ -218,6 +218,13 @@ ALTER TABLE "InferenceJob" ADD CONSTRAINT "InferenceJob_session_same_tenant_fkey
   FOREIGN KEY ("sessionId", "tenantId") REFERENCES "CheckoutSession"("id", "tenantId") ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE "InferenceJob" ADD CONSTRAINT "InferenceJob_visionEvent_same_tenant_fkey"
   FOREIGN KEY ("visionEventId", "tenantId") REFERENCES "VisionEvent"("id", "tenantId") ON DELETE RESTRICT ON UPDATE CASCADE;
+-- The creator too: an actor from another tenant must never persist as this
+-- job's createdById. User(id) is already unique; the composite unique below
+-- exists purely as the FK anchor. (MATCH SIMPLE: a NULL createdById — system
+-- flows — skips the check.)
+CREATE UNIQUE INDEX "User_id_tenantId_key" ON "User"("id", "tenantId");
+ALTER TABLE "InferenceJob" ADD CONSTRAINT "InferenceJob_creator_same_tenant_fkey"
+  FOREIGN KEY ("createdById", "tenantId") REFERENCES "User"("id", "tenantId") ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE "InferenceResult" ADD CONSTRAINT "InferenceResult_job_same_tenant_fkey"
   FOREIGN KEY ("jobId", "tenantId") REFERENCES "InferenceJob"("id", "tenantId") ON DELETE RESTRICT ON UPDATE NO ACTION;
 ALTER TABLE "InferenceCandidate" ADD CONSTRAINT "InferenceCandidate_result_same_tenant_fkey"

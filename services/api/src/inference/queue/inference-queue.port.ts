@@ -24,7 +24,8 @@ export type EnqueueRejection =
   | 'device-not-found'
   | 'device-unit-mismatch'
   | 'session-not-found'
-  | 'session-unit-mismatch';
+  | 'session-unit-mismatch'
+  | 'creator-not-found';
 
 export interface FailJobInput {
   errorCode: string;
