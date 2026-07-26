@@ -14,6 +14,7 @@ import {
 import {
   containsSensitiveValue,
   findSensitiveKeyPath,
+  isSensitiveKey,
 } from '../common/sensitive-keys';
 import { PlatformModulesService } from '../platform-modules/platform-modules.service';
 import { IngestVisionEventDto } from '../vision/dto/ingest-vision-event.dto';
@@ -62,11 +63,25 @@ function prismaErrorCode(error: unknown): string | undefined {
 // eslint-disable-next-line no-control-regex -- matching control chars IS the guard
 const CONTROL_CHARACTERS = /[\x00-\x1f\x7f]/;
 
+/**
+ * Control characters are screened at every percent-decode stage too: a
+ * "%09"-joined digit string contains no raw control character but decodes
+ * to a TAB-separated PAN that the contiguous/space/dash PAN detector cannot
+ * see — the decoded-stage control check closes that channel (any encoded
+ * separator that is not space/dash IS a control char or is caught by the
+ * sensitive check on the same stage).
+ */
+function hasControlCharacters(value: string): boolean {
+  return percentDecodeStages(value).some((stage) =>
+    CONTROL_CHARACTERS.test(stage),
+  );
+}
+
 function assertOpaque(field: string, value: string | undefined): void {
   if (value === undefined) {
     return;
   }
-  if (CONTROL_CHARACTERS.test(value)) {
+  if (hasControlCharacters(value)) {
     throw new BadRequestException(
       `${field} must not contain control characters`,
     );
@@ -84,10 +99,13 @@ function assertOpaque(field: string, value: string | undefined): void {
   }
 }
 
-/** Dotted path of the first key or string value carrying a control char. */
+/**
+ * Dotted path of the first key or string value carrying a control char at
+ * ANY percent-decode stage ("%00"/"%09" decode to NUL/TAB).
+ */
 function findControlCharacterPath(value: unknown, path = ''): string | null {
   if (typeof value === 'string') {
-    return CONTROL_CHARACTERS.test(value) ? path || '(value)' : null;
+    return hasControlCharacters(value) ? path || '(value)' : null;
   }
   if (Array.isArray(value)) {
     for (let index = 0; index < value.length; index += 1) {
@@ -101,7 +119,7 @@ function findControlCharacterPath(value: unknown, path = ''): string | null {
   if (value !== null && typeof value === 'object') {
     for (const [key, nested] of Object.entries(value)) {
       const keyPath = path ? `${path}.${key}` : key;
-      if (CONTROL_CHARACTERS.test(key)) {
+      if (hasControlCharacters(key)) {
         return keyPath;
       }
       const found = findControlCharacterPath(nested, keyPath);
@@ -138,8 +156,16 @@ function findEncodedSensitivePath(value: unknown, path = ''): string | null {
     for (const [key, nested] of Object.entries(value)) {
       const keyPath = path ? `${path}.${key}` : key;
       // KEY strings are attacker-controlled text too: a PAN or credential
-      // used AS a key ({"4111 ...": "x"}) must be rejected like a value.
-      if (percentDecodeStages(key).some(containsSensitiveValue)) {
+      // used AS a key ({"4111 ...": "x"}) must be rejected like a value,
+      // and a credential-CHANNEL key hidden by encoding ("c%76v" → "cvv",
+      // "pass%77ord" → "password") must be classified as a sensitive KEY
+      // at every decode stage — its VALUE is the secret and matches no
+      // value-shape check.
+      if (
+        percentDecodeStages(key).some(
+          (stage) => containsSensitiveValue(stage) || isSensitiveKey(stage),
+        )
+      ) {
         return keyPath;
       }
       const found = findEncodedSensitivePath(nested, keyPath);
@@ -149,6 +175,33 @@ function findEncodedSensitivePath(value: unknown, path = ''): string | null {
     }
   }
   return null;
+}
+
+/**
+ * The offending path is attacker-controlled text and can ITSELF be the
+ * sensitive material (a PAN or credential used as a key): reflecting it
+ * verbatim into the HTTP error would move card data into error records and
+ * telemetry. Each path segment whose decode stages carry sensitive
+ * content, a sensitive key name, or control characters is replaced with
+ * '[REDACTED]'; benign segments ("trigger.cropImageUrl") stay readable.
+ */
+function redactDescriptorPath(path: string): string {
+  const redacted = path
+    .split('.')
+    .map((segment) =>
+      percentDecodeStages(segment).some(
+        (stage) =>
+          containsSensitiveValue(stage) ||
+          isSensitiveKey(stage) ||
+          CONTROL_CHARACTERS.test(stage),
+      )
+        ? '[REDACTED]'
+        : segment,
+    )
+    .join('.');
+  // Belt and braces: sensitive content split ACROSS segments (a dotted key)
+  // must not survive re-joining.
+  return containsSensitiveValue(redacted) ? '[REDACTED]' : redacted;
 }
 
 /**
@@ -167,24 +220,26 @@ function assertSafeInputDescriptor(
   const controlPath = findControlCharacterPath(descriptor);
   if (controlPath) {
     throw new BadRequestException(
-      `inputDescriptor.${controlPath} must not contain control characters`,
+      `inputDescriptor.${redactDescriptorPath(controlPath)} must not ` +
+        `contain control characters`,
     );
   }
   const mediaPath = findForbiddenMediaPath(descriptor);
   if (mediaPath) {
     throw new BadRequestException(
-      `inputDescriptor.${mediaPath} is not accepted: raw media, media/` +
-        `storage URLs, signed URLs, and artifact descriptors are out of ` +
-        `scope for Phase 9 MVP — reference crops/zones/frames by id only.`,
+      `inputDescriptor.${redactDescriptorPath(mediaPath)} is not accepted: ` +
+        `raw media, media/storage URLs, signed URLs, and artifact ` +
+        `descriptors are out of scope for Phase 9 MVP — reference ` +
+        `crops/zones/frames by id only.`,
     );
   }
   const sensitivePath =
     findSensitiveKeyPath(descriptor) ?? findEncodedSensitivePath(descriptor);
   if (sensitivePath) {
     throw new BadRequestException(
-      `inputDescriptor.${sensitivePath} must not carry credential- or ` +
-        `payment-bearing content. Secrets belong in a dedicated secret ` +
-        `store, and payment data must never be stored.`,
+      `inputDescriptor.${redactDescriptorPath(sensitivePath)} must not ` +
+        `carry credential- or payment-bearing content. Secrets belong in a ` +
+        `dedicated secret store, and payment data must never be stored.`,
     );
   }
 }
@@ -370,7 +425,11 @@ export class InferenceJobsService {
           'terminal jobs never transition again',
       );
     }
-    if (result === 'not-claimable' || result === 'not-running') {
+    if (
+      result === 'not-claimable' ||
+      result === 'not-running' ||
+      result === 'lease-superseded'
+    ) {
       throw new ConflictException(
         'Only a QUEUED job can be started; this job is already running',
       );
@@ -439,6 +498,7 @@ export class InferenceJobsService {
     const result = await this.queue.complete(
       tenantId,
       jobId,
+      job.attempts,
       normalized,
       (before, after) =>
         this.auditEntry(tenantId, actor, {
@@ -459,6 +519,12 @@ export class InferenceJobsService {
           'terminal jobs never transition again',
       );
     }
+    if (result === 'lease-superseded') {
+      throw new ConflictException(
+        'Another attempt has claimed this job since this result was ' +
+          'produced; the stale result was not applied',
+      );
+    }
     if (result === 'not-running' || result === 'not-claimable') {
       throw new ConflictException(
         'Only a RUNNING job can be completed; start it first',
@@ -474,9 +540,14 @@ export class InferenceJobsService {
     actor?: AuditActor,
   ): Promise<InferenceJobDetail> {
     assertOpaque('errorMessage', dto.errorMessage);
+    // Read the job first so the failure is fenced to the attempt this
+    // caller observed — a stale worker must not fail an attempt that
+    // superseded its own.
+    const job = await this.findById(tenantId, jobId);
     const result = await this.queue.fail(
       tenantId,
       jobId,
+      job.attempts,
       { errorCode: dto.errorCode, errorMessage: dto.errorMessage },
       (before, after) =>
         this.auditEntry(tenantId, actor, {
@@ -490,6 +561,12 @@ export class InferenceJobsService {
     );
     if (result === null) {
       throw new NotFoundException(`Inference job "${jobId}" not found`);
+    }
+    if (result === 'lease-superseded') {
+      throw new ConflictException(
+        'Another attempt has claimed this job since this failure was ' +
+          'reported; the stale failure was not applied',
+      );
     }
     if (typeof result === 'string') {
       throw new ConflictException(

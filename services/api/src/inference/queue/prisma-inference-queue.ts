@@ -10,6 +10,10 @@ import {
   AuditLogService,
   SYSTEM_ACTOR_EMAIL,
 } from '../../common/audit/audit-log.service';
+import {
+  deviceAdvisoryLockKey,
+  unitAdvisoryLockKey,
+} from '../../common/locks';
 import { PrismaService } from '../../prisma/prisma.service';
 import { TenantScopedRepository } from '../../prisma/tenant-scoped.repository';
 import { NormalizedInferenceResult } from '../adapters/inference-adapter';
@@ -100,6 +104,16 @@ export class PrismaInferenceQueue
       }
       let unitLocationId: string | null = null;
       if (input.unitId) {
+        // Serialize with UnitsRepository.update()/delete() (same key), held
+        // through the insert — a unit reassigned to another store between
+        // this read and the job row would otherwise pass validation and
+        // produce a job Phase 7 later rejects at conversion. Lock order
+        // unit → device mirrors vision ingest and checkout create, so the
+        // creation paths cannot deadlock each other.
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${unitAdvisoryLockKey(
+          scopedTenantId,
+          input.unitId,
+        )}))`;
         const unit = await tx.retailUnit.findFirst({
           where: { id: input.unitId, tenantId: scopedTenantId },
           select: { id: true, locationId: true },
@@ -113,6 +127,13 @@ export class PrismaInferenceQueue
         unitLocationId = unit.locationId;
       }
       if (input.deviceId) {
+        // Serialize with DevicesRepository mutations (same key): a
+        // concurrent reassignment to another unit must not land between
+        // this check and the job row.
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceAdvisoryLockKey(
+          scopedTenantId,
+          input.deviceId,
+        )}))`;
         const device = await tx.device.findFirst({
           where: { id: input.deviceId, tenantId: scopedTenantId },
           select: { id: true, unitId: true },
@@ -374,6 +395,7 @@ export class PrismaInferenceQueue
   complete(
     tenantId: string,
     jobId: string,
+    expectedAttempts: number,
     result: NormalizedInferenceResult,
     buildAuditEntry: (
       before: InferenceJobDetail,
@@ -394,11 +416,20 @@ export class PrismaInferenceQueue
           ? ('terminal' as const)
           : ('not-running' as const);
       }
+      // Attempt fencing: status alone cannot distinguish the worker that
+      // currently owns the lease. If attempt A's lease expired, the job was
+      // reclaimed, and attempt B re-claimed it (bumping `attempts`), a late
+      // A still sees RUNNING — its stale result must not commit under B's
+      // lease.
+      if (before.attempts !== expectedAttempts) {
+        return 'lease-superseded' as const;
+      }
       const updated = await tx.inferenceJob.updateMany({
         where: {
           id: jobId,
           tenantId: scopedTenantId,
           status: InferenceJobStatus.RUNNING,
+          attempts: expectedAttempts,
         },
         data: {
           status: InferenceJobStatus.SUCCEEDED,
@@ -447,6 +478,7 @@ export class PrismaInferenceQueue
   fail(
     tenantId: string,
     jobId: string,
+    expectedAttempts: number,
     input: FailJobInput,
     buildAuditEntry: (
       before: InferenceJobDetail,
@@ -467,6 +499,11 @@ export class PrismaInferenceQueue
       if (TERMINAL_STATUSES.includes(before.status)) {
         return 'terminal' as const;
       }
+      // Same attempt fencing as complete(): a stale worker must not
+      // terminate the attempt that superseded it.
+      if (before.attempts !== expectedAttempts) {
+        return 'lease-superseded' as const;
+      }
       const updated = await tx.inferenceJob.updateMany({
         where: {
           id: jobId,
@@ -474,6 +511,7 @@ export class PrismaInferenceQueue
           status: {
             in: [InferenceJobStatus.QUEUED, InferenceJobStatus.RUNNING],
           },
+          attempts: expectedAttempts,
         },
         data: {
           status: InferenceJobStatus.FAILED,

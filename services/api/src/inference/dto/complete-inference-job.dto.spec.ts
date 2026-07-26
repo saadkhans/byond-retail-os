@@ -49,4 +49,26 @@ describe('CompleteInferenceJobDto numeric coercion', () => {
       expect(errors.length).toBeGreaterThan(0);
     }
   });
+
+  it('requires a timezone offset on occurredAt', () => {
+    // An offset-less ISO stamp reaches `new Date()` as SERVER-LOCAL time,
+    // silently shifting the source-reported event time on non-UTC
+    // deployments — mandatory 'Z' or +-HH:MM, like the Phase 8 mapper.
+    expect(
+      validationErrors({ ...validBody, occurredAt: '2026-07-26T10:00:30' })
+        .length,
+    ).toBeGreaterThan(0);
+    expect(
+      validationErrors({
+        ...validBody,
+        occurredAt: '2026-07-26T10:00:30.000Z',
+      }),
+    ).toHaveLength(0);
+    expect(
+      validationErrors({
+        ...validBody,
+        occurredAt: '2026-07-26T15:00:30+05:00',
+      }),
+    ).toHaveLength(0);
+  });
 });

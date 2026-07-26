@@ -81,10 +81,20 @@ export class SimulatedInferenceAdapter implements InferenceAdapter {
         `Adapter "${this.adapterKey}" does not support job type ${context.jobType}`,
       );
     }
-    if (Number.isNaN(Date.parse(input.occurredAt))) {
+    // The offset is mandatory (Phase 8 mapper parity): an offset-less stamp
+    // would be interpreted in the API process's LOCAL timezone by
+    // `new Date()`, silently shifting the source-reported time. Defense in
+    // depth for non-HTTP callers — the DTO enforces the same shape.
+    if (
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(
+        input.occurredAt,
+      ) ||
+      Number.isNaN(Date.parse(input.occurredAt))
+    ) {
       throw new BadRequestException(
-        'occurredAt must be a valid ISO 8601 timestamp (the source-' +
-          'reported interaction time)',
+        'occurredAt must be a timezone-aware ISO 8601 timestamp with an ' +
+          "explicit 'Z' or +-HH:MM offset (the source-reported interaction " +
+          'time)',
       );
     }
     if (!Number.isInteger(input.quantityDelta) || input.quantityDelta === 0) {

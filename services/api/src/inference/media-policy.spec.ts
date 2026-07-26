@@ -162,6 +162,25 @@ describe('inference media policy', () => {
         { ref: 'src=//cdn.host/frames/1' },
         'ref',
       ],
+      [
+        // "//cdn.host" alone is a fetchable protocol-relative URL — the
+        // authority may terminate at end of string, not only at '/'.
+        'a protocol-relative host without a path',
+        { ref: '//cdn.host' },
+        'ref',
+      ],
+      [
+        'a protocol-relative host without a path after whitespace',
+        { ref: ' //cdn.host' },
+        'ref',
+      ],
+      [
+        // An encoded media-channel KEY ("storage%4Bey" → "storageKey") is
+        // classified at every decode stage, like values are.
+        'an encoded storage-key KEY',
+        { 'storage%4Bey': 'bucket/object' },
+        'storage%4Bey',
+      ],
     ])('rejects %s by VALUE', (_label, descriptor, path) => {
       expect(findForbiddenMediaPath(descriptor)).toBe(path);
     });
@@ -174,6 +193,7 @@ describe('inference media policy', () => {
       ['a namespaced id with one slash', { ref: 'v2:zone/7' }],
       ['a bare percent sign', { discount: '15% off shelf 3' }],
       ['double slashes with no boundary', { path: 'a//b/c' }],
+      ['a benign percent-encoded key', { 'crop%20id': 'crop-42' }],
       ['the word data: without a mediatype', { status: 'data: pending' }],
       ['an encoded literal percent', { discount: '100%25' }],
     ])('keeps %s', (_label, descriptor) => {

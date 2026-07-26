@@ -253,6 +253,21 @@ describe('SimulatedInferenceAdapter', () => {
       ).toThrow(/occurredAt/);
     });
 
+    it('rejects an offset-less occurredAt (server-local interpretation)', () => {
+      expect(() =>
+        adapter.validateInput(context, {
+          ...baseInput,
+          occurredAt: '2026-07-26T10:00:30',
+        }),
+      ).toThrow(/timezone-aware/);
+      expect(() =>
+        adapter.validateInput(context, {
+          ...baseInput,
+          occurredAt: '2026-07-26T15:00:30+05:00',
+        }),
+      ).not.toThrow();
+    });
+
     it('carries the source occurredAt onto the normalized result', () => {
       const result = adapter.normalizeResult(baseInput);
       expect(result.occurredAt).toEqual(

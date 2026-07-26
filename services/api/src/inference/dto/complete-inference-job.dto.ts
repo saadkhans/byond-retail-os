@@ -9,6 +9,7 @@ import {
   IsInt,
   IsNumber,
   IsString,
+  Matches,
   Max,
   MaxLength,
   Min,
@@ -94,12 +95,22 @@ export class CompleteInferenceJobDto {
 
   @ApiProperty({
     description:
-      'When the observed interaction happened per the SOURCE (ISO 8601) — ' +
-      'not when inference ran. Carried onto the result and onto the ' +
-      'converted vision event, so delayed/queued jobs keep correct event ' +
-      'chronology (same contract as Phase 7 ingest and the Phase 8 mapper).',
+      'When the observed interaction happened per the SOURCE (ISO 8601 ' +
+      "WITH a mandatory 'Z' or +-HH:MM offset) — not when inference ran. " +
+      'Carried onto the result and onto the converted vision event, so ' +
+      'delayed/queued jobs keep correct event chronology (same contract ' +
+      'as Phase 7 ingest and the Phase 8 mapper).',
   })
   @IsDateString()
+  // @IsDateString alone accepts offset-less stamps ("2026-07-26T10:00:30"),
+  // which `new Date()` interprets in the API process's LOCAL timezone —
+  // silently shifting the source-reported time on non-UTC deployments. The
+  // offset is mandatory, same rule (and same shape) as the Phase 8 mapper.
+  @Matches(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/, {
+    message:
+      "occurredAt must be a timezone-aware ISO-8601 timestamp (include 'Z' " +
+      'or a +-HH:MM offset)',
+  })
   occurredAt!: string;
 
   @ApiProperty({

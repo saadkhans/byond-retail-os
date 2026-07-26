@@ -29,6 +29,7 @@ describe('PrismaInferenceQueue', () => {
     jobType: InferenceJobType.PRODUCT_RECOGNITION,
     status: InferenceJobStatus.QUEUED,
     priority: 100,
+    attempts: 0,
   } as unknown as InferenceJobDetail;
 
   const runningJob = {
@@ -61,6 +62,7 @@ describe('PrismaInferenceQueue', () => {
   };
 
   let tx: {
+    $queryRaw: jest.Mock;
     inferenceJob: {
       findFirst: jest.Mock;
       create: jest.Mock;
@@ -81,6 +83,7 @@ describe('PrismaInferenceQueue', () => {
 
   beforeEach(() => {
     tx = {
+      $queryRaw: jest.fn().mockResolvedValue(undefined),
       inferenceJob: {
         findFirst: jest.fn().mockResolvedValue(null),
         create: jest
@@ -137,10 +140,10 @@ describe('PrismaInferenceQueue', () => {
         queue.markRunning('  ', 'job-1', 'simulated', transitionAudit),
       ).toThrow(TenantIdRequiredError);
       expect(() =>
-        queue.complete('', 'job-1', normalizedResult, transitionAudit),
+        queue.complete('', 'job-1', 1, normalizedResult, transitionAudit),
       ).toThrow(TenantIdRequiredError);
       expect(() =>
-        queue.fail('', 'job-1', { errorCode: 'X_Y' }, transitionAudit),
+        queue.fail('', 'job-1', 0, { errorCode: 'X_Y' }, transitionAudit),
       ).toThrow(TenantIdRequiredError);
     });
 
@@ -298,6 +301,44 @@ describe('PrismaInferenceQueue', () => {
     it('skips the creator lookup for system flows (no createdById)', async () => {
       await queue.enqueue('tenant-a', baseEnqueue, enqueueAudit);
       expect(tx.user.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('takes the unit advisory lock BEFORE the unit read and holds it through the insert', async () => {
+      // Serializes with UnitsRepository.update()/delete() (same key): a
+      // unit moved to another store must not slip between the validation
+      // read and the job row.
+      await queue.enqueue('tenant-a', baseEnqueue, enqueueAudit);
+      expect(tx.$queryRaw.mock.calls[0][1]).toBe('retail-unit:tenant-a:unit-a1');
+      expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        tx.retailUnit.findFirst.mock.invocationCallOrder[0],
+      );
+      expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        tx.inferenceJob.create.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('takes the device advisory lock BEFORE the device read — unit lock first (deadlock-safe order)', async () => {
+      await queue.enqueue(
+        'tenant-a',
+        { ...baseEnqueue, deviceId: 'dev-1' },
+        enqueueAudit,
+      );
+      expect(tx.$queryRaw.mock.calls.map((call) => call[1] as string)).toEqual([
+        'retail-unit:tenant-a:unit-a1',
+        'device:tenant-a:dev-1',
+      ]);
+      expect(tx.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
+        tx.device.findFirst.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('takes no advisory locks when the job binds neither unit nor device', async () => {
+      await queue.enqueue(
+        'tenant-a',
+        { jobType: InferenceJobType.PRODUCT_RECOGNITION, priority: 100 },
+        enqueueAudit,
+      );
+      expect(tx.$queryRaw).not.toHaveBeenCalled();
     });
   });
 
@@ -543,6 +584,7 @@ describe('PrismaInferenceQueue', () => {
       await queue.complete(
         'tenant-a',
         'job-1',
+        1,
         normalizedResult,
         transitionAudit,
       );
@@ -551,6 +593,7 @@ describe('PrismaInferenceQueue', () => {
           id: 'job-1',
           tenantId: 'tenant-a',
           status: InferenceJobStatus.RUNNING,
+          attempts: 1,
         },
         data: expect.objectContaining({
           status: InferenceJobStatus.SUCCEEDED,
@@ -585,7 +628,13 @@ describe('PrismaInferenceQueue', () => {
     it('rejects a QUEUED job as not-running without writing a result', async () => {
       tx.inferenceJob.findFirst.mockResolvedValue(queuedJob);
       await expect(
-        queue.complete('tenant-a', 'job-1', normalizedResult, transitionAudit),
+        queue.complete(
+          'tenant-a',
+          'job-1',
+          0,
+          normalizedResult,
+          transitionAudit,
+        ),
       ).resolves.toBe('not-running');
       expect(tx.inferenceResult.create).not.toHaveBeenCalled();
     });
@@ -597,7 +646,13 @@ describe('PrismaInferenceQueue', () => {
     ])('rejects a terminal %s job', async (status) => {
       tx.inferenceJob.findFirst.mockResolvedValue({ ...runningJob, status });
       await expect(
-        queue.complete('tenant-a', 'job-1', normalizedResult, transitionAudit),
+        queue.complete(
+          'tenant-a',
+          'job-1',
+          1,
+          normalizedResult,
+          transitionAudit,
+        ),
       ).resolves.toBe('terminal');
       expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
       expect(tx.inferenceResult.create).not.toHaveBeenCalled();
@@ -606,8 +661,36 @@ describe('PrismaInferenceQueue', () => {
     it('loses a completion race as terminal without writing a result', async () => {
       tx.inferenceJob.updateMany.mockResolvedValue({ count: 0 });
       await expect(
-        queue.complete('tenant-a', 'job-1', normalizedResult, transitionAudit),
+        queue.complete(
+          'tenant-a',
+          'job-1',
+          1,
+          normalizedResult,
+          transitionAudit,
+        ),
       ).resolves.toBe('terminal');
+      expect(tx.inferenceResult.create).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
+    });
+
+    it('fences a stale attempt as lease-superseded without touching the job', async () => {
+      // Attempt A (expectedAttempts 1) went stale: the lease expired, the
+      // job was reclaimed, and attempt B re-claimed it (attempts now 2). A
+      // late A must not commit its result under B's lease.
+      tx.inferenceJob.findFirst.mockResolvedValue({
+        ...runningJob,
+        attempts: 2,
+      });
+      await expect(
+        queue.complete(
+          'tenant-a',
+          'job-1',
+          1,
+          normalizedResult,
+          transitionAudit,
+        ),
+      ).resolves.toBe('lease-superseded');
+      expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
       expect(tx.inferenceResult.create).not.toHaveBeenCalled();
       expect(auditLog.record).not.toHaveBeenCalled();
     });
@@ -619,6 +702,7 @@ describe('PrismaInferenceQueue', () => {
       await queue.fail(
         'tenant-a',
         'job-1',
+        0,
         { errorCode: 'NO_ADAPTER', errorMessage: 'nothing can run this' },
         transitionAudit,
       );
@@ -629,6 +713,7 @@ describe('PrismaInferenceQueue', () => {
           status: {
             in: [InferenceJobStatus.QUEUED, InferenceJobStatus.RUNNING],
           },
+          attempts: 0,
         },
         data: expect.objectContaining({
           status: InferenceJobStatus.FAILED,
@@ -646,6 +731,7 @@ describe('PrismaInferenceQueue', () => {
       await queue.fail(
         'tenant-a',
         'job-1',
+        1,
         { errorCode: 'ADAPTER_TIMEOUT' },
         transitionAudit,
       );
@@ -662,11 +748,30 @@ describe('PrismaInferenceQueue', () => {
         queue.fail(
           'tenant-a',
           'job-1',
+          0,
           { errorCode: 'X_Y' },
           transitionAudit,
         ),
       ).resolves.toBe('terminal');
       expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('fences a stale attempt as lease-superseded without failing the new attempt', async () => {
+      tx.inferenceJob.findFirst.mockResolvedValue({
+        ...runningJob,
+        attempts: 2,
+      });
+      await expect(
+        queue.fail(
+          'tenant-a',
+          'job-1',
+          1,
+          { errorCode: 'ADAPTER_TIMEOUT' },
+          transitionAudit,
+        ),
+      ).resolves.toBe('lease-superseded');
+      expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
     });
   });
 });

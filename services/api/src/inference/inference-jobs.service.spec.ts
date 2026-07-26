@@ -30,6 +30,7 @@ describe('InferenceJobsService', () => {
     jobType: InferenceJobType.PRODUCT_RECOGNITION,
     status: InferenceJobStatus.QUEUED,
     priority: 100,
+    attempts: 0,
     requestedAt: new Date('2026-07-26T10:00:00.000Z'),
     startedAt: null,
     completedAt: null,
@@ -310,6 +311,28 @@ describe('InferenceJobsService', () => {
         'a payment card number used as a key',
         { [['4111', '1111', '1111', '1111'].join(' ')]: 'x' },
       ],
+      [
+        // An encoded CVV KEY ("c%76v" → "cvv") names a credential CHANNEL:
+        // its VALUE is the secret and matches no value-shape check, so the
+        // decoded key name itself must be classified as sensitive.
+        'an encoded cvv key',
+        { 'c%76v': '123' },
+      ],
+      [
+        'an encoded password key',
+        { 'pass%77ord': 'hunter2' },
+      ],
+      [
+        // "%09" decodes to TAB: a TAB-separated PAN dodges the contiguous/
+        // space/dash PAN detector, so the decoded-stage control-char guard
+        // must reject it.
+        'a tab-encoded card number value',
+        { note: ['4111', '1111', '1111', '1111'].join('%09') },
+      ],
+      [
+        'a NUL-encoded key',
+        { ['zone%00id']: 'x' },
+      ],
     ])(
       'rejects an inputDescriptor carrying %s before any write',
       async (_label, inputDescriptor) => {
@@ -348,6 +371,68 @@ describe('InferenceJobsService', () => {
         actor,
       );
       expect(queue.enqueue).toHaveBeenCalled();
+    });
+
+    it('accepts a benign percent-encoded key', async () => {
+      await service.create(
+        'tenant-a',
+        { ...baseCreate, inputDescriptor: { 'crop%20id': 'crop-42' } },
+        actor,
+      );
+      expect(queue.enqueue).toHaveBeenCalled();
+    });
+
+    it('redacts a sensitive KEY out of the rejection message', async () => {
+      // The offending path segment IS the card number — reflecting it into
+      // the HTTP error would move card data into error records/telemetry.
+      const pan = ['4111', '1111', '1111', '1111'].join(' ');
+      await expect(
+        service.create(
+          'tenant-a',
+          { ...baseCreate, inputDescriptor: { [pan]: 'x' } },
+          actor,
+        ),
+      ).rejects.toMatchObject({
+        message: expect.not.stringContaining(pan),
+      });
+      await expect(
+        service.create(
+          'tenant-a',
+          { ...baseCreate, inputDescriptor: { [pan]: 'x' } },
+          actor,
+        ),
+      ).rejects.toMatchObject({
+        message: expect.stringContaining('[REDACTED]'),
+      });
+    });
+
+    it('keeps a benign offending key readable in the rejection message', async () => {
+      await expect(
+        service.create(
+          'tenant-a',
+          {
+            ...baseCreate,
+            inputDescriptor: { trigger: { cropImageUrl: 'crop-42' } },
+          },
+          actor,
+        ),
+      ).rejects.toMatchObject({
+        message: expect.stringContaining('trigger.cropImageUrl'),
+      });
+    });
+
+    it('rejects a tab-encoded PAN in sourceId with the control-character message', async () => {
+      await expect(
+        service.create(
+          'tenant-a',
+          {
+            ...baseCreate,
+            sourceId: ['4111', '1111', '1111', '1111'].join('%09'),
+          },
+          actor,
+        ),
+      ).rejects.toThrow(/control characters/);
+      expect(queue.enqueue).not.toHaveBeenCalled();
     });
   });
 
@@ -456,15 +541,17 @@ describe('InferenceJobsService', () => {
         ...jobDetail,
         status: InferenceJobStatus.RUNNING,
         adapterKey: 'simulated',
+        attempts: 1,
       });
     });
 
     it('normalizes detections through the adapter and audits COMPLETE', async () => {
       await service.complete('tenant-a', 'job-1', baseComplete, actor);
-      const [tenantId, jobId, normalized, buildAudit] = queue.complete.mock
-        .calls[0] as [
+      const [tenantId, jobId, expectedAttempts, normalized, buildAudit] =
+        queue.complete.mock.calls[0] as [
         string,
         string,
+        number,
         {
           eventType: VisionEventType;
           quantityDelta: number;
@@ -474,6 +561,9 @@ describe('InferenceJobsService', () => {
         (before: InferenceJobDetail, after: InferenceJobDetail) => AuditEntry,
       ];
       expect([tenantId, jobId]).toEqual(['tenant-a', 'job-1']);
+      // The observed attempt fences the transition against a reclaimed +
+      // re-claimed job (lease supersession).
+      expect(expectedAttempts).toBe(1);
       expect(normalized.eventType).toBe(VisionEventType.PRODUCT_PICKUP);
       expect(normalized.quantityDelta).toBe(2);
       expect(normalized.candidates).toEqual([
@@ -539,7 +629,7 @@ describe('InferenceJobsService', () => {
         },
         actor,
       );
-      const normalized = queue.complete.mock.calls[0][2] as {
+      const normalized = queue.complete.mock.calls[0][3] as {
         candidates: unknown[];
         evidenceScore?: number;
       };
@@ -584,7 +674,7 @@ describe('InferenceJobsService', () => {
         },
         actor,
       );
-      const normalized = queue.complete.mock.calls[0][2] as {
+      const normalized = queue.complete.mock.calls[0][3] as {
         candidates: { sku: string; rank: number; score: number }[];
       };
       expect(normalized.candidates).toEqual([
@@ -708,6 +798,13 @@ describe('InferenceJobsService', () => {
         service.complete('tenant-a', 'job-1', baseComplete, actor),
       ).rejects.toBeInstanceOf(ConflictException);
     });
+
+    it('maps lease-superseded to a 409 without applying the stale result', async () => {
+      queue.complete.mockResolvedValue('lease-superseded');
+      await expect(
+        service.complete('tenant-a', 'job-1', baseComplete, actor),
+      ).rejects.toThrow(/another attempt/i);
+    });
   });
 
   describe('fail', () => {
@@ -718,7 +815,9 @@ describe('InferenceJobsService', () => {
         { errorCode: 'ADAPTER_TIMEOUT', errorMessage: 'took too long' },
         actor,
       );
-      const buildAudit = queue.fail.mock.calls[0][3] as (
+      // Fenced to the attempt the caller observed (index 2), like complete.
+      expect(queue.fail.mock.calls[0][2]).toBe(0);
+      const buildAudit = queue.fail.mock.calls[0][4] as (
         before: InferenceJobDetail,
         after: InferenceJobDetail,
       ) => AuditEntry;
@@ -766,6 +865,13 @@ describe('InferenceJobsService', () => {
       await expect(
         service.fail('tenant-a', 'job-1', { errorCode: 'X_Y' }, actor),
       ).rejects.toBeInstanceOf(ConflictException);
+    });
+
+    it('maps lease-superseded to a 409 naming the newer attempt', async () => {
+      queue.fail.mockResolvedValue('lease-superseded');
+      await expect(
+        service.fail('tenant-a', 'job-1', { errorCode: 'X_Y' }, actor),
+      ).rejects.toThrow(/another attempt/i);
     });
 
     it('404s a missing job', async () => {

@@ -86,10 +86,13 @@ const URI_SCHEME_VALUE = /[a-z][a-z0-9+.-]*:\/\//i;
 // list is explicit so dotted opaque ids ("v2:zone/7") are not caught. A
 // protocol-relative locator counts at the start OR after a whitespace/
 // quote/paren/punctuation boundary (" //cdn.host/x", "src=//cdn.host/x",
-// "ref,//cdn.host/x") — but "a//b/c" has no such boundary and stays an
+// "ref,//cdn.host/x"), and the authority may terminate at END of string —
+// "//cdn.host" alone is a fetchable URL. Deliberate overbreadth: prose
+// like "see //note" now rejects too (defense in depth beats readability
+// for a reject-on-write policy). "a//b/c" has no boundary and stays an
 // opaque id.
 const SINGLE_SLASH_SCHEME_VALUE = /\b(?:file|s3|gs|https?|rtsp|rtmp|ftp):\//i;
-const PROTOCOL_RELATIVE_VALUE = /(?:^|[\s"'(,=;:[{])\/\/[^/\s]+\//;
+const PROTOCOL_RELATIVE_VALUE = /(?:^|[\s"'(,=;:[{])\/\/[^/\s]+(?:\/|$)/;
 
 // Media file extensions as ".ext" occurrences (word-bounded, case-
 // insensitive): a bare "frame.jpg" is a media reference even without a
@@ -182,6 +185,12 @@ export function isForbiddenMediaKey(key: string): boolean {
   );
 }
 
+// A media-channel key hidden by encoding ("storage%4Bey" → "storageKey")
+// must be classified at every decode stage, like values are.
+function isForbiddenMediaKeyAtAnyStage(key: string): boolean {
+  return percentDecodeStages(key).some(isForbiddenMediaKey);
+}
+
 /**
  * Recursively searches a JSON-shaped value for a media/artifact-shaped KEY
  * or a media-shaped VALUE (inline data: URI, any URI scheme, media file
@@ -208,7 +217,7 @@ export function findForbiddenMediaPath(
   if (value !== null && typeof value === 'object') {
     for (const [key, nested] of Object.entries(value)) {
       const keyPath = path ? `${path}.${key}` : key;
-      if (isForbiddenMediaKey(key)) {
+      if (isForbiddenMediaKeyAtAnyStage(key)) {
         return keyPath;
       }
       const found = findForbiddenMediaPath(nested, keyPath);

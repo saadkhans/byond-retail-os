@@ -33,7 +33,16 @@ export interface FailJobInput {
   errorMessage?: string;
 }
 
-export type TransitionRejection = 'not-claimable' | 'not-running' | 'terminal';
+/**
+ * 'lease-superseded': the caller's view of the job predates a lease
+ * reclaim + re-claim — another attempt now owns the job, so a late result
+ * from the previous attempt must not commit under the new attempt's lease.
+ */
+export type TransitionRejection =
+  | 'not-claimable'
+  | 'not-running'
+  | 'terminal'
+  | 'lease-superseded';
 
 /**
  * Lease ownership: every claim takes a lease of this many seconds and
@@ -108,19 +117,28 @@ export abstract class InferenceQueuePort<TJobDetail = unknown> {
 
   /**
    * RUNNING → SUCCEEDED, persisting the normalized result and its ranked
-   * candidates atomically with the status flip.
+   * candidates atomically with the status flip. `expectedAttempts` fences
+   * the transition to the attempt the caller observed: a stale worker whose
+   * lease was reclaimed (and whose job was re-claimed, bumping `attempts`)
+   * gets 'lease-superseded' instead of committing its result under the new
+   * attempt's lease.
    */
   abstract complete(
     tenantId: string,
     jobId: string,
+    expectedAttempts: number,
     result: NormalizedInferenceResult,
     buildAuditEntry: (before: TJobDetail, after: TJobDetail) => AuditEntry,
   ): Promise<TJobDetail | TransitionRejection | null>;
 
-  /** QUEUED/RUNNING → FAILED with a stable error code. */
+  /**
+   * QUEUED/RUNNING → FAILED with a stable error code, fenced to the
+   * observed attempt exactly like complete().
+   */
   abstract fail(
     tenantId: string,
     jobId: string,
+    expectedAttempts: number,
     input: FailJobInput,
     buildAuditEntry: (before: TJobDetail, after: TJobDetail) => AuditEntry,
   ): Promise<TJobDetail | TransitionRejection | null>;

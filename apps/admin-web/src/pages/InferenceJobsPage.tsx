@@ -62,8 +62,11 @@ export function InferenceJobsPage() {
 
   async function createJob(event: FormEvent) {
     event.preventDefault();
+    // A cleared input must fall back to the API default (100), not coerce
+    // Number('') -> 0 and silently queue at the lowest priority.
+    const priorityCleared = newPriority.trim() === '';
     const priority = Number(newPriority);
-    if (!Number.isInteger(priority)) {
+    if (!priorityCleared && !Number.isInteger(priority)) {
       setCreateError('Priority must be a whole number.');
       return;
     }
@@ -74,7 +77,7 @@ export function InferenceJobsPage() {
         method: 'POST',
         body: {
           jobType: newJobType,
-          priority,
+          ...(priorityCleared ? {} : { priority }),
           ...(newSessionId ? { sessionId: newSessionId } : {}),
           ...(newLocationId ? { locationId: newLocationId } : {}),
           ...(newUnitId ? { unitId: newUnitId } : {}),
@@ -107,7 +110,7 @@ export function InferenceJobsPage() {
           type="number"
           step={1}
           style={{ width: '6rem' }}
-          title="Priority (higher runs first)"
+          title="Priority (higher runs first; blank uses the default of 100)"
           value={newPriority}
           onChange={(e) => setNewPriority(e.target.value)}
         />
