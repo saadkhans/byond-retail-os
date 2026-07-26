@@ -76,6 +76,23 @@ export class InferenceDetectionDto {
  * magnitude.
  */
 export class CompleteInferenceJobDto {
+  @ApiProperty({
+    minimum: 1,
+    maximum: PG_INT_MAX,
+    description:
+      'The `attempts` value observed on the claim this result is reported ' +
+      'for (returned by start and by the job detail). Fences the ' +
+      'transition to that claim: if the lease expired and the job was ' +
+      're-claimed, the stale report is rejected with a 409 instead of ' +
+      'overwriting the newer attempt. A RUNNING job always has at least ' +
+      'one claim, so the minimum is 1.',
+  })
+  @Transform(toNumberRejectingBlank)
+  @IsInt()
+  @Min(1)
+  @Max(PG_INT_MAX)
+  attempt!: number;
+
   @ApiProperty({ enum: VisionEventType })
   @IsEnum(VisionEventType)
   eventType!: VisionEventType;

@@ -84,6 +84,27 @@ export class InferenceJobsController {
     return this.jobsService.search(tenantId, query);
   }
 
+  // Declared BEFORE the ':id' routes so Nest does not swallow the literal
+  // path segment as a job id.
+  @Post('reclaim-expired')
+  @RequirePermissions('inference:manage')
+  @ApiOperation({
+    summary: 'Reclaim RUNNING jobs whose lease expired',
+    description:
+      'Operator-triggered recovery for crashed/hung workers: every RUNNING ' +
+      'job in the tenant whose lease expired returns to QUEUED while ' +
+      'attempts remain, or FAILS with LEASE_EXPIRED once the attempt ' +
+      'budget is spent. The same sweep runs automatically before every ' +
+      'claim/start; this endpoint recovers a stranded job without waiting ' +
+      'for an unrelated start. Every reclaim is audited as a system action.',
+  })
+  @ApiCreatedResponse({ description: 'Reclaimed jobs returned (may be empty)' })
+  reclaimExpired(
+    @CurrentTenantId() tenantId: string,
+  ): Promise<{ reclaimed: InferenceJobDetail[] }> {
+    return this.jobsService.reclaimExpired(tenantId);
+  }
+
   @Get(':id')
   @RequirePermissions('inference:read')
   @ApiOperation({

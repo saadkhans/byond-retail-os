@@ -1,6 +1,19 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsString, Matches, MaxLength, MinLength } from 'class-validator';
-import { IsOptionalNonNull } from '../../common/validation';
+import { Transform } from 'class-transformer';
+import {
+  IsInt,
+  IsString,
+  Matches,
+  Max,
+  MaxLength,
+  Min,
+  MinLength,
+} from 'class-validator';
+import { PG_INT_MAX } from '../../common/integer-bounds';
+import {
+  IsOptionalNonNull,
+  toNumberRejectingBlank,
+} from '../../common/validation';
 
 export const ERROR_CODE_PATTERN = '^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$';
 export const ERROR_CODE_REGEX = new RegExp(ERROR_CODE_PATTERN);
@@ -13,6 +26,23 @@ export const MAX_ERROR_CODE_LENGTH = 64;
  * payment-bearing content before persistence.
  */
 export class FailInferenceJobDto {
+  @ApiProperty({
+    minimum: 0,
+    maximum: PG_INT_MAX,
+    description:
+      'The `attempts` value observed on the job being failed (from start ' +
+      'or the job detail). Fences the transition to that observation: a ' +
+      'reclaimed-and-re-claimed job rejects the stale failure with a 409. ' +
+      'A QUEUED job that was never claimed has attempts 0 — failing it ' +
+      'with attempt 0 fences correctly too, since only claims increment ' +
+      'the counter.',
+  })
+  @Transform(toNumberRejectingBlank)
+  @IsInt()
+  @Min(0)
+  @Max(PG_INT_MAX)
+  attempt!: number;
+
   @ApiProperty({
     maxLength: MAX_ERROR_CODE_LENGTH,
     pattern: ERROR_CODE_PATTERN,

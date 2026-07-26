@@ -289,6 +289,9 @@ export function InferenceJobDetailPage() {
 
   async function complete(event: FormEvent) {
     event.preventDefault();
+    if (!data) {
+      return;
+    }
     const delta = Number(quantityDelta);
     if (!Number.isInteger(delta) || delta === 0) {
       setActionError('Quantity delta must be a nonzero whole number.');
@@ -327,6 +330,9 @@ export function InferenceJobDetailPage() {
       return;
     }
     const succeeded = await act('/complete', {
+      // The claim this result reports for: a reclaim between page load and
+      // submit makes the server reject the stale report with a 409.
+      attempt: data.attempts,
       eventType,
       quantityDelta: delta,
       occurredAt,
@@ -340,11 +346,15 @@ export function InferenceJobDetailPage() {
 
   async function fail(event: FormEvent) {
     event.preventDefault();
+    if (!data) {
+      return;
+    }
     if (!errorCode.trim()) {
       setActionError('Enter an error code (e.g. LOW_CONFIDENCE).');
       return;
     }
     const succeeded = await act('/fail', {
+      attempt: data.attempts,
       errorCode: errorCode.trim().toUpperCase(),
     });
     if (succeeded) {
@@ -355,6 +365,26 @@ export function InferenceJobDetailPage() {
   const queued = data?.status === 'QUEUED';
   const running = data?.status === 'RUNNING';
   const convertible = data?.status === 'SUCCEEDED' && !data.visionEventId;
+  // A RUNNING job whose lease has lapsed belongs to a crashed/hung worker:
+  // reclamation otherwise only happens on the next start/claim, so surface
+  // an explicit recovery action here.
+  const leaseExpired =
+    running &&
+    !!data?.leaseExpiresAt &&
+    new Date(data.leaseExpiresAt).getTime() < Date.now();
+
+  async function reclaimExpired() {
+    setBusy(true);
+    setActionError(null);
+    try {
+      await api('/inference/jobs/reclaim-expired', { method: 'POST' });
+      setReload((n) => n + 1);
+    } catch (err) {
+      setActionError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <Page title="Inference job" error={error} loading={loading}>
@@ -380,6 +410,19 @@ export function InferenceJobDetailPage() {
                 >
                   Convert to CV event
                 </button>
+              ) : null}
+              {leaseExpired ? (
+                <>
+                  <span className="muted" title={data?.leaseExpiresAt ?? ''}>
+                    Lease expired — the worker likely crashed
+                  </span>
+                  <button
+                    disabled={busy}
+                    onClick={() => void reclaimExpired()}
+                  >
+                    Reclaim expired lease
+                  </button>
+                </>
               ) : null}
             </div>
           ) : null}

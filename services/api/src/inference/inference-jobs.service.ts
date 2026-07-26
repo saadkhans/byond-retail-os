@@ -437,6 +437,21 @@ export class InferenceJobsService {
     return result;
   }
 
+  /**
+   * Operator-triggered recovery: reclaim every RUNNING job in the tenant
+   * whose lease expired (crashed/hung worker) — back to QUEUED while
+   * attempts remain, FAILED with LEASE_EXPIRED once the budget is spent.
+   * The same sweep already runs before every claim/start; this method
+   * backs the explicit admin endpoint so the FIRST (or only) stranded job
+   * can be recovered without waiting for an unrelated start.
+   */
+  async reclaimExpired(
+    tenantId: string,
+  ): Promise<{ reclaimed: InferenceJobDetail[] }> {
+    const reclaimed = await this.queue.reclaimExpired(tenantId);
+    return { reclaimed };
+  }
+
   async complete(
     tenantId: string,
     jobId: string,
@@ -495,10 +510,13 @@ export class InferenceJobsService {
     const normalized = adapter.normalizeResult(
       await adapter.run(context, input),
     );
+    // Fence to the CALLER-observed claim (dto.attempt), never a fresh row
+    // read: a stale worker whose lease was reclaimed and re-claimed would
+    // otherwise read the NEW attempt here and overwrite the live claim.
     const result = await this.queue.complete(
       tenantId,
       jobId,
-      job.attempts,
+      dto.attempt,
       normalized,
       (before, after) =>
         this.auditEntry(tenantId, actor, {
@@ -540,14 +558,16 @@ export class InferenceJobsService {
     actor?: AuditActor,
   ): Promise<InferenceJobDetail> {
     assertOpaque('errorMessage', dto.errorMessage);
-    // Read the job first so the failure is fenced to the attempt this
-    // caller observed — a stale worker must not fail an attempt that
-    // superseded its own.
-    const job = await this.findById(tenantId, jobId);
+    // 404-before-CAS: the read also keeps NotFound semantics identical to
+    // the other transitions. The fence itself uses the CALLER-observed
+    // dto.attempt (never this fresh read) — a stale worker whose lease was
+    // reclaimed and re-claimed must not fail the attempt that superseded
+    // its own.
+    await this.findById(tenantId, jobId);
     const result = await this.queue.fail(
       tenantId,
       jobId,
-      job.attempts,
+      dto.attempt,
       { errorCode: dto.errorCode, errorMessage: dto.errorMessage },
       (before, after) =>
         this.auditEntry(tenantId, actor, {

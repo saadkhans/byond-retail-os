@@ -13,6 +13,7 @@ import { CompleteInferenceJobDto } from './complete-inference-job.dto';
  */
 describe('CompleteInferenceJobDto numeric coercion', () => {
   const validBody = {
+    attempt: 1,
     eventType: 'PRODUCT_PICKUP',
     quantityDelta: 2,
     occurredAt: '2026-07-26T10:00:30.000Z',
@@ -48,6 +49,21 @@ describe('CompleteInferenceJobDto numeric coercion', () => {
       const errors = validationErrors({ ...validBody, quantityDelta: blank });
       expect(errors.length).toBeGreaterThan(0);
     }
+  });
+
+  it('requires the observed claim attempt (fences to that claim)', () => {
+    // Missing, blank, and zero are all rejected: a RUNNING job always has
+    // at least one claim, and Number('') must not fabricate attempt 0.
+    const withoutAttempt: Record<string, unknown> = { ...validBody };
+    delete withoutAttempt.attempt;
+    expect(validationErrors(withoutAttempt).length).toBeGreaterThan(0);
+    expect(
+      validationErrors({ ...validBody, attempt: '' }).length,
+    ).toBeGreaterThan(0);
+    expect(
+      validationErrors({ ...validBody, attempt: 0 }).length,
+    ).toBeGreaterThan(0);
+    expect(validationErrors({ ...validBody, attempt: '1' })).toHaveLength(0);
   });
 
   it('requires a timezone offset on occurredAt', () => {

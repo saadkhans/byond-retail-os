@@ -119,6 +119,8 @@ describe('InferenceJobsService', () => {
   };
 
   const baseComplete: CompleteInferenceJobDto = {
+    // The claim the caller observed (from start / the detail read).
+    attempt: 1,
     eventType: VisionEventType.PRODUCT_PICKUP,
     quantityDelta: 2,
     occurredAt: '2026-07-26T10:00:30.000Z',
@@ -561,8 +563,8 @@ describe('InferenceJobsService', () => {
         (before: InferenceJobDetail, after: InferenceJobDetail) => AuditEntry,
       ];
       expect([tenantId, jobId]).toEqual(['tenant-a', 'job-1']);
-      // The observed attempt fences the transition against a reclaimed +
-      // re-claimed job (lease supersession).
+      // The CALLER-observed attempt (dto.attempt) fences the transition —
+      // never a fresh row read, which would defeat the fence entirely.
       expect(expectedAttempts).toBe(1);
       expect(normalized.eventType).toBe(VisionEventType.PRODUCT_PICKUP);
       expect(normalized.quantityDelta).toBe(2);
@@ -805,6 +807,29 @@ describe('InferenceJobsService', () => {
         service.complete('tenant-a', 'job-1', baseComplete, actor),
       ).rejects.toThrow(/another attempt/i);
     });
+
+    it('passes the CALLER-observed attempt even when the row has moved on', async () => {
+      // The job was reclaimed and re-claimed (attempts now 2) after this
+      // caller observed attempt 1: the STALE value must reach the queue so
+      // its fence rejects the write — reading the fresh row here would
+      // silently adopt the new claim and defeat the fence.
+      repository.findById.mockResolvedValue({
+        ...jobDetail,
+        status: InferenceJobStatus.RUNNING,
+        adapterKey: 'simulated',
+        attempts: 2,
+      });
+      queue.complete.mockResolvedValue('lease-superseded');
+      await expect(
+        service.complete(
+          'tenant-a',
+          'job-1',
+          { ...baseComplete, attempt: 1 },
+          actor,
+        ),
+      ).rejects.toThrow(/another attempt/i);
+      expect(queue.complete.mock.calls[0][2]).toBe(1);
+    });
   });
 
   describe('fail', () => {
@@ -812,10 +837,15 @@ describe('InferenceJobsService', () => {
       await service.fail(
         'tenant-a',
         'job-1',
-        { errorCode: 'ADAPTER_TIMEOUT', errorMessage: 'took too long' },
+        {
+          attempt: 0,
+          errorCode: 'ADAPTER_TIMEOUT',
+          errorMessage: 'took too long',
+        },
         actor,
       );
-      // Fenced to the attempt the caller observed (index 2), like complete.
+      // Fenced to the CALLER-observed dto.attempt (index 2), like complete
+      // — a never-claimed QUEUED job is failed at attempt 0.
       expect(queue.fail.mock.calls[0][2]).toBe(0);
       const buildAudit = queue.fail.mock.calls[0][4] as (
         before: InferenceJobDetail,
@@ -836,6 +866,7 @@ describe('InferenceJobsService', () => {
           'tenant-a',
           'job-1',
           {
+            attempt: 0,
             errorCode: 'ADAPTER_ERROR',
             errorMessage: 'auth failed: password=hunter2',
           },
@@ -851,6 +882,7 @@ describe('InferenceJobsService', () => {
           'tenant-a',
           'job-1',
           {
+            attempt: 0,
             errorCode: 'X_Y',
             errorMessage: 'line1' + String.fromCharCode(0) + 'line2',
           },
@@ -863,21 +895,48 @@ describe('InferenceJobsService', () => {
     it('maps terminal to a 409', async () => {
       queue.fail.mockResolvedValue('terminal');
       await expect(
-        service.fail('tenant-a', 'job-1', { errorCode: 'X_Y' }, actor),
+        service.fail('tenant-a', 'job-1', { attempt: 0, errorCode: 'X_Y' }, actor),
       ).rejects.toBeInstanceOf(ConflictException);
     });
 
     it('maps lease-superseded to a 409 naming the newer attempt', async () => {
       queue.fail.mockResolvedValue('lease-superseded');
       await expect(
-        service.fail('tenant-a', 'job-1', { errorCode: 'X_Y' }, actor),
+        service.fail('tenant-a', 'job-1', { attempt: 0, errorCode: 'X_Y' }, actor),
       ).rejects.toThrow(/another attempt/i);
+    });
+
+    it('passes the CALLER-observed attempt even when the row has moved on', async () => {
+      repository.findById.mockResolvedValue({
+        ...jobDetail,
+        status: InferenceJobStatus.RUNNING,
+        attempts: 2,
+      });
+      queue.fail.mockResolvedValue('lease-superseded');
+      await expect(
+        service.fail(
+          'tenant-a',
+          'job-1',
+          { attempt: 1, errorCode: 'ADAPTER_TIMEOUT' },
+          actor,
+        ),
+      ).rejects.toThrow(/another attempt/i);
+      expect(queue.fail.mock.calls[0][2]).toBe(1);
+    });
+
+    it('reclaimExpired sweeps the tenant queue and returns the reclaimed jobs', async () => {
+      const requeued = { ...jobDetail, id: 'job-9' };
+      queue.reclaimExpired.mockResolvedValue([requeued]);
+      await expect(service.reclaimExpired('tenant-a')).resolves.toEqual({
+        reclaimed: [requeued],
+      });
+      expect(queue.reclaimExpired).toHaveBeenCalledWith('tenant-a');
     });
 
     it('404s a missing job', async () => {
       queue.fail.mockResolvedValue(null);
       await expect(
-        service.fail('tenant-a', 'job-1', { errorCode: 'X_Y' }, actor),
+        service.fail('tenant-a', 'job-1', { attempt: 0, errorCode: 'X_Y' }, actor),
       ).rejects.toBeInstanceOf(NotFoundException);
     });
   });

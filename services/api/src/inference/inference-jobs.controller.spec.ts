@@ -32,6 +32,7 @@ describe('InferenceJobsController access policy', () => {
     ['complete', ['inference:simulate']],
     ['fail', ['inference:manage']],
     ['toVisionEvent', ['inference:apply']],
+    ['reclaimExpired', ['inference:manage']],
   ])('requires %s to hold %p', (handler, permissions) => {
     expect(
       Reflect.getMetadata(
@@ -41,6 +42,20 @@ describe('InferenceJobsController access policy', () => {
         ],
       ),
     ).toEqual(permissions);
+  });
+
+  it('declares reclaim-expired before the :id routes (route-shadowing guard)', () => {
+    const names = Object.getOwnPropertyNames(InferenceJobsController.prototype);
+    expect(names.indexOf('reclaimExpired')).toBeGreaterThan(-1);
+    expect(names.indexOf('reclaimExpired')).toBeLessThan(
+      names.indexOf('findById'),
+    );
+    expect(
+      Reflect.getMetadata(
+        'path',
+        InferenceJobsController.prototype.reclaimExpired,
+      ),
+    ).toBe('reclaim-expired');
   });
 
   it('exposes no public route (default-deny: every handler carries permissions)', () => {
