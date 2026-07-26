@@ -469,6 +469,38 @@ class SensitiveMetadataScreeningTests(unittest.TestCase):
         )
         self._assert_no_digits(errors)
 
+    def test_pan_dataset_version_rejected_without_echo(self) -> None:
+        # "4111111111111111.0.0" satisfies VERSION_PATTERN (unbounded digit
+        # runs) and datasetVersion is echoed in the CLI OK summary — so it
+        # gets the same screen as datasetName.
+        pan_version = self._pan() + ".0.0"
+        self.assertIsNotNone(
+            validate_dataset_manifest.VERSION_PATTERN.match(pan_version)
+        )
+        manifest = _valid_manifest()
+        manifest["datasetVersion"] = pan_version
+        errors = validate_manifest(manifest)
+        self.assertIn("datasetVersion contains a sensitive-looking value", errors)
+        self._assert_no_digits(errors)
+
+    def test_cli_rejects_pan_dataset_version_without_echoing_digits(self) -> None:
+        manifest = _valid_manifest()
+        manifest["datasetVersion"] = self._pan() + ".0.0"
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = _run_script("validate_dataset_manifest.py", [str(manifest_path)])
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "datasetVersion contains a sensitive-looking value", result.stdout
+            )
+            self.assertNotIn("4111", result.stdout + result.stderr)
+
+    def test_normal_dataset_version_accepted(self) -> None:
+        manifest = _valid_manifest()
+        manifest["datasetVersion"] = "1.0.0"
+        self.assertEqual(validate_manifest(manifest), [])
+
     def test_normal_metadata_values_accepted(self) -> None:
         manifest = _valid_manifest()
         manifest["labels"] = {
@@ -480,6 +512,91 @@ class SensitiveMetadataScreeningTests(unittest.TestCase):
         manifest["splits"]["train"][0]["storeId"] = "store-berlin-7"
         manifest["splits"]["train"][0]["planogramZone"] = "aisle-3-shelf-2"
         self.assertEqual(validate_manifest(manifest), [])
+
+
+class MetadataLengthCapTests(unittest.TestCase):
+    """Cheap length caps bound what the linear-but-heavy sensitive-value
+    scanner ever sees: datasetName (100), datasetVersion (64), and
+    licenseNotes (2000) are length-checked BEFORE their screens, so an
+    over-long PAN-bearing value fails the length rule (never the scanner)
+    and no digits are ever echoed."""
+
+    def test_overlong_dataset_name_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["datasetName"] = "a" * 101
+        errors = validate_manifest(manifest)
+        self.assertIn("datasetName must be at most 100 characters", errors)
+
+    def test_max_length_dataset_name_accepted(self) -> None:
+        manifest = _valid_manifest()
+        manifest["datasetName"] = "a" * 100
+        self.assertEqual(validate_manifest(manifest), [])
+
+    def test_overlong_dataset_version_rejected(self) -> None:
+        manifest = _valid_manifest()
+        # 67 chars, still matches VERSION_PATTERN — only the cap rejects it.
+        manifest["datasetVersion"] = "1" * 63 + ".0.0"
+        errors = validate_manifest(manifest)
+        self.assertIn("datasetVersion must be at most 64 characters", errors)
+
+    def test_max_length_dataset_version_accepted(self) -> None:
+        manifest = _valid_manifest()
+        manifest["datasetVersion"] = "1" * 60 + ".0.0"  # exactly 64 chars
+        self.assertEqual(validate_manifest(manifest), [])
+
+    def test_overlong_license_notes_rejected_before_screen(self) -> None:
+        manifest = _valid_manifest()
+        manifest["licenseNotes"] = "x" * 2001
+        errors = validate_manifest(manifest)
+        self.assertIn("licenseNotes must be at most 2000 characters", errors)
+
+    def test_overlong_pan_bearing_license_notes_fails_length_not_screen(self) -> None:
+        pan = "4111" * 4
+        manifest = _valid_manifest()
+        manifest["licenseNotes"] = f"Contact {pan} " + "x" * 2000
+        errors = validate_manifest(manifest)
+        self.assertIn("licenseNotes must be at most 2000 characters", errors)
+        self.assertNotIn("licenseNotes contains a sensitive-looking value", errors)
+        self.assertFalse(any("4111" in e for e in errors), errors)
+
+    def test_max_length_license_notes_accepted(self) -> None:
+        manifest = _valid_manifest()
+        manifest["licenseNotes"] = "x" * 2000
+        self.assertEqual(validate_manifest(manifest), [])
+
+
+class HostileJsonPayloadCliTests(unittest.TestCase):
+    """Python 3.11+ raises a plain ValueError (not JSONDecodeError) when a
+    JSON integer exceeds the 4300-digit int-conversion limit, and the parser
+    raises RecursionError on extreme nesting — both must be the controlled
+    exit-1 ERROR line from the validator CLI, never a traceback, and never
+    echoed content."""
+
+    def test_huge_integer_manifest_is_controlled_error(self) -> None:
+        digits = "1" * 5000
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text(
+                '{"datasetVersion": ' + digits + "}", encoding="utf-8"
+            )
+            result = _run_script("validate_dataset_manifest.py", [str(manifest_path)])
+            combined = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("ERROR", result.stdout)
+            self.assertNotIn("Traceback", combined)
+            self.assertNotIn("1" * 100, combined)
+
+    def test_deeply_nested_manifest_is_controlled_error(self) -> None:
+        depth = 200_000
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text("[" * depth + "]" * depth, encoding="utf-8")
+            result = _run_script("validate_dataset_manifest.py", [str(manifest_path)])
+            combined = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("ERROR", result.stdout)
+            self.assertIn("not valid JSON", result.stdout)
+            self.assertNotIn("Traceback", combined)
 
 
 class NulPathRejectionTests(unittest.TestCase):
@@ -1463,8 +1580,8 @@ class PrepareRpcEndToEndTests(unittest.TestCase):
                 # references must resolve against this file's image/category
                 # ids and the bbox must be 4 finite positive-size numbers.
                 "annotations": [
-                    {"image_id": 1, "category_id": 7, "bbox": [10, 20, 30, 40]},
-                    {"image_id": 1, "category_id": 3, "bbox": [5.5, 6.5, 7.5, 8.5]},
+                    {"id": 1001, "image_id": 1, "category_id": 7, "bbox": [10, 20, 30, 40]},
+                    {"id": 1002, "image_id": 1, "category_id": 3, "bbox": [5.5, 6.5, 7.5, 8.5]},
                 ],
             }
             (raw / f"instances_{split}2019.json").write_text(
@@ -1785,7 +1902,7 @@ class RpcCategoryConsistencyTests(unittest.TestCase):
             if split == "train":
                 # Train files must carry labels; val/test may omit the key.
                 coco["annotations"] = [
-                    {"image_id": 1, "category_id": 3, "bbox": [1, 2, 3, 4]}
+                    {"id": 1003, "image_id": 1, "category_id": 3, "bbox": [1, 2, 3, 4]}
                 ]
             (raw / f"instances_{split}2019.json").write_text(
                 json.dumps(coco), encoding="utf-8"
@@ -1872,7 +1989,7 @@ class RpcCocoShapeGuardTests(unittest.TestCase):
                 # categories, which only adds errors alongside the targeted
                 # one — assertions here check fragments, not exact output.
                 coco["annotations"] = [
-                    {"image_id": 1, "category_id": 3, "bbox": [1, 2, 3, 4]}
+                    {"id": 1004, "image_id": 1, "category_id": 3, "bbox": [1, 2, 3, 4]}
                 ]
             (raw / f"instances_{split}2019.json").write_text(
                 json.dumps(coco), encoding="utf-8"
@@ -2036,7 +2153,7 @@ class RpcRequiredCocoKeysTests(unittest.TestCase):
                 # images or categories key from train, the dangling join
                 # references only add errors alongside the targeted one.
                 coco["annotations"] = [
-                    {"image_id": 1, "category_id": 3, "bbox": [1, 2, 3, 4]}
+                    {"id": 1005, "image_id": 1, "category_id": 3, "bbox": [1, 2, 3, 4]}
                 ]
             if split == from_split:
                 del coco[drop_key]
@@ -2145,7 +2262,7 @@ class RpcCocoAnnotationValidationTests(unittest.TestCase):
     def test_unknown_category_id_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result, out = self._run_prepare(
-                Path(tmp), [{"image_id": 1, "category_id": 99, "bbox": [1, 2, 3, 4]}]
+                Path(tmp), [{"id": 1006, "image_id": 1, "category_id": 99, "bbox": [1, 2, 3, 4]}]
             )
             self._assert_rejected(
                 result, out, "annotations[0].category_id references an unknown category"
@@ -2154,7 +2271,7 @@ class RpcCocoAnnotationValidationTests(unittest.TestCase):
     def test_unknown_image_id_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result, out = self._run_prepare(
-                Path(tmp), [{"image_id": 42, "category_id": 7, "bbox": [1, 2, 3, 4]}]
+                Path(tmp), [{"id": 1007, "image_id": 42, "category_id": 7, "bbox": [1, 2, 3, 4]}]
             )
             self._assert_rejected(
                 result, out, "annotations[0].image_id references an unknown image"
@@ -2163,7 +2280,7 @@ class RpcCocoAnnotationValidationTests(unittest.TestCase):
     def test_negative_bbox_width_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result, out = self._run_prepare(
-                Path(tmp), [{"image_id": 1, "category_id": 7, "bbox": [1, 2, -3, 4]}]
+                Path(tmp), [{"id": 1008, "image_id": 1, "category_id": 7, "bbox": [1, 2, -3, 4]}]
             )
             self._assert_rejected(
                 result, out, "annotations[0].bbox must have positive width and height"
@@ -2173,7 +2290,7 @@ class RpcCocoAnnotationValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             result, out = self._run_prepare(
                 Path(tmp),
-                [{"image_id": 1, "category_id": 7, "bbox": [1, 2, float("nan"), 4]}],
+                [{"id": 1009, "image_id": 1, "category_id": 7, "bbox": [1, 2, float("nan"), 4]}],
             )
             self._assert_rejected(
                 result, out, "annotations[0].bbox values must be finite numbers"
@@ -2182,7 +2299,7 @@ class RpcCocoAnnotationValidationTests(unittest.TestCase):
     def test_wrong_arity_bbox_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result, out = self._run_prepare(
-                Path(tmp), [{"image_id": 1, "category_id": 7, "bbox": [1, 2, 3]}]
+                Path(tmp), [{"id": 1010, "image_id": 1, "category_id": 7, "bbox": [1, 2, 3]}]
             )
             self._assert_rejected(
                 result, out, "annotations[0].bbox must be a list of exactly 4 numbers"
@@ -2193,8 +2310,8 @@ class RpcCocoAnnotationValidationTests(unittest.TestCase):
             result, out = self._run_prepare(
                 Path(tmp),
                 [
-                    {"image_id": 1, "category_id": 7, "bbox": [10, 20, 30, 40]},
-                    {"image_id": 1, "category_id": 3, "bbox": [5.5, 6.5, 7.5, 8.5]},
+                    {"id": 1011, "image_id": 1, "category_id": 7, "bbox": [10, 20, 30, 40]},
+                    {"id": 1012, "image_id": 1, "category_id": 3, "bbox": [5.5, 6.5, 7.5, 8.5]},
                 ],
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -2222,7 +2339,7 @@ class RpcTrainAnnotationsRequiredTests(unittest.TestCase):
                 "images": [{"id": 1, "file_name": image_name}],
                 "categories": list(self.CATEGORIES),
                 "annotations": [
-                    {"image_id": 1, "category_id": 7, "bbox": [1, 2, 3, 4]}
+                    {"id": 1013, "image_id": 1, "category_id": 7, "bbox": [1, 2, 3, 4]}
                 ],
             }
             if split in drop_annotations:
@@ -2283,7 +2400,7 @@ class RpcMalformedJsonTests(unittest.TestCase):
                 "images": [{"id": 1, "file_name": image_name}],
                 "categories": list(self.CATEGORIES),
                 "annotations": [
-                    {"image_id": 1, "category_id": 7, "bbox": [1, 2, 3, 4]}
+                    {"id": 1014, "image_id": 1, "category_id": 7, "bbox": [1, 2, 3, 4]}
                 ],
             }
             (raw / f"instances_{split}2019.json").write_text(
@@ -2352,7 +2469,7 @@ class RpcLabelCollisionTests(unittest.TestCase):
                 if split == "train":
                     # Train files must carry labels; val/test may omit them.
                     coco["annotations"] = [
-                        {"image_id": 1, "category_id": 1, "bbox": [1, 2, 3, 4]}
+                        {"id": 1015, "image_id": 1, "category_id": 1, "bbox": [1, 2, 3, 4]}
                     ]
                 (raw / f"instances_{split}2019.json").write_text(
                     json.dumps(coco), encoding="utf-8"
@@ -2513,38 +2630,58 @@ class UnknownFieldKeyRedactionTests(unittest.TestCase):
         self.assertTrue(any("unknown top-level field: 'extraField'" in e for e in errors), errors)
 
 
-class AcceptedPathRedactionTests(unittest.TestCase):
+class SensitivePathScreeningTests(unittest.TestCase):
     """A path can pass the canonical-relative-path gate while still carrying
-    sensitive content in a filename (e.g. images/<PAN>.jpg) — accepted-path
-    echoes (missing-file, cross-split duplicate, ...) must screen the value
-    and redact sensitive-looking ones. Benign accepted paths stay echoed:
-    the policy is echo-only-when-non-sensitive. (PAN fixtures are assembled
-    at runtime so no card-shaped literal appears in source.)"""
+    sensitive content in a filename (e.g. images/<PAN>.jpg). Such a path is
+    now a VALIDATION failure — it must never reach the missing-file stage or
+    survive into a staged manifest — and the error must never echo the
+    value. Benign accepted paths still echo in missing-file errors (the
+    _safe_path redaction remains as defense-in-depth for them). (PAN
+    fixtures are assembled at runtime so no card-shaped literal appears in
+    source.)"""
 
     @staticmethod
     def _pan_image() -> str:
         return "images/" + "4111" * 4 + ".jpg"
 
-    def test_missing_pan_named_image_error_redacted(self) -> None:
+    def test_pan_named_image_path_fails_validation_without_echo(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["image"] = self._pan_image()
+        errors = validate_manifest(manifest)
+        self.assertIn(
+            "splits.train[0].image contains a sensitive-looking value", errors
+        )
+        self.assertFalse(any("4111" in e for e in errors), errors)
+
+    def test_pan_named_annotation_path_fails_validation_without_echo(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["annotation"] = (
+            "annotations/" + "4111" * 4 + ".json"
+        )
+        errors = validate_manifest(manifest)
+        self.assertIn(
+            "splits.train[0].annotation contains a sensitive-looking value", errors
+        )
+        self.assertFalse(any("4111" in e for e in errors), errors)
+
+    def test_pan_named_split_annotation_ref_fails_validation_without_echo(self) -> None:
+        manifest = _valid_manifest()
+        manifest["annotations"] = {"train": "annotations/" + "4111" * 4 + ".json"}
+        errors = validate_manifest(manifest)
+        self.assertIn(
+            "annotations.train contains a sensitive-looking value", errors
+        )
+        self.assertFalse(any("4111" in e for e in errors), errors)
+
+    def test_pan_named_image_never_reaches_missing_file_stage(self) -> None:
+        # Even with --check-files semantics, the shape screen fires and no
+        # error carries the digits.
         manifest = _valid_manifest()
         manifest["splits"]["train"][0]["image"] = self._pan_image()
         with tempfile.TemporaryDirectory() as tmp:
             errors = validate_manifest(manifest, base_dir=Path(tmp), check_files=True)
-        self.assertTrue(any("missing file:" in e for e in errors), errors)
-        self.assertFalse(any("4111" in e for e in errors), errors)
-
-    def test_cross_split_duplicate_pan_named_path_redacted(self) -> None:
-        pan_image = self._pan_image()
-        manifest = _valid_manifest()
-        manifest["splits"]["train"] = [{"image": pan_image}]
-        manifest["splits"]["test"] = [{"image": pan_image}]
-        errors = validate_manifest(manifest)
-        self.assertTrue(
-            any(
-                "splits.test[0].image duplicates splits.train[0].image" in e
-                for e in errors
-            ),
-            errors,
+        self.assertIn(
+            "splits.train[0].image contains a sensitive-looking value", errors
         )
         self.assertFalse(any("4111" in e for e in errors), errors)
 
@@ -2555,6 +2692,134 @@ class AcceptedPathRedactionTests(unittest.TestCase):
         self.assertTrue(
             any("missing file: images/a.jpg" in e for e in errors), errors
         )
+
+
+class LicenseNotesScreeningTests(unittest.TestCase):
+    """licenseNotes is free-form text a PAN or credential would silently
+    satisfy — it must fail validation with a redacted error. (Sensitive
+    fixtures are assembled at runtime so no card-shaped literal appears in
+    source.)"""
+
+    def test_pan_license_notes_rejected_without_echo(self) -> None:
+        pan = "4111" * 4
+        manifest = _valid_manifest()
+        manifest["licenseNotes"] = f"Contact card {pan} for licensing."
+        errors = validate_manifest(manifest)
+        self.assertIn("licenseNotes contains a sensitive-looking value", errors)
+        self.assertFalse(any("4111" in e for e in errors), errors)
+
+    def test_normal_license_notes_accepted(self) -> None:
+        manifest = _valid_manifest()
+        manifest["licenseNotes"] = "Synthetic test fixture."
+        self.assertEqual(validate_manifest(manifest), [])
+
+
+class PathControlCharacterTests(unittest.TestCase):
+    """Newline/CR/terminal-escape (or any other control character) in an
+    otherwise canonical path enables log forging when the path is echoed —
+    all must be rejected at shape validation, without echoing the value."""
+
+    def test_newline_in_image_path_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["image"] = "images/a\nERROR: forged.jpg"
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("splits.train[0].image" in e for e in errors), errors)
+        self.assertFalse(any("forged" in e for e in errors), errors)
+
+    def test_carriage_return_in_annotation_path_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["annotation"] = "ann\r.json"
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("splits.train[0].annotation" in e for e in errors), errors)
+
+    def test_escape_char_in_image_path_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["image"] = "images/a\x1b[31m.jpg"
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("splits.train[0].image" in e for e in errors), errors)
+
+    def test_del_char_in_split_annotation_ref_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["annotations"] = {"train": "instances\x7f.json"}
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("annotations.train" in e for e in errors), errors)
+
+
+class PathColonRejectionTests(unittest.TestCase):
+    """Any ':' in a path value is rejected: this covers scheme: prefixes
+    without '//' (file:/etc/passwd, data:text/plain,...), Windows drive
+    forms, and Windows-illegal filename characters in one portable rule."""
+
+    def test_file_scheme_single_slash_image_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["image"] = "file:/etc/passwd"
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("splits.train[0].image" in e for e in errors), errors)
+        self.assertFalse(any("passwd" in e for e in errors), errors)
+
+    def test_data_uri_image_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["image"] = "data:text/plain,hello"
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("splits.train[0].image" in e for e in errors), errors)
+
+    def test_bare_colon_in_annotation_path_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["splits"]["train"][0]["annotation"] = "annotations/a:b.json"
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("splits.train[0].annotation" in e for e in errors), errors)
+
+    def test_scheme_prefix_split_annotation_ref_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["annotations"] = {"train": "file:/labels.json"}
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("annotations.train" in e for e in errors), errors)
+
+
+class SkuLengthContractTests(unittest.TestCase):
+    """classes[].sku must match the tenant catalog contract: CreateProductDto
+    (services/api/src/catalog) caps catalog SKUs at 64 characters."""
+
+    def test_64_char_sku_accepted(self) -> None:
+        manifest = _valid_manifest()
+        manifest["classes"][0]["sku"] = "S" * 64
+        self.assertEqual(validate_manifest(manifest), [])
+
+    def test_65_char_sku_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["classes"][0]["sku"] = "S" * 65
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("classes[0].sku must match" in e for e in errors), errors)
+
+
+class AsciiAnchorPatternTests(unittest.TestCase):
+    """VERSION_PATTERN must accept ASCII digits only (\\d also matches e.g.
+    Arabic-Indic digits), and all three identifier patterns anchor with \\Z
+    so a trailing newline can never sneak past a $-anchor."""
+
+    def test_unicode_digit_version_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["datasetVersion"] = "1.0.١"  # Arabic-Indic digit ONE
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("datasetVersion must match" in e for e in errors), errors)
+
+    def test_trailing_newline_dataset_name_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["datasetName"] = "example-dataset\n"
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("datasetName must match" in e for e in errors), errors)
+
+    def test_trailing_newline_version_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["datasetVersion"] = "1.0.0\n"
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("datasetVersion must match" in e for e in errors), errors)
+
+    def test_trailing_newline_sku_rejected(self) -> None:
+        manifest = _valid_manifest()
+        manifest["classes"][0]["sku"] = "COLA-330\n"
+        errors = validate_manifest(manifest)
+        self.assertTrue(any("classes[0].sku must match" in e for e in errors), errors)
 
 
 class InvalidUtf8ManifestTests(unittest.TestCase):

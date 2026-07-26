@@ -300,8 +300,13 @@ def validate(input_dir: Path, output_dir) -> int:
 
     try:
         manifest = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        print(f"ERROR: {manifest_path} is not valid JSON: {exc}")
+    except (ValueError, RecursionError) as exc:
+        # ValueError subsumes json.JSONDecodeError AND the plain ValueError
+        # Python 3.11+ raises when converting a >4300-digit JSON integer;
+        # extreme nesting raises RecursionError from the parser. Controlled
+        # exit-1 ERROR line — never a traceback, never file content (the
+        # exception class name only).
+        print(f"ERROR: {manifest_path} is not valid JSON ({type(exc).__name__})")
         return 1
 
     # References resolve through sourceRoot (when present), exactly like the

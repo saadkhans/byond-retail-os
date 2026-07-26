@@ -53,6 +53,11 @@ def _credentialed_url() -> str:
     return f"https://svc-user:{password}@cdn.example.com/captures/a.jpg"
 
 
+# Sentinel distinguishing "no override supplied" from an explicit None
+# override (an explicitly-null annotations key is itself a tested input).
+_UNSET = object()
+
+
 class _RpcRawMixin:
     """Writes the minimal valid RPC raw layout the end-to-end tests use,
     with per-test overrides for the hostile pieces."""
@@ -68,6 +73,7 @@ class _RpcRawMixin:
         val_categories: list = None,
         train_annotations: list = None,
         train_images: list = None,
+        val_annotations: object = _UNSET,
     ) -> None:
         for split, image_name in self.IMAGE_NAMES.items():
             image_dir = raw / f"{split}2019"
@@ -85,11 +91,15 @@ class _RpcRawMixin:
                 "categories": categories,
             }
             if split == "train":
+                # The default annotation carries an `id`, like real RPC
+                # exports do (prepare_rpc validates ids when present).
                 coco["annotations"] = (
                     train_annotations
                     if train_annotations is not None
-                    else [{"image_id": 1, "category_id": 7, "bbox": [1, 2, 3, 4]}]
+                    else [{"id": 1, "image_id": 1, "category_id": 7, "bbox": [1, 2, 3, 4]}]
                 )
+            if split == "val" and val_annotations is not _UNSET:
+                coco["annotations"] = val_annotations
             (raw / f"instances_{split}2019.json").write_text(
                 json.dumps(coco), encoding="utf-8"
             )
@@ -333,6 +343,50 @@ class PreparerSensitiveValueScreenTests(_RpcRawMixin, unittest.TestCase):
             self.assertTrue((out / "manifest.json").exists())
 
 
+class HostileJsonNumberTests(_RpcRawMixin, unittest.TestCase):
+    """Python 3.11+ raises a plain ValueError (not JSONDecodeError) when a
+    JSON integer exceeds the 4300-digit int-conversion limit — every JSON
+    load site must turn it into the controlled ERROR line, never a
+    traceback, and never echo the digits."""
+
+    HUGE_INT_JSON = '{"images": ' + "1" * 5000 + "}"
+
+    def test_rpc_huge_integer_coco_json_is_controlled_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            out = Path(tmp) / "out"
+            self._write_raw(raw)
+            (raw / "instances_train2019.json").write_text(
+                self.HUGE_INT_JSON, encoding="utf-8"
+            )
+            result = _run_script(
+                "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+            )
+            combined = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("ERROR", result.stdout)
+            self.assertNotIn("Traceback", combined)
+            self.assertNotIn("1" * 100, combined)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_byond_huge_integer_manifest_json_is_controlled_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_dir = Path(tmp) / "input"
+            (input_dir / "raw" / "shelves").mkdir(parents=True)
+            (input_dir / "annotations").mkdir()
+            (input_dir / "manifest.json").write_text(
+                self.HUGE_INT_JSON, encoding="utf-8"
+            )
+            result = _run_script(
+                "prepare_byond_dataset.py", ["--input", str(input_dir)]
+            )
+            combined = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("ERROR", result.stdout)
+            self.assertNotIn("Traceback", combined)
+            self.assertNotIn("1" * 100, combined)
+
+
 class Sku110kCorruptCsvTests(unittest.TestCase):
     """Unparseable or undecodable annotation CSVs must produce controlled
     ERROR lines naming the file and exception class only — never the raw
@@ -535,6 +589,263 @@ class ByondCredentialedPathRedactionTests(unittest.TestCase):
         self.assertIn("splits.train[0].annotation must live under 'annotations/'", errors)
         self.assertFalse(any(url in e for e in errors), errors)
         self.assertFalse(any("hun" + "ter2" in e for e in errors), errors)
+
+
+class RpcNullAnnotationsKeyTests(_RpcRawMixin, unittest.TestCase):
+    """An `annotations` key that is PRESENT must hold a list: an explicit
+    null (JSON `"annotations": null`) is not the same as an omitted key and
+    must be a controlled shape error. Only a truly absent key marks an
+    unlabeled val/test split."""
+
+    def _run_rpc(self, tmp: Path, **overrides) -> tuple:
+        raw = Path(tmp) / "raw"
+        out = Path(tmp) / "out"
+        self._write_raw(raw, **overrides)
+        result = _run_script(
+            "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+        )
+        return result, out
+
+    def test_val_with_null_annotations_key_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_rpc(Path(tmp), val_annotations=None)
+            combined = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("instances_val2019.json", result.stdout)
+            self.assertIn(
+                "annotations must be a list when present", result.stdout
+            )
+            self.assertNotIn("Traceback", combined)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_val_without_annotations_key_accepted(self) -> None:
+        # The default fixture writes val/test WITHOUT the annotations key —
+        # a truly absent key stays a valid unlabeled evaluation split.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_rpc(Path(tmp))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("OK: wrote", result.stdout)
+            self.assertTrue((out / "manifest.json").exists())
+
+
+class RpcAnnotationIdTests(_RpcRawMixin, unittest.TestCase):
+    """Annotation `id`s are required and must be usable by standard COCO
+    consumers that key annotations on them: present, non-bool integers,
+    screened for PAN-likeness like category/image ids, and unique within
+    the file."""
+
+    def _run_rpc(self, tmp: Path, train_annotations: list) -> tuple:
+        raw = Path(tmp) / "raw"
+        out = Path(tmp) / "out"
+        self._write_raw(raw, train_annotations=train_annotations)
+        result = _run_script(
+            "prepare_rpc.py", ["--input", str(raw), "--output", str(out)]
+        )
+        return result, out
+
+    def test_missing_annotation_id_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_rpc(
+                Path(tmp),
+                [{"image_id": 1, "category_id": 7, "bbox": [1, 2, 3, 4]}],
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("annotations[0].id is required", result.stdout)
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_boolean_annotation_id_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_rpc(
+                Path(tmp),
+                [{"id": True, "image_id": 1, "category_id": 7, "bbox": [1, 2, 3, 4]}],
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("instances_train2019.json", result.stdout)
+            self.assertIn("annotations[0].id must be an integer", result.stdout)
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_non_integer_annotation_id_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_rpc(
+                Path(tmp),
+                [{"id": "a-1", "image_id": 1, "category_id": 7, "bbox": [1, 2, 3, 4]}],
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("annotations[0].id must be an integer", result.stdout)
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_duplicate_annotation_ids_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_rpc(
+                Path(tmp),
+                [
+                    {"id": 5, "image_id": 1, "category_id": 7, "bbox": [1, 2, 3, 4]},
+                    {"id": 5, "image_id": 1, "category_id": 3, "bbox": [1, 2, 3, 4]},
+                ],
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("instances_train2019.json", result.stdout)
+            self.assertIn(
+                "annotations[1].id duplicates annotations[0].id", result.stdout
+            )
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_pan_like_annotation_id_rejected_without_digits(self) -> None:
+        pan = _luhn_pan()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_rpc(
+                Path(tmp),
+                [
+                    {
+                        "id": int(pan),
+                        "image_id": 1,
+                        "category_id": 7,
+                        "bbox": [1, 2, 3, 4],
+                    }
+                ],
+            )
+            combined = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "annotations[0].id contains a sensitive-looking value",
+                result.stdout,
+            )
+            self.assertNotIn(pan, combined)
+            self.assertNotIn("Traceback", combined)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_valid_unique_annotation_ids_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_rpc(
+                Path(tmp),
+                [
+                    {"id": 1, "image_id": 1, "category_id": 7, "bbox": [10, 20, 30, 40]},
+                    {"id": 2, "image_id": 1, "category_id": 3, "bbox": [5.5, 6.5, 7.5, 8.5]},
+                ],
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("OK: wrote", result.stdout)
+            self.assertTrue((out / "manifest.json").exists())
+
+
+class _Sku110kRawMixin:
+    """Writes the minimal valid SKU-110K raw layout with per-split CSV
+    content overrides (image placeholder files always exist)."""
+
+    IMAGE_NAMES = {"train": "a.jpg", "val": "b.jpg", "test": "c.jpg"}
+
+    def _write_raw(self, raw: Path, *, csv_overrides: dict = None) -> None:
+        overrides = csv_overrides or {}
+        images_dir = raw / "images"
+        images_dir.mkdir(parents=True)
+        annotations_dir = raw / "annotations"
+        annotations_dir.mkdir(parents=True)
+        for split, image_name in self.IMAGE_NAMES.items():
+            content = overrides.get(
+                split, f"{image_name},10,10,20,20,object,100,100\n"
+            )
+            (annotations_dir / f"annotations_{split}.csv").write_text(
+                content, encoding="utf-8"
+            )
+            (images_dir / image_name).write_text(
+                f"pixels-{image_name}", encoding="utf-8"
+            )
+
+    def _run_prepare(self, tmp: Path, *, csv_overrides: dict = None) -> tuple:
+        raw = tmp / "raw"
+        out = tmp / "out"
+        self._write_raw(raw, csv_overrides=csv_overrides)
+        result = _run_script(
+            "prepare_sku110k.py", ["--input", str(raw), "--output", str(out)]
+        )
+        return result, out
+
+
+class Sku110kEmptyTrainSplitTests(_Sku110kRawMixin, unittest.TestCase):
+    """An annotations_train.csv yielding zero annotation rows must be a
+    controlled ERROR naming the file — never an OK manifest with an empty
+    training split. Empty val/test CSVs stay accepted (the base manifest
+    rule only requires a non-empty train split)."""
+
+    def test_empty_train_csv_with_populated_val_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), csv_overrides={"train": ""}
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("ERROR", result.stdout)
+            self.assertIn("annotations_train.csv", result.stdout)
+            self.assertIn("training split has no annotation rows", result.stdout)
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_blank_lines_only_train_csv_rejected(self) -> None:
+        # Blank lines are skipped silently by the row parser, so a file of
+        # nothing but blank lines also yields an empty training split.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp), csv_overrides={"train": "\n\n\n"}
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("annotations_train.csv", result.stdout)
+            self.assertIn("training split has no annotation rows", result.stdout)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_empty_val_csv_still_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(Path(tmp), csv_overrides={"val": ""})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("OK: wrote", result.stdout)
+            manifest = json.loads(
+                (out / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["splits"]["val"], [])
+            self.assertEqual(len(manifest["splits"]["train"]), 1)
+
+
+class Sku110kClassColumnTests(_Sku110kRawMixin, unittest.TestCase):
+    """Column 6 must carry SKU-110K's published class value `object` —
+    an empty or different value means the file is not a SKU-110K export.
+    The rejected cell content is never echoed."""
+
+    def test_empty_class_value_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp),
+                csv_overrides={"train": "a.jpg,10,10,20,20,,100,100\n"},
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("annotations/annotations_train.csv", result.stdout)
+            self.assertIn("row 1: unexpected class value", result.stdout)
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_wrong_class_value_rejected_without_echo(self) -> None:
+        marker = "NOTOBJECT77"
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(
+                Path(tmp),
+                csv_overrides={"train": f"a.jpg,10,10,20,20,{marker},100,100\n"},
+            )
+            combined = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("annotations/annotations_train.csv", result.stdout)
+            self.assertIn("row 1: unexpected class value", result.stdout)
+            self.assertNotIn(marker, combined)
+            self.assertNotIn("Traceback", combined)
+            self.assertFalse((out / "manifest.json").exists())
+
+    def test_object_class_value_accepted_end_to_end(self) -> None:
+        # The default fixture rows carry the published `object` class value.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, out = self._run_prepare(Path(tmp))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("OK: wrote", result.stdout)
+            self.assertTrue((out / "manifest.json").exists())
 
 
 if __name__ == "__main__":

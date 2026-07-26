@@ -20,8 +20,8 @@
     },
     "datasetVersion": {
       "type": "string",
-      "pattern": "^\\d+\\.\\d+\\.\\d+$",
-      "description": "Semantic version of this manifest / dataset snapshot."
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "description": "Semantic version of this manifest / dataset snapshot. ASCII digits only (the validator anchors with \\Z so a trailing newline is rejected too)."
     },
     "source": {
       "type": "string",
@@ -74,8 +74,8 @@
           },
           "sku": {
             "type": "string",
-            "pattern": "^[A-Z0-9][A-Z0-9._-]{0,99}$",
-            "description": "Tenant catalog SKU mapping. Optional in the schema; the validator requires it on every class when source == \"byond-custom\"."
+            "pattern": "^[A-Z0-9][A-Z0-9._-]{0,63}$",
+            "description": "Tenant catalog SKU mapping, max 64 characters to match the catalog contract (CreateProductDto in services/api/src/catalog/dto/create-product.dto.ts caps SKUs at 64). Optional in the schema; the validator requires it on every class when source == \"byond-custom\"."
           }
         }
       }
@@ -114,7 +114,7 @@
       "properties": {
         "image": {
           "type": "string",
-          "description": "Path to the image, relative to the dataset root. Absolute paths, backslashes, \"..\" traversal, and URI schemes are rejected by the validator."
+          "description": "Path to the image, relative to the dataset root. Absolute paths, backslashes, \"..\" traversal, ':' characters (URI schemes, drive letters), and control characters are rejected by the validator."
         },
         "annotation": {
           "type": "string",

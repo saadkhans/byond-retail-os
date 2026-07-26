@@ -32,8 +32,12 @@ and each split's samples are the image paths recorded in that split's COCO
 Annotation-label policy: the TRAIN split's COCO file must carry a present,
 non-empty `annotations` list — there is nothing to train on without labels.
 The val/test files MAY omit the key entirely (unlabeled evaluation sets
-exist); when any file does carry an `annotations` array it is fully
-cross-checked regardless of split.
+exist); when any file does carry an `annotations` key it must be a list —
+an explicitly-null (or otherwise non-list) value is a named error, only a
+truly absent key skips the check — and the array is fully cross-checked
+regardless of split. Annotation `id`s, when carried, must be unique
+screened non-bool integers (standard COCO consumers key annotations on
+them).
 """
 
 from __future__ import annotations
@@ -196,11 +200,17 @@ def _coco_shape_errors(coco) -> list:
     values are rejected too: they would collapse in the annotation-join
     reference set and silently corrupt image_id joins.
 
-    When an `annotations` array is present it is cross-checked too: every
-    entry must be an object whose `image_id` / `category_id` reference ids
-    that exist in this file's `images` / `categories` lists, with a `bbox`
-    of exactly 4 finite numbers and positive width/height. When the key is
-    absent the check is skipped (reference-only fixtures stay valid).
+    When an `annotations` KEY is present its value must be a list — an
+    explicit null (or any other non-list value) is a named error, because
+    presence is not the same as absence: only a truly omitted key means an
+    unlabeled split and skips the check (reference-only fixtures stay
+    valid). Every list entry must be an object whose `image_id` /
+    `category_id` reference ids that exist in this file's `images` /
+    `categories` lists, with a `bbox` of exactly 4 finite numbers and
+    positive width/height. An entry's `id`, when carried, must be a
+    non-bool int, pass the same sensitive-value screen as category/image
+    ids, and be unique within the file — duplicate ids silently corrupt
+    standard COCO consumers that key annotations on them.
 
     Redaction policy: every error names the file's array, index, field, and
     the violated rule only. COCO-supplied values (ids, names, file_names,
@@ -300,32 +310,63 @@ def _coco_shape_errors(coco) -> list:
                 )
             else:
                 seen_image_ids[image_id] = idx
-    annotations = coco.get("annotations")
-    if annotations is not None:
-        # Reference ids are collected only from well-formed entries; bool is
-        # excluded because True/False hash-equal 1/0 and would silently
-        # satisfy an integer id reference.
-        image_ids = set()
-        if isinstance(images, list):
-            for image in images:
-                if isinstance(image, dict):
-                    image_id = image.get("id")
-                    if isinstance(image_id, int) and not isinstance(image_id, bool):
-                        image_ids.add(image_id)
-        category_ids = set()
-        if isinstance(categories, list):
-            for category in categories:
-                if isinstance(category, dict):
-                    category_id = category.get("id")
-                    if isinstance(category_id, int) and not isinstance(category_id, bool):
-                        category_ids.add(category_id)
+    if "annotations" in coco:
+        annotations = coco["annotations"]
         if not isinstance(annotations, list):
-            errors.append(f"annotations must be a list, got {type(annotations).__name__}")
+            # Presence is checked on the KEY, not the value: an explicit
+            # null (or any other non-list value) must never be treated like
+            # an omitted key — only a truly absent key means an unlabeled
+            # split. Anything present must be a list.
+            errors.append(
+                f"annotations must be a list when present, got {type(annotations).__name__}"
+            )
         else:
+            # Reference ids are collected only from well-formed entries;
+            # bool is excluded because True/False hash-equal 1/0 and would
+            # silently satisfy an integer id reference.
+            image_ids = set()
+            if isinstance(images, list):
+                for image in images:
+                    if isinstance(image, dict):
+                        image_id = image.get("id")
+                        if isinstance(image_id, int) and not isinstance(image_id, bool):
+                            image_ids.add(image_id)
+            category_ids = set()
+            if isinstance(categories, list):
+                for category in categories:
+                    if isinstance(category, dict):
+                        category_id = category.get("id")
+                        if isinstance(category_id, int) and not isinstance(category_id, bool):
+                            category_ids.add(category_id)
+            # Standard COCO consumers key annotations on their `id`: a
+            # missing, bool/non-int, PAN-like, or duplicated id silently
+            # corrupts (or leaks into) downstream joins, so `id` is required
+            # on every entry and gets the same screen as category/image ids
+            # plus a uniqueness check within the file.
+            seen_annotation_ids = {}
             for idx, annotation in enumerate(annotations):
                 if not isinstance(annotation, dict):
                     errors.append(f"annotations[{idx}] must be an object")
                     continue
+                if "id" not in annotation:
+                    errors.append(f"annotations[{idx}].id is required")
+                else:
+                    annotation_id = annotation["id"]
+                    if isinstance(annotation_id, bool) or not isinstance(annotation_id, int):
+                        errors.append(f"annotations[{idx}].id must be an integer")
+                    elif _contains_sensitive_value(str(annotation_id)):
+                        # Same PAN-like-integer screen as categories[].id /
+                        # images[].id: the value itself is never printed.
+                        errors.append(
+                            f"annotations[{idx}].id contains a sensitive-looking value"
+                        )
+                    elif annotation_id in seen_annotation_ids:
+                        errors.append(
+                            f"annotations[{idx}].id duplicates "
+                            f"annotations[{seen_annotation_ids[annotation_id]}].id"
+                        )
+                    else:
+                        seen_annotation_ids[annotation_id] = idx
                 image_id = annotation.get("image_id")
                 if (
                     isinstance(image_id, bool)
@@ -368,11 +409,14 @@ def _load_coco(path: Path):
 
     A truncated/corrupt/unreadable file must produce the script's normal
     error style — the exception class name only, never file content or a
-    raw traceback."""
+    raw traceback. ValueError subsumes json.JSONDecodeError and
+    UnicodeDecodeError AND the plain ValueError Python 3.11+ raises when
+    converting a >4300-digit JSON integer; extreme nesting raises
+    RecursionError from the parser."""
     try:
         with path.open("r", encoding="utf-8") as fh:
             return json.load(fh)
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         print(f"ERROR: {path.name}: not valid JSON ({type(exc).__name__})")
         return _COCO_LOAD_ERROR
 
@@ -520,17 +564,24 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
     splits = {}
     annotations = {}
     for split_name, (image_dir, annotation_file) in SPLIT_MARKERS.items():
-        coco = _load_coco(input_dir / annotation_file)
-        if coco is _COCO_LOAD_ERROR:
-            return 1
-        # Same shape guard for every split's file (train's re-load included)
-        # BEFORE the category-map comparison and sample building below
-        # iterate/dereference its categories and images entries.
-        shape_errors = _coco_shape_errors(coco)
-        if shape_errors:
-            _report_coco_shape_errors(annotation_file, shape_errors)
-            return 1
-        if split_name != "train":
+        if split_name == "train":
+            # Reuse the payload parsed (and shape-validated) at the top of
+            # this function instead of re-reading the train file — the
+            # previous re-load doubled peak memory on the largest split
+            # without adding any validation coverage, and train is never
+            # compared against its own category map.
+            coco = train_annotations
+        else:
+            coco = _load_coco(input_dir / annotation_file)
+            if coco is _COCO_LOAD_ERROR:
+                return 1
+            # Same shape guard the train file already passed, BEFORE the
+            # category-map comparison and sample building below
+            # iterate/dereference this split's categories and images entries.
+            shape_errors = _coco_shape_errors(coco)
+            if shape_errors:
+                _report_coco_shape_errors(annotation_file, shape_errors)
+                return 1
             mismatches = _category_map_mismatches(train_categories, _category_id_names(coco))
             if mismatches:
                 print(

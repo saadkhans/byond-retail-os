@@ -20,7 +20,10 @@ Each annotations CSV row follows SKU-110K's published 8-column format:
 
 Rows are validated (column count, finite numeric coordinates/dimensions,
 x2 > x1, y2 > y1, positive dimensions, boxes inside the declared image
-bounds) before any manifest is written.
+bounds, and a class column that must be exactly `object` — SKU-110K's
+single published class value) before any manifest is written. The training
+split must yield at least one valid annotation row; val/test CSVs may be
+empty (matching the base manifest rule).
 Because SKU-110K only labels "product present", it maps to a single
 generic BYOND class rather than per-SKU classes.
 
@@ -169,8 +172,9 @@ def _print_plan(input_dir, output_dir: str) -> None:
     print(f"    {output_dir}/manifest.json — single generic 'product' class,")
     print("    each CSV row validated against SKU-110K's published 8-column")
     print("    shape (finite coordinates, x2 > x1, y2 > y1, positive image")
-    print("    dimensions) before any write, samples deduped from each split")
-    print("    CSV's image-name column")
+    print("    dimensions, class column exactly 'object') before any write,")
+    print("    a non-empty training split required, samples deduped from each")
+    print("    split CSV's image-name column")
     print("    (referenced in place via sourceRoot; nothing copied), per-split")
     print("    annotation CSV refs, and validated — including file existence")
     print("    under the input root — against ml/configs/dataset.schema.json")
@@ -219,6 +223,13 @@ def _row_errors(row: list) -> list:
         # one (credential fragment, known token format, Luhn-valid PAN)
         # before any manifest write. The value itself is never printed.
         errors.append("image name contains a sensitive-looking value")
+    # SKU-110K's published single class value is the literal "object"; the
+    # manifest declares one generic `product` class on that basis, so a row
+    # carrying anything else (including an empty cell) is not a SKU-110K
+    # export and must be rejected. Exact match — and the cell content is
+    # never echoed (an arbitrary export value could carry anything).
+    if row[5] != "object":
+        errors.append("unexpected class value")
     numbers = {}
     for column_index, column_name in NUMERIC_CSV_COLUMNS:
         value = _finite_number(row[column_index])
@@ -333,6 +344,18 @@ def prepare(input_dir: Path, output_dir: Path) -> int:
         )
         for error in row_errors:
             print(f"  - {error}")
+        return 1
+
+    # The training split is what the model learns from: a train CSV that
+    # yields zero annotation rows has nothing to train on and must be a
+    # named error, never an OK manifest. val/test may be empty — the base
+    # manifest rule only requires a non-empty train split.
+    if not splits["train"]:
+        print(
+            f"ERROR: annotations/{SPLIT_CSV_NAMES['train']}: training split "
+            "has no annotation rows — the training split needs labels "
+            "(val/test CSVs may be empty); no manifest was written"
+        )
         return 1
 
     # Resolve to the physical input root so the written sourceRoot and the

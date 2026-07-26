@@ -21,9 +21,18 @@ import re
 import sys
 from pathlib import Path
 
-SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
-VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
-SKU_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,99}$")
+# All three patterns anchor with \Z, not $: in Python, $ also matches just
+# before a trailing newline, so "name\n" would otherwise slip through. And
+# VERSION_PATTERN uses explicit [0-9] classes because \d matches any Unicode
+# decimal digit (e.g. Arabic-Indic), while semver digits must be ASCII.
+SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*\Z")
+VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+\Z")
+# Max total length 64 (1 + 63): classes[].sku maps into the tenant catalog,
+# whose CreateProductDto (services/api/src/catalog/dto/create-product.dto.ts)
+# caps SKUs at 64 characters — a longer SKU could never resolve to a catalog
+# product. (The VisionEvent candidate DTO allows 100; that is a different
+# contract and does not apply to catalog mappings.)
+SKU_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,63}\Z")
 
 # Sensitive-value screening for classes[n].sku: the VisionEvent mapper
 # (sample_inference_to_vision_event.py) rejects credential- or payment-
@@ -78,20 +87,18 @@ CLASS_KEYS = {"classId", "label", "sku", "sourceId"}
 LABELS_KEYS = {"tenantId", "storeId", "planogramZone"}
 SAMPLE_KEYS = {"image", "annotation", "captureContext", "planogramZone", "storeId", "tenantId"}
 
-_URI_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
-_WINDOWS_DRIVE_PATTERN = re.compile(r"^[a-zA-Z]:")
-
 # Shared error tail for every value _is_bad_path rejects. A REJECTED path is
 # unconstrained input — it can be a credentialed rtsp://user:secret@... URL,
 # an absolute path leaking directory layout, or non-string junk — so these
 # errors name the field and the rule only, never the supplied value. (Paths
 # that PASSED the gate are clean canonical relative strings, but canonical
 # syntax does not imply non-sensitive content — e.g. images/<PAN>.jpg — so
-# missing-file/duplicate/alias reports echo an accepted path only when the
-# sensitive-value screen passes, via _safe_path below.)
+# every accepted path value is additionally screened with
+# _contains_sensitive_value during validation and rejected on a hit; the
+# _safe_path redaction on echoes remains as defense-in-depth.)
 _BAD_PATH_RULE = (
-    "must be a canonical relative path (no absolute paths, URI schemes, "
-    "backslashes, '..', '.', empty segments, or NUL)"
+    "must be a canonical relative path (no absolute paths, backslashes, "
+    "'..', '.', empty segments, ':' characters, or control characters)"
 )
 
 
@@ -107,22 +114,22 @@ def _is_bad_path(value) -> bool:
     file (e.g. "images/a.jpg" vs "images/./a.jpg") can never slip past the
     exact-string duplicate/overlap checks: every accepted path is already in
     canonical form, and the dedupe may safely compare raw strings.
-    An embedded NUL is rejected here too: it is not a valid filesystem
-    string, so every path field (image, annotation, split-level annotation
-    ref) gets the same guard sourceRoot has — without it a NUL-bearing path
-    would pass shape validation whenever --check-files is off.
+    Any ':' is rejected outright: one portable rule covers every scheme:
+    prefix (not just "scheme://" — "file:/etc/passwd" and "data:text/..."
+    count too), Windows drive forms like "C:", and characters illegal in
+    Windows filenames. Control characters (ord < 0x20, which includes NUL,
+    and DEL 0x7F) are rejected as well: newline/CR/terminal-escape bytes in
+    a path enable log forging when the path is later echoed, and NUL is not
+    a valid filesystem string — this guard applies to every path field even
+    when --check-files is off.
     """
     if not isinstance(value, str) or not value:
         return True
-    if "\x00" in value:
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
         return True
-    if "\\" in value:
-        return True
-    if _URI_SCHEME_PATTERN.match(value):
+    if "\\" in value or ":" in value:
         return True
     if value.startswith("/"):
-        return True
-    if _WINDOWS_DRIVE_PATTERN.match(value):
         return True
     if any(segment in ("", ".", "..") for segment in value.split("/")):
         return True
@@ -135,9 +142,13 @@ def _safe_path(value: str) -> str:
     A value that passed _is_bad_path is a clean canonical relative path, but
     canonical syntax says nothing about content: a filename can embed a PAN
     or credential fragment (e.g. "images/<card-number>.jpg") that must not
-    reach terminal/CI logs. Echo the path only when the sensitive-value
-    screen passes; otherwise substitute a fixed placeholder — the field path
-    in the surrounding message still identifies the offending entry.
+    reach terminal/CI logs. Sensitive-looking accepted paths now fail shape
+    validation outright (see the per-field screens in validate_manifest), so
+    this redaction is normally unreachable — it is kept as defense-in-depth
+    for any echo path the screens do not cover. Echo the path only when the
+    sensitive-value screen passes; otherwise substitute a fixed placeholder —
+    the field path in the surrounding message still identifies the offending
+    entry.
     """
     if not _contains_sensitive_value(value):
         return value
@@ -187,12 +198,18 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
             # An arbitrary string reaches this check before any pattern
             # constraint holds, so the value is never echoed.
             errors.append(f"datasetName must match {SLUG_PATTERN.pattern!r}")
-        # An all-digit Luhn PAN is a perfectly valid slug, and datasetName is
-        # the one screened field the CLI later echoes (in the OK summary), so
-        # it gets the same sensitive-value screen as labels/SKUs. The error
-        # never echoes the value; the OK line stays safe because it is only
-        # reachable when this screen passed.
-        if isinstance(name, str) and _contains_sensitive_value(name):
+        # datasetName and datasetVersion are the two screened fields the CLI
+        # later echoes (in the OK summary), and their patterns admit
+        # arbitrarily long all-digit runs (an all-digit Luhn PAN is a
+        # perfectly valid slug, and a PAN dotted with ".0.0" still matches
+        # the semver pattern), so both get the same sensitive-value screen
+        # as labels/SKUs — behind a cheap length cap that bounds what the
+        # linear-but-heavy scanner ever sees. Errors never echo the value;
+        # the OK line stays safe because it is only reachable when these
+        # screens passed.
+        if isinstance(name, str) and len(name) > 100:
+            errors.append("datasetName must be at most 100 characters")
+        elif isinstance(name, str) and _contains_sensitive_value(name):
             errors.append("datasetName contains a sensitive-looking value")
 
     if "datasetVersion" not in manifest:
@@ -202,6 +219,13 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
         if not isinstance(version, str) or not VERSION_PATTERN.match(version):
             # Same redaction rationale as datasetName: unconstrained input.
             errors.append(f"datasetVersion must match {VERSION_PATTERN.pattern!r}")
+        # Same length-capped sensitive-value screen as datasetName (see the
+        # comment there): "4111111111111111.0.0" matches VERSION_PATTERN and
+        # would otherwise be echoed verbatim in the CLI OK summary.
+        if isinstance(version, str) and len(version) > 64:
+            errors.append("datasetVersion must be at most 64 characters")
+        elif isinstance(version, str) and _contains_sensitive_value(version):
+            errors.append("datasetVersion contains a sensitive-looking value")
 
     source = manifest.get("source")
     if "source" not in manifest:
@@ -231,6 +255,16 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
         license_notes = manifest["licenseNotes"]
         if not isinstance(license_notes, str) or len(license_notes) < 1:
             errors.append("licenseNotes must be a non-empty string")
+        elif len(license_notes) > 2000:
+            # Cheap bound checked BEFORE the sensitive screen: the scanner is
+            # linear but heavy (~seconds per MB), so unbounded free-form text
+            # must never reach it.
+            errors.append("licenseNotes must be at most 2000 characters")
+        elif _contains_sensitive_value(license_notes):
+            # Free-form text a PAN or credential would silently satisfy — and
+            # the staged manifest would persist it downstream. The error never
+            # echoes the value.
+            errors.append("licenseNotes contains a sensitive-looking value")
 
     if "classes" not in manifest:
         errors.append("missing required field: classes")
@@ -363,6 +397,11 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
             for key in SPLIT_NAMES:
                 if key in annotations and _is_bad_path(annotations[key]):
                     errors.append(f"annotations.{key} {_BAD_PATH_RULE}")
+                elif key in annotations and _contains_sensitive_value(annotations[key]):
+                    # Canonical syntax does not imply non-sensitive content: a
+                    # filename can embed a PAN/credential that byond staging
+                    # would then persist. Reject at validation; never echo.
+                    errors.append(f"annotations.{key} contains a sensitive-looking value")
 
     if "splits" not in manifest:
         errors.append("missing required field: splits")
@@ -409,6 +448,14 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
                         errors.append(f"{sample_path}.image {_BAD_PATH_RULE}")
                     else:
                         image = sample["image"]
+                        # An accepted (canonical) path can still carry a PAN or
+                        # credential in a filename; screening is a VALIDATION
+                        # failure so byond staging can never persist card data.
+                        # The error never echoes the value.
+                        if _contains_sensitive_value(image):
+                            errors.append(
+                                f"{sample_path}.image contains a sensitive-looking value"
+                            )
                         if image in seen_images:
                             errors.append(
                                 f"{sample_path}.image duplicates "
@@ -419,6 +466,12 @@ def validate_manifest(manifest, *, base_dir: "Path | None" = None, check_files: 
 
                     if "annotation" in sample and _is_bad_path(sample["annotation"]):
                         errors.append(f"{sample_path}.annotation {_BAD_PATH_RULE}")
+                    elif "annotation" in sample and _contains_sensitive_value(sample["annotation"]):
+                        # Same screen as .image: an accepted path with a
+                        # sensitive-looking filename fails validation outright.
+                        errors.append(
+                            f"{sample_path}.annotation contains a sensitive-looking value"
+                        )
 
                     if "captureContext" in sample:
                         capture_context = sample["captureContext"]
@@ -624,8 +677,13 @@ def main(argv=None) -> int:
 
     try:
         manifest = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        print(f"ERROR: {manifest_path} is not valid JSON: {exc}")
+    except (ValueError, RecursionError) as exc:
+        # ValueError subsumes json.JSONDecodeError AND the plain ValueError
+        # Python 3.11+ raises when converting a >4300-digit JSON integer;
+        # extreme nesting raises RecursionError from the parser. All must be
+        # the controlled exit-1 ERROR line — never a traceback, and never
+        # file content (the exception class name only).
+        print(f"ERROR: {manifest_path} is not valid JSON ({type(exc).__name__})")
         return 1
 
     if args.base_dir is not None:

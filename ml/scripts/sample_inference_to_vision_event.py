@@ -22,8 +22,10 @@ import argparse
 import datetime
 import json
 import math
+import os
 import re
 import sys
+import tempfile
 import urllib.parse
 from pathlib import Path
 
@@ -393,7 +395,19 @@ def contains_sensitive_value(value: str) -> bool:
 def _assert_opaque(name: str, value: str) -> None:
     """Mirror of the API's `assertOpaque`: reject credential- or payment-
     bearing content in fields persisted verbatim. Never echoes the value —
-    the whole point is that it may be a secret."""
+    the whole point is that it may be a secret.
+
+    Also rejects control characters (ord < 0x20, or 0x7F/DEL) in the same
+    emitted free-form strings: a NUL passes the sensitive-value screen but
+    Postgres `text` rejects it at insert time, so the payload would 500/400
+    downstream instead of failing loudly here. Applied at every
+    `_assert_opaque` call site (sku pre-normalization, label,
+    idempotencyKey, locationId, unitId, deviceId, checkoutSessionId).
+    Timestamps need no companion check: the strict `_ISO8601_STRICT` shape
+    gate already makes control characters impossible there. The error names
+    the field only — never the value."""
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise ValueError(f"{name} contains control characters")
     if _contains_sensitive_value(value):
         raise ValueError(
             f"{name} must be an opaque value and must not contain credential- "
@@ -406,6 +420,26 @@ def _assert_opaque(name: str, value: str) -> None:
 def _require_nonempty_string(value, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} is required and must be a non-empty string")
+    return value
+
+
+# Producer-side cap for reference ids (locationId, unitId, deviceId,
+# checkoutSessionId). The vision ingest DTO carries NO MaxLength on these
+# fields, so this cap is deliberately stricter than the API — the safe
+# direction (the mapper may reject what the API would accept, never the
+# reverse). It also cheaply bounds what the linear-but-heavy sensitive-value
+# scanner ever sees: the length check always runs BEFORE the screen.
+MAX_REFERENCE_ID_LENGTH = 200
+
+
+def _require_reference_id(name: str, value) -> str:
+    """Require a non-empty reference-id string: capped at
+    MAX_REFERENCE_ID_LENGTH BEFORE the sensitive screen, then screened like
+    every other opaque field. Errors name the field only, never the value."""
+    _require_nonempty_string(value, name)
+    if len(value) > MAX_REFERENCE_ID_LENGTH:
+        raise ValueError(f"{name} exceeds the {MAX_REFERENCE_ID_LENGTH}-character limit")
+    _assert_opaque(name, value)
     return value
 
 
@@ -505,10 +539,8 @@ def to_vision_event(inference: dict) -> dict:
     # stricter on the producer side, which is the safe direction: the mapper
     # may reject what the API would accept, never the reverse. Errors name
     # the field only, never the value.
-    location_id = _require_nonempty_string(inference.get("locationId"), "locationId")
-    _assert_opaque("locationId", location_id)
-    unit_id = _require_nonempty_string(inference.get("unitId"), "unitId")
-    _assert_opaque("unitId", unit_id)
+    location_id = _require_reference_id("locationId", inference.get("locationId"))
+    unit_id = _require_reference_id("unitId", inference.get("unitId"))
     occurred_at = _require_iso8601("occurredAt", inference.get("occurredAt"))
 
     detections = inference.get("detections")
@@ -522,13 +554,15 @@ def to_vision_event(inference: dict) -> dict:
         sku = detection.get("sku")
         if not isinstance(sku, str) or not sku.strip():
             raise ValueError(f"detections[{idx}].sku is required and must be a non-empty string")
+        normalized_sku = sku.strip().upper()
+        # The emitted (normalized) sku is what the API's MaxLength(100) sees.
+        # Checked BEFORE the sensitive screen so the cheap length cap bounds
+        # what the linear-but-heavy scanner ever sees.
+        if len(normalized_sku) > MAX_SKU_LENGTH:
+            raise ValueError(f"detections[{idx}].sku must be at most {MAX_SKU_LENGTH} characters when normalized")
         # Screen the RAW sku (before uppercasing, which would defeat the
         # case-sensitive secret-token patterns), like the service does.
         _assert_opaque(f"detections[{idx}].sku", sku)
-        normalized_sku = sku.strip().upper()
-        # The emitted (normalized) sku is what the API's MaxLength(100) sees.
-        if len(normalized_sku) > MAX_SKU_LENGTH:
-            raise ValueError(f"detections[{idx}].sku must be at most {MAX_SKU_LENGTH} characters when normalized")
         confidence = detection.get("confidence")
         if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
             raise ValueError(f"detections[{idx}].confidence is required and must be a number")
@@ -600,17 +634,15 @@ def to_vision_event(inference: dict) -> dict:
     if ranked_candidates:
         payload["candidates"] = ranked_candidates
 
-    # Same producer-side reference-ID screen as locationId/unitId above.
+    # Same producer-side reference-ID cap + screen as locationId/unitId above.
     device_id = inference.get("deviceId")
     if device_id is not None:
-        _require_nonempty_string(device_id, "deviceId")
-        _assert_opaque("deviceId", device_id)
+        _require_reference_id("deviceId", device_id)
         payload["deviceId"] = device_id
 
     session_id = inference.get("checkoutSessionId")
     if session_id is not None:
-        _require_nonempty_string(session_id, "checkoutSessionId")
-        _assert_opaque("checkoutSessionId", session_id)
+        _require_reference_id("checkoutSessionId", session_id)
         payload["sessionId"] = session_id
 
     if ranked_candidates:
@@ -644,6 +676,36 @@ def to_vision_event(inference: dict) -> dict:
     return payload
 
 
+def _write_text_atomically(text: str, destination: Path) -> None:
+    """Write text via a same-directory temp file + os.replace.
+
+    A failing write can therefore never truncate an existing valid payload
+    file behind `--out` — the destination either keeps its previous content
+    or receives the complete new one. (Local mirror of
+    `_write_json_atomically` in the prepare_* scripts — scripts stay
+    import-independent.)
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(destination.parent), prefix=destination.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        # mkstemp creates the temp file 0600; give the final payload the
+        # normal umask-derived mode so downstream readers can open it.
+        # (On Windows chmod is mostly a no-op — harmless.)
+        current_umask = os.umask(0)
+        os.umask(current_umask)
+        os.chmod(tmp_name, 0o666 & ~current_umask)
+        os.replace(tmp_name, destination)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Convert ML model inference output into a Phase 7 VisionEvent ingest payload."
@@ -665,8 +727,14 @@ def main(argv=None) -> int:
         # text would echo raw byte values from the file.
         print(f"ERROR: {path} is not valid UTF-8 text")
         return 1
-    except json.JSONDecodeError as exc:
-        print(f"ERROR: {path} is not valid JSON: {exc}")
+    except (ValueError, RecursionError) as exc:
+        # ValueError subsumes json.JSONDecodeError AND the plain ValueError
+        # Python 3.11+ raises when converting a >4300-digit JSON integer;
+        # extreme nesting raises RecursionError from the parser. (The
+        # UnicodeDecodeError clause above wins for non-UTF-8 bytes: it is a
+        # ValueError subclass but is listed first.) The message names the
+        # path and exception class only — never file content.
+        print(f"ERROR: {path} is not valid JSON ({type(exc).__name__})")
         return 1
 
     try:
@@ -680,9 +748,11 @@ def main(argv=None) -> int:
         # Guarded like the read side: a bad --out destination (nonexistent
         # directory, permission denial, path-is-a-directory) must be the
         # documented ERROR: line + exit 1, never a raw traceback. The message
-        # names the path and exception class only — no payload content.
+        # names the path and exception class only — no payload content. The
+        # write is atomic (temp file + os.replace): a failure can never
+        # truncate a previously written valid payload at the same path.
         try:
-            Path(args.out).write_text(rendered + "\n", encoding="utf-8")
+            _write_text_atomically(rendered + "\n", Path(args.out))
         except OSError as exc:
             print(f"ERROR: cannot write output file: {args.out} ({type(exc).__name__})")
             return 1

@@ -610,6 +610,75 @@ class SensitiveValueScreeningTests(unittest.TestCase):
             to_vision_event(inference)
 
 
+class ControlCharacterScreeningTests(unittest.TestCase):
+    """Codex P2: a NUL (or other control char) in an emitted free-form string
+    passed the sensitive-value screen and was emitted verbatim — Postgres
+    `text` rejects NUL at insert time. `_assert_opaque` now also rejects any
+    character with ord < 0x20 or == 0x7F in every emitted free-form string
+    (sku pre-normalization, label, idempotencyKey, locationId, unitId,
+    deviceId, checkoutSessionId). The error names the field only, never the
+    value. Timestamps are shape-locked by the strict ISO-8601 regex, so
+    control characters are impossible there without a companion check."""
+
+    def test_nul_label_rejected_names_field_not_value(self) -> None:
+        marker = "NULMARKERQQ"
+        inference = _base_inference()
+        inference["detections"] = [
+            {"sku": "cola-330", "confidence": 0.5, "label": marker + "\x00tail"}
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertEqual(message, "detections[0].label contains control characters")
+        self.assertNotIn(marker, message)
+        self.assertNotIn("\x00", message)
+
+    def test_nul_sku_rejected(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [{"sku": "cola\x00330", "confidence": 0.5}]
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        self.assertEqual(str(ctx.exception), "detections[0].sku contains control characters")
+
+    def test_esc_idempotency_key_rejected(self) -> None:
+        inference = _base_inference()
+        inference["idempotencyKey"] = "evt-\x1b[31m-0009"
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertEqual(message, "idempotencyKey contains control characters")
+        self.assertNotIn("\x1b", message)
+
+    def test_nul_location_id_rejected(self) -> None:
+        inference = _base_inference()
+        inference["locationId"] = "loc-1\x00"
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        self.assertEqual(str(ctx.exception), "locationId contains control characters")
+
+    def test_del_char_unit_id_rejected(self) -> None:
+        inference = _base_inference()
+        inference["unitId"] = "unit-\x7f-1"
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        self.assertEqual(str(ctx.exception), "unitId contains control characters")
+
+    def test_control_char_device_and_session_ids_rejected(self) -> None:
+        for field in ("deviceId", "checkoutSessionId"):
+            with self.subTest(field=field):
+                inference = _base_inference()
+                inference[field] = "id-\x01-x"
+                with self.assertRaises(ValueError) as ctx:
+                    to_vision_event(inference)
+                self.assertEqual(str(ctx.exception), f"{field} contains control characters")
+
+    def test_normal_printable_strings_still_accepted(self) -> None:
+        inference = _base_inference()
+        inference["idempotencyKey"] = "evt-7f3a2b1c-0009"
+        payload = to_vision_event(inference)
+        self.assertEqual(payload["idempotencyKey"], "evt-7f3a2b1c-0009")
+
+
 def _test_pan() -> str:
     # Runtime-assembled Luhn-valid test PAN (4111-1111-1111-1111) — no
     # contiguous PAN literal ever appears in source (Gitleaks-safe).
@@ -911,6 +980,72 @@ class StringLengthLimitTests(unittest.TestCase):
         self.assertEqual(payload["candidates"][0]["label"], "L" * 200)
 
 
+class ReferenceIdLengthCapTests(unittest.TestCase):
+    """Reference ids (locationId/unitId/deviceId/checkoutSessionId) get a
+    producer-side 200-char cap checked BEFORE the sensitive screen: the
+    vision ingest DTO has no MaxLength on these fields, so the cap is
+    deliberately stricter than the API (the safe direction) and cheaply
+    bounds what the linear-but-heavy scanner ever sees."""
+
+    def test_201_char_reference_ids_rejected(self) -> None:
+        for field in ("locationId", "unitId", "deviceId", "checkoutSessionId"):
+            with self.subTest(field=field):
+                inference = _base_inference()
+                inference[field] = "R" * 201
+                with self.assertRaises(ValueError) as ctx:
+                    to_vision_event(inference)
+                self.assertEqual(
+                    str(ctx.exception), f"{field} exceeds the 200-character limit"
+                )
+
+    def test_200_char_reference_ids_accepted(self) -> None:
+        inference = _base_inference()
+        inference["locationId"] = "L" * 200
+        inference["unitId"] = "U" * 200
+        payload = to_vision_event(inference)
+        self.assertEqual(payload["locationId"], "L" * 200)
+        self.assertEqual(payload["unitId"], "U" * 200)
+
+    def test_overlong_pan_bearing_location_id_fails_length_check_without_pan_echo(self) -> None:
+        # An over-long PAN-bearing reference id now fails the cheap length
+        # check first — the message names the cap, never the value.
+        inference = _base_inference()
+        inference["locationId"] = _test_pan() + "x" * 200
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertEqual(message, "locationId exceeds the 200-character limit")
+        self.assertNotIn("4111", message)
+
+
+class SkuLengthBeforeScreenTests(unittest.TestCase):
+    """The cheap MAX_SKU_LENGTH check now runs BEFORE the sensitive screen
+    (labels and idempotencyKey were already ordered this way): an over-long
+    PAN-bearing sku fails the length rule without the scanner ever running,
+    and the message never carries the value."""
+
+    def test_overlong_pan_bearing_sku_fails_length_check_first(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [
+            {"sku": _test_pan() + "S" * 100, "confidence": 0.5}
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertIn("detections[0].sku must be at most 100 characters", message)
+        self.assertNotIn("opaque", message)
+        self.assertNotIn("4111", message)
+
+    def test_in_range_pan_sku_still_screened(self) -> None:
+        inference = _base_inference()
+        inference["detections"] = [{"sku": _test_pan(), "confidence": 0.5}]
+        with self.assertRaises(ValueError) as ctx:
+            to_vision_event(inference)
+        message = str(ctx.exception)
+        self.assertIn("opaque", message)
+        self.assertNotIn("4111", message)
+
+
 class CaptureWindowOrderingTests(unittest.TestCase):
     """Mirror of normalizeBundle: strictly reversed capture windows are
     rejected; equal timestamps are allowed."""
@@ -986,6 +1121,36 @@ class CliErrorHandlingTests(unittest.TestCase):
         self.assertNotIn("Traceback", result.stdout + result.stderr)
 
 
+class CliHostileJsonTests(unittest.TestCase):
+    """Python 3.11+ raises a plain ValueError (not JSONDecodeError) when a
+    JSON integer exceeds the 4300-digit int-conversion limit — the CLI must
+    print the controlled ERROR line, never a traceback, and never echo the
+    digits."""
+
+    def test_huge_integer_json_is_controlled_error(self) -> None:
+        digits = "1" * 5000
+        with tempfile.TemporaryDirectory() as tmp:
+            model_output = Path(tmp) / "model_output.json"
+            model_output.write_text(
+                '{"quantityDelta": ' + digits + "}", encoding="utf-8"
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "sample_inference_to_vision_event.py"),
+                    str(model_output),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+            )
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ERROR", result.stdout)
+        self.assertNotIn("Traceback", combined)
+        self.assertNotIn("1" * 100, combined)
+
+
 class CliInvalidUtf8Tests(unittest.TestCase):
     """Codex P2: Path.read_text raises UnicodeDecodeError on non-UTF-8 bytes
     — neither OSError nor JSONDecodeError, so the CLI tracebacked. Now the
@@ -1055,7 +1220,39 @@ class CliOutWriteTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertNotIn("ERROR", result.stdout + result.stderr)
             written = json.loads(out_path.read_text(encoding="utf-8"))
+            # The atomic write must leave no temp-file litter behind: the
+            # destination directory contains exactly the final payload.
+            self.assertEqual(
+                [entry.name for entry in Path(out_tmp).iterdir()], ["payload.json"]
+            )
         self.assertEqual(written, to_vision_event(_base_inference()))
+
+    def test_out_failure_preserves_prior_output_file(self) -> None:
+        # Codex P2 (atomic --out): the old Path.write_text truncated an
+        # existing valid payload before a failing write. Making a directory
+        # read-only is unreliable on Windows, so the failure is simulated by
+        # pointing --out at a path whose PARENT is a regular file — mkstemp
+        # fails before anything is touched, and the previously written valid
+        # payload must remain byte-identical, with no temp litter.
+        with tempfile.TemporaryDirectory() as out_tmp:
+            out_path = Path(out_tmp) / "payload.json"
+            first = self._run_cli("--out", str(out_path), inference=_base_inference())
+            self.assertEqual(first.returncode, 0)
+            original_bytes = out_path.read_bytes()
+
+            bad_target = out_path / "nested.json"  # parent is a file
+            second = self._run_cli("--out", str(bad_target), inference=_base_inference())
+            self.assertEqual(second.returncode, 1)
+            self.assertIn("ERROR: cannot write output file:", second.stdout)
+            self.assertNotIn("Traceback", second.stdout + second.stderr)
+            # No payload content in the error output.
+            self.assertNotIn("locationId", second.stdout + second.stderr)
+            # The prior valid payload is untouched, byte for byte, and the
+            # directory holds nothing but it (no *.tmp remnants).
+            self.assertEqual(out_path.read_bytes(), original_bytes)
+            self.assertEqual(
+                [entry.name for entry in Path(out_tmp).iterdir()], ["payload.json"]
+            )
 
 
 if __name__ == "__main__":
