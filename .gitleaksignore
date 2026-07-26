@@ -1,0 +1,7 @@
+# Gitleaks false-positive fingerprints (commit:path:rule:line).
+# Each entry pins ONE historical hit — never a path- or rule-wide waiver.
+#
+# Fake AWS-key-shaped TEST FIXTURE (sensitive-value screening test), already
+# removed from the source in the following commit; this entry only covers the
+# historical commit that briefly contained the fixture. Not a real credential.
+fee2aa7cd0bf091830ca84f85f13657f6ed865e3:ml/tests/test_dataset_manifest.py:aws-access-token:220

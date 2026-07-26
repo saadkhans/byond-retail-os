@@ -1,0 +1,44 @@
+# Phase 8 training config - DOCUMENTATION ONLY.
+#
+# There is no training code in this repo yet (no train_detector.py, no
+# training runtime dependency). This file exists so the shape of a future
+# training run is written down and reviewable before any training code
+# lands, and so the manifest format (ml/configs/dataset.schema.json) has a
+# concrete consumer to design against.
+#
+# Provider choice stays neutral and pluggable: nothing here commits BYOND to
+# a specific detector architecture, framework, or vendor. Trained weights
+# are external build artifacts (produced by a training job, stored in model
+# registry/object storage) and are NEVER committed to this repository.
+
+dataset:
+  # Path to a manifest validated by ml/scripts/validate_dataset_manifest.py.
+  # (prepare_rpc.py writes the manifest into the processed/ directory, e.g.
+  # `--output ml/datasets/rpc/processed`; the SKU-110K and byond-custom
+  # preparers follow the same <dataset>/processed/manifest.json layout.)
+  manifestPath: ml/datasets/rpc/processed/manifest.json
+
+detector:
+  # Placeholder family names - either a YOLO-style single-stage detector or
+  # an RT-DETR-style transformer detector; the pipeline stays pluggable
+  # rather than hard-coding one architecture.
+  family: yolo-style # or: rt-detr
+  imgSize: 640 # placeholder - square input resolution in pixels
+  epochs: 100 # placeholder - full training run length
+  batch: 16 # placeholder - per-step batch size
+
+skuClassifier:
+  # Second-stage per-SKU classifier run on detector crops (RPC/SKU-110K
+  # detectors are class-agnostic or category-level only; tenant SKU
+  # resolution needs its own classifier trained on byond-custom data).
+  backbone: placeholder-backbone # e.g. a standard CNN/ViT image backbone
+  cropSize: 224 # placeholder - square crop resolution fed to the classifier
+
+export:
+  # Target formats for deployment; ONNX keeps the runtime vendor-neutral.
+  formats: [onnx]
+  # Exported/trained weights are external artifacts (model registry or
+  # object storage) - never committed to this repository.
+  note: >
+    Weights produced by this pipeline are external artifacts and are never
+    committed to the repository.

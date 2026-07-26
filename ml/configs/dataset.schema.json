@@ -1,0 +1,133 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "BYOND CV Dataset Manifest",
+  "description": "Manifest format shared by RPC, SKU-110K, and BYOND custom datasets used to train the Phase 8 CV pipeline. This file is the documentation copy of the format; ml/scripts/validate_dataset_manifest.py implements the same rules by hand (no jsonschema dependency) so validation works with the Python standard library only.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "datasetName",
+    "datasetVersion",
+    "source",
+    "licenseNotes",
+    "classes",
+    "splits"
+  ],
+  "properties": {
+    "datasetName": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:[-_][a-z0-9]+)*$",
+      "description": "Lowercase slug identifying the dataset."
+    },
+    "datasetVersion": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "description": "Semantic version of this manifest / dataset snapshot. ASCII digits only (the validator anchors with \\Z so a trailing newline is rejected too)."
+    },
+    "source": {
+      "type": "string",
+      "enum": ["rpc", "sku-110k", "byond-custom"],
+      "description": "Origin of the dataset. byond-custom manifests additionally require a sku on every class."
+    },
+    "sourceRoot": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Path to the dataset source root that all image/annotation references (samples and per-split annotation files) resolve against. A relative sourceRoot resolves against the manifest file's own directory — typically \"../raw\"-style, since generated manifests live in processed/ while media stays under raw/. Manifests reference source media in place; nothing is ever copied."
+    },
+    "licenseNotes": {
+      "type": "string",
+      "minLength": 1,
+      "description": "License / redistribution notes for this dataset snapshot."
+    },
+    "annotations": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-split annotation source file (e.g. RPC COCO JSON, SKU-110K CSV), path relative to sourceRoot, same path rules as sample paths. Original annotation data is referenced, not copied or discarded.",
+      "properties": {
+        "train": { "type": "string" },
+        "val": { "type": "string" },
+        "test": { "type": "string" }
+      }
+    },
+    "classes": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Class list. classId and label must each be unique across the array, and the set of classId values must be exactly the contiguous range 0..N-1.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["classId", "label"],
+        "properties": {
+          "classId": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Zero-based class index, unique across classes. Across the whole classes array the classId values must form the contiguous range 0..N-1 (list order need not match the id)."
+          },
+          "sourceId": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Original source-dataset category id (e.g. COCO category id) that the annotation files reference; classId remains the contiguous training index. Optional; must be unique across classes when present."
+          },
+          "label": {
+            "type": "string",
+            "pattern": "^[a-z0-9]+(?:[-_][a-z0-9]+)*$",
+            "description": "Lowercase slug class label, unique across classes."
+          },
+          "sku": {
+            "type": "string",
+            "pattern": "^[A-Z0-9][A-Z0-9._-]{0,63}$",
+            "description": "Tenant catalog SKU mapping, max 64 characters to match the catalog contract (CreateProductDto in services/api/src/catalog/dto/create-product.dto.ts caps SKUs at 64). Optional in the schema; the validator requires it on every class when source == \"byond-custom\"."
+          }
+        }
+      }
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional dataset-level label defaults, overridable per sample.",
+      "properties": {
+        "tenantId": { "type": "string" },
+        "storeId": { "type": "string" },
+        "planogramZone": { "type": "string" }
+      }
+    },
+    "splits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["train", "val", "test"],
+      "description": "Exactly the three named splits. Arrays may be individually empty, but at least one split must contain samples.",
+      "properties": {
+        "train": { "$ref": "#/definitions/split" },
+        "val": { "$ref": "#/definitions/split" },
+        "test": { "$ref": "#/definitions/split" }
+      }
+    }
+  },
+  "definitions": {
+    "split": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/sample" }
+    },
+    "sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image"],
+      "properties": {
+        "image": {
+          "type": "string",
+          "description": "Path to the image, relative to the dataset root. Absolute paths, backslashes, \"..\" traversal, ':' characters (URI schemes, drive letters), and control characters are rejected by the validator."
+        },
+        "annotation": {
+          "type": "string",
+          "description": "Path to the annotation file, relative to the dataset root. Same path rules as image."
+        },
+        "captureContext": {
+          "type": "string",
+          "enum": ["shelf", "pickup", "return", "cart_insertion", "exit"]
+        },
+        "planogramZone": { "type": "string" },
+        "storeId": { "type": "string" },
+        "tenantId": { "type": "string" }
+      }
+    }
+  }
+}

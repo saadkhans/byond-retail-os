@@ -25,3 +25,88 @@ Thumbs.db
 # Local editor/agent state — commit .claude/commands/, never local settings
 .vscode/
 .claude/settings.local.json
+
+# ML datasets, models, and media (Phase 8)
+# Datasets and trained weights are external artifacts, never committed.
+ml/datasets/**/raw/
+ml/datasets/**/processed/
+ml/models/
+ml/runs/
+ml/outputs/
+ml/checkpoints/
+ml/**/.cache/
+
+# Each dataset directory is ignored wholesale: misplaced extracted
+# annotations, manifests, labels, and CSV/JSON/XML files can never be
+# staged even when archives are extracted one level too high (outside
+# raw/ or processed/). Only each dataset's README.md is tracked. Real
+# BYOND capture data (customer labels, tenant/store identifiers) must
+# never be committed. Synthetic examples live in ml/examples/, which
+# stays trackable — no pattern here touches it.
+ml/datasets/byond-custom/**
+!ml/datasets/byond-custom/README.md
+ml/datasets/rpc/**
+!ml/datasets/rpc/README.md
+ml/datasets/sku-110k/**
+!ml/datasets/sku-110k/README.md
+
+# Model weight files — never committed, wherever they appear (global,
+# not scoped to ml/, since a model artifact could land anywhere by mistake).
+# Patterns use character classes so uppercase/mixed-case artifacts (e.g.
+# detector.PT, model.ONNX) are caught on case-sensitive filesystems.
+*.[pP][tT]
+*.[oO][nN][nN][xX]
+*.[eE][nN][gG][iI][nN][eE]
+*.[sS][aA][fF][eE][tT][eE][nN][sS][oO][rR][sS]
+*.[wW][eE][iI][gG][hH][tT][sS]
+*.[cC][kK][pP][tT]
+*.[pP][tT][hH]
+*.[hH]5
+*.[tT][fF][lL][iI][tT][eE]
+*.[mM][lL][mM][oO][dD][eE][lL]
+*.[pP][bB]
+*.[kK][eE][rR][aA][sS]
+*.[jJ][oO][bB][lL][iI][bB]
+*.[gG][gG][uU][fF]
+
+# Media files scoped to ml/ only — repo-wide *.png/*.jpg would swallow
+# future web/app image assets, so these patterns are deliberately
+# restricted to the ml/ workspace.
+# *.bin is also scoped to ml/ only (not global): repo-wide *.bin could
+# swallow legitimate non-ML binaries, and Hugging Face-style
+# pytorch_model.bin files would land under ml/.
+# All patterns in this block use character classes so uppercase/mixed-case
+# artifacts (e.g. capture.JPG, clip.MP4) are caught on case-sensitive
+# filesystems, same as the model weight extensions above.
+ml/**/*.[bB][iI][nN]
+ml/**/*.[jJ][pP][gG]
+ml/**/*.[jJ][pP][eE][gG]
+ml/**/*.[pP][nN][gG]
+ml/**/*.[wW][eE][bB][pP]
+ml/**/*.[mM][pP]4
+ml/**/*.[mM][oO][vV]
+ml/**/*.[aA][vV][iI]
+ml/**/*.[mM][kK][vV]
+ml/**/*.[bB][mM][pP]
+ml/**/*.[tT][iI][fF]
+ml/**/*.[tT][iI][fF][fF]
+ml/**/*.[gG][iI][fF]
+ml/**/*.[wW][eE][bB][mM]
+ml/**/*.[hH][eE][iI][cC]
+ml/**/*.[hH][eE][iI][fF]
+ml/**/*.[aA][vV][iI][fF]
+ml/**/*.[mM][pP][eE][gG]
+ml/**/*.[mM][pP][gG]
+
+# Numeric/tabular dataset blobs scoped to ml/ — same reasoning as media.
+ml/**/*.[nN][pP][yY]
+ml/**/*.[nN][pP][zZ]
+ml/**/*.[pP][aA][rR][qQ][uU][eE][tT]
+ml/**/*.[pP][kK][lL]
+ml/**/*.[pP][iI][cC][kK][lL][eE]
+
+# Python noise (ml/ workspace)
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/

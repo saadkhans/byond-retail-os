@@ -1,0 +1,46 @@
+{
+  "datasetName": "byond-demo-store",
+  "datasetVersion": "0.1.0",
+  "source": "byond-custom",
+  "licenseNotes": "Synthetic example data owned by BYOND; not derived from any third-party dataset.",
+  "classes": [
+    { "classId": 0, "label": "cola-330", "sku": "COLA-330" },
+    { "classId": 1, "label": "chips-50", "sku": "CHIPS-50" }
+  ],
+  "labels": {
+    "tenantId": "tenant-demo",
+    "storeId": "store-demo-001",
+    "planogramZone": "aisle-3-shelf-2"
+  },
+  "splits": {
+    "train": [
+      {
+        "image": "raw/products/cola-330-0001.jpg",
+        "annotation": "annotations/cola-330-0001.json",
+        "captureContext": "shelf",
+        "storeId": "store-demo-001",
+        "planogramZone": "aisle-3-shelf-2"
+      },
+      {
+        "image": "raw/pickup/chips-50-0002.jpg",
+        "annotation": "annotations/chips-50-0002.json",
+        "captureContext": "pickup",
+        "storeId": "store-demo-001"
+      }
+    ],
+    "val": [
+      {
+        "image": "raw/products/cola-330-0003.jpg",
+        "annotation": "annotations/cola-330-0003.json",
+        "captureContext": "shelf"
+      }
+    ],
+    "test": [
+      {
+        "image": "raw/pickup/chips-50-0004.jpg",
+        "annotation": "annotations/chips-50-0004.json",
+        "captureContext": "pickup"
+      }
+    ]
+  }
+}
