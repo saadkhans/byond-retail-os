@@ -294,6 +294,126 @@ describe('payments module backfill migration', () => {
   });
 });
 
+describe('inference migration hardening', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260726000000_inference',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('makes adapter output append-only at the database level', () => {
+    expect(sql).toContain('CREATE FUNCTION prevent_inference_result_mutation()');
+    expect(sql).toContain('BEFORE UPDATE OR DELETE ON "InferenceResult"');
+    expect(sql).toContain('BEFORE TRUNCATE ON "InferenceResult"');
+    expect(sql).toContain(
+      'CREATE FUNCTION prevent_inference_candidate_mutation()',
+    );
+    expect(sql).toContain('BEFORE UPDATE OR DELETE ON "InferenceCandidate"');
+    expect(sql).toContain('BEFORE TRUNCATE ON "InferenceCandidate"');
+  });
+
+  it('constrains priorities, deltas, scores, and ranks with CHECK constraints', () => {
+    expect(sql).toContain('InferenceJob_priority_range_check');
+    expect(sql).toContain('CHECK ("priority" >= 0 AND "priority" <= 1000)');
+    expect(sql).toContain('InferenceResult_quantityDelta_nonzero_check');
+    expect(sql).toContain('CHECK ("quantityDelta" <> 0)');
+    expect(sql).toContain('InferenceResult_return_direction_check');
+    expect(sql).toContain(
+      `CHECK (("quantityDelta" < 0) = ("eventType" = 'PRODUCT_RETURN'))`,
+    );
+    expect(sql).toContain('InferenceResult_evidenceScore_range_check');
+    expect(sql).toContain('InferenceCandidate_rank_positive_check');
+    expect(sql).toContain('InferenceCandidate_score_range_check');
+  });
+
+  it('keeps lifecycle timestamps and error codes coherent with the status', () => {
+    for (const constraint of [
+      'InferenceJob_queued_timestamps_check',
+      'InferenceJob_running_timestamps_check',
+      'InferenceJob_succeeded_timestamps_check',
+      'InferenceJob_terminal_completedAt_check',
+      'InferenceJob_error_only_failed_check',
+      'InferenceJob_visionEvent_succeeded_check',
+    ]) {
+      expect(sql).toContain(constraint);
+    }
+  });
+
+  it('enforces same-tenant references with composite foreign keys', () => {
+    for (const constraint of [
+      'InferenceJob_location_same_tenant_fkey',
+      'InferenceJob_unit_same_tenant_fkey',
+      'InferenceJob_device_same_tenant_fkey',
+      'InferenceJob_session_same_tenant_fkey',
+      'InferenceJob_visionEvent_same_tenant_fkey',
+      'InferenceResult_job_same_tenant_fkey',
+      'InferenceCandidate_result_same_tenant_fkey',
+    ]) {
+      expect(sql).toContain(constraint);
+    }
+  });
+
+  it('keeps idempotency keys unique per tenant and the claim ordering indexed', () => {
+    expect(sql).toContain('InferenceJob_tenantId_idempotencyKey_key');
+    expect(sql).toContain(
+      'InferenceJob_tenantId_status_priority_requestedAt_id_idx',
+    );
+  });
+
+  it('never cascades deletes into inference tables', () => {
+    expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
+  });
+});
+
+describe('inference module backfill migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260726000001_inference_module_backfill',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('activates a pre-existing inference module row instead of leaving it inactive', () => {
+    expect(sql).toContain('ON CONFLICT ("code") DO UPDATE SET');
+    expect(sql).toContain('"isActive" = true');
+    expect(sql).not.toMatch(/DO UPDATE SET[^;]*"id"\s*=/);
+  });
+
+  it('is idempotent and never overwrites a tenant admin choice', () => {
+    expect(sql).toContain('ON CONFLICT ("tenantId", "moduleId") DO NOTHING');
+    expect(sql).not.toMatch(/ON CONFLICT \("tenantId", "moduleId"\) DO UPDATE/);
+  });
+
+  it('enables inference for every pre-existing tenant with deterministic ids', () => {
+    expect(sql).toContain(`'tm-' || md5(t."id" || ':inference')`);
+    expect(sql).toContain(`WHERE pm."code" = 'inference'`);
+  });
+
+  it('backfills the inference permission catalog rows (migrate deploy runs without seed)', () => {
+    for (const code of [
+      'inference:read',
+      'inference:manage',
+      'inference:simulate',
+      'inference:apply',
+    ]) {
+      expect(sql).toContain(`'${code}'`);
+    }
+  });
+});
+
 describe('checkout line soft-delete migration hardening', () => {
   const sql = readFileSync(
     join(

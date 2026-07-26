@@ -24,6 +24,17 @@ The computer vision pipeline (`services/cv-pipeline/`) only ever *proposes* even
 ### Human review for low-confidence events
 Every proposed event carries a confidence score. Events below the confidence threshold are routed to a human review queue instead of being auto-applied. Thresholds are tenant-configurable.
 
+### Event-driven CV inference (Phase 9 foundation)
+The CV pipeline is event-driven, in three tiers, so heavy models never run on every full-resolution frame:
+
+1. **Continuous lightweight tracking** — people/hand/shelf-zone tracking runs on a DOWNSCALED stream (e.g. 640p) on the smart camera, a local edge box, or a server. It produces tracking metadata, never product decisions.
+2. **Trigger layer** — only meaningful moments (a hand entering a shelf zone, a suspected shelf change, a suspected cart insertion, a customer exit) create an **inference job**.
+3. **Heavy inference on triggered crops only** — product recognition / SKU classification (and OCR where useful) runs on HIGH-RESOLUTION crops from the 6MP/8MP source, only for triggered jobs. A VLM is a fallback VERIFIER that receives cropped product patches only — never full-store video.
+
+Phase 9 ships the cloud-side foundation for tier 2→3: a provider-neutral `InferenceJob` domain with a deterministic, tenant-safe, database-backed queue behind an `InferenceQueuePort` abstraction, a provider-neutral `InferenceAdapter` contract, and a SIMULATED adapter only. A successful result converts into a Phase 7 `VisionEvent` through the existing ingest contract (PENDING_REVIEW; the basket changes only on an approved review). The app database stores references, ids, scores, candidates, and safe metadata — never raw media, storage keys, signed URLs, or credentials.
+
+**Future adapters (explicitly NOT implemented in Phase 9 — no runtime dependency was added and no model executes):** message-broker queue adapters (e.g. Redis/NATS/MQTT/Kafka) behind `InferenceQueuePort`; batched model serving (Triton-style) behind `InferenceAdapter`; camera ingestion feeds (GStreamer-style pipelines, with DeepStream as an optional premium NVIDIA adapter and FFmpeg as a utility layer) feeding the trigger layer; Celery/Redis-style workers for offline/background jobs; and smart cameras streaming lightweight tracking metadata directly. Each arrives as an adapter behind the Phase 9 contracts, never as a rewrite.
+
 ## Swappability
 
 ### Model-swappable

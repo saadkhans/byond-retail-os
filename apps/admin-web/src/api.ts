@@ -467,6 +467,68 @@ export interface VisionEvent {
   evidenceBundle?: EvidenceBundle | null;
 }
 
+// Phase 9 — provider-neutral CV inference jobs. No real ML runs here: jobs
+// are simulated via the admin UI, and successful results convert into
+// Phase 7 vision events. Only safe descriptors — never raw media.
+export type InferenceJobType =
+  | 'TRACKING_EVENT'
+  | 'SHELF_AUDIT'
+  | 'PRODUCT_RECOGNITION'
+  | 'OCR_REVIEW'
+  | 'VLM_REVIEW'
+  | 'EXIT_RECONCILIATION';
+
+export type InferenceJobStatus =
+  | 'QUEUED'
+  | 'RUNNING'
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'CANCELLED';
+
+export interface InferenceCandidate {
+  id: string;
+  rank: number;
+  sku: string;
+  label: string | null;
+  score: number;
+}
+
+export interface InferenceResult {
+  id: string;
+  eventType: VisionEventType;
+  quantityDelta: number;
+  evidenceScore: number | null;
+  evidenceQuality: 'LOW' | 'MEDIUM' | 'HIGH' | null;
+  modelKey: string | null;
+  modelVersion: string | null;
+  candidates: InferenceCandidate[];
+  createdAt: string;
+}
+
+export interface InferenceJob {
+  id: string;
+  jobType: InferenceJobType;
+  status: InferenceJobStatus;
+  priority: number;
+  requestedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  locationId: string | null;
+  unitId: string | null;
+  deviceId: string | null;
+  sessionId: string | null;
+  sourceType: string;
+  sourceId: string | null;
+  adapterKey: string | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  idempotencyKey: string | null;
+  visionEventId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  result?: InferenceResult | null;
+}
+
 export interface Order extends EvidenceRefs {
   id: string;
   orderNumber: string;

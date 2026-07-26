@@ -1,0 +1,96 @@
+import { EvidenceSourceType, InferenceJobType, Prisma } from '@prisma/client';
+import { AuditEntry } from '../../common/audit/audit-log.service';
+import { NormalizedInferenceResult } from '../adapters/inference-adapter';
+
+/** Job creation input, already validated/screened by the service. */
+export interface EnqueueJobInput {
+  locationId?: string;
+  unitId?: string;
+  deviceId?: string;
+  sessionId?: string;
+  jobType: InferenceJobType;
+  priority: number;
+  sourceType?: EvidenceSourceType;
+  sourceId?: string;
+  inputDescriptor?: Prisma.InputJsonValue;
+  idempotencyKey?: string;
+  createdById?: string;
+}
+
+export type EnqueueRejection =
+  | 'location-not-found'
+  | 'unit-not-found'
+  | 'unit-location-mismatch'
+  | 'device-not-found'
+  | 'device-unit-mismatch'
+  | 'session-not-found'
+  | 'session-unit-mismatch';
+
+export interface FailJobInput {
+  errorCode: string;
+  errorMessage?: string;
+}
+
+export type TransitionRejection = 'not-claimable' | 'not-running' | 'terminal';
+
+/**
+ * The queue abstraction: enqueue, claim, and drive the job lifecycle.
+ * Phase 9 ships exactly one implementation — the database-backed
+ * PrismaInferenceQueue (deterministic ordering: priority DESC, requestedAt
+ * ASC, id ASC; tenant-safe compare-and-set transitions). Message-broker
+ * adapters can implement this same port in later phases without touching
+ * core code; no broker dependency exists today.
+ *
+ * The generic parameter object shapes are defined by the repository module
+ * (Prisma payload types); the port stays engine-neutral by treating the job
+ * detail as an opaque generic.
+ */
+export abstract class InferenceQueuePort<TJobDetail = unknown> {
+  /** Create (or idempotently replay) a QUEUED job. */
+  abstract enqueue(
+    tenantId: string,
+    input: EnqueueJobInput,
+    buildAuditEntry: (job: TJobDetail) => AuditEntry,
+  ): Promise<
+    { job: TJobDetail; replayed: boolean } | EnqueueRejection
+  >;
+
+  /**
+   * Claim the highest-priority QUEUED job (priority DESC, requestedAt ASC,
+   * id ASC) and flip it RUNNING under the given adapter. Returns null when
+   * the tenant's queue is empty.
+   */
+  abstract claimNext(
+    tenantId: string,
+    adapterKey: string,
+    buildAuditEntry: (before: TJobDetail, after: TJobDetail) => AuditEntry,
+    jobType?: InferenceJobType,
+  ): Promise<TJobDetail | null>;
+
+  /** QUEUED → RUNNING for a specific job (compare-and-set on status). */
+  abstract markRunning(
+    tenantId: string,
+    jobId: string,
+    adapterKey: string,
+    buildAuditEntry: (before: TJobDetail, after: TJobDetail) => AuditEntry,
+  ): Promise<TJobDetail | TransitionRejection | null>;
+
+  /**
+   * RUNNING → SUCCEEDED, persisting the normalized result and its ranked
+   * candidates atomically with the status flip.
+   */
+  abstract complete(
+    tenantId: string,
+    jobId: string,
+    result: NormalizedInferenceResult,
+    buildAuditEntry: (before: TJobDetail, after: TJobDetail) => AuditEntry,
+  ): Promise<TJobDetail | TransitionRejection | null>;
+
+  /** QUEUED/RUNNING → FAILED with a stable error code. */
+  abstract fail(
+    tenantId: string,
+    jobId: string,
+    input: FailJobInput,
+    buildAuditEntry: (before: TJobDetail, after: TJobDetail) => AuditEntry,
+  ): Promise<TJobDetail | TransitionRejection | null>;
+}

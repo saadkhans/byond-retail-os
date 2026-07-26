@@ -125,6 +125,18 @@ async function bootstrap(): Promise<void> {
           'phase.',
       )
       .addTag(
+        'inference',
+        'Provider-neutral CV inference jobs (Phase 9): QUEUED → RUNNING → ' +
+          'SUCCEEDED/FAILED lifecycle over a database-backed queue ' +
+          '(priority DESC, requestedAt ASC — deterministic), a SIMULATED ' +
+          'adapter only (no real model execution, no runtime ML/video ' +
+          'dependency), append-only results with ranked SKU candidates, ' +
+          'and a one-shot idempotent conversion of successful results into ' +
+          'Phase 7 vision events (PENDING_REVIEW; never touches the ' +
+          'basket). Jobs carry SAFE input descriptors only — no raw media, ' +
+          'no storage keys or signed URLs, no credentials.',
+      )
+      .addTag(
         'edge-registration',
         'Safe device/edge registration foundation: an admin issues a ' +
           'one-time, expiring, serial-bound token (only its SHA-256 hash ' +

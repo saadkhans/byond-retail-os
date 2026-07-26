@@ -8,6 +8,7 @@ import { RequestIdMiddleware } from './common/request-id.middleware';
 import { validateEnv } from './config/env.validation';
 import { DevicesModule } from './devices/devices.module';
 import { HealthModule } from './health/health.module';
+import { InferenceModule } from './inference/inference.module';
 import { InventoryModule } from './inventory/inventory.module';
 import { LocationsModule } from './locations/locations.module';
 import { OrdersModule } from './orders/orders.module';
@@ -38,6 +39,7 @@ import { VisionModule } from './vision/vision.module';
     OrdersModule,
     PaymentsModule,
     VisionModule,
+    InferenceModule,
   ],
 })
 export class AppModule implements NestModule {

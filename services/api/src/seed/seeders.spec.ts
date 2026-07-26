@@ -34,11 +34,11 @@ describe('platform module catalog', () => {
     expect(new Set(codes).size).toBe(codes.length);
   });
 
-  it('default-enables core plus the shipped inventory, devices, checkout, payments, and cv modules', () => {
+  it('default-enables core plus the shipped inventory, devices, checkout, payments, cv, and inference modules', () => {
     // inventory (Phase 3), devices (Phase 4), checkout (Phase 5), payments
-    // (Phase 6), and cv (Phase 7) are default-enabled so their routes are
-    // reachable for every new tenant (the only enable endpoint is
-    // tenant-scoped and needs a
+    // (Phase 6), cv (Phase 7), and inference (Phase 9) are default-enabled so
+    // their routes are reachable for every new tenant (the only enable
+    // endpoint is tenant-scoped and needs a
     // module:manage tenant user, which a brand-new tenant does not yet have).
     expect(DEFAULT_ENABLED_MODULE_CODES).toEqual([
       'core',
@@ -47,6 +47,7 @@ describe('platform module catalog', () => {
       'checkout',
       'payments',
       'cv',
+      'inference',
     ]);
   });
 
@@ -66,7 +67,8 @@ describe('platform module catalog', () => {
     // checkout (sessions, basket lines, order foundation): Phase 5;
     // payments (intents, simulated auth/capture, reconciliation): Phase 6;
     // cv (vision events, evidence bundle lineage, review → basket flow):
-    // Phase 7.
+    // Phase 7; inference (jobs, queue foundation, simulated adapter):
+    // Phase 9.
     expect(active).toEqual([
       'core',
       'inventory',
@@ -74,6 +76,7 @@ describe('platform module catalog', () => {
       'checkout',
       'payments',
       'cv',
+      'inference',
     ]);
   });
 

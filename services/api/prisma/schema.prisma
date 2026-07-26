@@ -214,6 +214,10 @@ model Tenant {
   paymentCaptures              PaymentCapture[]
   paymentEvents                PaymentEvent[]
   paymentReconciliationRecords PaymentReconciliationRecord[]
+
+  inferenceJobs       InferenceJob[]
+  inferenceResults    InferenceResult[]
+  inferenceCandidates InferenceCandidate[]
 }
 
 model User {
@@ -251,6 +255,8 @@ model User {
   paymentCapturesCreated       PaymentCapture[]              @relation("PaymentCaptureActor")
   paymentEventsCreated         PaymentEvent[]                @relation("PaymentEventActor")
   paymentReconciliationCreated PaymentReconciliationRecord[] @relation("PaymentReconciliationActor")
+
+  inferenceJobsCreated InferenceJob[] @relation("InferenceJobActor")
 
   @@index([tenantId, status])
 }
@@ -338,6 +344,7 @@ model Location {
   checkoutSessions   CheckoutSession[]
   orders             Order[]
   visionEvents       VisionEvent[]
+  inferenceJobs      InferenceJob[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -556,6 +563,7 @@ model RetailUnit {
   checkoutSessions CheckoutSession[]
   orders           Order[]
   visionEvents     VisionEvent[]
+  inferenceJobs    InferenceJob[]
 
   @@unique([tenantId, code])
   // Enables composite same-tenant FKs (devices must reference a unit of the
@@ -599,6 +607,7 @@ model Device {
   unit   RetailUnit @relation(fields: [unitId], references: [id], onDelete: Restrict)
   checkoutSessions CheckoutSession[]
   visionEvents     VisionEvent[]
+  inferenceJobs    InferenceJob[]
 
   @@unique([tenantId, serialNumber])
   @@unique([id, tenantId])
@@ -751,6 +760,7 @@ model CheckoutSession {
   order     Order?
   visionEvents   VisionEvent[]
   paymentIntents PaymentIntent[]
+  inferenceJobs  InferenceJob[]
 
   // Enables composite same-tenant FKs (lines/orders must reference a session
   // of the SAME tenant) — mirrors the Phase 3/4 hardening pattern.
@@ -1347,6 +1357,7 @@ model VisionEvent {
   createdBy      User?            @relation("VisionEventActor", fields: [createdById], references: [id], onDelete: Restrict)
   candidates VisionEventCandidate[]
   review     VisionEventReview?
+  inferenceJobs InferenceJob[]
 
   @@unique([id, tenantId])
   @@unique([tenantId, idempotencyKey])
@@ -1422,4 +1433,149 @@ model VisionEventReview {
   @@unique([id, tenantId])
   @@unique([tenantId, eventId])
   @@index([tenantId, createdAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9 — CV inference adapter & event queue foundation.
+//
+// Provider-neutral by construction: adapterKey/modelKey/modelVersion are
+// OPAQUE strings, jobs carry a SAFE input descriptor (screened JSON — no raw
+// media, no storage keys/signed URLs, no credentials), and no runtime ML or
+// video dependency exists. A job is the unit of work between the (future)
+// lightweight tracking/trigger layer and heavy crop inference; a SUCCEEDED
+// job's result converts into a Phase 7 VisionEvent via the existing ingest
+// contract — inference NEVER touches the basket or inventory itself.
+// ---------------------------------------------------------------------------
+
+enum InferenceJobType {
+  TRACKING_EVENT
+  SHELF_AUDIT
+  PRODUCT_RECOGNITION
+  OCR_REVIEW
+  VLM_REVIEW
+  EXIT_RECONCILIATION
+}
+
+enum InferenceJobStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+// A queued unit of inference work. Lifecycle QUEUED → RUNNING →
+// SUCCEEDED/FAILED (CANCELLED reserved for a future cancel path); terminal
+// statuses never transition again. The job row is the queue entry: claiming
+// is a guarded compare-and-set on status, ordered by priority DESC then
+// requestedAt ASC then id ASC (deterministic).
+model InferenceJob {
+  id       String @id @default(cuid())
+  tenantId String
+  // Optional store/unit/device/session context. Conversion to a Phase 7
+  // VisionEvent requires locationId + unitId (the vision ingest contract).
+  locationId String?
+  unitId     String?
+  deviceId   String?
+  sessionId  String?
+  jobType InferenceJobType
+  status  InferenceJobStatus @default(QUEUED)
+  // Queue priority, 0..1000 (CHECK in migration SQL); higher runs first.
+  priority    Int      @default(100)
+  requestedAt DateTime @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+  // Opaque, vendor-neutral provenance (same closed enum as Phase 7).
+  sourceType EvidenceSourceType @default(VISION)
+  sourceId   String?
+  // Which registered adapter claimed the job (opaque key, e.g. "simulated").
+  adapterKey String?
+  // SAFE, NON-SECRET input descriptor only (screened before persistence):
+  // trigger context, crop/zone references by id, frame counts — never raw
+  // media, media/storage URLs, signed URLs, or credentials.
+  inputDescriptor Json?
+  // FAILED only: a stable UPPER_SNAKE error code plus a screened message.
+  errorCode    String?
+  errorMessage String?
+  // Tenant-scoped creation idempotency: at-least-once trigger delivery
+  // replays the original job instead of duplicating it.
+  idempotencyKey String?
+  // Set once by the to-vision-event conversion; conversion is one-shot and
+  // replays the linked event afterwards.
+  visionEventId String?
+  createdById   String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  tenant      Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location    Location?        @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit        RetailUnit?      @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  device      Device?          @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  session     CheckoutSession? @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  visionEvent VisionEvent?     @relation(fields: [visionEventId], references: [id], onDelete: Restrict)
+  createdBy   User?            @relation("InferenceJobActor", fields: [createdById], references: [id], onDelete: Restrict)
+  result InferenceResult?
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, idempotencyKey])
+  // Matches the queue claim ordering (priority DESC, requestedAt ASC, id ASC)
+  // under the status predicate.
+  @@index([tenantId, status, priority(sort: Desc), requestedAt, id])
+  @@index([tenantId, requestedAt(sort: Desc), id(sort: Desc)])
+  @@index([tenantId, jobType])
+  @@index([tenantId, sessionId])
+  @@index([tenantId, unitId])
+}
+
+// The normalized outcome of a SUCCEEDED job: a Phase 7-compatible event
+// suggestion (eventType + signed quantityDelta) with ranked SKU candidates.
+// quantityDelta is never zero and negative ONLY for PRODUCT_RETURN (CHECKs
+// in migration SQL) — the VisionEvent conversion emits abs(quantityDelta),
+// the sign is carried by the event type, matching the Phase 8 mapper.
+// Append-only (triggers in migration SQL): what the adapter produced is
+// evidence and never changes.
+model InferenceResult {
+  id       String @id @default(cuid())
+  tenantId String
+  jobId    String @unique
+  eventType     VisionEventType
+  quantityDelta Int
+  evidenceScore   Float?
+  evidenceQuality EvidenceQuality?
+  // Opaque model/provider metadata (screened; never interpreted).
+  modelKey     String?
+  modelVersion String?
+  // SAFE, NON-SECRET normalized extras only (screened before persistence).
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  tenant Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  job    InferenceJob @relation(fields: [jobId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  candidates InferenceCandidate[]
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, jobId])
+}
+
+// Ranked SKU candidate produced by an adapter (rank 1 = strongest). SKUs are
+// normalized (uppercase) model-output strings — they resolve against the
+// tenant catalog at VisionEvent conversion time, exactly like the Phase 8
+// mapper output. Append-only (triggers in migration SQL).
+model InferenceCandidate {
+  id       String @id @default(cuid())
+  tenantId String
+  resultId String
+  rank     Int
+  sku      String
+  label    String?
+  // Normalized [0, 1] confidence, rounded to 4 decimals by the adapter.
+  score     Float
+  createdAt DateTime @default(now())
+
+  tenant Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  result InferenceResult @relation(fields: [resultId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, resultId, rank])
+  @@unique([tenantId, resultId, sku])
 }

@@ -112,6 +112,24 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
     isActive: true,
   },
   {
+    code: 'inference',
+    name: 'CV Inference',
+    description:
+      'Provider-neutral CV inference jobs, the database-backed queue ' +
+      'foundation, the simulated adapter, and the conversion of successful ' +
+      'results into Phase 7 vision events (no runtime ML or video ' +
+      'dependency; no real model execution).',
+    // Shipped in Phase 9 and DEFAULT-ENABLED for the same reason as
+    // inventory/devices/checkout/payments/cv (see above): the only enable
+    // endpoint is @TenantOnly(), so leaving this false would strand new
+    // tenants behind 403s. RBAC still gates every route independently.
+    // Tenants that existed BEFORE Phase 9 are covered by the
+    // 20260726000001_inference_module_backfill migration — defaultEnabled
+    // only applies at tenant creation time.
+    defaultEnabled: true,
+    isActive: true,
+  },
+  {
     code: 'esl',
     name: 'Electronic Shelf Labels',
     description: 'ESL vendor integration (later phase).',

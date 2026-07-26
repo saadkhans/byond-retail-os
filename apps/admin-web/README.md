@@ -7,6 +7,9 @@ minimal manual test flow — create a session, add/update/remove basket lines,
 and complete it into an order. Orders show no payment state: Phase 5 is the
 order foundation only, and evidence/source IDs shown on sessions, lines, and
 orders are vendor-neutral placeholders for future CV/VLM adapters.
+Inference jobs (Phase 9) add a provider-neutral queue view with a simulated
+create → start → complete/fail flow and conversion into a CV event — no real
+model runs and no raw media, only safe descriptors.
 Deliberately unpolished — the scope is visibility, not UI product work.
 
 ## Run locally
