@@ -67,9 +67,12 @@ const FORBIDDEN_MEDIA_SUFFIXES = [
   'base64',
 ];
 
-// Inline media smuggled as a VALUE under a harmless key: data: URIs with a
-// base64 payload are rejected wherever they appear.
-const DATA_URI_VALUE = /data:[a-z0-9.+-]+\/[a-z0-9.+-]+;base64,/i;
+// Inline media smuggled as a VALUE under a harmless key: EVERY data: URI
+// with a mediatype is rejected wherever it appears — base64 or not
+// ("data:image/jpeg;base64,...", "data:image/svg+xml,%3Csvg",
+// "data:image/jpeg,/9j/..."): the payload after the comma IS the media.
+// Prose like "data: pending" has no type/subtype and stays harmless.
+const DATA_URI_VALUE = /\bdata:[a-z0-9.+-]+\/[a-z0-9.+-]+[;,]/i;
 
 // A media/storage reference is rejected by its VALUE shape too, so an
 // innocuous key ({"cropId": "s3://bucket/frame.jpg"}) cannot smuggle one
@@ -80,9 +83,13 @@ const URI_SCHEME_VALUE = /[a-z][a-z0-9+.-]*:\/\//i;
 
 // Single-slash scheme forms (file:/tmp/clip, s3:/bucket/x) and protocol-
 // relative references (//cdn.host/frames/1) are addresses too; the scheme
-// list is explicit so dotted opaque ids ("v2:zone/7") are not caught.
+// list is explicit so dotted opaque ids ("v2:zone/7") are not caught. A
+// protocol-relative locator counts at the start OR after a whitespace/
+// quote/paren/punctuation boundary (" //cdn.host/x", "src=//cdn.host/x",
+// "ref,//cdn.host/x") — but "a//b/c" has no such boundary and stays an
+// opaque id.
 const SINGLE_SLASH_SCHEME_VALUE = /\b(?:file|s3|gs|https?|rtsp|rtmp|ftp):\//i;
-const PROTOCOL_RELATIVE_VALUE = /^\/\/[^/\s]+\//;
+const PROTOCOL_RELATIVE_VALUE = /(?:^|[\s"'(,=;:[{])\/\/[^/\s]+\//;
 
 // Media file extensions as ".ext" occurrences (word-bounded, case-
 // insensitive): a bare "frame.jpg" is a media reference even without a
@@ -123,29 +130,44 @@ function matchesForbiddenMediaShape(value: string): boolean {
 // never encodings this deep).
 const MAX_PERCENT_DECODE_DEPTH = 5;
 
-function isForbiddenMediaValue(value: string): boolean {
+/**
+ * The raw value plus every successful bounded percent-decode stage
+ * (stopping at stability, a decode failure, or the depth cap). Every
+ * REJECT-on-write screen over descriptor strings must run on EVERY stage —
+ * media shapes here, credential/PAN shapes in the service — or a single
+ * layer of encoding defeats the policy.
+ */
+export function percentDecodeStages(value: string): string[] {
+  const stages = [value];
   let current = value;
-  for (let depth = 0; depth <= MAX_PERCENT_DECODE_DEPTH; depth += 1) {
-    if (matchesForbiddenMediaShape(current)) {
-      return true;
-    }
+  for (let depth = 0; depth < MAX_PERCENT_DECODE_DEPTH; depth += 1) {
     if (!current.includes('%')) {
-      return false;
+      break;
     }
     let decoded: string;
     try {
       decoded = decodeURIComponent(current);
     } catch {
-      // Not valid percent-encoding; the checks already run on this stage
-      // stand.
-      return false;
+      // A single malformed sequence ("...%zz", trailing "%") must not veto
+      // screening of the VALID pairs around it: lenient decoders (Python's
+      // unquote, most gateways) decode those pairs anyway, so a smuggler
+      // could hide a PAN or locator behind one bad escape. Decode each
+      // valid %XX pair individually and keep going.
+      decoded = current.replace(/%([0-9a-f]{2})/gi, (_match, hex: string) =>
+        String.fromCharCode(parseInt(hex, 16)),
+      );
     }
     if (decoded === current) {
-      return false;
+      break;
     }
+    stages.push(decoded);
     current = decoded;
   }
-  return false;
+  return stages;
+}
+
+function isForbiddenMediaValue(value: string): boolean {
+  return percentDecodeStages(value).some(matchesForbiddenMediaShape);
 }
 
 function normalizeKey(key: string): string {

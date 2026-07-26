@@ -5,7 +5,10 @@ import {
   VisionEventType,
 } from '@prisma/client';
 import { InferenceAdapterInput, InferenceJobContext } from './inference-adapter';
-import { SimulatedInferenceAdapter } from './simulated.adapter';
+import {
+  roundScoreHalfEven,
+  SimulatedInferenceAdapter,
+} from './simulated.adapter';
 
 describe('SimulatedInferenceAdapter', () => {
   const adapter = new SimulatedInferenceAdapter();
@@ -152,6 +155,36 @@ describe('SimulatedInferenceAdapter', () => {
         ['HIGH', 1, 0.9877],
         ['LOW', 2, 0.1235],
       ]);
+    });
+
+    it('rounds half-to-even at 4 decimals, identical to Python round(x, 4)', () => {
+      // Binary-EXACT ties (multiples of 2^-5 / 2^-6): Python rounds these
+      // to the even neighbor, and so must we.
+      expect(roundScoreHalfEven(0.03125)).toBe(0.0312);
+      expect(roundScoreHalfEven(0.09375)).toBe(0.0938);
+      expect(roundScoreHalfEven(0.15625)).toBe(0.1562);
+      // Non-ties round to nearest exactly like Python.
+      expect(roundScoreHalfEven(0.92)).toBe(0.92);
+      expect(roundScoreHalfEven(0.41)).toBe(0.41);
+      expect(roundScoreHalfEven(0.123456)).toBe(0.1235);
+      expect(roundScoreHalfEven(0)).toBe(0);
+      expect(roundScoreHalfEven(1)).toBe(1);
+      expect(roundScoreHalfEven(0.99999)).toBe(1);
+      // Tiny near-tie doubles whose offset from the decimal tie point is
+      // below 1e-20 (ulp ~7e-21 here): a 20-digit decision base rounded
+      // these against Python; 25 digits resolve them. Values verified
+      // against CPython round(x, 4).
+      expect(roundScoreHalfEven(0.00005)).toBe(0.0001);
+      expect(roundScoreHalfEven(0.00035)).toBe(0.0003);
+      expect(roundScoreHalfEven(0.00095)).toBe(0.0009);
+      expect(roundScoreHalfEven(0.00645)).toBe(0.0065);
+      // The tie rule flows through candidate ranking and evidenceScore.
+      const result = adapter.normalizeResult({
+        ...baseInput,
+        detections: [{ sku: 'tie', confidence: 0.03125 }],
+      });
+      expect(result.candidates[0].score).toBe(0.0312);
+      expect(result.evidenceScore).toBe(0.0312);
     });
 
     it('caps the ranking at 20 candidates', () => {

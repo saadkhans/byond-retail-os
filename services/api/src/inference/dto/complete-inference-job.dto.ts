@@ -1,6 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { EvidenceQuality, VisionEventType } from '@prisma/client';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   IsArray,
@@ -16,7 +16,10 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { PG_INT_MAX } from '../../common/integer-bounds';
-import { IsOptionalNonNull } from '../../common/validation';
+import {
+  IsOptionalNonNull,
+  toNumberRejectingBlank,
+} from '../../common/validation';
 
 /**
  * One raw detection in the simulated model output. Field spellings match
@@ -40,7 +43,9 @@ export class InferenceDetectionDto {
     maximum: 1,
     description: 'Normalized confidence for THIS detection.',
   })
-  @Type(() => Number)
+  // Not @Type(() => Number): Number('') is 0, which would fabricate a
+  // VALID zero-confidence candidate from a blank string. Blank → NaN → 400.
+  @Transform(toNumberRejectingBlank)
   @IsNumber()
   @Min(0)
   @Max(1)
@@ -81,7 +86,7 @@ export class CompleteInferenceJobDto {
       'Signed quantity suggestion; never zero, negative only for ' +
       'PRODUCT_RETURN.',
   })
-  @Type(() => Number)
+  @Transform(toNumberRejectingBlank)
   @IsInt()
   @Min(-PG_INT_MAX)
   @Max(PG_INT_MAX)

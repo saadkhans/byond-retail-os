@@ -17,6 +17,44 @@ export const SIMULATED_ADAPTER_KEY = 'simulated';
 export const MAX_CANDIDATES = 20;
 
 /**
+ * Round a [0, 1] score to 4 decimals with round-half-to-EVEN, matching
+ * Python's round(x, 4) in the Phase 8 mapper exactly.
+ *
+ * Neither naive JS idiom is Python-compatible: round(x * 10000) / 10000
+ * introduces FP error in the scaled product (which can cross a .5 boundary
+ * the true value never reaches), and toFixed(4) rounds ties half-AWAY —
+ * Python emits round(0.03125, 4) === 0.0312 (down to even) while
+ * (0.03125).toFixed(4) === "0.0313". Binary-exact ties (0.03125, 0.09375,
+ * 0.15625, ...) are real inputs, so the tie rule matters.
+ *
+ * toFixed(25) is the decision base: the smallest positive 4-decimal tie
+ * point is 0.00005, where doubles are spaced ~7e-21 apart, so 25 decimal
+ * digits of the exact value always distinguish a true tie (…5 then zeros)
+ * from every neighboring double. (20 digits are NOT enough near zero —
+ * round(0.00005, 4) diverged from Python before this was widened.)
+ */
+export function roundScoreHalfEven(value: number): number {
+  const fixed = value.toFixed(25);
+  const dot = fixed.indexOf('.');
+  const integer = fixed.slice(0, dot);
+  const decimals = fixed.slice(dot + 1);
+  const kept = decimals.slice(0, 4);
+  const next = decimals[4] ?? '0';
+  const tail = decimals.slice(5);
+  const roundUp =
+    next > '5' ||
+    (next === '5' &&
+      (/[1-9]/.test(tail) || Number(kept[3]) % 2 === 1));
+  const truncated = Number(`${integer}.${kept}`);
+  if (!roundUp) {
+    return truncated;
+  }
+  // The +1e-4 step lands within ~1e-17 of an exact 4-decimal target, so
+  // re-rounding with toFixed(4) always snaps to the intended value.
+  return Number((truncated + 0.0001).toFixed(4));
+}
+
+/**
  * The Phase 9 simulated adapter: no real ML, no model download, no runtime
  * dependency. It takes caller-supplied sample model output, validates it
  * against the internal model-output contract, and normalizes detections into
@@ -24,11 +62,10 @@ export const MAX_CANDIDATES = 20;
  * (ml/scripts/sample_inference_to_vision_event.py): duplicate SKUs
  * collapse to the strongest detection (first seen wins a tie), candidates
  * sort by confidence descending, ranks are 1-based, scores round to 4
- * decimals, and the list caps at 20. Rounding uses toFixed(4) — the
- * correctly-rounded decimal of the double, like Python's round(x, 4) —
- * differing only on exact half-way ties, which no binary double at 4
- * decimal places can represent. Useful for tests and the admin UI;
- * real adapters replace `run()` in later phases.
+ * decimals with round-half-to-EVEN (identical to Python's round(x, 4),
+ * including binary-exact ties like 0.03125 → 0.0312 — see
+ * roundScoreHalfEven), and the list caps at 20. Useful for tests and the
+ * admin UI; real adapters replace `run()` in later phases.
  */
 @Injectable()
 export class SimulatedInferenceAdapter implements InferenceAdapter {
@@ -142,9 +179,7 @@ export class SimulatedInferenceAdapter implements InferenceAdapter {
       .map((candidate, index) => ({
         sku: candidate.sku,
         rank: index + 1,
-        // toFixed avoids the FP error of round(x * 10000) / 10000, whose
-        // scaled product can cross a .5 boundary the true value never reaches.
-        score: Number(candidate.confidence.toFixed(4)),
+        score: roundScoreHalfEven(candidate.confidence),
         ...(candidate.label !== undefined ? { label: candidate.label } : {}),
       }));
     return {

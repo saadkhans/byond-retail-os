@@ -215,6 +215,7 @@ describe('InferenceJobsService', () => {
       'device-unit-mismatch',
       'session-not-found',
       'session-unit-mismatch',
+      'session-location-mismatch',
       'creator-not-found',
     ])('maps %s to a 400', async (rejection) => {
       queue.enqueue.mockResolvedValue(rejection);
@@ -253,6 +254,13 @@ describe('InferenceJobsService', () => {
     it.each([
       ['sourceId', { sourceId: 'rtsp://admin:hunter2@cam.local/1' }],
       ['idempotencyKey', { idempotencyKey: 'password=hunter2' }],
+      [
+        // Opaque fields screen decode stages like the descriptor policy:
+        // an encoded card number in sourceId must not persist. (Fixture
+        // joined so no PAN-shaped literal exists on one line.)
+        'percent-encoded-PAN sourceId',
+        { sourceId: ['4111', '1111', '1111', '1111'].join('%20') },
+      ],
     ])(
       'rejects a credential-bearing %s before any write',
       async (_field, fields) => {
@@ -278,6 +286,29 @@ describe('InferenceJobsService', () => {
       [
         'a credential-bearing value',
         { stream: 'rtsp://admin:hunter2@cam.local/1' },
+      ],
+      [
+        // Encoded stages are screened for credential/PAN content too — a
+        // percent-encoded spaced test PAN must not persist. (Fixture built
+        // by joining groups so no PAN-shaped literal exists on one line.)
+        'a percent-encoded payment card number',
+        { note: ['4111', '1111', '1111', '1111'].join('%20') },
+      ],
+      [
+        'a percent-encoded credential fragment',
+        { ref: 'password%3Dhunter2' },
+      ],
+      [
+        // A malformed trailing escape must not veto screening of the valid
+        // pairs around it (lenient decoders recover them).
+        'an encoded card number shielded by one malformed escape',
+        { note: ['4111', '1111', '1111', '1111'].join('%20') + '%zz' },
+      ],
+      [
+        // KEY strings are screened like values: a card number used AS a key
+        // must not persist either.
+        'a payment card number used as a key',
+        { [['4111', '1111', '1111', '1111'].join(' ')]: 'x' },
       ],
     ])(
       'rejects an inputDescriptor carrying %s before any write',
@@ -305,6 +336,15 @@ describe('InferenceJobsService', () => {
             frameCount: 4,
           },
         },
+        actor,
+      );
+      expect(queue.enqueue).toHaveBeenCalled();
+    });
+
+    it('accepts a legitimately percent-encoded opaque value', async () => {
+      await service.create(
+        'tenant-a',
+        { ...baseCreate, inputDescriptor: { zone: 'crop%20zone%203' } },
         actor,
       );
       expect(queue.enqueue).toHaveBeenCalled();
@@ -939,6 +979,38 @@ describe('InferenceJobsService', () => {
         service.toVisionEvent('tenant-a', 'job-1', actor),
       ).rejects.toBeInstanceOf(ConflictException);
       expect(repository.linkVisionEvent).not.toHaveBeenCalled();
+    });
+
+    it('409s when an UNBOUND job replays a session-bound event', async () => {
+      // Strict null-binding rule: a squatted event bound to some session
+      // must never link to a job that referenced no session at all.
+      repository.findById.mockResolvedValue({
+        ...succeededJob,
+        sessionId: null,
+      });
+      visionEvents.ingest.mockResolvedValue({
+        ...visionEvent,
+        id: 'foreign-event',
+        sessionId: 'sess-9',
+      });
+      await expect(
+        service.toVisionEvent('tenant-a', 'job-1', actor),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(repository.linkVisionEvent).not.toHaveBeenCalled();
+    });
+
+    it('links an UNBOUND job to an unbound matching event', async () => {
+      repository.findById.mockResolvedValue({
+        ...succeededJob,
+        sessionId: null,
+      });
+      visionEvents.ingest.mockResolvedValue({
+        ...visionEvent,
+        sessionId: null,
+      });
+      const outcome = await service.toVisionEvent('tenant-a', 'job-1', actor);
+      expect(outcome.replayed).toBe(false);
+      expect(repository.linkVisionEvent).toHaveBeenCalled();
     });
 
     it('409s and does NOT link when the replayed event occurredAt mismatches', async () => {

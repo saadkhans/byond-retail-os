@@ -39,7 +39,7 @@ import {
   InferenceJobsRepository,
   InferenceJobWithRefs,
 } from './inference-jobs.repository';
-import { findForbiddenMediaPath } from './media-policy';
+import { findForbiddenMediaPath, percentDecodeStages } from './media-policy';
 import { InferenceQueuePort } from './queue/inference-queue.port';
 
 function prismaErrorCode(error: unknown): string | undefined {
@@ -71,7 +71,10 @@ function assertOpaque(field: string, value: string | undefined): void {
       `${field} must not contain control characters`,
     );
   }
-  if (containsSensitiveValue(value)) {
+  // Screen every percent-decode stage, not just the raw string — the same
+  // rule as the descriptor policy, so "4111%20..." cannot hide a PAN in an
+  // opaque id field either.
+  if (percentDecodeStages(value).some(containsSensitiveValue)) {
     throw new BadRequestException(
       `${field} must be an opaque value and must not contain credential- ` +
         `or payment-bearing content. Secrets belong in a dedicated secret ` +
@@ -111,6 +114,44 @@ function findControlCharacterPath(value: unknown, path = ''): string | null {
 }
 
 /**
+ * Percent-encoding must not hide credential- or payment-bearing content
+ * either: "4111%201111%20..." decodes to a spaced Luhn-valid PAN that the
+ * raw-string check cannot see. Every decode stage (same bounded discipline
+ * as the media policy) runs through containsSensitiveValue.
+ */
+function findEncodedSensitivePath(value: unknown, path = ''): string | null {
+  if (typeof value === 'string') {
+    return percentDecodeStages(value).some(containsSensitiveValue)
+      ? path || '(value)'
+      : null;
+  }
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const found = findEncodedSensitivePath(value[index], `${path}[${index}]`);
+      if (found) {
+        return found;
+      }
+    }
+    return null;
+  }
+  if (value !== null && typeof value === 'object') {
+    for (const [key, nested] of Object.entries(value)) {
+      const keyPath = path ? `${path}.${key}` : key;
+      // KEY strings are attacker-controlled text too: a PAN or credential
+      // used AS a key ({"4111 ...": "x"}) must be rejected like a value.
+      if (percentDecodeStages(key).some(containsSensitiveValue)) {
+        return keyPath;
+      }
+      const found = findEncodedSensitivePath(nested, keyPath);
+      if (found) {
+        return found;
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * Phase 9 input-descriptor policy: SAFE, TYPED references only. Raw media,
  * media/storage URLs, signed URLs, artifact descriptors, inline base64,
  * and credential-/payment-bearing content are all controlled 400s — the
@@ -137,7 +178,8 @@ function assertSafeInputDescriptor(
         `scope for Phase 9 MVP — reference crops/zones/frames by id only.`,
     );
   }
-  const sensitivePath = findSensitiveKeyPath(descriptor);
+  const sensitivePath =
+    findSensitiveKeyPath(descriptor) ?? findEncodedSensitivePath(descriptor);
   if (sensitivePath) {
     throw new BadRequestException(
       `inputDescriptor.${sensitivePath} must not carry credential- or ` +
@@ -240,6 +282,11 @@ export class InferenceJobsService {
     if (result === 'session-unit-mismatch') {
       throw new BadRequestException(
         `Checkout session "${dto.sessionId}" is not at unit "${dto.unitId}"`,
+      );
+    }
+    if (result === 'session-location-mismatch') {
+      throw new BadRequestException(
+        `Checkout session "${dto.sessionId}" is not in the job's store`,
       );
     }
     if (result === 'creator-not-found') {
@@ -633,7 +680,10 @@ export class InferenceJobsService {
       event.locationId === job.locationId &&
       event.unitId === job.unitId &&
       (event.deviceId ?? null) === (job.deviceId ?? null) &&
-      (job.sessionId === null || event.sessionId === job.sessionId) &&
+      // Strict: an UNBOUND job only matches an UNBOUND event — a session-
+      // bound squatted event must never link to (and later apply against)
+      // a session the job never referenced.
+      (event.sessionId ?? null) === (job.sessionId ?? null) &&
       event.sourceType === job.sourceType;
     if (!matches) {
       throw new ConflictException(

@@ -110,9 +110,11 @@ describe('PrismaInferenceQueue', () => {
           .mockResolvedValue({ id: 'dev-1', unitId: 'unit-a1' }),
       },
       checkoutSession: {
-        findFirst: jest
-          .fn()
-          .mockResolvedValue({ id: 'sess-1', unitId: 'unit-a1' }),
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'sess-1',
+          unitId: 'unit-a1',
+          locationId: 'loc-a1',
+        }),
       },
       user: { findFirst: jest.fn().mockResolvedValue({ id: 'user-1' }) },
     };
@@ -215,6 +217,7 @@ describe('PrismaInferenceQueue', () => {
       tx.checkoutSession.findFirst.mockResolvedValue({
         id: 'sess-1',
         unitId: 'unit-OTHER',
+        locationId: 'loc-a1',
       });
       await expect(
         queue.enqueue(
@@ -223,6 +226,47 @@ describe('PrismaInferenceQueue', () => {
           enqueueAudit,
         ),
       ).resolves.toBe('session-unit-mismatch');
+    });
+
+    it('rejects a session at a different store (reassigned unit) before any write', async () => {
+      // The unit moved stores after the session opened: same unit id, but
+      // the session kept its original store. Without this check the job
+      // would SUCCEED and then be permanently unconvertible (Phase 7
+      // rejects session-location-mismatch at ingest).
+      tx.checkoutSession.findFirst.mockResolvedValue({
+        id: 'sess-1',
+        unitId: 'unit-a1',
+        locationId: 'loc-OLD',
+      });
+      await expect(
+        queue.enqueue(
+          'tenant-a',
+          { ...baseEnqueue, sessionId: 'sess-1' },
+          enqueueAudit,
+        ),
+      ).resolves.toBe('session-location-mismatch');
+      expect(tx.inferenceJob.create).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
+    });
+
+    it("falls back to the unit's store when the job has no explicit store", async () => {
+      tx.checkoutSession.findFirst.mockResolvedValue({
+        id: 'sess-1',
+        unitId: 'unit-a1',
+        locationId: 'loc-OLD',
+      });
+      await expect(
+        queue.enqueue(
+          'tenant-a',
+          {
+            jobType: InferenceJobType.PRODUCT_RECOGNITION,
+            priority: 100,
+            unitId: 'unit-a1',
+            sessionId: 'sess-1',
+          },
+          enqueueAudit,
+        ),
+      ).resolves.toBe('session-location-mismatch');
     });
 
     it('validates the creator under the scoped tenant inside the transaction', async () => {

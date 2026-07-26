@@ -98,6 +98,7 @@ export class PrismaInferenceQueue
           return 'location-not-found' as const;
         }
       }
+      let unitLocationId: string | null = null;
       if (input.unitId) {
         const unit = await tx.retailUnit.findFirst({
           where: { id: input.unitId, tenantId: scopedTenantId },
@@ -109,6 +110,7 @@ export class PrismaInferenceQueue
         if (input.locationId && unit.locationId !== input.locationId) {
           return 'unit-location-mismatch' as const;
         }
+        unitLocationId = unit.locationId;
       }
       if (input.deviceId) {
         const device = await tx.device.findFirst({
@@ -125,7 +127,7 @@ export class PrismaInferenceQueue
       if (input.sessionId) {
         const session = await tx.checkoutSession.findFirst({
           where: { id: input.sessionId, tenantId: scopedTenantId },
-          select: { id: true, unitId: true },
+          select: { id: true, unitId: true, locationId: true },
         });
         if (!session) {
           return 'session-not-found' as const;
@@ -135,6 +137,15 @@ export class PrismaInferenceQueue
         // as vision ingest.
         if (input.unitId && session.unitId !== input.unitId) {
           return 'session-unit-mismatch' as const;
+        }
+        // The session's store must match the job's effective store too: a
+        // unit reassigned to a new store after the session opened would
+        // otherwise pass the unit check here and then fail Phase 7's
+        // session-location-mismatch at conversion — a SUCCEEDED job that
+        // can never convert. Fail fast at enqueue instead.
+        const effectiveLocationId = input.locationId ?? unitLocationId;
+        if (effectiveLocationId && session.locationId !== effectiveLocationId) {
+          return 'session-location-mismatch' as const;
         }
       }
       if (input.createdById) {

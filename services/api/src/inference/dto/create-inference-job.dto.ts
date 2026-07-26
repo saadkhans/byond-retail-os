@@ -1,6 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { EvidenceSourceType, InferenceJobType } from '@prisma/client';
-import { Type } from 'class-transformer';
+import { Transform } from 'class-transformer';
 import {
   IsEnum,
   IsInt,
@@ -11,7 +11,10 @@ import {
   Min,
   MinLength,
 } from 'class-validator';
-import { IsOptionalNonNull } from '../../common/validation';
+import {
+  IsOptionalNonNull,
+  toNumberRejectingBlank,
+} from '../../common/validation';
 
 export const MAX_PRIORITY = 1000;
 export const DEFAULT_PRIORITY = 100;
@@ -67,8 +70,10 @@ export class CreateInferenceJobDto {
     default: DEFAULT_PRIORITY,
     description: 'Queue priority; higher runs first.',
   })
+  // Not @Type(() => Number): Number('') is 0 — a blank string would become
+  // a silently VALID priority instead of a 400. Blank → NaN → rejected.
   @IsOptionalNonNull()
-  @Type(() => Number)
+  @Transform(toNumberRejectingBlank)
   @IsInt()
   @Min(0)
   @Max(MAX_PRIORITY)

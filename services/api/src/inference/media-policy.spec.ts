@@ -113,6 +113,26 @@ describe('inference media policy', () => {
         'ref',
       ],
       [
+        'a non-base64 data: URI (URL-encoded SVG)',
+        { icon: 'data:image/svg+xml,%3Csvg%20xmlns%3D%22a%22%3E' },
+        'icon',
+      ],
+      [
+        'a non-base64 data: URI (raw jpeg payload)',
+        { blob: 'data:image/jpeg,/9j/4AAQSkZJRg' },
+        'blob',
+      ],
+      [
+        'a protocol-relative locator after leading whitespace',
+        { ref: ' //cdn.host/frames/1' },
+        'ref',
+      ],
+      [
+        'a protocol-relative locator after explanatory text',
+        { note: 'see //cdn.host/frames/1' },
+        'note',
+      ],
+      [
         'a DOUBLY percent-encoded scheme',
         { ref: 's3%253A%252F%252Fbucket%252Fframe' },
         'ref',
@@ -127,6 +147,21 @@ describe('inference media policy', () => {
         { name: 'frame%252Ejpg' },
         'name',
       ],
+      [
+        'an encoded locator shielded by one malformed escape',
+        { ref: 's3%3A%2F%2Fbucket%2Fframe%zz' },
+        'ref',
+      ],
+      [
+        'a protocol-relative locator after a comma',
+        { ref: 'ref,//cdn.host/frames/1' },
+        'ref',
+      ],
+      [
+        'a protocol-relative locator after an equals sign',
+        { ref: 'src=//cdn.host/frames/1' },
+        'ref',
+      ],
     ])('rejects %s by VALUE', (_label, descriptor, path) => {
       expect(findForbiddenMediaPath(descriptor)).toBe(path);
     });
@@ -138,6 +173,8 @@ describe('inference media policy', () => {
       ['a version-style dotted value', { contract: 'v2.1.0' }],
       ['a namespaced id with one slash', { ref: 'v2:zone/7' }],
       ['a bare percent sign', { discount: '15% off shelf 3' }],
+      ['double slashes with no boundary', { path: 'a//b/c' }],
+      ['the word data: without a mediatype', { status: 'data: pending' }],
       ['an encoded literal percent', { discount: '100%25' }],
     ])('keeps %s', (_label, descriptor) => {
       expect(findForbiddenMediaPath(descriptor)).toBeNull();
