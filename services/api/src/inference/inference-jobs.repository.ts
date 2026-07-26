@@ -37,6 +37,8 @@ export const INFERENCE_JOB_LIST_SELECT = {
   requestedAt: true,
   startedAt: true,
   completedAt: true,
+  attempts: true,
+  leaseExpiresAt: true,
   sourceType: true,
   sourceId: true,
   adapterKey: true,

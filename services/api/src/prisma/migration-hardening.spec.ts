@@ -322,6 +322,8 @@ describe('inference migration hardening', () => {
   it('constrains priorities, deltas, scores, and ranks with CHECK constraints', () => {
     expect(sql).toContain('InferenceJob_priority_range_check');
     expect(sql).toContain('CHECK ("priority" >= 0 AND "priority" <= 1000)');
+    expect(sql).toContain('InferenceJob_attempts_nonnegative_check');
+    expect(sql).toContain('CHECK ("attempts" >= 0)');
     expect(sql).toContain('InferenceResult_quantityDelta_nonzero_check');
     expect(sql).toContain('CHECK ("quantityDelta" <> 0)');
     expect(sql).toContain('InferenceResult_return_direction_check');
@@ -344,6 +346,17 @@ describe('inference migration hardening', () => {
     ]) {
       expect(sql).toContain(constraint);
     }
+  });
+
+  it('ties the queue lease to the RUNNING status at the database level', () => {
+    expect(sql).toContain('InferenceJob_running_lease_check');
+    expect(sql).toContain(
+      `CHECK (("status" = 'RUNNING') = ("leaseExpiresAt" IS NOT NULL))`,
+    );
+  });
+
+  it('stores the source-reported occurrence time on every result', () => {
+    expect(sql).toContain('"occurredAt" TIMESTAMP(3) NOT NULL');
   });
 
   it('enforces same-tenant references with composite foreign keys', () => {

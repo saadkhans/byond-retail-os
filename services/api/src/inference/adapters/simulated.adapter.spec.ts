@@ -1,15 +1,28 @@
 import { BadRequestException } from '@nestjs/common';
-import { InferenceJobType, VisionEventType } from '@prisma/client';
-import { InferenceAdapterInput } from './inference-adapter';
+import {
+  EvidenceSourceType,
+  InferenceJobType,
+  VisionEventType,
+} from '@prisma/client';
+import { InferenceAdapterInput, InferenceJobContext } from './inference-adapter';
 import { SimulatedInferenceAdapter } from './simulated.adapter';
 
 describe('SimulatedInferenceAdapter', () => {
   const adapter = new SimulatedInferenceAdapter();
 
-  const baseInput: InferenceAdapterInput = {
+  const context: InferenceJobContext = {
+    jobId: 'job-1',
+    tenantId: 'tenant-a',
     jobType: InferenceJobType.PRODUCT_RECOGNITION,
+    unitId: 'unit-a1',
+    sourceType: EvidenceSourceType.VISION,
+    inputDescriptor: { zoneId: 'zone-3', cropId: 'crop-42' },
+  };
+
+  const baseInput: InferenceAdapterInput = {
     eventType: VisionEventType.PRODUCT_PICKUP,
     quantityDelta: 1,
+    occurredAt: '2026-07-26T10:00:30.000Z',
     detections: [{ sku: 'cola-330', confidence: 0.92 }],
   };
 
@@ -21,27 +34,27 @@ describe('SimulatedInferenceAdapter', () => {
 
   describe('validateInput', () => {
     it('accepts a valid pickup', () => {
-      expect(() => adapter.validateInput(baseInput)).not.toThrow();
+      expect(() => adapter.validateInput(context, baseInput)).not.toThrow();
     });
 
     it.each([0, 1.5, Number.NaN])(
       'rejects quantityDelta %p',
       (quantityDelta) => {
         expect(() =>
-          adapter.validateInput({ ...baseInput, quantityDelta }),
+          adapter.validateInput(context, { ...baseInput, quantityDelta }),
         ).toThrow(BadRequestException);
       },
     );
 
     it('rejects a negative quantityDelta for a non-return event', () => {
       expect(() =>
-        adapter.validateInput({ ...baseInput, quantityDelta: -1 }),
+        adapter.validateInput(context, { ...baseInput, quantityDelta: -1 }),
       ).toThrow(/PRODUCT_RETURN/);
     });
 
     it('rejects a positive quantityDelta for PRODUCT_RETURN', () => {
       expect(() =>
-        adapter.validateInput({
+        adapter.validateInput(context, {
           ...baseInput,
           eventType: VisionEventType.PRODUCT_RETURN,
           quantityDelta: 1,
@@ -51,7 +64,7 @@ describe('SimulatedInferenceAdapter', () => {
 
     it('accepts a negative quantityDelta for PRODUCT_RETURN', () => {
       expect(() =>
-        adapter.validateInput({
+        adapter.validateInput(context, {
           ...baseInput,
           eventType: VisionEventType.PRODUCT_RETURN,
           quantityDelta: -2,
@@ -61,13 +74,13 @@ describe('SimulatedInferenceAdapter', () => {
 
     it('requires at least one detection for basket-affecting event types', () => {
       expect(() =>
-        adapter.validateInput({ ...baseInput, detections: [] }),
+        adapter.validateInput(context, { ...baseInput, detections: [] }),
       ).toThrow(/at least one detection/);
     });
 
     it('accepts zero detections for record-only event types', () => {
       expect(() =>
-        adapter.validateInput({
+        adapter.validateInput(context, {
           ...baseInput,
           eventType: VisionEventType.EXIT_RECONCILIATION,
           detections: [],
@@ -79,7 +92,7 @@ describe('SimulatedInferenceAdapter', () => {
       'rejects an out-of-range confidence %p',
       (confidence) => {
         expect(() =>
-          adapter.validateInput({
+          adapter.validateInput(context, {
             ...baseInput,
             detections: [{ sku: 'A', confidence }],
           }),
@@ -89,7 +102,7 @@ describe('SimulatedInferenceAdapter', () => {
 
     it('rejects a blank sku', () => {
       expect(() =>
-        adapter.validateInput({
+        adapter.validateInput(context, {
           ...baseInput,
           detections: [{ sku: '   ', confidence: 0.5 }],
         }),
@@ -184,6 +197,34 @@ describe('SimulatedInferenceAdapter', () => {
   });
 
   it('run() echoes the sample output (no real ML)', async () => {
-    await expect(adapter.run(baseInput)).resolves.toBe(baseInput);
+    await expect(adapter.run(context, baseInput)).resolves.toBe(baseInput);
+  });
+
+  describe('job context', () => {
+    it('rejects a job type outside supportedJobTypes via the context', () => {
+      const restricted = new SimulatedInferenceAdapter();
+      Object.defineProperty(restricted, 'supportedJobTypes', {
+        value: [InferenceJobType.OCR_REVIEW],
+      });
+      expect(() =>
+        restricted.validateInput(context, baseInput),
+      ).toThrow(/does not support job type PRODUCT_RECOGNITION/);
+    });
+
+    it('rejects an unparseable occurredAt', () => {
+      expect(() =>
+        adapter.validateInput(context, {
+          ...baseInput,
+          occurredAt: 'not-a-timestamp',
+        }),
+      ).toThrow(/occurredAt/);
+    });
+
+    it('carries the source occurredAt onto the normalized result', () => {
+      const result = adapter.normalizeResult(baseInput);
+      expect(result.occurredAt).toEqual(
+        new Date('2026-07-26T10:00:30.000Z'),
+      );
+    });
   });
 });

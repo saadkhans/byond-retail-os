@@ -497,6 +497,7 @@ export interface InferenceResult {
   id: string;
   eventType: VisionEventType;
   quantityDelta: number;
+  occurredAt: string;
   evidenceScore: number | null;
   evidenceQuality: 'LOW' | 'MEDIUM' | 'HIGH' | null;
   modelKey: string | null;
@@ -511,6 +512,8 @@ export interface InferenceJob {
   status: InferenceJobStatus;
   priority: number;
   requestedAt: string;
+  attempts: number;
+  leaseExpiresAt: string | null;
   startedAt: string | null;
   completedAt: string | null;
   locationId: string | null;

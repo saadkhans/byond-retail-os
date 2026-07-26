@@ -3,8 +3,8 @@ import { EvidenceQuality, VisionEventType } from '@prisma/client';
 import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
-  ArrayMinSize,
   IsArray,
+  IsDateString,
   IsEnum,
   IsInt,
   IsNumber,
@@ -88,15 +88,27 @@ export class CompleteInferenceJobDto {
   quantityDelta!: number;
 
   @ApiProperty({
+    description:
+      'When the observed interaction happened per the SOURCE (ISO 8601) — ' +
+      'not when inference ran. Carried onto the result and onto the ' +
+      'converted vision event, so delayed/queued jobs keep correct event ' +
+      'chronology (same contract as Phase 7 ingest and the Phase 8 mapper).',
+  })
+  @IsDateString()
+  occurredAt!: string;
+
+  @ApiProperty({
     type: [InferenceDetectionDto],
-    minItems: 1,
     maxItems: 20,
     description:
-      'Raw detections (1-20). Duplicate SKUs collapse to the strongest ' +
-      'detection during normalization.',
+      'Raw detections (0-20). Duplicate SKUs collapse to the strongest ' +
+      'detection during normalization. Basket-affecting event types ' +
+      '(PRODUCT_PICKUP, CART_INSERTION, PRODUCT_RETURN) require at least ' +
+      'one detection; record-only types (PRODUCT_TRANSFER, ' +
+      'EXIT_RECONCILIATION) may complete with none — the adapter enforces ' +
+      'this, matching the Phase 7 contract and the Phase 8 mapper.',
   })
   @IsArray()
-  @ArrayMinSize(1)
   @ArrayMaxSize(20)
   @ValidateNested({ each: true })
   @Type(() => InferenceDetectionDto)

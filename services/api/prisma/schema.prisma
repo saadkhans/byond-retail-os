@@ -1485,6 +1485,13 @@ model InferenceJob {
   requestedAt DateTime @default(now())
   startedAt   DateTime?
   completedAt DateTime?
+  // Lease ownership: every claim increments attempts and takes a lease;
+  // complete/fail clear it. A RUNNING job whose lease expired (worker
+  // crashed) is reclaimed on the next claim — back to QUEUED, or FAILED
+  // with LEASE_EXPIRED once attempts are exhausted. RUNNING ⟺ leased
+  // (CHECK in migration SQL).
+  attempts       Int       @default(0)
+  leaseExpiresAt DateTime?
   // Opaque, vendor-neutral provenance (same closed enum as Phase 7).
   sourceType EvidenceSourceType @default(VISION)
   sourceId   String?
@@ -1540,6 +1547,10 @@ model InferenceResult {
   jobId    String @unique
   eventType     VisionEventType
   quantityDelta Int
+  // The SOURCE-reported interaction time (from the completion input), NOT
+  // when inference ran — delayed/queued jobs keep correct event chronology,
+  // and the VisionEvent conversion emits exactly this timestamp.
+  occurredAt      DateTime
   evidenceScore   Float?
   evidenceQuality EvidenceQuality?
   // Opaque model/provider metadata (screened; never interpreted).

@@ -77,5 +77,54 @@ describe('inference media policy', () => {
         }),
       ).toBe('note');
     });
+
+    it.each([
+      ['an s3 URL under an innocuous key', { cropId: 's3://bucket/frame.jpg' }, 'cropId'],
+      ['an https media URL', { reference: 'https://host/frame.jpg' }, 'reference'],
+      ['a stream URL without an extension', { ref: 'rtsp://cam.local/stream' }, 'ref'],
+      ['a gs URL', { pointer: 'gs://bucket/object' }, 'pointer'],
+      ['a bare media filename', { name: 'frame.jpg' }, 'name'],
+      ['a nested media filename value', { zones: [{ hint: 'aisle3.mp4' }] }, 'zones[0].hint'],
+      [
+        'AWS presigned signature params',
+        { token: 'X-Amz-Signature=abc&X-Amz-Credential=xyz' },
+        'token',
+      ],
+      [
+        'an Azure SAS fragment',
+        { token: 'sv=2024-01-01&se=2026-08-01&sig=abc123' },
+        'token',
+      ],
+      ['a single-slash file: path', { ref: 'file:/tmp/clip001' }, 'ref'],
+      ['a single-slash s3: path', { ref: 's3:/bucket/object' }, 'ref'],
+      [
+        'a protocol-relative reference',
+        { ref: '//cdn.host/frames/1' },
+        'ref',
+      ],
+      [
+        'a percent-encoded media extension',
+        { name: 'frame%2Ejpg' },
+        'name',
+      ],
+      [
+        'a percent-encoded scheme',
+        { ref: 's3%3A%2F%2Fbucket%2Fframe' },
+        'ref',
+      ],
+    ])('rejects %s by VALUE', (_label, descriptor, path) => {
+      expect(findForbiddenMediaPath(descriptor)).toBe(path);
+    });
+
+    it.each([
+      ['plain opaque ids', { cropId: 'crop-8f3a', zoneId: 'TRIGGER_ZONE_A' }],
+      ['dotted ids without a media extension', { source: 'shelf.cam.7' }],
+      ['a numeric value under a rate-style key', { framerate: 30 }],
+      ['a version-style dotted value', { contract: 'v2.1.0' }],
+      ['a namespaced id with one slash', { ref: 'v2:zone/7' }],
+      ['a bare percent sign', { discount: '15% off shelf 3' }],
+    ])('keeps %s', (_label, descriptor) => {
+      expect(findForbiddenMediaPath(descriptor)).toBeNull();
+    });
   });
 });

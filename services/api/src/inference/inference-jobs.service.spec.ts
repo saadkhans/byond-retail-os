@@ -51,6 +51,9 @@ describe('InferenceJobsService', () => {
       jobId: 'job-1',
       eventType: VisionEventType.PRODUCT_PICKUP,
       quantityDelta: 2,
+      // The SOURCE-reported interaction time — deliberately different from
+      // completedAt so the conversion tests prove which one is emitted.
+      occurredAt: new Date('2026-07-26T10:00:30.000Z'),
       evidenceScore: 0.92,
       evidenceQuality: 'HIGH',
       modelKey: 'sim-model',
@@ -68,7 +71,18 @@ describe('InferenceJobsService', () => {
     },
   } as unknown as InferenceJobDetail;
 
-  const visionEvent = { id: 'event-1', tenantId: 'tenant-a' };
+  // Shaped like the event the conversion itself creates: the replay-
+  // verification guard compares it against the job/result before linking.
+  const visionEvent = {
+    id: 'event-1',
+    tenantId: 'tenant-a',
+    type: VisionEventType.PRODUCT_PICKUP,
+    quantity: 2,
+    locationId: 'loc-a1',
+    unitId: 'unit-a1',
+    sessionId: 'sess-1',
+    sourceType: 'VISION',
+  };
 
   let repository: {
     findById: jest.Mock;
@@ -82,6 +96,7 @@ describe('InferenceJobsService', () => {
     markRunning: jest.Mock;
     complete: jest.Mock;
     fail: jest.Mock;
+    reclaimExpired: jest.Mock;
   };
   let visionEvents: { ingest: jest.Mock; findById: jest.Mock };
   let platformModules: { isEnabledForTenant: jest.Mock };
@@ -97,6 +112,7 @@ describe('InferenceJobsService', () => {
   const baseComplete: CompleteInferenceJobDto = {
     eventType: VisionEventType.PRODUCT_PICKUP,
     quantityDelta: 2,
+    occurredAt: '2026-07-26T10:00:30.000Z',
     detections: [
       { sku: 'cola-330', confidence: 0.92, label: 'red can' },
       { sku: 'chips-50', confidence: 0.41 },
@@ -128,6 +144,7 @@ describe('InferenceJobsService', () => {
         ...jobDetail,
         status: InferenceJobStatus.FAILED,
       }),
+      reclaimExpired: jest.fn().mockResolvedValue([]),
     };
     visionEvents = {
       ingest: jest.fn().mockResolvedValue(visionEvent),
@@ -313,6 +330,14 @@ describe('InferenceJobsService', () => {
       expect(queue.markRunning).not.toHaveBeenCalled();
     });
 
+    it('reclaims expired leases before claiming (self-heal on the /start path)', async () => {
+      await service.start('tenant-a', 'job-1', {}, actor);
+      expect(queue.reclaimExpired).toHaveBeenCalledWith('tenant-a');
+      expect(queue.reclaimExpired.mock.invocationCallOrder[0]).toBeLessThan(
+        queue.markRunning.mock.invocationCallOrder[0],
+      );
+    });
+
     it('rejects an adapter that does not support the job type', async () => {
       registry.register({
         adapterKey: 'ocr-only',
@@ -383,6 +408,91 @@ describe('InferenceJobsService', () => {
       expect(buildAudit(jobDetail, succeededJob)).toEqual(
         expect.objectContaining({ action: AuditAction.COMPLETE }),
       );
+    });
+
+    it('hands the adapter the claimed job context (id, tenant, descriptor)', async () => {
+      const descriptor = { zoneId: 'zone-3', cropId: 'crop-42' };
+      repository.findById.mockResolvedValue({
+        ...jobDetail,
+        status: InferenceJobStatus.RUNNING,
+        adapterKey: 'spy',
+        inputDescriptor: descriptor,
+      });
+      const spyAdapter = {
+        adapterKey: 'spy',
+        supportedJobTypes: Object.values(InferenceJobType),
+        validateInput: jest.fn(),
+        run: jest.fn().mockImplementation((_context, input) =>
+          Promise.resolve(input),
+        ),
+        normalizeResult: jest.fn().mockReturnValue({
+          eventType: VisionEventType.PRODUCT_PICKUP,
+          quantityDelta: 2,
+          occurredAt: new Date('2026-07-26T10:00:30.000Z'),
+          candidates: [],
+        }),
+      };
+      registry.register(spyAdapter as never);
+      await service.complete('tenant-a', 'job-1', baseComplete, actor);
+      const expectedContext = expect.objectContaining({
+        jobId: 'job-1',
+        tenantId: 'tenant-a',
+        jobType: InferenceJobType.PRODUCT_RECOGNITION,
+        unitId: 'unit-a1',
+        sessionId: 'sess-1',
+        inputDescriptor: descriptor,
+      });
+      expect(spyAdapter.validateInput).toHaveBeenCalledWith(
+        expectedContext,
+        expect.objectContaining({ occurredAt: '2026-07-26T10:00:30.000Z' }),
+      );
+      expect(spyAdapter.run).toHaveBeenCalledWith(
+        expectedContext,
+        expect.anything(),
+      );
+    });
+
+    it('completes a record-only EXIT_RECONCILIATION with zero detections', async () => {
+      await service.complete(
+        'tenant-a',
+        'job-1',
+        {
+          ...baseComplete,
+          eventType: VisionEventType.EXIT_RECONCILIATION,
+          detections: [],
+        },
+        actor,
+      );
+      const normalized = queue.complete.mock.calls[0][2] as {
+        candidates: unknown[];
+        evidenceScore?: number;
+      };
+      expect(normalized.candidates).toEqual([]);
+      expect(normalized.evidenceScore).toBeUndefined();
+    });
+
+    it('rejects zero detections for a basket-affecting event type', async () => {
+      await expect(
+        service.complete(
+          'tenant-a',
+          'job-1',
+          { ...baseComplete, detections: [] },
+          actor,
+        ),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(queue.complete).not.toHaveBeenCalled();
+    });
+
+    it('rejects an unparseable occurredAt before any write', async () => {
+      await expect(
+        service.complete(
+          'tenant-a',
+          'job-1',
+          { ...baseComplete, occurredAt: 'not-a-timestamp' },
+          actor,
+        ),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(queue.complete).not.toHaveBeenCalled();
     });
 
     it('dedupes duplicate SKUs keeping the strongest detection', async () => {
@@ -565,7 +675,9 @@ describe('InferenceJobsService', () => {
           deviceId: undefined,
           sessionId: 'sess-1',
           type: VisionEventType.PRODUCT_PICKUP,
-          occurredAt: '2026-07-26T10:02:00.000Z',
+          // The SOURCE-reported time from the result — NOT completedAt
+          // (10:02:00): delayed jobs keep correct event chronology.
+          occurredAt: '2026-07-26T10:00:30.000Z',
           quantity: 2,
           candidates: [
             { sku: 'COLA-330', rank: 1, score: 0.92, label: 'red can' },
@@ -577,6 +689,7 @@ describe('InferenceJobsService', () => {
           idempotencyKey: 'inference:job-1',
         },
         actor,
+        { allowReservedIdempotencyKey: true },
       );
       // Phase 7 rejects provenance strings: modelKey/modelVersion stay
       // internal to the inference result and must NEVER reach the payload.
@@ -606,6 +719,11 @@ describe('InferenceJobsService', () => {
           eventType: VisionEventType.PRODUCT_RETURN,
           quantityDelta: -3,
         },
+      });
+      visionEvents.ingest.mockResolvedValue({
+        ...visionEvent,
+        type: VisionEventType.PRODUCT_RETURN,
+        quantity: 3,
       });
       await service.toVisionEvent('tenant-a', 'job-1', actor);
       const payload = visionEvents.ingest.mock.calls[0][1] as {
@@ -705,6 +823,77 @@ describe('InferenceJobsService', () => {
         'cv',
       );
       expect(visionEvents.ingest).not.toHaveBeenCalled();
+    });
+
+    it('403s an already-linked replay too when cv is disabled (no read back door)', async () => {
+      platformModules.isEnabledForTenant.mockResolvedValue(false);
+      repository.findById.mockResolvedValue({
+        ...succeededJob,
+        visionEventId: 'event-1',
+      });
+      await expect(
+        service.toVisionEvent('tenant-a', 'job-1', actor),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(visionEvents.findById).not.toHaveBeenCalled();
+    });
+
+    it('409s and does NOT link when the replayed event mismatches the result', async () => {
+      // A same-tenant caller pre-ingested an unrelated event under the
+      // job's derived key (pre-fix data / direct service caller): ingest
+      // replays it — conversion must refuse to adopt it.
+      visionEvents.ingest.mockResolvedValue({
+        ...visionEvent,
+        id: 'foreign-event',
+        type: VisionEventType.CART_INSERTION,
+        quantity: 9,
+      });
+      await expect(
+        service.toVisionEvent('tenant-a', 'job-1', actor),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(repository.linkVisionEvent).not.toHaveBeenCalled();
+    });
+
+    it('409s and does NOT link when the replayed event deviceId mismatches', async () => {
+      visionEvents.ingest.mockResolvedValue({
+        ...visionEvent,
+        id: 'foreign-event',
+        deviceId: 'device-z9',
+      });
+      await expect(
+        service.toVisionEvent('tenant-a', 'job-1', actor),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(repository.linkVisionEvent).not.toHaveBeenCalled();
+    });
+
+    it('links normally when the replayed event matches the result', async () => {
+      const outcome = await service.toVisionEvent('tenant-a', 'job-1', actor);
+      expect(outcome.replayed).toBe(false);
+      expect(repository.linkVisionEvent).toHaveBeenCalled();
+    });
+
+    it('converts a record-only result with no candidates', async () => {
+      repository.findById.mockResolvedValue({
+        ...succeededJob,
+        result: {
+          ...(succeededJob.result as object),
+          eventType: VisionEventType.EXIT_RECONCILIATION,
+          quantityDelta: 1,
+          evidenceScore: null,
+          candidates: [],
+        },
+      });
+      visionEvents.ingest.mockResolvedValue({
+        ...visionEvent,
+        type: VisionEventType.EXIT_RECONCILIATION,
+        quantity: 1,
+      });
+      await service.toVisionEvent('tenant-a', 'job-1', actor);
+      const payload = visionEvents.ingest.mock.calls[0][1] as {
+        candidates: unknown[];
+        evidenceScore?: number;
+      };
+      expect(payload.candidates).toEqual([]);
+      expect(payload.evidenceScore).toBeUndefined();
     });
   });
 });

@@ -28,6 +28,8 @@ CREATE TABLE "InferenceJob" (
     "requestedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "startedAt" TIMESTAMP(3),
     "completedAt" TIMESTAMP(3),
+    "attempts" INTEGER NOT NULL DEFAULT 0,
+    "leaseExpiresAt" TIMESTAMP(3),
     "sourceType" "EvidenceSourceType" NOT NULL DEFAULT 'VISION',
     "sourceId" TEXT,
     "adapterKey" TEXT,
@@ -50,6 +52,7 @@ CREATE TABLE "InferenceResult" (
     "jobId" TEXT NOT NULL,
     "eventType" "VisionEventType" NOT NULL,
     "quantityDelta" INTEGER NOT NULL,
+    "occurredAt" TIMESTAMP(3) NOT NULL,
     "evidenceScore" DOUBLE PRECISION,
     "evidenceQuality" "EvidenceQuality",
     "modelKey" TEXT,
@@ -164,6 +167,8 @@ ALTER TABLE "InferenceCandidate" ADD CONSTRAINT "InferenceCandidate_resultId_fke
 --    validates first; these backstop any future code path that forgets to.
 ALTER TABLE "InferenceJob" ADD CONSTRAINT "InferenceJob_priority_range_check"
   CHECK ("priority" >= 0 AND "priority" <= 1000);
+ALTER TABLE "InferenceJob" ADD CONSTRAINT "InferenceJob_attempts_nonnegative_check"
+  CHECK ("attempts" >= 0);
 ALTER TABLE "InferenceResult" ADD CONSTRAINT "InferenceResult_quantityDelta_nonzero_check"
   CHECK ("quantityDelta" <> 0);
 ALTER TABLE "InferenceResult" ADD CONSTRAINT "InferenceResult_return_direction_check"
@@ -191,6 +196,10 @@ ALTER TABLE "InferenceJob" ADD CONSTRAINT "InferenceJob_error_only_failed_check"
   CHECK (("status" = 'FAILED') = ("errorCode" IS NOT NULL));
 ALTER TABLE "InferenceJob" ADD CONSTRAINT "InferenceJob_visionEvent_succeeded_check"
   CHECK ("visionEventId" IS NULL OR "status" = 'SUCCEEDED');
+-- A RUNNING job is exactly a LEASED job: claims take a lease (worker-crash
+-- reclaim depends on it), and every other status carries none.
+ALTER TABLE "InferenceJob" ADD CONSTRAINT "InferenceJob_running_lease_check"
+  CHECK (("status" = 'RUNNING') = ("leaseExpiresAt" IS NOT NULL));
 
 -- 3. Cross-tenant reference integrity at the database level (same pattern as
 --    Phases 3-7): a job can never reference another tenant's store/unit/

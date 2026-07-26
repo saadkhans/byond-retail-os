@@ -1,9 +1,16 @@
 import { InferenceJobStatus, InferenceJobType } from '@prisma/client';
-import { AuditEntry } from '../../common/audit/audit-log.service';
+import {
+  AuditEntry,
+  SYSTEM_ACTOR_EMAIL,
+} from '../../common/audit/audit-log.service';
 import { TenantIdRequiredError } from '../../common/errors/domain.errors';
 import { PrismaService } from '../../prisma/prisma.service';
 import { NormalizedInferenceResult } from '../adapters/inference-adapter';
 import { InferenceJobDetail } from '../inference-jobs.repository';
+import {
+  INFERENCE_JOB_MAX_ATTEMPTS,
+  LEASE_EXPIRED_ERROR_CODE,
+} from './inference-queue.port';
 import { PrismaInferenceQueue, QUEUE_CLAIM_ORDER } from './prisma-inference-queue';
 
 describe('PrismaInferenceQueue', () => {
@@ -28,11 +35,14 @@ describe('PrismaInferenceQueue', () => {
     ...queuedJob,
     status: InferenceJobStatus.RUNNING,
     adapterKey: 'simulated',
+    attempts: 1,
+    leaseExpiresAt: new Date(Date.now() + 300_000),
   } as InferenceJobDetail;
 
   const normalizedResult: NormalizedInferenceResult = {
     eventType: 'PRODUCT_PICKUP',
     quantityDelta: 2,
+    occurredAt: new Date('2026-07-26T10:00:30.000Z'),
     candidates: [
       { sku: 'COLA-330', rank: 1, score: 0.92, label: 'red can' },
       { sku: 'CHIPS-50', rank: 2, score: 0.41 },
@@ -65,6 +75,7 @@ describe('PrismaInferenceQueue', () => {
   };
   let auditLog: { record: jest.Mock };
   let prismaFindFirst: jest.Mock;
+  let prismaFindMany: jest.Mock;
   let queue: PrismaInferenceQueue;
 
   beforeEach(() => {
@@ -105,9 +116,10 @@ describe('PrismaInferenceQueue', () => {
     };
     auditLog = { record: jest.fn().mockResolvedValue(undefined) };
     prismaFindFirst = jest.fn().mockResolvedValue(null);
+    prismaFindMany = jest.fn().mockResolvedValue([]);
     const prisma = {
       $transaction: (fn: (client: typeof tx) => Promise<unknown>) => fn(tx),
-      inferenceJob: { findFirst: prismaFindFirst },
+      inferenceJob: { findFirst: prismaFindFirst, findMany: prismaFindMany },
     } as unknown as PrismaService;
     queue = new PrismaInferenceQueue(prisma, auditLog as never);
   });
@@ -234,10 +246,20 @@ describe('PrismaInferenceQueue', () => {
           status: InferenceJobStatus.RUNNING,
           startedAt: expect.any(Date),
           adapterKey: 'simulated',
+          attempts: { increment: 1 },
+          leaseExpiresAt: expect.any(Date),
         }),
       });
       expect(result).toBe(runningJob);
       expect(auditLog.record).toHaveBeenCalledTimes(1);
+    });
+
+    it('takes a lease in the future when claiming', async () => {
+      await queue.markRunning('tenant-a', 'job-1', 'simulated', transitionAudit);
+      const { data } = tx.inferenceJob.updateMany.mock.calls[0][0] as {
+        data: { leaseExpiresAt: Date };
+      };
+      expect(data.leaseExpiresAt.getTime()).toBeGreaterThan(Date.now());
     });
 
     it('returns null when the job is missing in this tenant', async () => {
@@ -326,6 +348,115 @@ describe('PrismaInferenceQueue', () => {
     });
   });
 
+  describe('reclaimExpired', () => {
+    const expiredJob = {
+      ...runningJob,
+      attempts: 1,
+      leaseExpiresAt: new Date(Date.now() - 60_000),
+    } as InferenceJobDetail;
+
+    beforeEach(() => {
+      prismaFindMany.mockResolvedValue([{ id: 'job-1' }]);
+      tx.inferenceJob.findFirst.mockResolvedValue(expiredJob);
+    });
+
+    it('selects only RUNNING jobs with an expired lease, tenant-scoped', async () => {
+      await queue.reclaimExpired('tenant-a');
+      expect(prismaFindMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            tenantId: 'tenant-a',
+            status: InferenceJobStatus.RUNNING,
+            leaseExpiresAt: { lt: expect.any(Date) },
+          }),
+        }),
+      );
+    });
+
+    it('requeues an expired job that still has attempts, audited as SYSTEM', async () => {
+      const reclaimed = await queue.reclaimExpired('tenant-a');
+      expect(tx.inferenceJob.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: {
+            status: InferenceJobStatus.QUEUED,
+            startedAt: null,
+            leaseExpiresAt: null,
+            adapterKey: null,
+          },
+        }),
+      );
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          actorEmail: SYSTEM_ACTOR_EMAIL,
+          action: 'UPDATE',
+          entityType: 'InferenceJob',
+          entityId: 'job-1',
+        }),
+        tx,
+      );
+      expect(reclaimed).toHaveLength(1);
+    });
+
+    it('is claimable again after a requeue', async () => {
+      // After the reclaim requeues job-1, the claim pass finds and wins it.
+      prismaFindFirst.mockResolvedValueOnce({ id: 'job-1' });
+      tx.inferenceJob.findFirst
+        .mockResolvedValueOnce(expiredJob)
+        .mockResolvedValueOnce(queuedJob);
+      const claimed = await queue.claimNext(
+        'tenant-a',
+        'simulated',
+        transitionAudit,
+      );
+      expect(claimed).toBe(runningJob);
+    });
+
+    it('fails a job that exhausted its attempts with LEASE_EXPIRED', async () => {
+      tx.inferenceJob.findFirst.mockResolvedValue({
+        ...expiredJob,
+        attempts: INFERENCE_JOB_MAX_ATTEMPTS,
+      });
+      await queue.reclaimExpired('tenant-a');
+      expect(tx.inferenceJob.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: InferenceJobStatus.FAILED,
+            completedAt: expect.any(Date),
+            leaseExpiresAt: null,
+            errorCode: LEASE_EXPIRED_ERROR_CODE,
+          }),
+        }),
+      );
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          actorEmail: SYSTEM_ACTOR_EMAIL,
+          action: 'FAIL',
+          reason: expect.stringContaining(LEASE_EXPIRED_ERROR_CODE),
+        }),
+        tx,
+      );
+    });
+
+    it('does not touch RUNNING jobs whose lease is still live', async () => {
+      prismaFindMany.mockResolvedValue([]);
+      await expect(queue.reclaimExpired('tenant-a')).resolves.toEqual([]);
+      expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
+    });
+
+    it('skips a job a live worker finished between listing and reclaiming', async () => {
+      tx.inferenceJob.findFirst.mockResolvedValue(null);
+      await expect(queue.reclaimExpired('tenant-a')).resolves.toEqual([]);
+      expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('rejects a blank tenantId instead of widening the query', async () => {
+      await expect(queue.reclaimExpired('')).rejects.toThrow(
+        TenantIdRequiredError,
+      );
+    });
+  });
+
   describe('complete', () => {
     beforeEach(() => {
       tx.inferenceJob.findFirst.mockResolvedValue(runningJob);
@@ -347,6 +478,7 @@ describe('PrismaInferenceQueue', () => {
         data: expect.objectContaining({
           status: InferenceJobStatus.SUCCEEDED,
           completedAt: expect.any(Date),
+          leaseExpiresAt: null,
         }),
       });
       expect(tx.inferenceResult.create).toHaveBeenCalledWith({
@@ -355,6 +487,7 @@ describe('PrismaInferenceQueue', () => {
           jobId: 'job-1',
           eventType: 'PRODUCT_PICKUP',
           quantityDelta: 2,
+          occurredAt: new Date('2026-07-26T10:00:30.000Z'),
           evidenceScore: 0.92,
           candidates: {
             create: [
@@ -423,6 +556,7 @@ describe('PrismaInferenceQueue', () => {
         data: expect.objectContaining({
           status: InferenceJobStatus.FAILED,
           completedAt: expect.any(Date),
+          leaseExpiresAt: null,
           errorCode: 'NO_ADAPTER',
           errorMessage: 'nothing can run this',
         }),

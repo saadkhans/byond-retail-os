@@ -22,6 +22,7 @@ import { VisionEventsService } from '../vision/vision-events.service';
 import {
   InferenceAdapter,
   InferenceAdapterInput,
+  InferenceJobContext,
 } from './adapters/inference-adapter';
 import { InferenceAdapterRegistry } from './adapters/adapter.registry';
 import { SIMULATED_ADAPTER_KEY } from './adapters/simulated.adapter';
@@ -233,6 +234,10 @@ export class InferenceJobsService {
   ): Promise<InferenceJobDetail> {
     const adapterKey = dto.adapterKey ?? SIMULATED_ADAPTER_KEY;
     assertOpaque('adapterKey', adapterKey);
+    // Stranded work first: /start is the only production path into RUNNING,
+    // so it is also where expired leases must be reclaimed — otherwise a
+    // crashed worker's RUNNING job would never re-enter the queue.
+    await this.queue.reclaimExpired(tenantId);
     const job = await this.findById(tenantId, jobId);
     const adapter = this.requireAdapter(adapterKey);
     if (!adapter.supportedJobTypes.includes(job.jobType)) {
@@ -297,10 +302,25 @@ export class InferenceJobsService {
     const adapter = this.requireAdapter(
       job.adapterKey ?? SIMULATED_ADAPTER_KEY,
     );
-    const input: InferenceAdapterInput = {
+    // The adapter receives the CLAIMED JOB's context (id, tenant, screened
+    // trigger descriptor) alongside the model output: a real provider runs
+    // from exactly this contract, never from an out-of-band lookup.
+    const context: InferenceJobContext = {
+      jobId: job.id,
+      tenantId: job.tenantId,
       jobType: job.jobType,
+      locationId: job.locationId ?? undefined,
+      unitId: job.unitId ?? undefined,
+      deviceId: job.deviceId ?? undefined,
+      sessionId: job.sessionId ?? undefined,
+      sourceType: job.sourceType,
+      sourceId: job.sourceId ?? undefined,
+      inputDescriptor: job.inputDescriptor ?? undefined,
+    };
+    const input: InferenceAdapterInput = {
       eventType: dto.eventType,
       quantityDelta: dto.quantityDelta,
+      occurredAt: dto.occurredAt,
       detections: dto.detections.map((detection) => ({
         sku: detection.sku,
         confidence: detection.confidence,
@@ -310,8 +330,10 @@ export class InferenceJobsService {
       modelKey: dto.modelKey,
       modelVersion: dto.modelVersion,
     };
-    adapter.validateInput(input);
-    const normalized = adapter.normalizeResult(await adapter.run(input));
+    adapter.validateInput(context, input);
+    const normalized = adapter.normalizeResult(
+      await adapter.run(context, input),
+    );
     const result = await this.queue.complete(
       tenantId,
       jobId,
@@ -395,6 +417,22 @@ export class InferenceJobsService {
     replayed: boolean;
   }> {
     const job = await this.findById(tenantId, jobId);
+    // The vision route is gated by the `cv` module for its own callers;
+    // this endpoint is gated by `inference` — so re-check `cv` FIRST (before
+    // the already-linked replay as well as creation), or a tenant with cv
+    // disabled could keep creating vision events — or keep READING linked
+    // ones — through the inference back door. Fails closed, same semantics
+    // as ModuleEnabledGuard.
+    const cvEnabled = await this.platformModulesService.isEnabledForTenant(
+      tenantId,
+      'cv',
+    );
+    if (!cvEnabled) {
+      throw new ForbiddenException(
+        'The cv module is not enabled for this tenant, so an inference ' +
+          'result cannot become (or replay) a vision event; enable cv first',
+      );
+    }
     if (job.visionEventId) {
       return {
         job,
@@ -423,33 +461,21 @@ export class InferenceJobsService {
           'both',
       );
     }
-    // The vision route is gated by the `cv` module for its own callers;
-    // this endpoint is gated by `inference` — so re-check `cv` here, or a
-    // tenant with cv disabled could keep creating vision events through
-    // the inference back door. Fails closed, same semantics as
-    // ModuleEnabledGuard.
-    const cvEnabled = await this.platformModulesService.isEnabledForTenant(
-      tenantId,
-      'cv',
-    );
-    if (!cvEnabled) {
-      throw new ForbiddenException(
-        'The cv module is not enabled for this tenant, so an inference ' +
-          'result cannot become a vision event; enable cv first',
-      );
-    }
-    // Phase 7-compatible ingest payload. modelKey/modelVersion stay
-    // INTERNAL to the inference result (the Phase 7 ingest contract
-    // deliberately accepts no provenance strings — same as the Phase 8
-    // mapper, which never emits them); the deterministic idempotency key
-    // plus the job's visionEventId link carry the lineage instead.
+    // Phase 7-compatible ingest payload. occurredAt is the SOURCE-reported
+    // interaction time carried on the result — never the completion time,
+    // so delayed/queued jobs keep correct event chronology. modelKey/
+    // modelVersion stay INTERNAL to the inference result (the Phase 7
+    // ingest contract deliberately accepts no provenance strings — same as
+    // the Phase 8 mapper, which never emits them); the deterministic
+    // idempotency key plus the job's visionEventId link carry the lineage
+    // instead.
     const ingestDto = {
       locationId: job.locationId,
       unitId: job.unitId,
       deviceId: job.deviceId ?? undefined,
       sessionId: job.sessionId ?? undefined,
       type: result.eventType,
-      occurredAt: (job.completedAt ?? job.requestedAt).toISOString(),
+      occurredAt: result.occurredAt.toISOString(),
       quantity: Math.abs(result.quantityDelta),
       candidates: result.candidates.map((candidate) => ({
         sku: candidate.sku,
@@ -462,11 +488,20 @@ export class InferenceJobsService {
       evidenceQuality: result.evidenceQuality ?? undefined,
       idempotencyKey: `inference:${job.id}`,
     } as IngestVisionEventDto;
+    // The reserved-namespace flag is the trusted-caller channel: the PUBLIC
+    // ingest path rejects `inference:` keys wholesale, so a same-tenant
+    // client cannot squat a job's derived key ahead of conversion.
     const visionEvent = await this.visionEventsService.ingest(
       tenantId,
       ingestDto,
       actor,
+      { allowReservedIdempotencyKey: true },
     );
+    // Belt and braces for the idempotent-replay path: if the key already
+    // existed (pre-fix data, direct service callers), ingest returned that
+    // EXISTING event without comparing payloads. Never link an event that
+    // does not match this job's result.
+    this.assertReplayedEventMatches(job, result, visionEvent);
     const linked = await this.jobsRepository.linkVisionEvent(
       tenantId,
       job.id,
@@ -501,6 +536,34 @@ export class InferenceJobsService {
       };
     }
     return { job: linked, visionEvent, replayed: false };
+  }
+
+  /**
+   * A replayed ingest under the job's derived idempotency key must BE this
+   * job's event: same type, magnitude, binding, and source. On any mismatch
+   * the conversion aborts (409) without linking — only the foreign event's
+   * id is disclosed, never its contents.
+   */
+  private assertReplayedEventMatches(
+    job: InferenceJobDetail,
+    result: NonNullable<InferenceJobDetail['result']>,
+    event: VisionEventDetail,
+  ): void {
+    const matches =
+      event.type === result.eventType &&
+      event.quantity === Math.abs(result.quantityDelta) &&
+      event.locationId === job.locationId &&
+      event.unitId === job.unitId &&
+      (event.deviceId ?? null) === (job.deviceId ?? null) &&
+      (job.sessionId === null || event.sessionId === job.sessionId) &&
+      event.sourceType === job.sourceType;
+    if (!matches) {
+      throw new ConflictException(
+        `Vision event "${event.id}" already exists under this job's ` +
+          'reserved idempotency key but does not match the inference ' +
+          'result; conversion aborted and the job remains unlinked',
+      );
+    }
   }
 
   private requireAdapter(adapterKey: string): InferenceAdapter {

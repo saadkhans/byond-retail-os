@@ -34,6 +34,24 @@ export interface FailJobInput {
 export type TransitionRejection = 'not-claimable' | 'not-running' | 'terminal';
 
 /**
+ * Lease ownership: every claim takes a lease of this many seconds and
+ * increments the job's attempt counter; complete/fail clear the lease. A
+ * RUNNING job whose lease expired belonged to a crashed/hung worker and is
+ * reclaimed on the next claim pass.
+ */
+export const INFERENCE_JOB_LEASE_SECONDS = 300;
+
+/**
+ * A job whose lease expired with this many attempts already spent FAILS
+ * with LEASE_EXPIRED instead of requeueing — at-least-once delivery, but
+ * never an infinite crash loop.
+ */
+export const INFERENCE_JOB_MAX_ATTEMPTS = 3;
+
+/** Stable error code stamped on jobs that exhausted their lease attempts. */
+export const LEASE_EXPIRED_ERROR_CODE = 'LEASE_EXPIRED';
+
+/**
  * The queue abstraction: enqueue, claim, and drive the job lifecycle.
  * Phase 9 ships exactly one implementation — the database-backed
  * PrismaInferenceQueue (deterministic ordering: priority DESC, requestedAt
@@ -56,9 +74,20 @@ export abstract class InferenceQueuePort<TJobDetail = unknown> {
   >;
 
   /**
+   * Reclaim RUNNING jobs whose lease expired (crashed/hung worker): back to
+   * QUEUED while attempts remain, FAILED with LEASE_EXPIRED once
+   * INFERENCE_JOB_MAX_ATTEMPTS is spent. Every reclaim is audited as a
+   * SYSTEM action. Returns the reclaimed jobs. claimNext and the /start
+   * service path run this first, so stranded work re-enters the queue
+   * without an operator.
+   */
+  abstract reclaimExpired(tenantId: string): Promise<TJobDetail[]>;
+
+  /**
    * Claim the highest-priority QUEUED job (priority DESC, requestedAt ASC,
-   * id ASC) and flip it RUNNING under the given adapter. Returns null when
-   * the tenant's queue is empty.
+   * id ASC) and flip it RUNNING under the given adapter, taking a lease
+   * (INFERENCE_JOB_LEASE_SECONDS) and incrementing attempts. Returns null
+   * when the tenant's queue is empty.
    */
   abstract claimNext(
     tenantId: string,

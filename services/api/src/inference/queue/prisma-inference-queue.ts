@@ -4,9 +4,11 @@ import {
   InferenceJobType,
   Prisma,
 } from '@prisma/client';
+import { AuditAction } from '@prisma/client';
 import {
   AuditEntry,
   AuditLogService,
+  SYSTEM_ACTOR_EMAIL,
 } from '../../common/audit/audit-log.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { TenantScopedRepository } from '../../prisma/tenant-scoped.repository';
@@ -19,7 +21,10 @@ import {
   EnqueueJobInput,
   EnqueueRejection,
   FailJobInput,
+  INFERENCE_JOB_LEASE_SECONDS,
+  INFERENCE_JOB_MAX_ATTEMPTS,
   InferenceQueuePort,
+  LEASE_EXPIRED_ERROR_CODE,
   TransitionRejection,
 } from './inference-queue.port';
 
@@ -154,6 +159,100 @@ export class PrismaInferenceQueue
     });
   }
 
+  /**
+   * Lease reclaim: a worker that died after markRunning committed leaves
+   * its job RUNNING forever, and QUEUED-only claims would never see it
+   * again. Each expired lease is reclaimed with its own guarded compare-
+   * and-set transaction (re-checking status AND expiry inside the tx, so a
+   * still-alive worker's complete/fail always wins the race) and audited as
+   * a SYSTEM action — there is no acting user when the trigger is a crash.
+   */
+  async reclaimExpired(tenantId: string): Promise<InferenceJobDetail[]> {
+    const scopedTenantId = this.requireTenantId(tenantId);
+    const now = new Date();
+    const expired = await this.prisma.inferenceJob.findMany({
+      where: {
+        tenantId: scopedTenantId,
+        status: InferenceJobStatus.RUNNING,
+        leaseExpiresAt: { lt: now },
+      },
+      select: { id: true },
+      orderBy: [{ leaseExpiresAt: 'asc' }, { id: 'asc' }],
+    });
+    const reclaimed: InferenceJobDetail[] = [];
+    for (const { id } of expired) {
+      const job = await this.prisma.$transaction(async (tx) => {
+        const before = await tx.inferenceJob.findFirst({
+          where: {
+            id,
+            tenantId: scopedTenantId,
+            status: InferenceJobStatus.RUNNING,
+            leaseExpiresAt: { lt: now },
+          },
+          include: INFERENCE_JOB_DETAIL_INCLUDE,
+        });
+        if (!before) {
+          return null;
+        }
+        const exhausted = before.attempts >= INFERENCE_JOB_MAX_ATTEMPTS;
+        const updated = await tx.inferenceJob.updateMany({
+          where: {
+            id,
+            tenantId: scopedTenantId,
+            status: InferenceJobStatus.RUNNING,
+            leaseExpiresAt: { lt: now },
+          },
+          data: exhausted
+            ? {
+                status: InferenceJobStatus.FAILED,
+                completedAt: new Date(),
+                leaseExpiresAt: null,
+                errorCode: LEASE_EXPIRED_ERROR_CODE,
+                errorMessage:
+                  `The worker lease expired ${before.attempts} time(s); ` +
+                  'the attempt budget is spent',
+              }
+            : {
+                status: InferenceJobStatus.QUEUED,
+                startedAt: null,
+                leaseExpiresAt: null,
+                adapterKey: null,
+              },
+        });
+        if (updated.count === 0) {
+          return null;
+        }
+        const after = await tx.inferenceJob.findFirstOrThrow({
+          where: { id, tenantId: scopedTenantId },
+          include: INFERENCE_JOB_DETAIL_INCLUDE,
+        });
+        await this.auditLog.record(
+          {
+            tenantId: scopedTenantId,
+            actorId: null,
+            actorEmail: SYSTEM_ACTOR_EMAIL,
+            action: exhausted ? AuditAction.FAIL : AuditAction.UPDATE,
+            entityType: 'InferenceJob',
+            entityId: id,
+            before,
+            after,
+            reason: exhausted
+              ? `Inference job failed (${LEASE_EXPIRED_ERROR_CODE}): lease ` +
+                `expired with all ${INFERENCE_JOB_MAX_ATTEMPTS} attempt(s) spent`
+              : `Inference job lease expired (attempt ${before.attempts} of ` +
+                `${INFERENCE_JOB_MAX_ATTEMPTS}); requeued for another worker`,
+          },
+          tx,
+        );
+        return after;
+      });
+      if (job) {
+        reclaimed.push(job);
+      }
+    }
+    return reclaimed;
+  }
+
   async claimNext(
     tenantId: string,
     adapterKey: string,
@@ -164,6 +263,9 @@ export class PrismaInferenceQueue
     jobType?: InferenceJobType,
   ): Promise<InferenceJobDetail | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
+    // Stranded work first: without this, a crashed worker's RUNNING job
+    // would be invisible to every future claim.
+    await this.reclaimExpired(scopedTenantId);
     // Claim loop: losing a compare-and-set race to another worker moves on
     // to the next queued job instead of failing. Terminates because every
     // iteration either claims or observes the queue shrinking.
@@ -228,6 +330,10 @@ export class PrismaInferenceQueue
           status: InferenceJobStatus.RUNNING,
           startedAt: new Date(),
           adapterKey,
+          attempts: { increment: 1 },
+          leaseExpiresAt: new Date(
+            Date.now() + INFERENCE_JOB_LEASE_SECONDS * 1000,
+          ),
         },
       });
       if (updated.count === 0) {
@@ -274,6 +380,7 @@ export class PrismaInferenceQueue
         data: {
           status: InferenceJobStatus.SUCCEEDED,
           completedAt: new Date(),
+          leaseExpiresAt: null,
         },
       });
       if (updated.count === 0) {
@@ -289,6 +396,7 @@ export class PrismaInferenceQueue
           jobId,
           eventType: result.eventType,
           quantityDelta: result.quantityDelta,
+          occurredAt: result.occurredAt,
           evidenceScore: result.evidenceScore,
           evidenceQuality: result.evidenceQuality,
           modelKey: result.modelKey,
@@ -347,6 +455,7 @@ export class PrismaInferenceQueue
         data: {
           status: InferenceJobStatus.FAILED,
           completedAt: new Date(),
+          leaseExpiresAt: null,
           errorCode: input.errorCode,
           errorMessage: input.errorMessage,
         },

@@ -37,8 +37,9 @@ export function InferenceJobsPage() {
   const take = 25;
 
   const [newJobType, setNewJobType] = useState('PRODUCT_RECOGNITION');
-  const [newPriority, setNewPriority] = useState('0');
+  const [newPriority, setNewPriority] = useState('100');
   const [newSessionId, setNewSessionId] = useState('');
+  const [newLocationId, setNewLocationId] = useState('');
   const [newUnitId, setNewUnitId] = useState('');
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -69,6 +70,7 @@ export function InferenceJobsPage() {
           jobType: newJobType,
           priority,
           ...(newSessionId ? { sessionId: newSessionId } : {}),
+          ...(newLocationId ? { locationId: newLocationId } : {}),
           ...(newUnitId ? { unitId: newUnitId } : {}),
           idempotencyKey: crypto.randomUUID(),
         },
@@ -111,8 +113,17 @@ export function InferenceJobsPage() {
         />
         <input
           type="text"
-          placeholder="Unit id (optional)"
+          placeholder="Store id (needed to convert)"
           style={{ minWidth: '12rem' }}
+          title="Converting a result to a CV event requires the job to carry a store and a unit"
+          value={newLocationId}
+          onChange={(e) => setNewLocationId(e.target.value)}
+        />
+        <input
+          type="text"
+          placeholder="Unit id (needed to convert)"
+          style={{ minWidth: '12rem' }}
+          title="Converting a result to a CV event requires the job to carry a store and a unit"
           value={newUnitId}
           onChange={(e) => setNewUnitId(e.target.value)}
         />
@@ -226,6 +237,7 @@ export function InferenceJobDetailPage() {
 
   const [eventType, setEventType] = useState('PRODUCT_PICKUP');
   const [quantityDelta, setQuantityDelta] = useState('1');
+  const [occurredAt, setOccurredAt] = useState(() => new Date().toISOString());
   const [evidenceQuality, setEvidenceQuality] = useState('');
   const [detections, setDetections] = useState(EMPTY_DETECTIONS);
   const [errorCode, setErrorCode] = useState('');
@@ -268,9 +280,21 @@ export function InferenceJobDetailPage() {
       setActionError('Quantity delta must be a nonzero whole number.');
       return;
     }
+    if (Number.isNaN(Date.parse(occurredAt))) {
+      setActionError('Occurred-at must be an ISO 8601 timestamp.');
+      return;
+    }
     const rows = detections.filter((row) => row.sku.trim());
-    if (!rows.length) {
-      setActionError('Add at least one detection (SKU + confidence).');
+    const basketAffecting = [
+      'PRODUCT_PICKUP',
+      'CART_INSERTION',
+      'PRODUCT_RETURN',
+    ].includes(eventType);
+    if (!rows.length && basketAffecting) {
+      setActionError(
+        'Add at least one detection (SKU + confidence) for a basket-' +
+          'affecting event type.',
+      );
       return;
     }
     const parsed = rows.map((row) => ({
@@ -285,6 +309,7 @@ export function InferenceJobDetailPage() {
     await act('/complete', {
       eventType,
       quantityDelta: delta,
+      occurredAt,
       detections: parsed,
       ...(evidenceQuality ? { evidenceQuality } : {}),
     });
@@ -297,7 +322,7 @@ export function InferenceJobDetailPage() {
       setActionError('Enter an error code (e.g. LOW_CONFIDENCE).');
       return;
     }
-    await act('/fail', { errorCode: errorCode.trim() });
+    await act('/fail', { errorCode: errorCode.trim().toUpperCase() });
     setErrorCode('');
   }
 
@@ -351,6 +376,14 @@ export function InferenceJobDetailPage() {
                 title="Quantity delta (negative only for PRODUCT_RETURN)"
                 value={quantityDelta}
                 onChange={(e) => setQuantityDelta(e.target.value)}
+              />
+              <input
+                type="text"
+                style={{ minWidth: '15rem' }}
+                title="When the interaction happened per the source (ISO 8601) — not when inference ran"
+                placeholder="Occurred at (ISO 8601)"
+                value={occurredAt}
+                onChange={(e) => setOccurredAt(e.target.value)}
               />
               <select
                 value={evidenceQuality}
@@ -426,6 +459,8 @@ export function InferenceJobDetailPage() {
             </dd>
             <dt>Priority</dt>
             <dd>{data.priority}</dd>
+            <dt>Attempts</dt>
+            <dd>{data.attempts}</dd>
             <dt>Requested</dt>
             <dd>{formatDate(data.requestedAt)}</dd>
             <dt>Started</dt>
@@ -498,6 +533,8 @@ export function InferenceJobDetailPage() {
                 <dd>{data.result.eventType}</dd>
                 <dt>Quantity delta</dt>
                 <dd>{data.result.quantityDelta}</dd>
+                <dt>Occurred</dt>
+                <dd>{formatDate(data.result.occurredAt)}</dd>
                 <dt>Evidence score</dt>
                 <dd>{data.result.evidenceScore ?? '—'}</dd>
                 <dt>Evidence quality</dt>
