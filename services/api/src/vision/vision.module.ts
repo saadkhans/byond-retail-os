@@ -14,5 +14,9 @@ import { VisionEventsService } from './vision-events.service';
 @Module({
   controllers: [VisionEventsController, EvidenceBundlesController],
   providers: [VisionEventsService, VisionEventsRepository],
+  // Exported for the Phase 9 inference module: converting a successful
+  // inference result into a vision event goes through the SAME ingest
+  // contract (never a parallel implementation).
+  exports: [VisionEventsService],
 })
 export class VisionModule {}

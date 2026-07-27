@@ -15,6 +15,10 @@ import {
 } from './pages/CheckoutSessionsPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { DeviceDetailPage, DevicesPage } from './pages/DevicesPage';
+import {
+  InferenceJobDetailPage,
+  InferenceJobsPage,
+} from './pages/InferenceJobsPage';
 import { InventoryPage } from './pages/InventoryPage';
 import { LoginPage } from './pages/LoginPage';
 import { OrderDetailPage, OrdersPage } from './pages/OrdersPage';
@@ -66,6 +70,7 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/payment-events">Payment events</NavLink>
         <NavLink to="/reconciliation">Reconciliation</NavLink>
         <NavLink to="/vision-events">CV events</NavLink>
+        <NavLink to="/inference">Inference jobs</NavLink>
         <div className="spacer" />
         <div className="who">{user?.email}</div>
         <button onClick={() => void logout()}>Sign out</button>
@@ -127,6 +132,11 @@ export function App() {
                     <Route
                       path="vision-events/:id"
                       element={<VisionEventDetailPage />}
+                    />
+                    <Route path="inference" element={<InferenceJobsPage />} />
+                    <Route
+                      path="inference/:id"
+                      element={<InferenceJobDetailPage />}
                     />
                     <Route path="*" element={<Navigate to="/" replace />} />
                   </Routes>

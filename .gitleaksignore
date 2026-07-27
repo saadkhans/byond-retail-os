@@ -5,3 +5,11 @@
 # removed from the source in the following commit; this entry only covers the
 # historical commit that briefly contained the fixture. Not a real credential.
 fee2aa7cd0bf091830ca84f85f13657f6ed865e3:ml/tests/test_dataset_manifest.py:aws-access-token:220
+#
+# Fake Stripe-shaped and key=value-shaped TEST FIXTURES (Phase 9 sensitive-
+# value screening tests, proving such values are REJECTED before persistence).
+# The literals were split in the following commit so they never match a
+# secret-scanner rule again; these entries only cover the historical commit
+# that introduced them. Not real credentials.
+a474033fff9eae0b715aeeeb3f318ef4aab11f8b:services/api/src/inference/inference-jobs.service.spec.ts:stripe-access-token:438
+a474033fff9eae0b715aeeeb3f318ef4aab11f8b:services/api/src/inference/inference-jobs.service.spec.ts:generic-api-key:467

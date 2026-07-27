@@ -44,4 +44,8 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   { code: 'vision:read', module: 'cv', description: 'View vision events, SKU candidates, reviews, and evidence bundle lineage records' },
   { code: 'vision:ingest', module: 'cv', description: 'Ingest normalized product interaction events (with lineage-only evidence bundles) from vision adapters' },
   { code: 'vision:review', module: 'cv', description: 'Approve, reject, or manually override vision events, applying approved events to checkout baskets' },
+  { code: 'inference:read', module: 'inference', description: 'View inference jobs, results, and SKU candidate rankings' },
+  { code: 'inference:manage', module: 'inference', description: 'Create inference jobs and drive their lifecycle (start, fail)' },
+  { code: 'inference:simulate', module: 'inference', description: 'Complete jobs with simulated adapter output (no real model execution)' },
+  { code: 'inference:apply', module: 'inference', description: 'Convert a successful inference result into a Phase 7 vision event' },
 ];

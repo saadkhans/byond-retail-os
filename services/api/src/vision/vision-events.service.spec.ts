@@ -372,6 +372,31 @@ describe('VisionEventsService', () => {
       );
     });
 
+    it('rejects public keys in the reserved "inference:" namespace', async () => {
+      // Idempotent replay returns an existing event WITHOUT comparing
+      // payloads, so a caller squatting a Phase 9 job's derived key could
+      // otherwise feed the converter an arbitrary event.
+      await expect(
+        service.ingest(
+          'tenant-a',
+          { ...baseIngest, idempotencyKey: 'inference:job-1' },
+          actor,
+        ),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(repository.ingest).not.toHaveBeenCalled();
+    });
+
+    it('allows the reserved namespace for the trusted conversion caller', async () => {
+      await expect(
+        service.ingest(
+          'tenant-a',
+          { ...baseIngest, idempotencyKey: 'inference:job-1' },
+          actor,
+          { allowReservedIdempotencyKey: true },
+        ),
+      ).resolves.toBe(eventDetail);
+    });
+
     it('builds CREATE audit entries for the event and inline bundle', async () => {
       await service.ingest(
         'tenant-a',

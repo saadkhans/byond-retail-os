@@ -103,6 +103,22 @@ function rejectEvidencePayload(path: string): never {
   );
 }
 
+/**
+ * Idempotency-key namespace reserved for the Phase 9 inference → vision
+ * conversion (`inference:<jobId>`). Public ingest callers may not use it:
+ * a caller who pre-ingested an arbitrary event under a job's derived key
+ * would otherwise be REPLAYED to the converter, permanently linking the
+ * wrong event to the job. Only the internal conversion path (which also
+ * verifies the replayed event against the job's result) may pass keys in
+ * this namespace.
+ */
+export const RESERVED_INFERENCE_IDEMPOTENCY_PREFIX = 'inference:';
+
+/** Internal options for trusted service-to-service ingest callers. */
+export interface IngestOptions {
+  allowReservedIdempotencyKey?: boolean;
+}
+
 function assertNoEventEvidencePayload(dto: IngestVisionEventDto): void {
   const record = dto as unknown as Record<string, unknown>;
   for (const key of REMOVED_EVENT_FIELDS) {
@@ -158,12 +174,23 @@ export class VisionEventsService {
     tenantId: string,
     dto: IngestVisionEventDto,
     actor?: AuditActor,
+    options: IngestOptions = {},
   ): Promise<VisionEventDetail> {
     // Phase 7 evidence policy: reject every removed payload-capable
     // field with the stable out-of-scope message before any other work.
     assertNoEventEvidencePayload(dto);
     assertOpaque('evidenceBundleId', dto.evidenceBundleId);
     assertOpaque('idempotencyKey', dto.idempotencyKey);
+    if (
+      !options.allowReservedIdempotencyKey &&
+      dto.idempotencyKey?.startsWith(RESERVED_INFERENCE_IDEMPOTENCY_PREFIX)
+    ) {
+      throw new BadRequestException(
+        `idempotencyKey namespace "${RESERVED_INFERENCE_IDEMPOTENCY_PREFIX}" ` +
+          'is reserved for the inference conversion path; choose a key ' +
+          'outside it',
+      );
+    }
     for (const [index, code] of (dto.reasonCodes ?? []).entries()) {
       assertReasonCode(`reasonCodes[${index}]`, code);
     }
