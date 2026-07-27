@@ -16,10 +16,13 @@ import {
 import {
   ExtractionFailedError,
   ExtractionInfrastructureError,
+  ExtractorUnavailableError,
   FrameUnavailableError,
 } from './extraction/video-frame-extractor.port';
 import { VideoScreeningDecision } from './dto/screen-video-asset.dto';
+import { VideoStorageOperationError } from './storage/video-storage.port';
 import {
+  SCREENING_PREVIEW_MAX_FRAMES,
   UploadedVideoFile,
   VideoAssetsService,
 } from './video-assets.service';
@@ -120,14 +123,24 @@ function cropFingerprint(params: {
   });
 }
 
-/** Mirrors the service's CANONICAL frames fingerprint (defaults applied). */
+/**
+ * Mirrors the service's CANONICAL frames fingerprint: sampling mode applies
+ * the defaults; single-frame mode records EVERY supplied field raw
+ * (explicit null = not supplied), so a supplied-but-ignored interval/limit
+ * is still part of the request identity.
+ */
 function framesFingerprint(params: {
   timestampMs?: number;
   intervalMs?: number;
   maxFrames?: number;
 } = {}): string {
   return params.timestampMs !== undefined
-    ? JSON.stringify({ op: 'FRAMES', timestampMs: params.timestampMs })
+    ? JSON.stringify({
+        op: 'FRAMES',
+        timestampMs: params.timestampMs,
+        intervalMs: params.intervalMs ?? null,
+        maxFrames: params.maxFrames ?? null,
+      })
     : JSON.stringify({
         op: 'FRAMES',
         intervalMs: params.intervalMs ?? 1000,
@@ -278,6 +291,10 @@ function buildService(overrides: {
     findById: jest.fn(async () => ({
       id: 'job-1',
       jobType: InferenceJobType.PRODUCT_RECOGNITION,
+    })),
+    cancelOrphanedJob: jest.fn(async () => ({
+      id: 'job-1',
+      status: 'CANCELLED',
     })),
     ...overrides.inference,
   };
@@ -442,54 +459,107 @@ describe('VideoAssetsService.upload', () => {
     }
   });
 
-  it('retries a transient cleanup failure and still surfaces the ORIGINAL error', async () => {
-    // File stored, row failed (broken FK), first deletePrefix throws, the
-    // retry succeeds: the caller sees the controlled 400 for the broken
-    // reference — the cleanup failure was transient and is NOT escalated.
-    const deletePrefix = jest
-      .fn()
-      .mockRejectedValueOnce(new Error('EBUSY'))
-      .mockResolvedValueOnce(undefined);
-    const { service } = buildService({
-      storage: { deletePrefix },
-      repository: {
-        createAsset: jest.fn(async () => {
-          throw Object.assign(new Error('fk'), { code: 'P2003' });
-        }),
-      },
-    });
-    await expect(
-      service.upload(TENANT, uploadFile(), { ...ATTEST, unitId: 'missing-unit' }),
-    ).rejects.toBeInstanceOf(BadRequestException);
-    expect(deletePrefix).toHaveBeenCalledTimes(2);
+  it('commits the asset row BEFORE any byte reaches storage (DB-first staging)', async () => {
+    // A crash between the two steps must leave a row referencing the key —
+    // the row IS the recovery record. The old put-then-create ordering
+    // stranded quarantined media no row referenced (unrecoverable orphan).
+    const { service, repository, storage } = buildService();
+    await service.upload(TENANT, uploadFile(), { ...ATTEST });
+    const createOrder = (repository.createAsset as jest.Mock).mock
+      .invocationCallOrder[0];
+    const putOrder = (storage.put as jest.Mock).mock.invocationCallOrder[0];
+    expect(createOrder).toBeLessThan(putOrder);
   });
 
-  it('escalates a PERSISTENT cleanup failure as 503 instead of discarding it', async () => {
-    // Row creation failed AND both cleanup attempts failed: no asset row
-    // references the generated key, so silently ignoring the failure would
-    // strand untracked media on disk. The controlled 503 names the
-    // condition so the operator acts on it.
-    const deletePrefix = jest.fn(async () => {
-      throw new Error('EACCES');
+  it('marks the committed row FAILED (UPLOAD_INCOMPLETE) and 503s when the media write fails', async () => {
+    // DB-first consequence: the row is already durable when put fails. The
+    // media dir is removed best-effort, the row transitions QUARANTINED →
+    // FAILED with the stable UPLOAD_INCOMPLETE code (error codes exist
+    // exactly on REJECTED/FAILED — the error_only_terminal_check
+    // constraint), the transition is audited, and the caller sees the
+    // storage failure as the existing controlled 503. The row remains as
+    // durable evidence referencing the key.
+    const put = jest.fn(async () => {
+      throw new VideoStorageOperationError();
     });
-    const { service } = buildService({
-      storage: { deletePrefix },
-      repository: {
-        createAsset: jest.fn(async () => {
-          throw Object.assign(new Error('fk'), { code: 'P2003' });
-        }),
+    let auditReason: string | undefined;
+    const transitionStatus = jest.fn(
+      async (
+        _t: string,
+        _id: string,
+        _expected: unknown,
+        data: { status: VideoAssetStatus },
+        build: (b: unknown, a: unknown) => { reason?: string },
+      ) => {
+        const after = assetRow({ ...data });
+        auditReason = build(
+          assetRow({ status: VideoAssetStatus.QUARANTINED }),
+          after,
+        ).reason;
+        return after;
       },
+    );
+    const { service, repository, storage } = buildService({
+      storage: { put },
+      repository: { transitionStatus },
     });
     await expect(
       service.upload(TENANT, uploadFile(), { ...ATTEST }),
     ).rejects.toBeInstanceOf(ServiceUnavailableException);
-    // One retry, then escalation — never an unbounded loop.
+    // Best-effort media-dir removal ran BEFORE the FAILED transition.
+    expect(storage.deletePrefix).toHaveBeenCalledTimes(1);
+    expect(
+      (storage.deletePrefix as jest.Mock).mock.invocationCallOrder[0],
+    ).toBeLessThan(transitionStatus.mock.invocationCallOrder[0]);
+    const [, , expected, data] = repository.transitionStatus.mock
+      .calls[0] as unknown as [
+      string,
+      string,
+      VideoAssetStatus[],
+      { status: VideoAssetStatus; errorCode: string },
+    ];
+    expect(expected).toEqual([VideoAssetStatus.QUARANTINED]);
+    expect(data.status).toBe(VideoAssetStatus.FAILED);
+    expect(data.errorCode).toBe('UPLOAD_INCOMPLETE');
+    expect(auditReason).toContain('recovery record');
+  });
+
+  it('still records the FAILED transition when the best-effort removal keeps failing', async () => {
+    // The removal is BEST-EFFORT (prefix removal is idempotent and the
+    // FAILED row is what an operator acts on): a persistent removal
+    // failure must not swallow the durable evidence transition or the 503.
+    const put = jest.fn(async () => {
+      throw new VideoStorageOperationError();
+    });
+    const deletePrefix = jest.fn(async () => {
+      throw new Error('EACCES');
+    });
+    const { service, repository } = buildService({
+      storage: { put, deletePrefix },
+    });
+    await expect(
+      service.upload(TENANT, uploadFile(), { ...ATTEST }),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    // One retry, then the escalation is swallowed (best-effort) — never an
+    // unbounded loop, and the FAILED claim still lands.
     expect(deletePrefix).toHaveBeenCalledTimes(2);
+    expect(repository.transitionStatus).toHaveBeenCalledTimes(1);
+    const [, , , data] = repository.transitionStatus.mock
+      .calls[0] as unknown as [
+      string,
+      string,
+      VideoAssetStatus[],
+      { status: VideoAssetStatus; errorCode: string },
+    ];
+    expect(data.status).toBe(VideoAssetStatus.FAILED);
+    expect(data.errorCode).toBe('UPLOAD_INCOMPLETE');
   });
 
   it('rejects context references that do not form one consistent hierarchy', async () => {
     // Same rules and vocabulary as PrismaInferenceQueue.enqueue(): an asset
-    // the queue would later reject must fail AT UPLOAD.
+    // the queue would later reject must fail AT UPLOAD — and DB-first
+    // staging means the rejection happens BEFORE any bytes are written, so
+    // there is nothing to clean up.
     const { service, storage } = buildService({
       repository: {
         createAsset: jest.fn(async () => 'unit-location-mismatch' as const),
@@ -502,11 +572,11 @@ describe('VideoAssetsService.upload', () => {
         unitId: 'unit-from-other-store',
       }),
     ).rejects.toBeInstanceOf(BadRequestException);
-    // The stored file must not outlive the rejected row.
-    expect(storage.deletePrefix).toHaveBeenCalledTimes(1);
+    expect(storage.put).not.toHaveBeenCalled();
+    expect(storage.deletePrefix).not.toHaveBeenCalled();
   });
 
-  it('maps broken references to a controlled 400 and cleans the stored file', async () => {
+  it('maps broken references to a controlled 400 with no bytes written', async () => {
     const { service, storage } = buildService({
       repository: {
         createAsset: jest.fn(async () => {
@@ -517,7 +587,38 @@ describe('VideoAssetsService.upload', () => {
     await expect(
       service.upload(TENANT, uploadFile(), { ...ATTEST, unitId: 'other-tenant-unit' }),
     ).rejects.toBeInstanceOf(BadRequestException);
-    expect(storage.deletePrefix).toHaveBeenCalledTimes(1);
+    expect(storage.put).not.toHaveBeenCalled();
+    expect(storage.deletePrefix).not.toHaveBeenCalled();
+  });
+
+  it('REDACTS payment-bearing reference ids from reference-rejection messages', async () => {
+    // The rejection message reflects CALLER-SUPPLIED, unresolved ids —
+    // error responses land in logs and telemetry, so a PAN smuggled as a
+    // reference id must echo back as [REDACTED], never verbatim.
+    const pan = '4111111111111111';
+    const cases: [string, Record<string, string>][] = [
+      ['location-not-found', { locationId: pan }],
+      ['unit-not-found', { unitId: pan }],
+      ['unit-location-mismatch', { unitId: pan, locationId: pan }],
+      ['device-not-found', { deviceId: pan }],
+      ['device-unit-mismatch', { deviceId: pan, unitId: pan }],
+      ['session-not-found', { sessionId: pan }],
+      ['session-unit-mismatch', { sessionId: pan, unitId: pan }],
+    ];
+    for (const [rejection, refs] of cases) {
+      const { service } = buildService({
+        repository: { createAsset: jest.fn(async () => rejection) },
+      });
+      const error: Error = await service
+        .upload(TENANT, uploadFile(), { ...ATTEST, ...refs })
+        .then(() => {
+          throw new Error('expected rejection');
+        })
+        .catch((caught: Error) => caught);
+      expect(error).toBeInstanceOf(BadRequestException);
+      expect(error.message).toContain('[REDACTED]');
+      expect(error.message).not.toContain(pan);
+    }
   });
 });
 
@@ -723,9 +824,36 @@ describe('VideoAssetsService.screen', () => {
     expect(expected).toEqual([VideoAssetStatus.QUARANTINED]);
     expect(data.status).toBe(VideoAssetStatus.REJECTED);
     expect(data.errorCode).toBe('SCREENING_REJECTED');
+    // CLAIM-FIRST ordering: the audited terminal transition commits BEFORE
+    // any media removal, so a concurrent APPROVE can never release an
+    // asset whose bytes are already gone.
+    const claimOrder = (transitionStatus as jest.Mock).mock
+      .invocationCallOrder[0];
+    const removalOrder = (storage.deletePrefix as jest.Mock).mock
+      .invocationCallOrder[0];
+    expect(claimOrder).toBeLessThan(removalOrder);
     // The screened operator note rides in the audited record.
     expect(entry?.reason).toContain('screening rejected');
     expect(entry?.reason).toContain('payment terminal visible in frame 3');
+  });
+
+  it('REJECT that loses the claim CAS to a concurrent decision 409s WITHOUT touching media', async () => {
+    // A concurrent APPROVE (or another REJECT) resolved first: the claim
+    // loses the compare-and-set, the rejection is a controlled 409, and —
+    // claim-first — the stored media was never touched, so the winning
+    // APPROVE released an asset whose bytes are fully intact.
+    const { service, storage } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () => quarantined()),
+        transitionStatus: jest.fn(async () => null),
+      },
+    });
+    await expect(
+      service.screen(TENANT, 'asset-1', {
+        decision: VideoScreeningDecision.REJECT,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(storage.deletePrefix).not.toHaveBeenCalled();
   });
 
   it('REJECT retries a transient media-removal failure and still completes', async () => {
@@ -744,10 +872,12 @@ describe('VideoAssetsService.screen', () => {
     expect(repository.transitionStatus).toHaveBeenCalledTimes(1);
   });
 
-  it('REJECT escalates a persistent media-removal failure as 503 and stays QUARANTINED', async () => {
-    // The 503 fires BEFORE any transition, so the rejection is retryable
-    // through the same endpoint — bytes can never outlive a recorded
-    // rejection.
+  it('REJECT escalates a persistent media-removal failure as 503 AFTER the terminal claim committed', async () => {
+    // Claim-first: the audited QUARANTINED → REJECTED transition is
+    // already durable when the removal fails, so the asset is REJECTED —
+    // terminal, unprocessable, never served — and the 503 names the
+    // orphaned media; replaying the rejection (below) completes the
+    // removal.
     const deletePrefix = jest.fn(async () => {
       throw new Error('EACCES');
     });
@@ -755,14 +885,74 @@ describe('VideoAssetsService.screen', () => {
       storage: { deletePrefix },
       repository: { findByIdInternal: jest.fn(async () => quarantined()) },
     });
+    const error: Error = await service
+      .screen(TENANT, 'asset-1', { decision: VideoScreeningDecision.REJECT })
+      .then(() => {
+        throw new Error('expected rejection');
+      })
+      .catch((caught: Error) => caught);
+    expect(error).toBeInstanceOf(ServiceUnavailableException);
+    // The controlled 503 names the orphan condition and the recovery path.
+    expect(error.message).toContain('orphaned');
+    // One retry, then escalation — never an unbounded loop.
+    expect(deletePrefix).toHaveBeenCalledTimes(2);
+    // The claim committed FIRST (REJECTED with the stable error code).
+    expect(repository.transitionStatus).toHaveBeenCalledTimes(1);
+    const claimOrder = (repository.transitionStatus as jest.Mock).mock
+      .invocationCallOrder[0];
+    expect(claimOrder).toBeLessThan(deletePrefix.mock.invocationCallOrder[0]);
+  });
+
+  it('REJECT replays on an asset already REJECTED by screening: re-attempts the removal and succeeds', async () => {
+    // Recovery path for a removal that failed post-claim: the SAME
+    // endpoint, retried, re-runs the (idempotent) media removal and
+    // returns success — allowed for EXACTLY errorCode SCREENING_REJECTED,
+    // because only a screening rejection claims media it then removes.
+    const rejectedRow = () =>
+      assetRow({
+        status: VideoAssetStatus.REJECTED,
+        errorCode: 'SCREENING_REJECTED',
+        errorMessage:
+          'Frame-content screening rejected this upload; the stored media ' +
+          'was removed',
+      });
+    const { service, storage, repository } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () => rejectedRow()),
+        findById: jest.fn(async () => rejectedRow()),
+      },
+    });
+    const result = await service.screen(TENANT, 'asset-1', {
+      decision: VideoScreeningDecision.REJECT,
+    });
+    expect((result as { status: VideoAssetStatus }).status).toBe(
+      VideoAssetStatus.REJECTED,
+    );
+    // The removal re-ran; no second transition and no second audit entry.
+    expect(storage.deletePrefix).toHaveBeenCalledWith(`${TENANT}/uuid-1`);
+    expect(repository.transitionStatus).not.toHaveBeenCalled();
+  });
+
+  it('REJECT does NOT replay a REJECTED asset with a different error code', async () => {
+    // A PROBE_FAILED rejection never claimed its media through screening —
+    // replaying it would delete media outside the screening contract.
+    const { service, storage } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () =>
+          assetRow({
+            status: VideoAssetStatus.REJECTED,
+            errorCode: 'PROBE_FAILED',
+            errorMessage: 'The file could not be read as a video',
+          }),
+        ),
+      },
+    });
     await expect(
       service.screen(TENANT, 'asset-1', {
         decision: VideoScreeningDecision.REJECT,
       }),
-    ).rejects.toBeInstanceOf(ServiceUnavailableException);
-    // One retry, then escalation — never an unbounded loop.
-    expect(deletePrefix).toHaveBeenCalledTimes(2);
-    expect(repository.transitionStatus).not.toHaveBeenCalled();
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(storage.deletePrefix).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -801,19 +991,41 @@ describe('VideoAssetsService.screen', () => {
   });
 
   it('rejects a note carrying credential- or payment-bearing content BEFORE any read', async () => {
+    // The fused free-text predicate screens the note: key=value fragments
+    // and PANs as before, PLUS credential labels fused with their value in
+    // one token (cvv123, pin1234) — which the older value/PAN pair missed.
+    // The rejection lands before any read or transition.
     const { service, repository } = buildService();
     for (const note of [
       ['4111', '1111', '1111', '1111'].join(' '),
       'password=hunter2',
+      'cvv123',
+      'pin1234',
     ]) {
-      await expect(
-        service.screen(TENANT, 'asset-1', {
-          decision: VideoScreeningDecision.APPROVE,
-          note,
-        }),
-      ).rejects.toBeInstanceOf(BadRequestException);
+      for (const decision of [
+        VideoScreeningDecision.APPROVE,
+        VideoScreeningDecision.REJECT,
+      ]) {
+        await expect(
+          service.screen(TENANT, 'asset-1', { decision, note }),
+        ).rejects.toBeInstanceOf(BadRequestException);
+      }
     }
     expect(repository.findByIdInternal).not.toHaveBeenCalled();
+    expect(repository.transitionStatus).not.toHaveBeenCalled();
+  });
+
+  it('still accepts a benign screening note', async () => {
+    const { service } = buildService({
+      repository: { findByIdInternal: jest.fn(async () => quarantined()) },
+    });
+    const result = await service.screen(TENANT, 'asset-1', {
+      decision: VideoScreeningDecision.APPROVE,
+      note: 'shelf and product zone only; no cards or terminals visible',
+    });
+    expect((result as { status: VideoAssetStatus }).status).toBe(
+      VideoAssetStatus.UPLOADED,
+    );
   });
 
   it('409s when the CAS loses to a concurrent decision', async () => {
@@ -828,6 +1040,209 @@ describe('VideoAssetsService.screen', () => {
         decision: VideoScreeningDecision.APPROVE,
       }),
     ).rejects.toBeInstanceOf(ConflictException);
+  });
+});
+
+describe('VideoAssetsService.screeningPreview', () => {
+  const quarantined = () => assetRow({ status: VideoAssetStatus.QUARANTINED });
+
+  it('serves evenly spaced in-memory frames for a QUARANTINED asset and persists NOTHING', async () => {
+    const { service, storage, repository, extractor } = buildService({
+      repository: { findByIdInternal: jest.fn(async () => quarantined()) },
+    });
+    const preview = await service.screeningPreview(TENANT, 'asset-1', {
+      id: 'u1',
+      email: 'screener@x.io',
+    });
+    // 10 s probe → the full cap, evenly spaced strictly inside the duration.
+    expect(preview.frames).toHaveLength(SCREENING_PREVIEW_MAX_FRAMES);
+    expect(preview.frames.map((frame) => frame.timestampMs)).toEqual([
+      0, 1666, 3333, 5000, 6666, 8333,
+    ]);
+    expect(preview.skippedOverBudget).toBe(0);
+    for (const frame of preview.frames) {
+      // Base64 payload decodes back to the extractor's bytes.
+      expect(Buffer.from(frame.imageBase64, 'base64').toString()).toBe('f');
+      expect(frame.mimeType).toBe('image/png');
+    }
+    // The extractor was asked for exactly the sampled positions.
+    expect(extractor.extractFrameAt).toHaveBeenCalledTimes(
+      SCREENING_PREVIEW_MAX_FRAMES,
+    );
+    // FRAMES ARE NEVER PERSISTED: no storage writes, no artifact rows, and
+    // no status transition — the screening decision stays open.
+    expect(storage.put).not.toHaveBeenCalled();
+    expect(repository.createArtifactsBatch).not.toHaveBeenCalled();
+    expect(repository.transitionStatus).not.toHaveBeenCalled();
+  });
+
+  it('AUDITS every served preview (READ action, frame count in the reason)', async () => {
+    const { service, auditLog } = buildService({
+      repository: { findByIdInternal: jest.fn(async () => quarantined()) },
+    });
+    await service.screeningPreview(TENANT, 'asset-1', {
+      id: 'u1',
+      email: 'screener@x.io',
+    });
+    expect(auditLog.record).toHaveBeenCalledTimes(1);
+    const [entry] = auditLog.record.mock.calls[0] as unknown as [
+      {
+        action: string;
+        entityType: string;
+        entityId: string;
+        actorEmail: string;
+        reason: string;
+      },
+    ];
+    expect(entry.action).toBe('READ');
+    expect(entry.entityType).toBe('VideoAsset');
+    expect(entry.entityId).toBe('asset-1');
+    expect(entry.actorEmail).toBe('screener@x.io');
+    expect(entry.reason).toContain('Screening preview served: 6 sample frame');
+  });
+
+  it('serves a single frame for a very short clip', async () => {
+    const { service, extractor } = buildService({
+      repository: { findByIdInternal: jest.fn(async () => quarantined()) },
+      extractor: {
+        probe: jest.fn(async () => ({
+          durationMs: 800,
+          width: 640,
+          height: 360,
+          fps: 30,
+        })),
+      },
+    });
+    const preview = await service.screeningPreview(TENANT, 'asset-1');
+    expect(preview.frames).toHaveLength(1);
+    expect(preview.frames[0].timestampMs).toBe(0);
+    expect(extractor.extractFrameAt).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips undecodable sample positions instead of failing the preview', async () => {
+    // Container durations routinely overshoot the last decodable frame —
+    // a missing sample is a gap in the strip, not an error.
+    const { service } = buildService({
+      repository: { findByIdInternal: jest.fn(async () => quarantined()) },
+      extractor: {
+        extractFrameAt: jest.fn(async (_k: string, _p: unknown, ts: number) => {
+          if (ts > 5000) {
+            throw new FrameUnavailableError();
+          }
+          return {
+            data: Buffer.from('f'),
+            width: 1280,
+            height: 720,
+            mimeType: 'image/png',
+            timestampMs: ts,
+          };
+        }),
+      },
+    });
+    const preview = await service.screeningPreview(TENANT, 'asset-1');
+    expect(preview.frames.map((frame) => frame.timestampMs)).toEqual([
+      0, 1666, 3333, 5000,
+    ]);
+  });
+
+  it('skips frames that would exceed the decoded-byte budget and reports the skip', async () => {
+    // Reuses the module's request-wide extraction byte budget — an
+    // over-budget frame is dropped and COUNTED, never partially returned.
+    const huge = { length: 200 * 1024 * 1024 } as Buffer;
+    const { service } = buildService({
+      repository: { findByIdInternal: jest.fn(async () => quarantined()) },
+      extractor: {
+        extractFrameAt: jest.fn(async (_k: string, _p: unknown, ts: number) => ({
+          data: ts === 0 ? huge : Buffer.from('f'),
+          width: 1280,
+          height: 720,
+          mimeType: 'image/png',
+          timestampMs: ts,
+        })),
+      },
+    });
+    const preview = await service.screeningPreview(TENANT, 'asset-1');
+    expect(preview.skippedOverBudget).toBe(1);
+    expect(preview.frames).toHaveLength(SCREENING_PREVIEW_MAX_FRAMES - 1);
+    expect(
+      preview.frames.some((frame) => frame.timestampMs === 0),
+    ).toBe(false);
+  });
+
+  it.each([
+    [VideoAssetStatus.UPLOADED],
+    [VideoAssetStatus.VALIDATED],
+    [VideoAssetStatus.READY],
+    [VideoAssetStatus.REJECTED],
+    [VideoAssetStatus.FAILED],
+  ])('409s a preview of a non-QUARANTINED asset (%s)', async (status) => {
+    // Screening decisions are only pending while QUARANTINED — outside
+    // that window the preview would be a general-purpose frame download.
+    const { service, extractor } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () => assetRow({ status })),
+      },
+    });
+    await expect(
+      service.screeningPreview(TENANT, 'asset-1'),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(extractor.probe).not.toHaveBeenCalled();
+    expect(extractor.extractFrameAt).not.toHaveBeenCalled();
+  });
+
+  it('404s an unknown asset and REDACTS a payment-bearing route id', async () => {
+    const pan = '4111111111111111';
+    const { service } = buildService({
+      repository: { findByIdInternal: jest.fn(async () => null) },
+    });
+    const error: Error = await service
+      .screeningPreview(TENANT, pan)
+      .then(() => {
+        throw new Error('expected rejection');
+      })
+      .catch((caught: Error) => caught);
+    expect(error).toBeInstanceOf(NotFoundException);
+    expect(error.message).toContain('[REDACTED]');
+    expect(error.message).not.toContain(pan);
+  });
+
+  it('maps extractor-unavailable and infrastructure failures to 503 with no transition', async () => {
+    for (const failure of [
+      new ExtractorUnavailableError(),
+      new ExtractionInfrastructureError(),
+    ]) {
+      const { service, repository, auditLog } = buildService({
+        repository: { findByIdInternal: jest.fn(async () => quarantined()) },
+        extractor: {
+          probe: jest.fn(async () => {
+            throw failure;
+          }),
+        },
+      });
+      await expect(
+        service.screeningPreview(TENANT, 'asset-1'),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(repository.transitionStatus).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
+    }
+  });
+
+  it('maps unreadable content to a controlled 400 WITHOUT any status transition', async () => {
+    // A preview failure must never auto-reject: the screening decision
+    // remains open (this also covers the DB-first crash window — a
+    // QUARANTINED row whose media never landed previews as a 400).
+    const { service, repository } = buildService({
+      repository: { findByIdInternal: jest.fn(async () => quarantined()) },
+      extractor: {
+        probe: jest.fn(async () => {
+          throw new ExtractionFailedError();
+        }),
+      },
+    });
+    await expect(
+      service.screeningPreview(TENANT, 'asset-1'),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(repository.transitionStatus).not.toHaveBeenCalled();
   });
 });
 
@@ -906,7 +1321,8 @@ describe('VideoAssetsService crop & frame extraction', () => {
 
   it('409s frame extraction AND crops on a QUARANTINED asset', async () => {
     // Quarantine must hold at EVERY processing entry point — an unscreened
-    // clip's bytes are never decoded, sampled, or cropped.
+    // clip's bytes never become artifacts (the ONLY decode path while
+    // QUARANTINED is the audited, in-memory screening preview).
     const { service, extractor, storage } = buildService({
       repository: {
         findByIdInternal: jest.fn(async () =>
@@ -1154,13 +1570,35 @@ describe('extraction idempotency', () => {
     expect(storage.delete).toHaveBeenCalledTimes(1);
   });
 
-  it('rejects idempotency keys carrying sensitive content', async () => {
-    const { service } = buildService();
-    await expect(
-      service.extractFrames(TENANT, 'asset-1', {
-        idempotencyKey: `pan-${['4111', '1111', '1111', '1111'].join(' ')}`,
-      }),
-    ).rejects.toBeInstanceOf(BadRequestException);
+  it('rejects idempotency keys carrying sensitive content, including grouped PANs', async () => {
+    // The key is PERSISTED verbatim in VideoExtractionRequest, so both the
+    // shared payment predicate AND the grouping-aware PAN detector screen
+    // it: "4111_1111_1111_1111" (any single separator) must 400 before the
+    // key is read or written anywhere.
+    const { service, repository } = buildService();
+    const panParts = ['4111', '1111', '1111', '1111'];
+    for (const idempotencyKey of [
+      `pan-${panParts.join(' ')}`,
+      panParts.join('_'), // grouped PAN the shared predicate cannot see
+      `key.${panParts.join('.')}`,
+    ]) {
+      await expect(
+        service.extractFrames(TENANT, 'asset-1', { idempotencyKey }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      await expect(
+        service.createCrop(TENANT, 'asset-1', {
+          timestampMs: 1000,
+          x: 0,
+          y: 0,
+          width: 10,
+          height: 10,
+          idempotencyKey,
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
+    // The key never reached the persistence layer on any path.
+    expect(repository.findExtractionReplay).not.toHaveBeenCalled();
+    expect(repository.createArtifactsBatch).not.toHaveBeenCalled();
   });
 
   it('409s a same-key crop retry whose timestamp, box, or reason changed', async () => {
@@ -1256,6 +1694,75 @@ describe('extraction idempotency', () => {
     });
     expect(explicit.replayed).toBe(true);
     expect(extractor.extractFrames).not.toHaveBeenCalled();
+  });
+
+  it('409s a single-frame same-key retry whose SUPPLIED interval or limit changed', async () => {
+    // Single-frame extraction ignores interval/limit, but a supplied value
+    // is still part of the request identity: a same-key retry changing a
+    // supplied-but-ignored field must 409, never replay the old batch as
+    // if it answered the new request.
+    const singleFrameReplay = () => ({
+      asset: assetRow({ status: VideoAssetStatus.READY }),
+      artifacts: [
+        artifactRow({ artifactType: VideoArtifactType.FRAME, cropX: null }),
+      ],
+      replayed: true as const,
+      // Original request: timestampMs WITH both supplementary fields
+      // supplied (and ignored by extraction).
+      requestFingerprint: framesFingerprint({
+        timestampMs: 0,
+        intervalMs: 1000,
+        maxFrames: 5,
+      }),
+    });
+    for (const dto of [
+      { timestampMs: 0, intervalMs: 2000, maxFrames: 5 }, // changed interval
+      { timestampMs: 0, intervalMs: 1000, maxFrames: 10 }, // changed limit
+      { timestampMs: 0 }, // previously-supplied fields now absent
+    ]) {
+      const { service, extractor, storage, repository } = buildService({
+        repository: {
+          findExtractionReplay: jest.fn(async () => singleFrameReplay()),
+        },
+      });
+      await expect(
+        service.extractFrames(TENANT, 'asset-1', {
+          ...dto,
+          idempotencyKey: 'op-1',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(extractor.extractFrameAt).not.toHaveBeenCalled();
+      expect(storage.put).not.toHaveBeenCalled();
+      expect(repository.createArtifactsBatch).not.toHaveBeenCalled();
+    }
+  });
+
+  it('replays an IDENTICAL single-frame retry including supplied-but-ignored fields', async () => {
+    const singleFrameReplay = {
+      asset: assetRow({ status: VideoAssetStatus.READY }),
+      artifacts: [
+        artifactRow({ artifactType: VideoArtifactType.FRAME, cropX: null }),
+      ],
+      replayed: true as const,
+      requestFingerprint: framesFingerprint({
+        timestampMs: 0,
+        intervalMs: 1000,
+        maxFrames: 5,
+      }),
+    };
+    const { service, extractor } = buildService({
+      repository: {
+        findExtractionReplay: jest.fn(async () => singleFrameReplay),
+      },
+    });
+    const result = await service.extractFrames(TENANT, 'asset-1', {
+      timestampMs: 0,
+      intervalMs: 1000,
+      maxFrames: 5,
+      idempotencyKey: 'op-1',
+    });
+    expect(result.replayed).toBe(true);
+    expect(extractor.extractFrameAt).not.toHaveBeenCalled();
   });
 
   it('fails CLOSED on a recorded batch with no fingerprint (pre-column row)', async () => {
@@ -1401,6 +1908,31 @@ describe('plain-id validation on reads', () => {
     expect(repository.findById).not.toHaveBeenCalled();
     expect(repository.findArtifactById).not.toHaveBeenCalled();
     expect(repository.list).not.toHaveBeenCalled();
+  });
+
+  it('REDACTS a payment-bearing route id from not-found messages', async () => {
+    // 404 messages reflect the CALLER-SUPPLIED path segment; a PAN used as
+    // an id must echo back as [REDACTED] (error responses are logged).
+    const pan = '4111111111111111';
+    const { service } = buildService({
+      repository: {
+        findById: jest.fn(async () => null),
+        findArtifactById: jest.fn(async () => null),
+      },
+    });
+    for (const lookup of [
+      () => service.findById(TENANT, pan),
+      () => service.findArtifactById(TENANT, pan),
+    ]) {
+      const error: Error = await lookup()
+        .then(() => {
+          throw new Error('expected rejection');
+        })
+        .catch((caught: Error) => caught);
+      expect(error).toBeInstanceOf(NotFoundException);
+      expect(error.message).toContain('[REDACTED]');
+      expect(error.message).not.toContain(pan);
+    }
   });
 });
 
@@ -1612,6 +2144,65 @@ describe('VideoAssetsService.createInferenceJobFromCrop', () => {
     await expect(
       service.createInferenceJobFromCrop(TENANT, 'artifact-1', {}),
     ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('CANCELS the just-created job when the parent asset is deleted before the link, then 404s', async () => {
+    // Deletion race: the job creation committed, then DELETE
+    // /video-assets/:id soft-deleted the parent before the one-shot link
+    // could stamp — the link write zeroes out and the artifact re-read
+    // sees nothing. The created job must not stay QUEUED as orphan work:
+    // it is cancelled through the inference module's internal seam BEFORE
+    // the 404 surfaces.
+    const { service, inference, auditLog } = buildService({
+      repository: {
+        findArtifactById: jest
+          .fn()
+          .mockResolvedValueOnce(artifactRow()) // initial resolve
+          .mockResolvedValueOnce(null), // post-link re-read: parent deleted
+        linkArtifactToInferenceJob: jest.fn(async () => null),
+      },
+    });
+    await expect(
+      service.createInferenceJobFromCrop(TENANT, 'artifact-1', {}),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(inference.cancelOrphanedJob).toHaveBeenCalledWith(
+      TENANT,
+      'job-1',
+      expect.stringContaining('deleted'),
+      undefined,
+    );
+    // Cancellation succeeded — no orphan-condition audit entry is needed
+    // (the cancel itself is audited inside the inference module).
+    expect(auditLog.record).not.toHaveBeenCalled();
+  });
+
+  it('AUDITS the orphan condition when the created job is no longer cancellable, and still 404s', async () => {
+    // The job was claimed (RUNNING) before the compensation ran: it cannot
+    // be cancelled, so the orphan condition is recorded in the audit trail
+    // and the caller still gets the honest 404.
+    const { service, inference, auditLog } = buildService({
+      repository: {
+        findArtifactById: jest
+          .fn()
+          .mockResolvedValueOnce(artifactRow())
+          .mockResolvedValueOnce(null),
+        linkArtifactToInferenceJob: jest.fn(async () => null),
+      },
+      inference: {
+        cancelOrphanedJob: jest.fn(async () => 'not-cancellable' as const),
+      },
+    });
+    await expect(
+      service.createInferenceJobFromCrop(TENANT, 'artifact-1', {}),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(inference.cancelOrphanedJob).toHaveBeenCalledTimes(1);
+    expect(auditLog.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entityType: 'InferenceJob',
+        entityId: 'job-1',
+        reason: expect.stringContaining('Orphaned inference job'),
+      }),
+    );
   });
 });
 

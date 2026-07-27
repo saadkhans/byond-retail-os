@@ -78,6 +78,8 @@ export type InferenceJobDetail = Prisma.InferenceJobGetPayload<{
 
 export type LinkVisionEventRejection = 'already-linked';
 
+export type CancelQueuedJobRejection = 'not-queued';
+
 @Injectable()
 export class InferenceJobsRepository extends TenantScopedRepository {
   constructor(
@@ -183,6 +185,59 @@ export class InferenceJobsRepository extends TenantScopedRepository {
       });
       if (linked.count === 0) {
         return 'already-linked' as const;
+      }
+      const after = await tx.inferenceJob.findFirstOrThrow({
+        where: { id: jobId, tenantId: scopedTenantId },
+        include: INFERENCE_JOB_DETAIL_INCLUDE,
+      });
+      await this.auditLog.record(buildAuditEntry(before, after), tx);
+      return after;
+    });
+  }
+
+  /**
+   * QUEUED → CANCELLED compare-and-set for the orphaned-job compensation
+   * path (see InferenceJobsService.cancelOrphanedJob). CANCELLED is a
+   * terminal status, so completedAt is stamped with the flip (DB CHECK:
+   * every terminal job has completedAt); errorCode stays NULL (errors
+   * exist exactly on FAILED) and no lease is involved (QUEUED jobs carry
+   * none). Only a QUEUED job cancels — a job that was claimed or finished
+   * (before or during the CAS) returns 'not-queued' without writing.
+   */
+  cancelQueuedJob(
+    tenantId: string,
+    jobId: string,
+    buildAuditEntry: (
+      before: InferenceJobDetail,
+      after: InferenceJobDetail,
+    ) => AuditEntry,
+  ): Promise<InferenceJobDetail | CancelQueuedJobRejection | null> {
+    const scopedTenantId = this.requireTenantId(tenantId);
+    return this.prisma.$transaction(async (tx) => {
+      const before = await tx.inferenceJob.findFirst({
+        where: { id: jobId, tenantId: scopedTenantId },
+        include: INFERENCE_JOB_DETAIL_INCLUDE,
+      });
+      if (!before) {
+        return null;
+      }
+      if (before.status !== InferenceJobStatus.QUEUED) {
+        return 'not-queued' as const;
+      }
+      const updated = await tx.inferenceJob.updateMany({
+        where: {
+          id: jobId,
+          tenantId: scopedTenantId,
+          status: InferenceJobStatus.QUEUED,
+        },
+        data: {
+          status: InferenceJobStatus.CANCELLED,
+          completedAt: new Date(),
+        },
+      });
+      if (updated.count === 0) {
+        // Lost the CAS to a concurrent claim — the job left QUEUED.
+        return 'not-queued' as const;
       }
       const after = await tx.inferenceJob.findFirstOrThrow({
         where: { id: jobId, tenantId: scopedTenantId },

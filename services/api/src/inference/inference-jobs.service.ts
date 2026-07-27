@@ -352,6 +352,43 @@ export class InferenceJobsService {
     return result.job;
   }
 
+  /**
+   * INTERNAL service-only seam (no controller route): compensation for a
+   * caller whose downstream linkage to a just-created job failed
+   * permanently — e.g. video-ingest's crop → job link losing the race with
+   * the source asset's deletion — leaving the job as orphan work nothing
+   * will ever consume. Transitions QUEUED → CANCELLED only, as an audited
+   * (CANCEL) compare-and-set; a job already claimed (RUNNING) or finished
+   * returns 'not-cancellable' so the caller records the orphan condition
+   * instead — this path never throws HTTP errors, because it runs while a
+   * different controlled error is already being surfaced. `reason` is
+   * composed by the internal caller (never end-user input) and lands in
+   * the audit trail verbatim.
+   */
+  async cancelOrphanedJob(
+    tenantId: string,
+    jobId: string,
+    reason: string,
+    actor?: AuditActor,
+  ): Promise<InferenceJobDetail | 'not-cancellable'> {
+    const result = await this.jobsRepository.cancelQueuedJob(
+      tenantId,
+      jobId,
+      (before, after) =>
+        this.auditEntry(tenantId, actor, {
+          action: AuditAction.CANCEL,
+          entityType: 'InferenceJob',
+          entityId: after.id,
+          before,
+          after,
+          reason,
+        }),
+    );
+    return result === null || result === 'not-queued'
+      ? 'not-cancellable'
+      : result;
+  }
+
   async search(
     tenantId: string,
     query: QueryInferenceJobsDto,

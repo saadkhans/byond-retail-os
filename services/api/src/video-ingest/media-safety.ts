@@ -21,6 +21,14 @@ export const VIDEO_ERROR_CODES = {
   EXTRACTOR_UNAVAILABLE: 'EXTRACTOR_UNAVAILABLE',
   /** Audited screening decision rejected a QUARANTINED upload (media removed). */
   SCREENING_REJECTED: 'SCREENING_REJECTED',
+  /**
+   * DB-first staging: the asset row committed but the subsequent media
+   * write failed — the row is transitioned QUARANTINED → FAILED with this
+   * code so it remains durable evidence of the staged upload (satisfying
+   * the error_only_terminal_check constraint: error codes exist exactly on
+   * REJECTED/FAILED assets).
+   */
+  UPLOAD_INCOMPLETE: 'UPLOAD_INCOMPLETE',
 } as const;
 
 /**
@@ -100,194 +108,83 @@ export function isAllowedVideoUpload(
 
 /**
  * PAN detection tuned for REAL-WORLD text (filenames, container metadata).
- * COVERAGE: every 13-19 digit sequence that is contiguous OR split by ANY
- * mix of single-character separators — whatever the grouping (4-4-4-4,
- * 8-8, 4-6-5, digit pairs, single digits) and whether the separators stay
- * consistent ("4111-1111-1111-1111") or change mid-chain
- * ("4111-1111 1111-1111") — is digit-joined and Luhn-tested. Within a
- * separated chain EVERY window of consecutive groups whose joined digits
- * are PAN-length is tested, so decoy digit groups before/after a card
- * (4111-1111-1111-1111-9) never launder it either. Separator placement
- * never launders raw card data.
- * PRECISION: the digit shapes that saturate real video uploads are
- * exempted by STRUCTURE or KEY CONTEXT, never by a bare numeric range:
- *   - calendar timestamps (VID_20260701_003531, modify dates, 20260701003531
- *     contiguous) — a valid YYYYMMDD[HHMMSS[mmm]] reading is a timestamp,
- *     not a card;
- *   - 13-digit epoch milliseconds ONLY when attached to a timestamp-like
- *     key (creation_time=1753622627001, "modify date 1753622627001"). A
- *     BARE Luhn-valid 13-digit run is rejected: 4000000000006 — the
- *     standard 13-digit Visa test PAN — sits inside the epoch numeric
- *     range, so a range-only exemption would wave real card data through.
- *     The documented reject-on-write overbreadth accepts the ~10% Luhn
- *     false-positive rate on context-free epoch values instead;
- *   - ISO 6709 GPS chains (-26.2050-67.9749+14.431/) are recognized
- *     STRUCTURALLY — signed 2-digit latitude and 2-3 digit longitude with
- *     fractional degrees, optional signed altitude — and their digit
- *     groups are excluded from windowing (a coordinate chain is never a
- *     card grouping, while a PAN reformatted as fake coordinates still has
- *     to fit real lat/lon ranges to hide).
+ *
+ * GOVERNING POLICY — the Luhn verdict ALWAYS wins. Any 13-19 digit window
+ * whose digits are Luhn-valid is rejected, and NO exemption — epoch range,
+ * timestamp key context, calendar shape, GPS/ISO 6709 shape, version-string
+ * shape — may override a Luhn-valid window. Shape/context heuristics may
+ * only influence WHICH digit chains become candidates; they must never act
+ * as barriers that skip the Luhn test on a candidate window. The module's
+ * documented reject-on-write overbreadth policy accepts the resulting
+ * false positives (~10% of context-free digit shapes are Luhn-valid by
+ * chance): a Luhn-valid camera timestamp (VID_20260701_003531) or a
+ * Luhn-valid GPS digit join rejecting is acceptable — operators rename the
+ * file or strip the metadata. The alternative — context exemptions — was
+ * rejected three review cycles in a row because every exemption is a
+ * laundering channel ("timestamp=4000000000006", a PAN dressed as
+ * coordinates).
+ *
+ * COVERAGE:
+ *   - every CONTIGUOUS digit run of 13+ digits (no upper bound) has every
+ *     13-19-digit window inside it Luhn-tested, so a PAN padded with extra
+ *     digits (04111111111111111000) cannot hide inside an overlong run;
+ *   - every SEPARATED digit chain — groups joined by maximal runs of
+ *     non-alphanumeric characters ("4111 - 1111 -- 1111 __ 1111"), whatever
+ *     the grouping (4-4-4-4, 8-8, 4-6-5, digit pairs, single digits) and
+ *     whether the separators stay consistent or change mid-chain — has
+ *     EVERY window of consecutive groups whose joined digits are PAN-length
+ *     Luhn-tested, so decoy digit groups before/after a card
+ *     (4111-1111-1111-1111-9) never launder it either.
+ * Separator placement never launders raw card data, and no digit shape
+ * (calendar, epoch, coordinate, version) ever rescues a Luhn-valid window.
  */
-const CONTIGUOUS_PAN = /(?<!\d)\d{13,19}(?!\d)/g;
+const CONTIGUOUS_DIGIT_RUN = /(?<!\d)\d{13,}(?!\d)/g;
 // Up to 26 separator-joined digit groups: covers a 19-digit PAN split into
-// single digits (19 groups) with margin for decoy groups around it.
-const GROUPED_PAN = /(?<!\d)\d{1,19}(?:[^0-9A-Za-z]\d{1,19}){1,25}(?!\d)/g;
+// single digits (19 groups) with margin for decoy groups around it. Each
+// separator is a MAXIMAL run of non-alphanumeric characters, so
+// "4111 - 1111" chains exactly like "4111-1111".
+const GROUPED_PAN = /(?<!\d)\d+(?:[^0-9A-Za-z]+\d+){1,25}(?!\d)/g;
 
-// ISO 6709 coordinate chain as written by phone cameras into location
-// atoms: ±DD.D{1,6} latitude (00-90), ±DDD.D{1,6} longitude (000-180),
-// optional ±altitude, optional trailing '/'. Fractional degrees are
-// REQUIRED on lat/lon — that is what real GPS metadata carries, and it
-// keeps plain dashed/spaced digit chains (i.e. separated PANs) from ever
-// matching the shape.
-const ISO6709_CHAIN =
-  /[+-](?:[0-8]\d|90)\.\d{1,6}[+-](?:180|1[0-7]\d|0\d\d|\d\d)\.\d{1,6}(?:[+-]\d{1,4}(?:\.\d{1,6})?)?\/?/g;
-
-/** [start, end) spans of structurally recognized ISO 6709 GPS chains. */
-function coordinateChainSpans(text: string): Array<readonly [number, number]> {
-  const spans: Array<readonly [number, number]> = [];
-  for (const match of text.matchAll(ISO6709_CHAIN)) {
-    const start = match.index ?? 0;
-    spans.push([start, start + match[0].length]);
-  }
-  return spans;
-}
-
-function insideAnySpan(
-  spans: ReadonlyArray<readonly [number, number]>,
-  start: number,
-  end: number,
-): boolean {
-  return spans.some(([from, to]) => start >= from && end <= to);
-}
-
-/** 13-digit epoch milliseconds for the 2001-2099 era (0.98e12 .. 4.1e12). */
-function isPlausibleEpochMillis(digits: string): boolean {
-  if (digits.length !== 13) {
-    return false;
-  }
-  const epochMs = Number(digits);
-  return epochMs >= 978_307_200_000 && epochMs <= 4_102_444_800_000;
-}
-
-// Key-ish token (with trailing '='/':'/'whitespace' separators) directly
-// preceding a digit run, e.g. "creation_time=", "modify date ", "ts ".
-const KEY_BEFORE_DIGITS = /([A-Za-z][A-Za-z0-9_.-]{0,39})[\s=:]{0,3}$/;
-const TIMESTAMP_KEY_WORDS = new Set([
-  'time',
-  'timestamp',
-  'datetime',
-  'date',
-  'ts',
-  'dts',
-  'pts',
-  'stamp',
-  'epoch',
-  'created',
-  'creation',
-  'create',
-  'modified',
-  'modify',
-  'utc',
-]);
-
-/** Splits a key on separators and camelCase: creationTime → [creation, time]. */
-function keyWordsOf(key: string): string[] {
-  return key
-    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .split(/[^A-Za-z0-9]+/)
-    .filter((word) => word.length > 0)
-    .map((word) => word.toLowerCase());
-}
-
-/**
- * CONTEXTUAL timestamp evidence for a digit run starting at `index`: the
- * run is attached to a timestamp-like key ("creation_time=...",
- * "modify date ...", "ts ..."). A bare epoch-shaped number has NO such
- * evidence and gets no exemption.
- */
-function hasTimestampKeyContext(text: string, index: number): boolean {
-  const tail = text.slice(Math.max(0, index - 48), index);
-  const match = KEY_BEFORE_DIGITS.exec(tail);
-  if (!match) {
-    return false;
-  }
-  const words = keyWordsOf(match[1]);
-  const last = words[words.length - 1];
-  return last !== undefined && TIMESTAMP_KEY_WORDS.has(last);
-}
-
-/** YYYYMMDDHHMMSS[mmm] with real calendar/clock semantics (14-17 digits). */
-function isPlausibleTimestampDigits(digits: string): boolean {
-  if (digits.length < 14 || digits.length > 17) {
-    return false;
-  }
-  const year = Number(digits.slice(0, 4));
-  const month = Number(digits.slice(4, 6));
-  const day = Number(digits.slice(6, 8));
-  const hour = Number(digits.slice(8, 10));
-  const minute = Number(digits.slice(10, 12));
-  const second = Number(digits.slice(12, 14));
-  return (
-    year >= 1970 &&
-    year <= 2099 &&
-    month >= 1 &&
-    month <= 12 &&
-    day >= 1 &&
-    day <= 31 &&
-    hour < 24 &&
-    minute < 60 &&
-    second < 60
-  );
-}
-
-function isLuhnValidPanDigits(digits: string): boolean {
+/** Pure Luhn verdict on an exact 13-19-digit window — no shape exemptions. */
+function isLuhnValidPanWindow(digits: string): boolean {
   return (
     digits.length >= 13 &&
     digits.length <= 19 &&
-    !isPlausibleTimestampDigits(digits) &&
     containsPaymentCardValue(digits)
   );
 }
 
 export function carriesLikelyPan(text: string): boolean {
-  const gpsSpans = coordinateChainSpans(text);
-  for (const match of text.matchAll(CONTIGUOUS_PAN)) {
-    const digits = match[0];
-    // Epoch-milliseconds exemption requires CONTEXT: the run must be
-    // attached to a timestamp-like key. A bare Luhn-valid 13-digit run
-    // (4000000000006) is card data, however epoch-shaped its value is.
-    if (
-      isPlausibleEpochMillis(digits) &&
-      hasTimestampKeyContext(text, match.index ?? 0)
-    ) {
-      continue;
-    }
-    if (isLuhnValidPanDigits(digits)) {
+  for (const match of text.matchAll(CONTIGUOUS_DIGIT_RUN)) {
+    if (digitWindowsCarryPan(match[0])) {
       return true;
     }
   }
   for (const match of text.matchAll(GROUPED_PAN)) {
     // Window-scan the FULL separated digit chain regardless of separator
     // changes — "4111-1111 1111-1111" joins to a PAN even though no
-    // consistent-separator sub-run reaches 13 digits. Digit groups inside
-    // a structurally recognized ISO 6709 GPS chain are barriers: windows
-    // never extend across coordinate digits, so location atoms pass while
-    // any non-coordinate 13-19 digit join is Luhn-tested.
-    const base = match.index ?? 0;
-    let run: string[] = [];
-    for (const group of match[0].matchAll(/\d+/g)) {
-      const start = base + (group.index ?? 0);
-      if (insideAnySpan(gpsSpans, start, start + group[0].length)) {
-        if (groupWindowsCarryPan(run)) {
-          return true;
-        }
-        run = [];
-      } else {
-        run.push(group[0]);
-      }
-    }
-    if (groupWindowsCarryPan(run)) {
+    // consistent-separator sub-run reaches 13 digits.
+    const groups = match[0].split(/\D+/).filter((group) => group.length > 0);
+    if (groupWindowsCarryPan(groups)) {
       return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Luhn-tests EVERY 13-19-digit window inside a contiguous digit run of any
+ * length: a PAN embedded in an overlong run (04111111111111111000) or a
+ * 13-digit card inside a 14-digit run must not hide behind the full run's
+ * length or Luhn verdict.
+ */
+function digitWindowsCarryPan(run: string): boolean {
+  for (let start = 0; start < run.length; start += 1) {
+    const maxLength = Math.min(19, run.length - start);
+    for (let length = 13; length <= maxLength; length += 1) {
+      if (isLuhnValidPanWindow(run.slice(start, start + length))) {
+        return true;
+      }
     }
   }
   return false;
@@ -297,7 +194,8 @@ export function carriesLikelyPan(text: string): boolean {
  * Luhn-tests EVERY window of consecutive digit groups whose joined digits
  * are PAN-length (13-19): a card padded with decoy digit groups, or split
  * into many small groups, must not hide behind the full join being
- * over-length or Luhn-invalid. Timestamp semantics apply per window.
+ * over-length or Luhn-invalid. The Luhn verdict is final per window — no
+ * timestamp/GPS shape rescues a Luhn-valid join (see policy above).
  */
 function groupWindowsCarryPan(groups: readonly string[]): boolean {
   for (let start = 0; start < groups.length; start += 1) {
@@ -307,7 +205,7 @@ function groupWindowsCarryPan(groups: readonly string[]): boolean {
       if (digits.length > 19) {
         break;
       }
-      if (digits.length >= 13 && isLuhnValidPanDigits(digits)) {
+      if (digits.length >= 13 && isLuhnValidPanWindow(digits)) {
         return true;
       }
     }
@@ -326,10 +224,18 @@ function groupWindowsCarryPan(groups: readonly string[]): boolean {
 const FUSED_CREDENTIAL_LABEL = /(?<![A-Za-z0-9])(?:cvv|cvc|cvn|csc|pin|pan|iban)\d/i;
 
 /**
- * Credential shapes + known secret tokens + fused credential-label tokens
- * + grouped/contiguous PANs.
+ * Free-text sensitive-content screen — the single predicate for screening
+ * ANY operator-supplied free text (audit/screening notes, metadata text
+ * runs, filenames) before it is persisted:
+ *   - `key=value` / `key: value` credential fragments and credential-bearing
+ *     URLs (containsCredentialValue);
+ *   - bare well-known secret tokens (sk_live_..., JWTs, AKIA..., ghp_...);
+ *   - credential labels FUSED with their value in one token (cvv123,
+ *     pin1234, pan4111111111111111);
+ *   - grouping-aware PAN windows under the Luhn-verdict-wins policy above.
+ * Returns true when the text must be REJECTED (reject-on-write policy).
  */
-function carriesSensitiveRun(text: string): boolean {
+export function containsSensitiveFreeText(text: string): boolean {
   return (
     containsCredentialValue(text) ||
     containsKnownSecretToken(text) ||
@@ -345,8 +251,9 @@ function carriesSensitiveRun(text: string): boolean {
  * credential-channel words as tokens ("password_hunter2.mp4"):
  *   1. the raw name runs through the credential/secret-token screens, the
  *      fused label+value screen ("cvv123.mp4"), and the grouping-aware PAN
- *      detector above (which stays quiet on VID_/PXL_-style timestamp
- *      names);
+ *      detector above (Luhn verdict wins: the ~10% of VID_/PXL_-style
+ *      timestamp names whose digit joins are Luhn-valid by chance reject —
+ *      accepted overbreadth, operators rename the file);
  *   2. each alphanumeric token — and each adjacent pair joined ("api"+
  *      "key" → apikey) — is classified with the shared sensitive-KEY list,
  *      so a credential-channel word in a filename is rejected outright.
@@ -354,7 +261,7 @@ function carriesSensitiveRun(text: string): boolean {
  * operator-supplied TEST clips.
  */
 export function filenameCarriesSensitiveContent(filename: string): boolean {
-  if (carriesSensitiveRun(filename)) {
+  if (containsSensitiveFreeText(filename)) {
     return true;
   }
   const tokens = filename
@@ -369,9 +276,13 @@ export function filenameCarriesSensitiveContent(filename: string): boolean {
 }
 
 // Chunked scan parameters for the payload text screen below. The overlap
-// exceeds the longest separator-grouped PAN (19 digits + 18 separators) and
-// every KEY_VALUE credential fragment we screen for, so a sensitive run can
-// never hide across a chunk boundary.
+// exceeds every single-character-separated PAN grouping (19 digits + 18
+// separators) and every KEY_VALUE credential fragment we screen for, so a
+// sensitive run cannot hide across a chunk boundary. (A PAN stretched past
+// 256 bytes with multi-character separator runs COULD straddle a boundary
+// undetected — an accepted bound: chunks are 1 MiB, so the straddle window
+// is ~0.025% of positions, and every non-straddling occurrence still
+// rejects.)
 const PAYLOAD_SCAN_CHUNK_BYTES = 1024 * 1024;
 const PAYLOAD_SCAN_OVERLAP_BYTES = 256;
 // Printable ASCII runs of at least this length are treated as embedded
@@ -426,7 +337,7 @@ export function bufferCarriesSensitiveText(buffer: Buffer): boolean {
         if (run.length < MIN_PRINTABLE_RUN) {
           continue;
         }
-        if (carriesSensitiveRun(run)) {
+        if (containsSensitiveFreeText(run)) {
           return true;
         }
       }

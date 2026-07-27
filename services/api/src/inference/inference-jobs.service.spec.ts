@@ -98,6 +98,7 @@ describe('InferenceJobsService', () => {
     findByIdempotencyKey: jest.Mock;
     search: jest.Mock;
     linkVisionEvent: jest.Mock;
+    cancelQueuedJob: jest.Mock;
   };
   let queue: {
     enqueue: jest.Mock;
@@ -138,6 +139,11 @@ describe('InferenceJobsService', () => {
       linkVisionEvent: jest.fn().mockResolvedValue({
         ...succeededJob,
         visionEventId: 'event-1',
+      }),
+      cancelQueuedJob: jest.fn().mockResolvedValue({
+        ...jobDetail,
+        status: InferenceJobStatus.CANCELLED,
+        completedAt: new Date('2026-07-26T10:03:00.000Z'),
       }),
     };
     queue = {
@@ -459,6 +465,50 @@ describe('InferenceJobsService', () => {
       await expect(
         service.findById('tenant-a', 'missing'),
       ).rejects.toBeInstanceOf(NotFoundException);
+    });
+  });
+
+  describe('cancelOrphanedJob', () => {
+    it('cancels a QUEUED job through the audited CAS with a CANCEL entry', async () => {
+      const result = await service.cancelOrphanedJob(
+        'tenant-a',
+        'job-1',
+        'Inference job cancelled: downstream linkage failed',
+        actor,
+      );
+      expect(result).toEqual(
+        expect.objectContaining({ status: InferenceJobStatus.CANCELLED }),
+      );
+      const [tenantId, jobId, buildAudit] = repository.cancelQueuedJob.mock
+        .calls[0] as [
+        string,
+        string,
+        (before: InferenceJobDetail, after: InferenceJobDetail) => AuditEntry,
+      ];
+      expect([tenantId, jobId]).toEqual(['tenant-a', 'job-1']);
+      const entry = buildAudit(jobDetail, {
+        ...jobDetail,
+        status: InferenceJobStatus.CANCELLED,
+      } as InferenceJobDetail);
+      expect(entry.action).toBe(AuditAction.CANCEL);
+      expect(entry.entityType).toBe('InferenceJob');
+      expect(entry.actorId).toBe(actor.id);
+      expect(entry.reason).toBe(
+        'Inference job cancelled: downstream linkage failed',
+      );
+    });
+
+    it("maps a claimed/finished job and a missing job to 'not-cancellable' WITHOUT throwing", async () => {
+      // The compensation path runs while a different controlled error is
+      // already being surfaced — it must never throw HTTP errors itself.
+      repository.cancelQueuedJob.mockResolvedValueOnce('not-queued');
+      await expect(
+        service.cancelOrphanedJob('tenant-a', 'job-1', 'orphan'),
+      ).resolves.toBe('not-cancellable');
+      repository.cancelQueuedJob.mockResolvedValueOnce(null);
+      await expect(
+        service.cancelOrphanedJob('tenant-a', 'job-1', 'orphan'),
+      ).resolves.toBe('not-cancellable');
     });
   });
 

@@ -50,6 +50,7 @@ import {
 import {
   bufferCarriesSensitiveText,
   carriesLikelyPan,
+  containsSensitiveFreeText,
   fileExtensionOf,
   filenameCarriesSensitiveContent,
   isAllowedVideoUpload,
@@ -77,6 +78,32 @@ export const DEFAULT_MAX_UPLOAD_BYTES = 52_428_800; // 50 MiB — test clips onl
  * enforces its own budget while looping).
  */
 export const MAX_TOTAL_ARTIFACT_BYTES = 128 * 1024 * 1024;
+
+/**
+ * Hard cap on quarantine screening-preview frames per request: enough to
+ * inspect a 10–30 s test clip end to end, small enough that the in-memory
+ * extraction and base64 response stay bounded.
+ */
+export const SCREENING_PREVIEW_MAX_FRAMES = 6;
+
+/** One in-memory preview frame — NEVER persisted, base64 in the response. */
+export interface ScreeningPreviewFrame {
+  timestampMs: number;
+  width: number;
+  height: number;
+  mimeType: string;
+  imageBase64: string;
+}
+
+/** Screening-preview response: sample frames + what was skipped and why. */
+export interface ScreeningPreviewResult {
+  assetId: string;
+  status: VideoAssetStatus;
+  durationMs: number;
+  frames: ScreeningPreviewFrame[];
+  /** Frames dropped because they would exceed the decoded-byte budget. */
+  skippedOverBudget: number;
+}
 
 /** Uploaded file shape (multer memory mode) — declared locally so the
  * service depends on the CONTRACT, not on multer types. */
@@ -110,10 +137,16 @@ function assertPlainId(field: string, value: string | undefined): void {
   }
 }
 
-/** Idempotency keys are PERSISTED verbatim — opaque AND secret-free. */
+/**
+ * Idempotency keys are PERSISTED verbatim — opaque AND secret-free. The
+ * single fused free-text predicate screens them (key=value credentials,
+ * known secret tokens, fused labels like "cvv123", and grouping-aware
+ * Luhn-wins PAN windows): "4111_1111_1111_1111" (any single separator)
+ * must never land in VideoExtractionRequest.idempotencyKey.
+ */
 function assertOpaqueKey(field: string, value: string | undefined): void {
   assertPlainId(field, value);
-  if (value !== undefined && containsSensitiveValue(value)) {
+  if (value !== undefined && containsSensitiveFreeText(value)) {
     throw new BadRequestException(
       `${field} must be an opaque value and must not contain credential- ` +
         `or payment-bearing content`,
@@ -126,13 +159,38 @@ function assertOpaqueKey(field: string, value: string | undefined): void {
  * id) persists attacker-controlled text as its entityId — a PAN or
  * credential smuggled as a URL path segment must be redacted, never stored
  * verbatim (AGENTS.md payments invariant). Resolved ids are server data
- * and stay readable.
+ * and stay readable. The SAME policy applies to caller-supplied values
+ * reflected into error messages (reference-rejection 400s, unresolved-id
+ * 404s): error responses land in logs and telemetry, so a PAN-valued
+ * locationId/deviceId/sessionId/route id must echo back as [REDACTED].
  */
 function safeAuditEntityId(id: string): string {
   return containsSensitiveValue(id) || carriesLikelyPan(id)
     ? '[REDACTED]'
     : id;
 }
+
+/**
+ * safeAuditEntityId for OPTIONAL caller-supplied references interpolated
+ * into error messages: undefined passes through unchanged so message
+ * templates render exactly as before the redaction sweep.
+ */
+function safeReference(value: string | undefined): string | undefined {
+  return value === undefined ? value : safeAuditEntityId(value);
+}
+
+/**
+ * 503 escalation for a screening rejection whose media removal failed
+ * AFTER the terminal claim committed: the asset is already REJECTED
+ * (unprocessable and never served), so the message names the orphaned
+ * media and the recovery path — replaying the rejection re-attempts the
+ * removal.
+ */
+const SCREENING_MEDIA_ORPHAN_MESSAGE =
+  'The screening rejection is recorded (the asset is REJECTED and can ' +
+  'never be processed or served) but the stored media could not be ' +
+  'removed and remains orphaned under the local storage root; retry the ' +
+  'rejection to complete the removal';
 
 /** Crop reason → default Phase 9 job type (closed 1:1 where one exists). */
 const REASON_TO_JOB_TYPE: Partial<Record<VideoCropReason, InferenceJobType>> = {
@@ -151,11 +209,22 @@ const REASON_TO_JOB_TYPE: Partial<Record<VideoCropReason, InferenceJobType>> = {
  * replay of the old batch answering a different question.
  */
 function framesRequestFingerprint(dto: ExtractFramesDto): string {
-  // timestampMs wins over interval sampling (mirroring the extraction
-  // branch below), so a supplied-but-ignored interval/limit can never
-  // change the fingerprint of a single-frame request.
+  // timestampMs wins over interval sampling for EXTRACTION (mirroring the
+  // extraction branch below) — but request IDENTITY covers EVERY supplied
+  // field: in single-frame mode a supplied interval/limit is ignored by
+  // the extractor yet still part of what the caller asked for, so it is
+  // fingerprinted RAW (explicit null = not supplied) and a same-key retry
+  // that changes any supplied value is a controlled 409, never a silent
+  // replay. Sampling mode keeps normalized defaults: there the values ARE
+  // consumed, so an omitted parameter and its explicit default are the
+  // same request.
   return dto.timestampMs !== undefined
-    ? JSON.stringify({ op: 'FRAMES', timestampMs: dto.timestampMs })
+    ? JSON.stringify({
+        op: 'FRAMES',
+        timestampMs: dto.timestampMs,
+        intervalMs: dto.intervalMs ?? null,
+        maxFrames: dto.maxFrames ?? null,
+      })
     : JSON.stringify({
         op: 'FRAMES',
         intervalMs: dto.intervalMs ?? DEFAULT_FRAME_INTERVAL_MS,
@@ -293,15 +362,21 @@ export class VideoAssetsService {
     // Server-generated key: tenant / random UUID / fixed name. The client's
     // filename NEVER participates (only its allowlisted extension).
     const storageKey = `${tenantId}/${randomUUID()}/original${extension}`;
-    try {
-      await this.storage.put(storageKey, file.buffer);
-    } catch (error) {
-      if (error instanceof VideoStorageOperationError) {
-        // Environmental (disk full, permissions) — 503, not a caller error.
-        throw new ServiceUnavailableException(error.message);
-      }
-      throw error;
-    }
+    // DB-FIRST STAGING: the asset row (QUARANTINED, with the storage key,
+    // size, and checksum — all known from the in-memory buffer) commits
+    // BEFORE any byte reaches storage. The old put-then-create ordering had
+    // an unrecoverable orphan class: a crash between the two stranded
+    // quarantined media that no row referenced, so nothing could ever find
+    // or clean it. Reordered, THE ROW IS THE RECOVERY RECORD — a crash
+    // between the row commit and the put leaves a QUARANTINED row with no
+    // media, and every existing flow handles that gracefully: validate is
+    // 409-gated while QUARANTINED; a screening APPROVE releases an asset
+    // whose probe then fails controlled; a screening REJECT's media removal
+    // is idempotent over a missing directory (deletePrefix treats a missing
+    // path as success); the screening preview maps the unreadable media to
+    // a controlled 400; and DELETE /video-assets/:id cleans the row. A
+    // side benefit: hierarchy-validation rejections now happen before any
+    // bytes are written, so those paths need no cleanup at all.
     let result: VideoAssetView | AssetReferenceRejection;
     try {
       result = await this.repository.createAsset(
@@ -334,9 +409,9 @@ export class VideoAssetsService {
           }),
       );
     } catch (error) {
-      // The DB row failed — never leave an orphaned file behind.
-      await this.cleanupUploadDir(storageKey);
       if (prismaErrorCode(error) === 'P2003') {
+        // No bytes were written yet — a broken reference is a clean 400
+        // with nothing to clean up.
         throw new BadRequestException(
           'A referenced store, unit, device, or session does not exist in this tenant',
         );
@@ -345,28 +420,63 @@ export class VideoAssetsService {
     }
     if (typeof result === 'string') {
       // Hierarchy rejection (same vocabulary as inference enqueue) — the
-      // stored file must not outlive the rejected row.
-      await this.cleanupUploadDir(storageKey);
+      // row never committed and no bytes were written: nothing to clean up.
       throw new BadRequestException(this.referenceRejectionMessage(result, dto));
     }
-    return result;
-  }
-
-  /**
-   * Cleanup of a stored upload whose row never landed. A cleanup failure is
-   * NEVER swallowed: no row references the generated key, so an ignored
-   * failure would strand untracked media on disk with nothing able to find
-   * it again. One retry for transient errors, then a controlled 503 that
-   * names the condition (media left behind under the local storage root)
-   * so the operator acts on it.
-   */
-  private async cleanupUploadDir(storageKey: string): Promise<void> {
-    await this.removeAssetMediaDir(
-      storageKey,
-      'The upload could not be recorded AND its media could not be ' +
-        'cleaned up; local video storage needs attention before ' +
-        'retrying',
-    );
+    const created = result;
+    try {
+      await this.storage.put(storageKey, file.buffer);
+    } catch (error) {
+      if (error instanceof VideoStorageOperationError) {
+        // Environmental (disk full, permissions) — the committed row now
+        // references media that never landed. Best-effort removal of the
+        // media directory first (put publishes atomically, but the parent
+        // directory may exist; a persistent removal failure is swallowed
+        // here — the FAILED row below is the durable evidence an operator
+        // acts on, and prefix removal is idempotent), then the audited CAS
+        // transition QUARANTINED → FAILED with a stable UPLOAD_INCOMPLETE
+        // code (error codes exist exactly on REJECTED/FAILED — the DB
+        // error_only_terminal_check constraint). The row is KEPT as durable
+        // evidence referencing the key; the caller sees the storage failure
+        // as the existing controlled 503.
+        try {
+          await this.removeAssetMediaDir(
+            storageKey,
+            'The upload media could not be stored and its partial media ' +
+              'directory could not be removed; local video storage needs ' +
+              'attention',
+          );
+        } catch {
+          // Best-effort: the FAILED transition below must still record the
+          // incomplete upload even when the removal escalates.
+        }
+        await this.repository.transitionStatus(
+          tenantId,
+          created.id,
+          [VideoAssetStatus.QUARANTINED],
+          {
+            status: VideoAssetStatus.FAILED,
+            errorCode: VIDEO_ERROR_CODES.UPLOAD_INCOMPLETE,
+            errorMessage:
+              'The upload was recorded but its media could not be stored',
+          },
+          (before, after) =>
+            this.auditEntry(tenantId, actor, {
+              action: AuditAction.UPDATE,
+              entityType: 'VideoAsset',
+              entityId: created.id,
+              before,
+              after,
+              reason:
+                'Upload staging incomplete: the asset row committed but the ' +
+                'media write failed; the row is kept as the recovery record',
+            }),
+        );
+        throw new ServiceUnavailableException(error.message);
+      }
+      throw error;
+    }
+    return created;
   }
 
   /**
@@ -424,25 +534,34 @@ export class VideoAssetsService {
     rejection: AssetReferenceRejection,
     dto: UploadVideoAssetDto,
   ): string {
+    // Every interpolated value is CALLER-SUPPLIED and unresolved (the
+    // rejection proves it references nothing in this tenant), so it runs
+    // through the same redaction as existence-blind audit entity ids: a
+    // PAN smuggled as locationId/unitId/deviceId/sessionId must never be
+    // reflected verbatim into the 400 message.
+    const locationId = safeReference(dto.locationId);
+    const unitId = safeReference(dto.unitId);
+    const deviceId = safeReference(dto.deviceId);
+    const sessionId = safeReference(dto.sessionId);
     switch (rejection) {
       case 'location-not-found':
-        return `Store "${dto.locationId}" not found`;
+        return `Store "${locationId}" not found`;
       case 'unit-not-found':
-        return `Unit "${dto.unitId}" not found`;
+        return `Unit "${unitId}" not found`;
       case 'unit-location-mismatch':
-        return `Unit "${dto.unitId}" does not belong to store "${dto.locationId}"`;
+        return `Unit "${unitId}" does not belong to store "${locationId}"`;
       case 'device-not-found':
-        return `Device "${dto.deviceId}" not found`;
+        return `Device "${deviceId}" not found`;
       case 'device-unit-mismatch':
-        return `Device "${dto.deviceId}" is not attached to unit "${dto.unitId}"`;
+        return `Device "${deviceId}" is not attached to unit "${unitId}"`;
       case 'device-location-mismatch':
-        return `Device "${dto.deviceId}" is not in store "${dto.locationId}"`;
+        return `Device "${deviceId}" is not in store "${locationId}"`;
       case 'session-not-found':
-        return `Session "${dto.sessionId}" not found`;
+        return `Session "${sessionId}" not found`;
       case 'session-unit-mismatch':
-        return `Session "${dto.sessionId}" is not on unit "${dto.unitId}"`;
+        return `Session "${sessionId}" is not on unit "${unitId}"`;
       case 'session-location-mismatch':
-        return `Session "${dto.sessionId}" is not in the asset's store`;
+        return `Session "${sessionId}" is not in the asset's store`;
     }
   }
 
@@ -473,7 +592,9 @@ export class VideoAssetsService {
     assertPlainId('id', id);
     const asset = await this.repository.findById(tenantId, id);
     if (!asset) {
-      throw new NotFoundException(`Video asset "${id}" not found`);
+      throw new NotFoundException(
+        `Video asset "${safeAuditEntityId(id)}" not found`,
+      );
     }
     return asset;
   }
@@ -493,7 +614,9 @@ export class VideoAssetsService {
     assertPlainId('id', artifactId);
     const artifact = await this.repository.findArtifactById(tenantId, artifactId);
     if (!artifact) {
-      throw new NotFoundException(`Video artifact "${artifactId}" not found`);
+      throw new NotFoundException(
+        `Video artifact "${safeAuditEntityId(artifactId)}" not found`,
+      );
     }
     return artifact;
   }
@@ -511,7 +634,9 @@ export class VideoAssetsService {
     assertPlainId('id', id);
     const internal = await this.repository.findByIdInternal(tenantId, id);
     if (!internal) {
-      throw new NotFoundException(`Video asset "${id}" not found`);
+      throw new NotFoundException(
+        `Video asset "${safeAuditEntityId(id)}" not found`,
+      );
     }
     if (
       internal.status === VideoAssetStatus.VALIDATED ||
@@ -603,12 +728,16 @@ export class VideoAssetsService {
    * The audited frame-content screening decision for a QUARANTINED upload —
    * the ENFORCED control the upload attestation only complements (an
    * attestation proves nothing about the bytes). APPROVE releases the asset
-   * for processing (QUARANTINED → UPLOADED); REJECT removes the stored
-   * media with the same retry/escalate policy as every other cleanup and
-   * parks the metadata row as evidence (QUARANTINED → REJECTED, stable
-   * error code). Any decision on a non-QUARANTINED asset is a controlled
-   * 409. A later phase plugs an automated CV frame screener into this same
-   * step; the manual decision is the MVP.
+   * for processing (QUARANTINED → UPLOADED); REJECT first CLAIMS the
+   * terminal transition (QUARANTINED → REJECTED, stable error code — so a
+   * racing APPROVE loses the CAS instead of releasing an asset whose bytes
+   * are gone) and then removes the stored media with the same
+   * retry/escalate policy as every other cleanup, parking the metadata row
+   * as evidence. A REJECT retry on an asset already REJECTED with
+   * SCREENING_REJECTED replays the media removal (recovery for a removal
+   * that failed post-claim); any other decision on a non-QUARANTINED asset
+   * is a controlled 409. A later phase plugs an automated CV frame
+   * screener into this same step; the manual decision is the MVP.
    */
   async screen(
     tenantId: string,
@@ -620,8 +749,12 @@ export class VideoAssetsService {
     if (dto.note !== undefined) {
       // The note lands verbatim in the audit trail (same policy as Phase 7
       // review reasons): opaque, single-line, and secret-/payment-free.
+      // Screened with the single fused free-text predicate so fused
+      // credential labels ("cvv123", "pin1234") reject exactly like
+      // key=value fragments, known secret tokens, and PAN windows — and
+      // the rejection happens BEFORE any read or transition.
       assertPlainId('note', dto.note);
-      if (containsSensitiveValue(dto.note) || carriesLikelyPan(dto.note)) {
+      if (containsSensitiveFreeText(dto.note)) {
         throw new BadRequestException(
           'note must not contain credential- or payment-bearing content',
         );
@@ -629,7 +762,27 @@ export class VideoAssetsService {
     }
     const internal = await this.repository.findByIdInternal(tenantId, id);
     if (!internal) {
-      throw new NotFoundException(`Video asset "${id}" not found`);
+      throw new NotFoundException(
+        `Video asset "${safeAuditEntityId(id)}" not found`,
+      );
+    }
+    // REJECT replay — allowed for EXACTLY errorCode SCREENING_REJECTED and
+    // no other REJECTED asset: the claim-first ordering below can leave a
+    // REJECTED row whose media removal failed (503). Replaying the
+    // rejection is the documented recovery path for that orphan condition:
+    // it re-attempts the (idempotent) removal and returns success once the
+    // media is gone. Assets rejected for any other reason (PROBE_FAILED)
+    // never claimed their media through screening and stay 409s below.
+    if (
+      dto.decision === VideoScreeningDecision.REJECT &&
+      internal.status === VideoAssetStatus.REJECTED &&
+      internal.errorCode === VIDEO_ERROR_CODES.SCREENING_REJECTED
+    ) {
+      await this.removeAssetMediaDir(
+        internal.storageKey,
+        SCREENING_MEDIA_ORPHAN_MESSAGE,
+      );
+      return this.findById(tenantId, id);
     }
     if (internal.status !== VideoAssetStatus.QUARANTINED) {
       throw new ConflictException(
@@ -667,17 +820,16 @@ export class VideoAssetsService {
       return approved;
     }
 
-    // REJECT: the stored media goes FIRST (retry once, then a controlled
-    // 503 that leaves the asset QUARANTINED so the rejection is retryable),
-    // then the audited terminal transition. A crash between the two leaves
-    // a QUARANTINED row whose retried REJECT re-runs the (idempotent)
-    // removal and completes the transition — bytes can never outlive a
-    // recorded rejection.
-    await this.removeAssetMediaDir(
-      internal.storageKey,
-      'The screening rejection could not remove the stored media; local ' +
-        'video storage needs attention before retrying',
-    );
+    // REJECT: CLAIM FIRST — the audited terminal transition (QUARANTINED →
+    // REJECTED, stable error code) commits BEFORE any media removal. The
+    // old delete-first ordering had a race: a concurrent APPROVE could win
+    // the CAS in the window after the bytes were gone, leaving an UPLOADED
+    // asset with no media that still looked processable. Claim-first closes
+    // it — an APPROVE racing after the claim simply loses the CAS and 409s.
+    // Only once the rejection is durable does the media removal run (retry
+    // once, then a controlled 503 naming the orphan condition); a failure
+    // there leaves the asset REJECTED — terminal, unprocessable, and never
+    // served — and the replay branch above completes the removal on retry.
     const rejected = await this.repository.transitionStatus(
       tenantId,
       id,
@@ -707,7 +859,149 @@ export class VideoAssetsService {
           'again',
       );
     }
+    await this.removeAssetMediaDir(
+      internal.storageKey,
+      SCREENING_MEDIA_ORPHAN_MESSAGE,
+    );
     return rejected;
+  }
+
+  /**
+   * Quarantine-safe screening preview — the module's ONE deliberate
+   * exception to "bytes are never served", so the screening decision is an
+   * informed inspection instead of a second blind attestation. Serves a
+   * bounded set of sample frames (evenly spaced across the probed duration,
+   * capped at SCREENING_PREVIEW_MAX_FRAMES; a single frame for very short
+   * clips) extracted IN MEMORY through the extractor port and returned as
+   * base64 images with timestamps. NOTHING IS PERSISTED: no artifact rows,
+   * no storage writes — and the response never carries the video container
+   * or the original bytes (the video file itself stays non-downloadable).
+   * Only QUARANTINED assets qualify (screening decisions are only pending
+   * then — controlled 409 otherwise), and every served preview is recorded
+   * in the audit trail (AuditAction.READ, with the frame count in the
+   * reason). Failure mapping mirrors validate(): extractor missing or
+   * infrastructure trouble → 503; unreadable content → controlled 400
+   * WITHOUT any status transition — the screening decision stays open and
+   * is never auto-rejected by a preview failure. A QUARANTINED row whose
+   * media never landed (DB-first staging crash window) therefore previews
+   * as a controlled 400, not a 500.
+   */
+  async screeningPreview(
+    tenantId: string,
+    id: string,
+    actor?: AuditActor,
+  ): Promise<ScreeningPreviewResult> {
+    assertPlainId('id', id);
+    const internal = await this.repository.findByIdInternal(tenantId, id);
+    if (!internal) {
+      throw new NotFoundException(
+        `Video asset "${safeAuditEntityId(id)}" not found`,
+      );
+    }
+    if (internal.status !== VideoAssetStatus.QUARANTINED) {
+      throw new ConflictException(
+        `Video asset is ${internal.status}; the screening preview is only ` +
+          'available while a screening decision is pending on a ' +
+          'QUARANTINED asset',
+      );
+    }
+    let probe: VideoProbeResult;
+    try {
+      probe = await this.extractor.probe(internal.storageKey);
+    } catch (error) {
+      throw this.mapPreviewError(error);
+    }
+    // Evenly spaced sample positions strictly inside the duration
+    // (exclusive endpoint — no frame exists AT durationMs): one frame per
+    // started second, capped. A very short clip yields a single frame at 0.
+    const count = Math.max(
+      1,
+      Math.min(SCREENING_PREVIEW_MAX_FRAMES, Math.floor(probe.durationMs / 1000)),
+    );
+    const frames: ScreeningPreviewFrame[] = [];
+    let retainedBytes = 0;
+    let skippedOverBudget = 0;
+    for (let index = 0; index < count; index += 1) {
+      const timestampMs = Math.floor((probe.durationMs * index) / count);
+      let image;
+      try {
+        image = await this.extractor.extractFrameAt(
+          internal.storageKey,
+          probe,
+          timestampMs,
+        );
+      } catch (error) {
+        if (error instanceof FrameUnavailableError) {
+          // Container durations routinely overshoot the last decodable
+          // frame — a missing sample position is not a preview failure.
+          continue;
+        }
+        throw this.mapPreviewError(error);
+      }
+      // Response-size cap: the SAME request-wide decoded-byte budget the
+      // extraction batches enforce. A frame that would blow the budget is
+      // skipped and reported, never partially returned.
+      if (retainedBytes + image.data.length > MAX_TOTAL_ARTIFACT_BYTES) {
+        skippedOverBudget += 1;
+        continue;
+      }
+      retainedBytes += image.data.length;
+      frames.push({
+        timestampMs: image.timestampMs,
+        width: image.width,
+        height: image.height,
+        mimeType: image.mimeType,
+        imageBase64: image.data.toString('base64'),
+      });
+    }
+    // Audited byte-exposing read: serving quarantined frames to a screener
+    // must never be invisible in the audit trail. Closed-vocabulary fields
+    // only — the frame counts ride in the reason string.
+    await this.auditLog.record(
+      this.auditEntry(tenantId, actor, {
+        action: AuditAction.READ,
+        entityType: 'VideoAsset',
+        entityId: id,
+        reason:
+          `Screening preview served: ${frames.length} sample frame(s) ` +
+          'extracted in memory from the QUARANTINED upload for the audited ' +
+          `screening decision (${skippedOverBudget} skipped over the byte ` +
+          'budget; nothing persisted)',
+      }),
+    );
+    return {
+      assetId: id,
+      status: internal.status,
+      durationMs: probe.durationMs,
+      frames,
+      skippedOverBudget,
+    };
+  }
+
+  /**
+   * Failure mapping for the screening preview: environmental trouble is a
+   * retryable 503, unreadable content is a controlled 400 — and NEITHER
+   * transitions the asset (the pending screening decision stays open; a
+   * preview failure never auto-rejects).
+   */
+  private mapPreviewError(error: unknown): Error {
+    if (
+      error instanceof ExtractorUnavailableError ||
+      error instanceof ExtractionInfrastructureError
+    ) {
+      return new ServiceUnavailableException(error.message);
+    }
+    if (
+      error instanceof ExtractionFailedError ||
+      error instanceof FrameUnavailableError
+    ) {
+      return new BadRequestException(
+        'The quarantined media could not be read for a preview; the ' +
+          'screening decision remains open — inspect the clip through the ' +
+          'staging process or reject it if it cannot be verified',
+      );
+    }
+    return error instanceof Error ? error : new Error('Preview failed');
   }
 
   /**
@@ -1061,7 +1355,23 @@ export class VideoAssetsService {
     if (linked === 'already-linked' || linked === null) {
       // Concurrent creation stamped first — replay ITS link, but only when
       // it resolves to the SAME job type this request asked for.
-      const current = await this.findArtifactById(tenantId, artifactId);
+      const current = await this.repository.findArtifactById(
+        tenantId,
+        artifactId,
+      );
+      if (!current) {
+        // The parent asset was soft-deleted between the job creation
+        // committing and the link write: the just-created job would sit
+        // QUEUED forever referencing a crop nobody can read — orphan work
+        // that might still be processed. Compensate BEFORE surfacing the
+        // 404: cancel the job while it is still QUEUED; if it was already
+        // claimed (not cancellable), record the orphan condition in the
+        // audit trail and still 404.
+        await this.retireOrphanedJob(tenantId, job.id, actor);
+        throw new NotFoundException(
+          `Video artifact "${safeAuditEntityId(artifactId)}" not found`,
+        );
+      }
       if (current.inferenceJobId) {
         const existing = await this.inferenceJobsService.findById(
           tenantId,
@@ -1101,7 +1411,9 @@ export class VideoAssetsService {
       id,
     );
     if (!internal) {
-      throw new NotFoundException(`Video asset "${id}" not found`);
+      throw new NotFoundException(
+        `Video asset "${safeAuditEntityId(id)}" not found`,
+      );
     }
     if (!internal.deletedAt) {
       const marked = await this.repository.softDelete(
@@ -1193,6 +1505,42 @@ export class VideoAssetsService {
     );
   }
 
+  /**
+   * Compensation for the deletion race in createInferenceJobFromCrop: the
+   * inference job committed but the crop link never can (the parent asset
+   * was soft-deleted), so the job must not stay QUEUED as processable
+   * orphan work. QUEUED → CANCELLED through the inference module's audited
+   * internal seam; a job already claimed or finished is left alone but the
+   * orphan condition is recorded in the audit trail so it is never
+   * invisible.
+   */
+  private async retireOrphanedJob(
+    tenantId: string,
+    jobId: string,
+    actor: AuditActor | undefined,
+  ): Promise<void> {
+    const cancelled = await this.inferenceJobsService.cancelOrphanedJob(
+      tenantId,
+      jobId,
+      'Inference job cancelled: the source video asset was deleted before ' +
+        'its crop artifact could link to the job',
+      actor,
+    );
+    if (cancelled === 'not-cancellable') {
+      await this.auditLog.record(
+        this.auditEntry(tenantId, actor, {
+          action: AuditAction.UPDATE,
+          entityType: 'InferenceJob',
+          entityId: jobId,
+          reason:
+            'Orphaned inference job: the source video asset was deleted ' +
+            'before its crop artifact could link to the job, and the job ' +
+            'was already claimed or finished so it could not be cancelled',
+        }),
+      );
+    }
+  }
+
   /** Replay a committed extraction request, or map a cross-asset key. */
   private async replayExtraction(
     tenantId: string,
@@ -1240,7 +1588,9 @@ export class VideoAssetsService {
     assertPlainId('id', id);
     const internal = await this.repository.findByIdInternal(tenantId, id);
     if (!internal) {
-      throw new NotFoundException(`Video asset "${id}" not found`);
+      throw new NotFoundException(
+        `Video asset "${safeAuditEntityId(id)}" not found`,
+      );
     }
     if (internal.status === VideoAssetStatus.QUARANTINED) {
       // Quarantined bytes are NOT processable — the audited screening

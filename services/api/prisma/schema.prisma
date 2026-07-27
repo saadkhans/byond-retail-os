@@ -85,6 +85,11 @@ enum AuditAction {
   APPROVE
   REJECT
   OVERRIDE
+  // Phase 10 — audited byte-exposing reads (quarantine screening preview).
+  // The only audited READ so far: sample frames of a QUARANTINED upload
+  // served in-memory to a `video-asset:screen` holder so the screening
+  // decision is informed, not blind. Ordinary metadata reads stay unaudited.
+  READ
   // Phase 6 — payment lifecycle. Intent creation reuses CREATE; these cover
   // the state-machine transitions that have no generic equivalent.
   AUTHORIZE

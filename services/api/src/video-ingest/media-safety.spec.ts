@@ -1,5 +1,6 @@
 import {
   bufferCarriesSensitiveText,
+  containsSensitiveFreeText,
   fileExtensionOf,
   filenameCarriesSensitiveContent,
   isAllowedVideoUpload,
@@ -54,6 +55,11 @@ describe('media-safety', () => {
       ['4111.1111.1111.1111.mp4'],
       ['4111-1111-1111-1111.mp4'],
       ['4111 1111 1111 1111.mp4'],
+      // MULTI-CHARACTER separator runs between groups: a maximal run of
+      // non-alphanumeric characters is ONE separator, so these chain and
+      // join to the PAN exactly like single-character separators.
+      ['4111 - 1111 - 1111 - 1111.mp4'],
+      ['4111 -- 1111 __ 1111 .. 1111.mp4'],
       // NONCANONICAL groupings: separator placement never launders a PAN.
       ['41111111-11111111.mp4'],
       ['4-111111111111111.mp4'],
@@ -73,11 +79,19 @@ describe('media-safety', () => {
       ['4111.1111_1111 1111.mp4'],
       // Contiguous.
       ['4111111111111111.mp4'],
+      // Overlong contiguous run (20 digits): every 13-19-digit window is
+      // Luhn-tested, so a PAN padded with extra digits never hides.
+      ['04111111111111111000.mp4'],
       // Luhn-valid 13-digit Visa test PAN whose VALUE sits inside the
-      // epoch-milliseconds numeric range: bare runs get NO epoch
-      // exemption — only timestamp-key-attached values do.
+      // epoch-milliseconds numeric range: the Luhn verdict wins — no
+      // epoch-range exemption, with OR without a timestamp-like key.
       ['4000000000006.mp4'],
       ['scan_4000000000006.mp4'],
+      ['timestamp_4000000000006.mp4'],
+      // Luhn-valid epoch-ms value attached to a timestamp key: key context
+      // never overrides a Luhn-valid window (1753622627001 IS Luhn-valid —
+      // verified by direct computation).
+      ['creation_time_1753622627001.mp4'],
       // Credential labels FUSED with their value in one token.
       ['cvv123.mp4'],
       ['pin1234.mp4'],
@@ -97,9 +111,14 @@ describe('media-safety', () => {
       ['pickup_2026-07-27_cam3.mp4'],
       ['shot_2026-07-27-11-33-47.mp4'], // ISO datetime — timestamp semantics
       ['1234_5678.mp4'], // digits, but no PAN
-      // Luhn-valid epoch-ms value WITH a timestamp key attached: contextual
-      // evidence keeps legitimate encoder metadata passing.
-      ['creation_time_1753622627001.mp4'],
+      // Epoch-ms value that is Luhn-INVALID (verified by computation):
+      // legitimate encoder metadata passes because it fails Luhn, not
+      // because of any timestamp-key exemption.
+      ['creation_time_1753612345678.mp4'],
+      // 20-digit contiguous run whose EVERY 13-19-digit window is
+      // Luhn-invalid (verified by computation): overlong runs are windowed,
+      // not blanket-rejected.
+      ['11111111111111111111.mp4'],
       // Ordinary words that merely START with a credential label must not
       // trip the fused label+value screen (label must be followed by a
       // digit, not letters).
@@ -112,23 +131,82 @@ describe('media-safety', () => {
       expect(filenameCarriesSensitiveContent(name)).toBe(false);
     });
 
-    it('accepts EVERY default camera-app timestamp filename (no Luhn fabrication)', () => {
-      // Strip-all-separators joins fabricated Luhn-valid runs from date+time
-      // digits and deterministically rejected ~10% of real Android/Pixel/
-      // GoPro clips (e.g. VID_20260701_003531.mp4). The grouping-aware
-      // detector must accept ALL of them: date/time groupings (8-6, 8-9)
-      // are never card groupings.
+    it('camera-app timestamp filenames: the Luhn verdict wins per join', () => {
+      // POLICY (Codex cycles 1-3): NO calendar-shape exemption. Each
+      // VID_/PXL_ name joins its date+time groups into a single 14/17-digit
+      // window that is ALWAYS Luhn-tested. The ~10% of real camera
+      // filenames whose join happens to be Luhn-valid REJECT — accepted
+      // reject-on-write overbreadth (operators rename the file). The
+      // expected-reject stamps below were adjudicated by direct Luhn
+      // computation over the joined digits; everything else must accept.
+      const luhnValidVidStamps = new Set([
+        '20260701_003531',
+        '20260702_235959',
+        '20260705_120000',
+        '20260708_083015',
+        '20260710_235959',
+        '20260713_120000',
+        '20260716_083015',
+        '20260719_003531',
+        '20260721_120000',
+        '20260724_083015',
+        '20260727_003531',
+        '20260728_235959',
+      ]);
+      const luhnValidPxlStamps = new Set([
+        '20260702_235959123',
+        '20260704_083015123',
+        '20260705_003531123',
+        '20260707_120000123',
+        '20260710_003531123',
+        '20260712_120000123',
+        '20260716_235959123',
+        '20260718_083015123',
+        '20260721_235959123',
+        '20260723_083015123',
+        '20260726_120000123',
+      ]);
       for (let day = 1; day <= 28; day += 1) {
         for (const hhmmss of ['003531', '120000', '235959', '083015']) {
           const dd = String(day).padStart(2, '0');
-          expect(
-            filenameCarriesSensitiveContent(`VID_202607${dd}_${hhmmss}.mp4`),
-          ).toBe(false);
-          expect(
-            filenameCarriesSensitiveContent(`PXL_202607${dd}_${hhmmss}123.mp4`),
-          ).toBe(false);
+          const vidStamp = `202607${dd}_${hhmmss}`;
+          expect(filenameCarriesSensitiveContent(`VID_${vidStamp}.mp4`)).toBe(
+            luhnValidVidStamps.has(vidStamp),
+          );
+          const pxlStamp = `202607${dd}_${hhmmss}123`;
+          expect(filenameCarriesSensitiveContent(`PXL_${pxlStamp}.mp4`)).toBe(
+            luhnValidPxlStamps.has(pxlStamp),
+          );
         }
       }
+    });
+  });
+
+  describe('containsSensitiveFreeText (audit/screening-note free-text screen)', () => {
+    it.each([
+      // key=value / key: value credential fragments.
+      ['operator note password=hunter2'],
+      ['token: abc123 issued for retest'],
+      // Bare well-known secret tokens.
+      ['pasted sk_live_abcdefghijklmnop by mistake'],
+      // Fused credential label + value in one token.
+      ['card read cvv123 during test'],
+      ['keypad pin1234 visible'],
+      // Grouping-aware PAN windows under the Luhn-wins policy.
+      ['card 4111 - 1111 - 1111 - 1111 visible in frame'],
+      ['pan4111111111111111 seen on receipt'],
+      ['ref 4000000000006 end'],
+    ])('rejects %p', (text) => {
+      expect(containsSensitiveFreeText(text)).toBe(true);
+    });
+
+    it.each([
+      ['approved: shelf occlusion acceptable, retest cam3'],
+      ['rejected due to glare on aisle 4 between 10:00 and 10:15'],
+      ['pinch-zoom artifact near panorama seam, keep clip'],
+      ['clip recorded 2026-07-27, duration 00:00:10'],
+    ])('accepts %p', (text) => {
+      expect(containsSensitiveFreeText(text)).toBe(false);
     });
   });
 
@@ -175,6 +253,9 @@ describe('media-safety', () => {
         '4111-1111-1111-1111.5', // decoy behind a separator change
         '4111-1111 1111-1111', // CHANGING separators — full-chain join
         '4111.1111-1111_1111', // every separator different
+        '4111 - 1111 - 1111 - 1111', // MULTI-CHAR separator runs
+        '4111 -- 1111 __ 1111 .. 1111', // longer mixed separator runs
+        '04111111111111111000', // PAN inside an overlong contiguous run
       ]) {
         const payload = Buffer.concat([
           noise,
@@ -187,18 +268,19 @@ describe('media-safety', () => {
       }
     });
 
-    it('accepts calendar timestamps and KEY-ATTACHED epoch-ms values', () => {
-      // Encoder/creation metadata carries 14-digit datetimes (structural
-      // calendar semantics) and 13-digit epoch milliseconds. Epoch values
-      // are exempt ONLY with a timestamp-like key attached — 1753622627001
-      // is deliberately Luhn-VALID to pin the contextual exemption.
+    it('accepts Luhn-INVALID timestamp/epoch metadata values', () => {
+      // Encoder/creation metadata carries 14-digit datetimes and 13-digit
+      // epoch milliseconds. Under the Luhn-wins policy they pass because
+      // their digit joins fail Luhn (verified by direct computation) — NOT
+      // because of any calendar-shape or timestamp-key exemption.
       for (const value of [
-        'modify_date 20260701003531',
-        'stamp 20260701_003531',
-        'creation 1753612345678',
-        'creation_time=1753622627001', // Luhn-valid epoch, key=value form
-        'ts 1753622627001', // Luhn-valid epoch, short key form
-        'shoot 2026-07-27-11-33-47', // ISO datetime, consistent separator
+        'modify_date 20260727113347', // Luhn-invalid 14-digit datetime
+        'stamp 20260727_113347', // same digits, 8-6 grouped
+        'creation 1753612345678', // Luhn-invalid epoch-ms
+        'creation_time=1753612345678', // Luhn-invalid epoch, key=value form
+        'ts 1753612345678', // Luhn-invalid epoch, short key form
+        'shoot 2026-07-27-11-33-47', // ISO datetime — join is Luhn-invalid
+        'serial 66006800686644864268 end', // 20 digits, EVERY window Luhn-invalid
       ]) {
         const payload = Buffer.concat([
           Buffer.alloc(2),
@@ -209,14 +291,22 @@ describe('media-safety', () => {
       }
     });
 
-    it('rejects Luhn-valid 13-digit runs WITHOUT timestamp context, even in the epoch range', () => {
-      // 4000000000006 (13-digit Visa test PAN) < 4_102_444_800_000: a
-      // numeric-range-only epoch exemption would wave it through. Bare
-      // PAN-shaped runs must be flagged; the ~10% Luhn false-positive rate
-      // on context-free epoch values is the documented overbreadth.
+    it('rejects EVERY Luhn-valid 13-19-digit window — key context never overrides', () => {
+      // GOVERNING POLICY: the Luhn verdict always wins. 4000000000006 (the
+      // 13-digit Visa test PAN), 1753622627001 (a Luhn-VALID epoch-ms
+      // value), and 20260701003531 (a Luhn-VALID calendar datetime) all
+      // reject even when attached to a timestamp-like key — an exemption
+      // there would be a laundering channel for real card data. The Luhn
+      // false-positive rate on timestamp shapes (~10%) is the documented
+      // reject-on-write overbreadth.
       for (const value of [
         'ref 4000000000006 end',
-        'scan 1753622627001 done', // Luhn-valid epoch value, non-timestamp key
+        'timestamp=4000000000006', // Finding 3: timestamp key must NOT rescue
+        'scan 1753622627001 done',
+        'creation_time=1753622627001', // Luhn-valid epoch behind a timestamp key
+        'ts 1753622627001',
+        'modify_date 20260701003531', // Luhn-valid calendar datetime
+        'ref 04111111111111111000 end', // Finding 4: PAN inside 20-digit run
       ]) {
         const payload = Buffer.concat([
           Buffer.alloc(2),
@@ -282,17 +372,19 @@ describe('media-safety', () => {
       expect(bufferCarriesSensitiveText(payload)).toBe(false);
     });
 
-    it('accepts ISO 6709 GPS location atoms from real phone videos', () => {
-      // Coordinate digit chains across '.', '+', '-' fabricate Luhn-valid
-      // PAN candidates under full-chain windowing and would reject ~10% of
-      // location-tagged clips. ISO 6709 chains are recognized STRUCTURALLY
-      // (signed lat/lon with fractional degrees) and their digit groups
-      // excluded from windowing — all of these must pass.
+    it('accepts ISO 6709 GPS location atoms whose digit joins are Luhn-invalid', () => {
+      // Under the Luhn-wins policy GPS shape is NOT an exemption: coordinate
+      // digit groups are windowed and Luhn-tested like any other chain.
+      // Most real coordinates pass because every 13-19-digit window of
+      // their joins fails Luhn — verified by direct computation for each
+      // value below (including the "ISO6709" digits in the atom key, which
+      // join into the chain).
       for (const iso6709 of [
-        '-26.2050-67.9749+14.431/',
-        '+37.3349-122.0090+021.000/',
         '+48.8577+002.2950/',
         '-33.8688+151.2093+058.000/',
+        '+35.6581+139.7017+040.000/',
+        '-22.9519-043.2105+710.000/',
+        '+51.5007-000.1246+035.000/',
       ]) {
         const payload = Buffer.concat([
           Buffer.alloc(4),
@@ -300,6 +392,27 @@ describe('media-safety', () => {
           Buffer.alloc(4),
         ]);
         expect(bufferCarriesSensitiveText(payload)).toBe(false);
+      }
+    });
+
+    it('rejects GPS-shaped chains whose digit joins ARE Luhn-valid (no coordinate exemption)', () => {
+      // Finding 2: '+41.111111+111.11111/' is a syntactically valid ISO
+      // 6709 chain whose joined digits are 4111111111111111 — a PAN dressed
+      // as coordinates. Coordinate shape must never act as a window
+      // barrier; the Luhn verdict wins. Legitimate coordinates whose joins
+      // happen to be Luhn-valid (the other two values, verified by
+      // computation) reject too — accepted overbreadth.
+      for (const iso6709 of [
+        '+41.111111+111.11111/', // joins to the 16-digit Visa test PAN
+        '-26.2050-67.9749+14.431/', // real-shaped; 17-digit join is Luhn-valid
+        '+37.3349-122.0090+021.000/', // real-shaped; 19/13-digit joins Luhn-valid
+      ]) {
+        const payload = Buffer.concat([
+          Buffer.alloc(4),
+          Buffer.from(`com.apple.quicktime.location.ISO6709${iso6709}`, 'ascii'),
+          Buffer.alloc(4),
+        ]);
+        expect(bufferCarriesSensitiveText(payload)).toBe(true);
       }
     });
 

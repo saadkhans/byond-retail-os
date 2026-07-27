@@ -35,6 +35,7 @@ import { QueryVideoAssetsDto } from './dto/query-video-assets.dto';
 import { ScreenVideoAssetDto } from './dto/screen-video-asset.dto';
 import { UploadVideoAssetDto } from './dto/upload-video-asset.dto';
 import {
+  ScreeningPreviewResult,
   UploadedVideoFile,
   VideoAssetsService,
 } from './video-assets.service';
@@ -104,7 +105,14 @@ export class VideoAssetsController {
 
   @Get(':id')
   @RequirePermissions('video-asset:read')
-  @ApiOperation({ summary: 'Get a video asset (metadata only — never bytes)' })
+  @ApiOperation({
+    summary: 'Get a video asset (metadata only — no bytes on this route)',
+    description:
+      'Metadata only. Media bytes are never served by this module EXCEPT ' +
+      'through the audited quarantine screening preview (frames only, ' +
+      'never the video container or original bytes — the video file itself ' +
+      'is never downloadable).',
+  })
   @ApiNotFoundResponse({ description: 'Not found in this tenant' })
   findById(
     @CurrentTenantId() tenantId: string,
@@ -124,6 +132,40 @@ export class VideoAssetsController {
     @Param('id') id: string,
   ): Promise<VideoArtifactView[]> {
     return this.assetsService.listArtifacts(tenantId, id);
+  }
+
+  @Post(':id/screening-preview')
+  @RequirePermissions('video-asset:screen')
+  @ApiOperation({
+    summary:
+      'Serve in-memory sample frames of a QUARANTINED upload for screening',
+    description:
+      'The audited inspection path behind the screening decision — and the ' +
+      'module’s ONE deliberate exception to "bytes are never served": ' +
+      'up to 6 sample frames, evenly spaced across the probed duration, ' +
+      'extracted IN MEMORY and returned base64-encoded with timestamps. ' +
+      'Frames are NEVER persisted (no artifact rows, no storage writes) ' +
+      'and the video container / original bytes are never downloadable. ' +
+      'Only while the asset is QUARANTINED (409 otherwise). POST, not GET: ' +
+      'every served preview writes an audit entry (module idiom for ' +
+      'audited actions). Extractor unavailable or infrastructure trouble ' +
+      'is a retryable 503; unreadable content is a controlled 400 with NO ' +
+      'status transition — the screening decision stays open.',
+  })
+  @ApiCreatedResponse({
+    description: 'Sample frames returned (base64, in-memory only)',
+  })
+  @ApiNotFoundResponse({ description: 'Asset not found in this tenant' })
+  @ApiConflictResponse({ description: 'Asset is not QUARANTINED' })
+  screeningPreview(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @CurrentUser() actor: RequestContext,
+  ): Promise<ScreeningPreviewResult> {
+    return this.assetsService.screeningPreview(tenantId, id, {
+      id: actor.userId,
+      email: actor.email,
+    });
   }
 
   @Post(':id/screening')

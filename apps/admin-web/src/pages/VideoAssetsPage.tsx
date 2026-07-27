@@ -6,6 +6,7 @@ import {
   apiUpload,
   InferenceJob,
   Paginated,
+  ScreeningPreview,
   VideoArtifact,
   VideoAsset,
 } from '../api';
@@ -285,6 +286,10 @@ export function VideoAssetDetailPage() {
   // defense-in-depth — this audited decision is what releases (or rejects)
   // the quarantined bytes before ANY processing.
   const [screeningNote, setScreeningNote] = useState('');
+  // In-memory screening preview frames (audited server-side, never
+  // persisted): the screener inspects them before Approve/Reject instead of
+  // attesting blind.
+  const [preview, setPreview] = useState<ScreeningPreview | null>(null);
 
   // Crop form (same idempotency-key rotation).
   const [cropTimestampMs, setCropTimestampMs] = useState('0');
@@ -326,6 +331,40 @@ export function VideoAssetDetailPage() {
     });
   }
 
+  async function loadPreview() {
+    // Deliberately NOT run(): a preview is a read (no reload needed), and
+    // the 503 case gets its own actionable message.
+    setBusy(true);
+    setActionError(null);
+    setNotice(null);
+    try {
+      const result = await api<ScreeningPreview>(
+        `/video-assets/${id}/screening-preview`,
+        { method: 'POST', body: {} },
+      );
+      setPreview(result);
+      if (result.frames.length === 0) {
+        setNotice(
+          'The preview returned no frames (nothing decodable at the ' +
+            'sampled positions). Decide from the staged clip itself, or ' +
+            'reject if it cannot be verified.',
+        );
+      }
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 503) {
+        setActionError(
+          'Preview unavailable: the video extractor is not available right ' +
+            'now. Retry later — the screening decision stays open; nothing ' +
+            'was rejected.',
+        );
+      } else {
+        setActionError(errorMessage(err));
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function screen(decision: 'APPROVE' | 'REJECT') {
     await run(async () => {
       const note = screeningNote.trim();
@@ -334,6 +373,7 @@ export function VideoAssetDetailPage() {
         body: { decision, ...(note ? { note } : {}) },
       });
       setScreeningNote('');
+      setPreview(null);
       setNotice(
         decision === 'APPROVE'
           ? 'Screening approved — the asset is released for validation.'
@@ -441,8 +481,68 @@ export function VideoAssetDetailPage() {
                 Pending frame-content screening: the upload is QUARANTINED
                 and cannot be validated or processed until an audited
                 screening decision approves it. Rejecting removes the stored
-                media (the metadata row is kept as evidence).
+                media (the metadata row is kept as evidence). Load the
+                preview frames and inspect them before deciding — the
+                preview is extracted in memory, audited, and never
+                persisted.
               </p>
+              <div className="toolbar">
+                <button
+                  disabled={busy}
+                  title={
+                    'Sample frames of the quarantined clip, extracted in ' +
+                    'memory and audited — inspect before Approve/Reject.'
+                  }
+                  onClick={() => void loadPreview()}
+                >
+                  {preview
+                    ? 'Reload preview frames'
+                    : 'Load preview frames (audited)'}
+                </button>
+                {preview ? (
+                  <span className="muted">
+                    {preview.frames.length} frame(s) sampled across{' '}
+                    {formatDurationMs(preview.durationMs)}
+                    {preview.skippedOverBudget > 0
+                      ? `; ${preview.skippedOverBudget} skipped (over the byte budget)`
+                      : ''}
+                  </span>
+                ) : null}
+              </div>
+              {preview && preview.frames.length > 0 ? (
+                <div
+                  style={{
+                    display: 'flex',
+                    flexWrap: 'wrap',
+                    gap: '0.75rem',
+                    margin: '0.5rem 0 1rem',
+                  }}
+                >
+                  {preview.frames.map((frame) => (
+                    <figure
+                      key={frame.timestampMs}
+                      style={{ margin: 0, textAlign: 'center' }}
+                    >
+                      <img
+                        src={`data:${frame.mimeType};base64,${frame.imageBase64}`}
+                        alt={`Preview frame at ${formatDurationMs(frame.timestampMs)}`}
+                        width={frame.width}
+                        height={frame.height}
+                        style={{
+                          maxWidth: '14rem',
+                          height: 'auto',
+                          display: 'block',
+                          border: '1px solid var(--border, #ccc)',
+                          borderRadius: '4px',
+                        }}
+                      />
+                      <figcaption className="muted">
+                        {formatDurationMs(frame.timestampMs)}
+                      </figcaption>
+                    </figure>
+                  ))}
+                </div>
+              ) : null}
               <div className="toolbar">
                 <input
                   type="text"

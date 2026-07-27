@@ -32,6 +32,9 @@ describe('VideoAssetsController access policy', () => {
     ['listArtifacts', ['video-asset:read']],
     // Screening is its own least-privilege permission: releasing (or
     // rejecting) a QUARANTINED upload is a distinct duty from processing.
+    // The preview (the module's only byte-returning route) is gated on the
+    // SAME screening permission — only the deciding duty may see frames.
+    ['screeningPreview', ['video-asset:screen']],
     ['screen', ['video-asset:screen']],
     ['validate', ['video-asset:process']],
     ['extractFrames', ['video-asset:process']],

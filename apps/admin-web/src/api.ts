@@ -650,6 +650,28 @@ export interface VideoAsset {
   session?: { id: string; status: CheckoutSessionStatus } | null;
 }
 
+// Quarantine screening preview — the ONE deliberate exception to the
+// "no media byte field" note above: sample frames of a QUARANTINED upload,
+// extracted in memory and served base64 to `video-asset:screen` holders so
+// the screening decision is an informed inspection. Frames are never
+// persisted server-side, every serve is audited, and the video container /
+// original bytes remain non-downloadable.
+export interface ScreeningPreviewFrame {
+  timestampMs: number;
+  width: number;
+  height: number;
+  mimeType: string;
+  imageBase64: string;
+}
+
+export interface ScreeningPreview {
+  assetId: string;
+  status: VideoAssetStatus;
+  durationMs: number;
+  frames: ScreeningPreviewFrame[];
+  skippedOverBudget: number;
+}
+
 export interface VideoArtifact {
   id: string;
   tenantId: string;
