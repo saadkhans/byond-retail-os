@@ -3,6 +3,7 @@ import {
   buildCropArgs,
   buildFrameArgs,
   buildProbeArgs,
+  classifyCommandError,
   FfmpegVideoFrameExtractor,
   MAX_PROBE_DIMENSION,
   MAX_PROBE_DURATION_MS,
@@ -11,6 +12,7 @@ import {
 } from './ffmpeg-extractor.adapter';
 import {
   ExtractionFailedError,
+  ExtractionInfrastructureError,
   ExtractorUnavailableError,
   FrameUnavailableError,
 } from './video-frame-extractor.port';
@@ -251,6 +253,120 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
       name: 'ExtractionFailedError',
       message: expect.not.stringContaining('/secret/path') as unknown,
     });
+  });
+
+  it('keeps ffprobe INFRASTRUCTURE failures retryable — never a content rejection', async () => {
+    // A timeout kill, an OS resource/permission refusal, or a maxBuffer
+    // overrun says nothing about the video; mapping any of these to
+    // ExtractionFailedError would let the validation flow permanently
+    // REJECT an otherwise-valid UPLOADED asset.
+    const probe = (rejection: unknown) =>
+      new FfmpegVideoFrameExtractor(storageStub, () =>
+        Promise.reject(rejection),
+      ).probe('a/original.mp4');
+
+    // Killed by the 30s timeout: killed=true + signal, code null.
+    const timeoutKill = new Error('spawn killed') as NodeJS.ErrnoException & {
+      killed: boolean;
+      signal: string;
+    };
+    timeoutKill.killed = true;
+    timeoutKill.signal = 'SIGTERM';
+    await expect(probe(timeoutKill)).rejects.toBeInstanceOf(
+      ExtractionInfrastructureError,
+    );
+
+    // External kill (e.g. OOM killer): signal set without killed.
+    const externalKill = Object.assign(new Error('killed'), {
+      killed: false,
+      signal: 'SIGKILL',
+    });
+    await expect(probe(externalKill)).rejects.toBeInstanceOf(
+      ExtractionInfrastructureError,
+    );
+
+    // Transient OS spawn errors carry STRING errno codes.
+    for (const errno of ['EACCES', 'EAGAIN', 'ENOMEM', 'EMFILE']) {
+      const spawnError = new Error(`spawn ${errno}`) as NodeJS.ErrnoException;
+      spawnError.code = errno;
+      await expect(probe(spawnError)).rejects.toBeInstanceOf(
+        ExtractionInfrastructureError,
+      );
+    }
+
+    // maxBuffer overrun: modern Node sets a string code; older shapes only
+    // carry the message.
+    const maxBufferCoded = Object.assign(
+      new RangeError('stdout maxBuffer length exceeded'),
+      { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' },
+    );
+    await expect(probe(maxBufferCoded)).rejects.toBeInstanceOf(
+      ExtractionInfrastructureError,
+    );
+    await expect(
+      probe(new Error('stdout maxBuffer length exceeded')),
+    ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+  });
+
+  it('keeps a nonzero ffprobe exit (tool ran, judged the file) a content failure', async () => {
+    // Numeric exit code = the tool executed and reported the container
+    // unreadable — the ONLY case that stays ExtractionFailedError.
+    const exitFailure = Object.assign(
+      new Error('ffprobe exited 1: moov atom not found'),
+      { code: 1, killed: false, signal: null },
+    );
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.reject(exitFailure),
+    );
+    await expect(extractor.probe('a/original.mp4')).rejects.toBeInstanceOf(
+      ExtractionFailedError,
+    );
+  });
+
+  it('classifies ffmpeg frame-extraction infrastructure failures the same way', async () => {
+    // The frame/crop exec path shares run(): a timeout kill there is just
+    // as environmental as on the probe path.
+    const timeoutKill = Object.assign(new Error('killed'), {
+      killed: true,
+      signal: 'SIGTERM',
+    });
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.reject(timeoutKill),
+    );
+    const probe = { durationMs: 10_000, width: 100, height: 100, fps: 30 };
+    await expect(
+      extractor.extractFrameAt('a/original.mp4', probe, 0),
+    ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+    await expect(
+      extractor.extractCrop('a/original.mp4', probe, 0, {
+        x: 0,
+        y: 0,
+        width: 10,
+        height: 10,
+      }),
+    ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+    await expect(
+      extractor.extractFrames('a/original.mp4', probe, {
+        intervalMs: 1000,
+        maxFrames: 5,
+        startMs: 0,
+      }),
+    ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+  });
+
+  it('never echoes signals, errno values, or paths from classified errors', () => {
+    const noisy = Object.assign(
+      new Error('spawn EACCES /secret/path/ffprobe'),
+      { code: 'EACCES' },
+    );
+    const classified = classifyCommandError(noisy);
+    expect(classified).toBeInstanceOf(ExtractionInfrastructureError);
+    expect(classified.message).not.toContain('EACCES');
+    expect(classified.message).not.toContain('/secret/path');
+    // Degenerate shapes (nullish rejection) stay a controlled content error.
+    expect(classifyCommandError(undefined)).toBeInstanceOf(
+      ExtractionFailedError,
+    );
   });
 
   it('returns stdout bytes with honest geometry for frames and crops', async () => {

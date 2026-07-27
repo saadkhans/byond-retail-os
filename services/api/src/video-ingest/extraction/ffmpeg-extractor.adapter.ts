@@ -5,6 +5,7 @@ import {
   CropBox,
   ExtractedImage,
   ExtractionFailedError,
+  ExtractionInfrastructureError,
   ExtractorUnavailableError,
   FrameExtractionOptions,
   FrameUnavailableError,
@@ -209,6 +210,56 @@ type RunCommand = (
   maxOutputBytes: number,
 ) => Promise<{ stdout: Buffer }>;
 
+/** Error shape execFile produces: exit failures carry a NUMERIC code, spawn/
+ *  OS failures a STRING errno, kills a signal/killed flag. */
+interface CommandError {
+  code?: string | number | null;
+  killed?: boolean;
+  signal?: string | null;
+  message?: string;
+}
+
+/**
+ * Classify a child-process failure so INFRASTRUCTURE problems stay
+ * retryable instead of permanently rejecting a valid asset:
+ *
+ * - Missing binary (spawn ENOENT) → ExtractorUnavailableError: the host has
+ *   no ffmpeg/ffprobe at all (503, no status change — existing behavior).
+ * - Killed process (timeout kill sets `killed`/`signal`; an external
+ *   SIGKILL sets `signal` alone) → ExtractionInfrastructureError: the tool
+ *   never got to judge the file.
+ * - Output overran maxBuffer (code ERR_CHILD_PROCESS_STDIO_MAXBUFFER, or
+ *   the pre-code Node message naming maxBuffer) →
+ *   ExtractionInfrastructureError: a parent-side cap fired, not a verdict
+ *   on the video.
+ * - Any other STRING errno (EACCES, EAGAIN, ENOMEM, EMFILE, ...) →
+ *   ExtractionInfrastructureError: the OS refused to run the tool.
+ * - NUMERIC exit code (the tool RAN and reported failure) or an unknown
+ *   error shape → ExtractionFailedError: genuine content failure.
+ *
+ * Exported for tests; never echoes stderr, signals, errno values, or paths.
+ */
+export function classifyCommandError(error: unknown): Error {
+  const failure = (error ?? {}) as CommandError;
+  if (failure.code === 'ENOENT') {
+    return new ExtractorUnavailableError();
+  }
+  if (failure.killed === true || typeof failure.signal === 'string') {
+    return new ExtractionInfrastructureError();
+  }
+  if (
+    failure.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' ||
+    (typeof failure.message === 'string' &&
+      failure.message.includes('maxBuffer'))
+  ) {
+    return new ExtractionInfrastructureError();
+  }
+  if (typeof failure.code === 'string') {
+    return new ExtractionInfrastructureError();
+  }
+  return new ExtractionFailedError();
+}
+
 const defaultRunCommand: RunCommand = (binary, args, maxOutputBytes) =>
   new Promise((resolvePromise, rejectPromise) => {
     execFile(
@@ -262,10 +313,7 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
       const { stdout } = await this.runCommand(binary, args, maxOutputBytes);
       return stdout;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        throw new ExtractorUnavailableError();
-      }
-      throw new ExtractionFailedError();
+      throw classifyCommandError(error);
     }
   }
 

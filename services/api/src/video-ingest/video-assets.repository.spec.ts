@@ -319,6 +319,93 @@ describe('VideoAssetsRepository.createAsset hierarchy validation', () => {
     expect(data.locationId).toBe('loc-1');
   });
 
+  it('locks the SESSION-derived unit and validates the CURRENT unit for a session-only upload', async () => {
+    // The session's unitId/locationId pair is a historical copy; the fix
+    // requires the unit advisory lock (learned via a preliminary session
+    // read, canonical order) and a CURRENT-unit read before persisting.
+    const tx = makeTx();
+    const { repository } = makeRepository(tx);
+    await repository.createAsset(
+      TENANT,
+      { ...baseAssetData, sessionId: 'session-1' },
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+    );
+    // Preliminary session read + locked re-read.
+    expect(tx.checkoutSession.findFirst).toHaveBeenCalledTimes(2);
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(tx.$queryRaw.mock.calls[0][1]).toBe(`retail-unit:${TENANT}:unit-1`);
+    // The CURRENT unit is read under the lock (not the session's copy).
+    expect(tx.retailUnit.findFirst).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a session-only upload whose unit was re-homed to another store', async () => {
+    // The session carries the HISTORICAL unit/store pair; the unit now
+    // lives in store-B. Persisting the stale pair would make enqueue()
+    // reject the asset's crops with unit-location-mismatch later.
+    const tx = makeTx();
+    tx.retailUnit.findFirst.mockResolvedValue({
+      id: 'unit-1',
+      locationId: 'store-B',
+    });
+    const { repository, auditLog } = makeRepository(tx);
+    const result = await repository.createAsset(
+      TENANT,
+      { ...baseAssetData, sessionId: 'session-1' },
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+    );
+    expect(result).toBe('session-location-mismatch');
+    expect(tx.videoAsset.create).not.toHaveBeenCalled();
+    expect(auditLog.record).not.toHaveBeenCalled();
+  });
+
+  it('rejects a session that moved units between the preliminary read and the locks', async () => {
+    const tx = makeTx();
+    tx.checkoutSession.findFirst
+      .mockResolvedValueOnce({ unitId: 'unit-1' }) // preliminary
+      .mockResolvedValueOnce({
+        id: 'session-1',
+        unitId: 'unit-MOVED',
+        locationId: 'loc-1',
+      }); // locked re-read
+    const { repository } = makeRepository(tx);
+    const result = await repository.createAsset(
+      TENANT,
+      { ...baseAssetData, sessionId: 'session-1' },
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+    );
+    expect(result).toBe('session-unit-mismatch');
+    expect(tx.videoAsset.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects a session-only upload whose current unit no longer exists', async () => {
+    const tx = makeTx();
+    tx.retailUnit.findFirst.mockResolvedValue(null);
+    const { repository } = makeRepository(tx);
+    const result = await repository.createAsset(
+      TENANT,
+      { ...baseAssetData, sessionId: 'session-1' },
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+    );
+    expect(result).toBe('unit-not-found');
+  });
+
+  it('persists every new asset as QUARANTINED (forced at the persistence layer)', async () => {
+    // The upload attestation proves nothing about the bytes: the row must
+    // land non-processable until an audited screening decision releases it,
+    // and no caller-supplied field can override that.
+    const tx = makeTx();
+    const { repository } = makeRepository(tx);
+    await repository.createAsset(
+      TENANT,
+      { ...baseAssetData },
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+    );
+    const [{ data }] = tx.videoAsset.create.mock.calls[0] as unknown as [
+      { data: { status: VideoAssetStatus } },
+    ];
+    expect(data.status).toBe(VideoAssetStatus.QUARANTINED);
+  });
+
   it('creates the row and audits when the hierarchy is consistent', async () => {
     const tx = makeTx();
     const { repository, auditLog } = makeRepository(tx);
@@ -380,6 +467,73 @@ describe('deleted-parent scoping on artifact reads', () => {
     const [{ where }] = tx.videoArtifact.findFirst.mock
       .calls[0] as unknown as [{ where: { videoAsset: { deletedAt: null } } }];
     expect(where.videoAsset).toEqual({ deletedAt: null });
+  });
+
+  it('linkArtifactToInferenceJob requires a non-deleted parent IN THE WRITE itself', async () => {
+    // The earlier read is not enough: a DELETE can commit between the read
+    // and the updateMany. The conditional write must atomically require
+    // the parent not deleted.
+    const tx = makeTx();
+    tx.videoArtifact.findFirst.mockResolvedValueOnce({
+      id: 'artifact-1',
+      inferenceJobId: null,
+    });
+    tx.videoArtifact.findFirstOrThrow.mockResolvedValueOnce({
+      id: 'artifact-1',
+      inferenceJobId: 'job-1',
+    });
+    const { repository } = makeRepository(tx);
+    const result = await repository.linkArtifactToInferenceJob(
+      TENANT,
+      'artifact-1',
+      'job-1',
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
+    );
+    expect(result).toEqual({ id: 'artifact-1', inferenceJobId: 'job-1' });
+    const [{ where }] = tx.videoArtifact.updateMany.mock
+      .calls[0] as unknown as [
+      {
+        where: {
+          inferenceJobId: null;
+          videoAsset: { deletedAt: null };
+        };
+      },
+    ];
+    expect(where.inferenceJobId).toBeNull();
+    expect(where.videoAsset).toEqual({ deletedAt: null });
+  });
+
+  it('linkArtifactToInferenceJob returns null when the parent was deleted mid-flight', async () => {
+    const tx = makeTx();
+    tx.videoArtifact.findFirst
+      .mockResolvedValueOnce({ id: 'artifact-1', inferenceJobId: null }) // read
+      .mockResolvedValueOnce(null); // zero-count recheck: parent now deleted
+    tx.videoArtifact.updateMany.mockResolvedValue({ count: 0 });
+    const { repository, auditLog } = makeRepository(tx);
+    const result = await repository.linkArtifactToInferenceJob(
+      TENANT,
+      'artifact-1',
+      'job-1',
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
+    );
+    expect(result).toBeNull();
+    expect(auditLog.record).not.toHaveBeenCalled();
+  });
+
+  it('linkArtifactToInferenceJob reports already-linked when a concurrent link zeroed the write', async () => {
+    const tx = makeTx();
+    tx.videoArtifact.findFirst
+      .mockResolvedValueOnce({ id: 'artifact-1', inferenceJobId: null }) // read
+      .mockResolvedValueOnce({ id: 'artifact-1' }); // recheck: still visible
+    tx.videoArtifact.updateMany.mockResolvedValue({ count: 0 });
+    const { repository } = makeRepository(tx);
+    const result = await repository.linkArtifactToInferenceJob(
+      TENANT,
+      'artifact-1',
+      'job-1',
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
+    );
+    expect(result).toBe('already-linked');
   });
 });
 

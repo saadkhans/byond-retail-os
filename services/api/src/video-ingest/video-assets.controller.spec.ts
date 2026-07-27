@@ -30,6 +30,9 @@ describe('VideoAssetsController access policy', () => {
     ['list', ['video-asset:read']],
     ['findById', ['video-asset:read']],
     ['listArtifacts', ['video-asset:read']],
+    // Screening is its own least-privilege permission: releasing (or
+    // rejecting) a QUARANTINED upload is a distinct duty from processing.
+    ['screen', ['video-asset:screen']],
     ['validate', ['video-asset:process']],
     ['extractFrames', ['video-asset:process']],
     ['createCrop', ['video-asset:process']],

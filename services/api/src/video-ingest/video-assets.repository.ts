@@ -140,11 +140,11 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       // Serialization: the SAME advisory locks (unit FIRST, then device —
       // canonical order, mirroring enqueue/checkout) that
       // UnitsRepository/DevicesRepository mutations take, held through the
-      // insert. When the unit is only DERIVABLE from the device, a
-      // preliminary UNLOCKED device read learns the unit id so the locks
-      // can still be taken in canonical order; the locked re-read then
-      // verifies the device did not move in between (controlled rejection,
-      // caller retries).
+      // insert. When the unit is only DERIVABLE from the device or the
+      // session, a preliminary UNLOCKED read learns the unit id so the
+      // locks can still be taken in canonical order; the locked re-read
+      // then verifies the reference did not move in between (controlled
+      // rejection, caller retries).
       let lockUnitId = data.unitId ?? null;
       if (data.deviceId && !lockUnitId) {
         const preliminary = await tx.device.findFirst({
@@ -153,6 +153,20 @@ export class VideoAssetsRepository extends TenantScopedRepository {
         });
         if (!preliminary) {
           return 'device-not-found' as const;
+        }
+        lockUnitId = preliminary.unitId;
+      }
+      // Session-only uploads derive their unit the same way: a preliminary
+      // UNLOCKED session read learns the unit id so the unit advisory lock
+      // can be taken in canonical order; the locked session re-read below
+      // then verifies the session did not move units in between.
+      if (data.sessionId && !lockUnitId) {
+        const preliminary = await tx.checkoutSession.findFirst({
+          where: { id: data.sessionId, tenantId: scopedTenantId },
+          select: { unitId: true },
+        });
+        if (!preliminary) {
+          return 'session-not-found' as const;
         }
         lockUnitId = preliminary.unitId;
       }
@@ -230,11 +244,37 @@ export class VideoAssetsRepository extends TenantScopedRepository {
         if (!session) {
           return 'session-not-found' as const;
         }
+        // lockUnitId covers the explicit/derived-unit mismatch AND a
+        // session that moved units between the preliminary read and this
+        // locked re-read (mirroring the device re-read check above).
+        if (lockUnitId && session.unitId !== lockUnitId) {
+          return 'session-unit-mismatch' as const;
+        }
         if (effectiveUnitId && session.unitId !== effectiveUnitId) {
           return 'session-unit-mismatch' as const;
         }
         if (effectiveLocationId && session.locationId !== effectiveLocationId) {
           return 'session-location-mismatch' as const;
+        }
+        if (!effectiveUnitId) {
+          // Session-only derivation: the session's unitId/locationId pair
+          // is a HISTORICAL copy taken when the session opened — the unit
+          // may have been re-homed to another store since. The unit
+          // advisory lock is already held (preliminary read above), so
+          // read the CURRENT unit and require the session's recorded store
+          // to still match it; persisting the stale pair would strand the
+          // asset (PrismaInferenceQueue.enqueue() rejects its crops with
+          // unit-location-mismatch).
+          const sessionUnit = await tx.retailUnit.findFirst({
+            where: { id: session.unitId, tenantId: scopedTenantId },
+            select: { id: true, locationId: true },
+          });
+          if (!sessionUnit) {
+            return 'unit-not-found' as const;
+          }
+          if (sessionUnit.locationId !== session.locationId) {
+            return 'session-location-mismatch' as const;
+          }
         }
         // A session-only upload still yields a complete persisted context.
         effectiveUnitId = effectiveUnitId ?? session.unitId;
@@ -246,6 +286,12 @@ export class VideoAssetsRepository extends TenantScopedRepository {
           unitId: effectiveUnitId ?? undefined,
           locationId: effectiveLocationId ?? undefined,
           tenantId: scopedTenantId,
+          // NON-NEGOTIABLE at the persistence layer (not caller-supplied):
+          // every new upload lands QUARANTINED. The operator attestation
+          // proves nothing about the bytes, so the asset stays
+          // non-processable until an audited screening decision releases
+          // (→ UPLOADED) or rejects (media removed, → REJECTED) it.
+          status: VideoAssetStatus.QUARANTINED,
         },
         select: VIDEO_ASSET_SELECT,
       });
@@ -414,7 +460,12 @@ export class VideoAssetsRepository extends TenantScopedRepository {
     videoAssetId: string,
     idempotencyKey: string,
   ): Promise<
-    | { asset: VideoAssetView; artifacts: VideoArtifactView[]; replayed: true }
+    | {
+        asset: VideoAssetView;
+        artifacts: VideoArtifactView[];
+        replayed: true;
+        requestFingerprint: string | null;
+      }
     | 'key-conflict'
     | null
   > {
@@ -445,6 +496,9 @@ export class VideoAssetsRepository extends TenantScopedRepository {
         .map((id) => byId.get(id))
         .filter((artifact): artifact is VideoArtifactView => Boolean(artifact)),
       replayed: true,
+      // The recorded request parameters — the service honors the replay
+      // ONLY when the incoming request's canonical fingerprint matches.
+      requestFingerprint: request.requestFingerprint ?? null,
     };
   }
 
@@ -487,8 +541,16 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       before: VideoAssetView,
       after: VideoAssetView,
     ) => AuditEntry,
+    // Canonical request fingerprint recorded WITH the batch (same
+    // transaction) so replays can prove the retried request is identical.
+    requestFingerprint?: string,
   ): Promise<
-    | { asset: VideoAssetView; artifacts: VideoArtifactView[]; replayed: boolean }
+    | {
+        asset: VideoAssetView;
+        artifacts: VideoArtifactView[];
+        replayed: boolean;
+        requestFingerprint?: string | null;
+      }
     | 'key-conflict'
     | null
   > {
@@ -523,6 +585,9 @@ export class VideoAssetsRepository extends TenantScopedRepository {
                 Boolean(artifact),
               ),
             replayed: true,
+            // The recorded parameters ride along so the caller can reject a
+            // same-key request whose parameters changed.
+            requestFingerprint: existing.requestFingerprint ?? null,
           };
         }
       }
@@ -565,6 +630,7 @@ export class VideoAssetsRepository extends TenantScopedRepository {
             videoAssetId,
             idempotencyKey,
             artifactIds: artifacts.map((artifact) => artifact.id),
+            requestFingerprint,
           },
         });
       }
@@ -609,9 +675,11 @@ export class VideoAssetsRepository extends TenantScopedRepository {
 
   /**
    * One-shot crop → inference-job link. Conditional write (inferenceJobId
-   * IS NULL): the append-only trigger allows exactly this mutation, and two
-   * concurrent creations cannot both stamp — the loser reads the winner's
-   * link back and replays it.
+   * IS NULL and the parent asset NOT soft-deleted): the append-only trigger
+   * allows exactly this mutation, two concurrent creations cannot both
+   * stamp — the loser reads the winner's link back and replays it — and a
+   * parent DELETE racing the link zeroes the count instead of linking a job
+   * to a deleted asset's crop.
    */
   linkArtifactToInferenceJob(
     tenantId: string,
@@ -641,15 +709,32 @@ export class VideoAssetsRepository extends TenantScopedRepository {
         return 'already-linked' as const;
       }
       const linked = await tx.videoArtifact.updateMany({
+        // The non-deleted-parent condition is part of the CONDITIONAL WRITE
+        // itself, not just the read above: a DELETE /video-assets/:id can
+        // commit between the two, and a job must never link to a crop whose
+        // parent (and media) is already gone.
         where: {
           id: artifactId,
           tenantId: scopedTenantId,
           inferenceJobId: null,
+          videoAsset: { deletedAt: null },
         },
         data: { inferenceJobId },
       });
       if (linked.count === 0) {
-        return 'already-linked' as const;
+        // Count 0 now has two causes: a concurrent link stamped first, or
+        // the parent was deleted after the read above. Re-read through the
+        // deleted-parent scope to report the honest one — null (gone, 404
+        // downstream) vs already-linked (caller replays the winner's link).
+        const stillVisible = await tx.videoArtifact.findFirst({
+          where: {
+            id: artifactId,
+            tenantId: scopedTenantId,
+            videoAsset: { deletedAt: null },
+          },
+          select: { id: true },
+        });
+        return stillVisible ? ('already-linked' as const) : null;
       }
       const after = await tx.videoArtifact.findFirstOrThrow({
         where: { id: artifactId, tenantId: scopedTenantId },

@@ -57,6 +57,24 @@ export class ExtractionFailedError extends Error {
 }
 
 /**
+ * Controlled failure: the extraction TOOLING could not run to completion —
+ * the process was killed (timeout or external signal), the OS refused to
+ * spawn or resource it (EACCES, EAGAIN, ENOMEM, EMFILE, ...), or its
+ * output overran the parent's buffer cap. Says NOTHING about the video
+ * itself, so callers must treat it as transient/retryable (503) and must
+ * NOT transition the asset to REJECTED or FAILED — distinct from
+ * ExtractionFailedError, where the tool ran and reported the content
+ * unreadable.
+ */
+export class ExtractionInfrastructureError extends Error {
+  constructor() {
+    // No binary names, signals, errno values, or paths — controlled message.
+    super('Video processing is temporarily unavailable; retry later');
+    this.name = 'ExtractionInfrastructureError';
+  }
+}
+
+/**
  * Controlled failure: the video is fine but NO frame is decodable at the
  * requested position (a timestamp inside the reported duration can still
  * land after the last decodable frame — real containers routinely report a

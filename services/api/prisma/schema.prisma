@@ -1615,6 +1615,12 @@ model InferenceCandidate {
 // ---------------------------------------------------------------------------
 
 enum VideoAssetStatus {
+  // Every new upload lands QUARANTINED: bytes are held in local storage but
+  // the asset is NOT processable (validate/extract/crop all 409) until an
+  // audited frame-content screening decision APPROVEs it (→ UPLOADED) or
+  // REJECTs it (media removed, → REJECTED). The upload attestation is
+  // defense-in-depth only — quarantine is the enforced control.
+  QUARANTINED
   UPLOADED
   VALIDATED
   REJECTED
@@ -1747,6 +1753,13 @@ model VideoExtractionRequest {
   // The artifact ids the committed batch produced, in creation order —
   // replay resolves them through the tenant-scoped artifact reads.
   artifactIds    Json
+  // Canonical fingerprint of the request parameters that produced the batch
+  // (fixed operation tag, fixed field order, defaults applied). A replay is
+  // honored ONLY when the incoming request's fingerprint matches — the same
+  // key with changed parameters is a controlled 409, never a silent replay
+  // of the old batch. Null only on rows recorded before this column existed
+  // (those fail closed: they can no longer prove the request is identical).
+  requestFingerprint String?
   createdAt      DateTime @default(now())
 
   tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)

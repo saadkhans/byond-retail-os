@@ -32,6 +32,7 @@ import { RequestContext } from '../auth/request-context';
 import { CreateVideoCropDto } from './dto/create-video-crop.dto';
 import { ExtractFramesDto } from './dto/extract-frames.dto';
 import { QueryVideoAssetsDto } from './dto/query-video-assets.dto';
+import { ScreenVideoAssetDto } from './dto/screen-video-asset.dto';
 import { UploadVideoAssetDto } from './dto/upload-video-asset.dto';
 import {
   UploadedVideoFile,
@@ -62,9 +63,12 @@ export class VideoAssetsController {
       '+ magic bytes), conservative size limit, filename traversal ' +
       'rejection, SHA-256 checksum. Bytes land in LOCAL/DEV storage behind ' +
       'a server-generated internal key — no public URLs, no client-supplied ' +
-      'paths, no media in the database.',
+      'paths, no media in the database. The asset lands QUARANTINED and is ' +
+      'not processable until an audited screening decision approves it.',
   })
-  @ApiCreatedResponse({ description: 'Asset created (UPLOADED)' })
+  @ApiCreatedResponse({
+    description: 'Asset created (QUARANTINED pending screening)',
+  })
   upload(
     @CurrentTenantId() tenantId: string,
     @UploadedFile() file: UploadedVideoFile | undefined,
@@ -120,6 +124,32 @@ export class VideoAssetsController {
     @Param('id') id: string,
   ): Promise<VideoArtifactView[]> {
     return this.assetsService.listArtifacts(tenantId, id);
+  }
+
+  @Post(':id/screening')
+  @RequirePermissions('video-asset:screen')
+  @ApiOperation({
+    summary: 'Record the audited frame-content screening decision',
+    description:
+      'QUARANTINED → UPLOADED (APPROVE: released for processing) or ' +
+      'QUARANTINED → REJECTED (REJECT: stored media removed, metadata row ' +
+      'kept as evidence). The upload attestation is defense-in-depth only — ' +
+      'this audited decision is the enforced control before ANY processing. ' +
+      'Decisions on non-QUARANTINED assets are controlled 409s.',
+  })
+  @ApiCreatedResponse({ description: 'Screening decision recorded' })
+  @ApiNotFoundResponse({ description: 'Asset not found in this tenant' })
+  @ApiConflictResponse({ description: 'Asset is not QUARANTINED' })
+  screen(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Body() dto: ScreenVideoAssetDto,
+    @CurrentUser() actor: RequestContext,
+  ): Promise<VideoAssetView> {
+    return this.assetsService.screen(tenantId, id, dto, {
+      id: actor.userId,
+      email: actor.email,
+    });
   }
 
   @Post(':id/validate')

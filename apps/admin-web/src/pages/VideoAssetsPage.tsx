@@ -13,6 +13,7 @@ import { formatDate, Page, StatusBadge, useLoad } from '../components';
 
 const ASSET_STATUSES = [
   '',
+  'QUARANTINED',
   'UPLOADED',
   'VALIDATED',
   'REJECTED',
@@ -163,7 +164,8 @@ export function VideoAssetsPage() {
           style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}
           title={
             'Required attestation: the API refuses to store a clip without ' +
-            'it. Text screening cannot inspect pixels.'
+            'it. Defense-in-depth only — the upload still lands QUARANTINED ' +
+            'until an audited screening decision approves it.'
           }
         >
           <input
@@ -279,6 +281,11 @@ export function VideoAssetDetailPage() {
     crypto.randomUUID(),
   );
 
+  // Screening decision (QUARANTINED assets only): the upload attestation is
+  // defense-in-depth — this audited decision is what releases (or rejects)
+  // the quarantined bytes before ANY processing.
+  const [screeningNote, setScreeningNote] = useState('');
+
   // Crop form (same idempotency-key rotation).
   const [cropTimestampMs, setCropTimestampMs] = useState('0');
   const [cropX, setCropX] = useState('0');
@@ -316,6 +323,23 @@ export function VideoAssetDetailPage() {
   async function validate() {
     await run(async () => {
       await api(`/video-assets/${id}/validate`, { method: 'POST', body: {} });
+    });
+  }
+
+  async function screen(decision: 'APPROVE' | 'REJECT') {
+    await run(async () => {
+      const note = screeningNote.trim();
+      await api(`/video-assets/${id}/screening`, {
+        method: 'POST',
+        body: { decision, ...(note ? { note } : {}) },
+      });
+      setScreeningNote('');
+      setNotice(
+        decision === 'APPROVE'
+          ? 'Screening approved — the asset is released for validation.'
+          : 'Screening rejected — the stored media was removed; the ' +
+              'metadata row is kept as evidence.',
+      );
     });
   }
 
@@ -411,6 +435,39 @@ export function VideoAssetDetailPage() {
         <div className="detail">
           {actionError ? <div className="error">{actionError}</div> : null}
           {notice ? <p className="muted">{notice}</p> : null}
+          {data.status === 'QUARANTINED' ? (
+            <>
+              <p className="muted">
+                Pending frame-content screening: the upload is QUARANTINED
+                and cannot be validated or processed until an audited
+                screening decision approves it. Rejecting removes the stored
+                media (the metadata row is kept as evidence).
+              </p>
+              <div className="toolbar">
+                <input
+                  type="text"
+                  maxLength={500}
+                  style={{ minWidth: '18rem' }}
+                  placeholder="Screening note (optional, audited)"
+                  value={screeningNote}
+                  onChange={(e) => setScreeningNote(e.target.value)}
+                />
+                <button
+                  className="primary"
+                  disabled={busy}
+                  onClick={() => void screen('APPROVE')}
+                >
+                  Approve screening
+                </button>
+                <button
+                  disabled={busy}
+                  onClick={() => void screen('REJECT')}
+                >
+                  Reject screening (remove media)
+                </button>
+              </div>
+            </>
+          ) : null}
           <div className="toolbar">
             {data.status === 'UPLOADED' ? (
               <button

@@ -15,8 +15,10 @@ import {
 } from '@prisma/client';
 import {
   ExtractionFailedError,
+  ExtractionInfrastructureError,
   FrameUnavailableError,
 } from './extraction/video-frame-extractor.port';
+import { VideoScreeningDecision } from './dto/screen-video-asset.dto';
 import {
   UploadedVideoFile,
   VideoAssetsService,
@@ -98,6 +100,41 @@ function artifactRow(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** Mirrors the service's CANONICAL crop fingerprint (fixed field order). */
+function cropFingerprint(params: {
+  timestampMs: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  reason?: VideoCropReason | null;
+}): string {
+  return JSON.stringify({
+    op: 'CROP',
+    timestampMs: params.timestampMs,
+    x: params.x,
+    y: params.y,
+    width: params.width,
+    height: params.height,
+    reason: params.reason ?? null,
+  });
+}
+
+/** Mirrors the service's CANONICAL frames fingerprint (defaults applied). */
+function framesFingerprint(params: {
+  timestampMs?: number;
+  intervalMs?: number;
+  maxFrames?: number;
+} = {}): string {
+  return params.timestampMs !== undefined
+    ? JSON.stringify({ op: 'FRAMES', timestampMs: params.timestampMs })
+    : JSON.stringify({
+        op: 'FRAMES',
+        intervalMs: params.intervalMs ?? 1000,
+        maxFrames: params.maxFrames ?? 5,
+      });
+}
+
 function buildService(overrides: {
   repository?: Record<string, unknown>;
   storage?: Record<string, unknown>;
@@ -108,7 +145,13 @@ function buildService(overrides: {
 } = {}) {
   const repository = {
     createAsset: jest.fn(async (_t: string, data: unknown, build: (a: unknown) => unknown) => {
-      const created = assetRow({ status: VideoAssetStatus.UPLOADED, ...(data as Record<string, unknown>) });
+      // Mirrors the real repository: every new upload is persisted
+      // QUARANTINED (status is forced at the persistence layer, never
+      // caller-supplied).
+      const created = assetRow({
+        ...(data as Record<string, unknown>),
+        status: VideoAssetStatus.QUARANTINED,
+      });
       build(created);
       return created;
     }),
@@ -232,7 +275,10 @@ function buildService(overrides: {
         sessionId: dto.sessionId ?? null,
       }),
     ),
-    findById: jest.fn(async () => ({ id: 'job-1' })),
+    findById: jest.fn(async () => ({
+      id: 'job-1',
+      jobType: InferenceJobType.PRODUCT_RECOGNITION,
+    })),
     ...overrides.inference,
   };
   const modules = {
@@ -275,6 +321,16 @@ describe('VideoAssetsService.upload', () => {
     expect(data.storageKey).toBe(key);
     expect(data.originalFilename).toBe('clip.mp4');
     expect((repository.createAsset.mock.calls[0] as unknown as [string])[0]).toBe(TENANT);
+  });
+
+  it('creates the asset QUARANTINED pending frame-content screening', async () => {
+    // The attestation proves nothing about the bytes: the upload must land
+    // NON-processable until an audited screening decision releases it.
+    const { service } = buildService();
+    const asset = await service.upload(TENANT, uploadFile(), { ...ATTEST });
+    expect((asset as { status: VideoAssetStatus }).status).toBe(
+      VideoAssetStatus.QUARANTINED,
+    );
   });
 
   it('rejects a missing file part', async () => {
@@ -516,6 +572,29 @@ describe('VideoAssetsService.validate', () => {
     expect(data.errorCode).toBe('PROBE_FAILED');
   });
 
+  it('maps an infrastructure failure during probe to 503 WITHOUT rejecting the asset', async () => {
+    // The probe TOOLING could not run (killed/refused/over-buffered) —
+    // that says nothing about the video: the asset stays UPLOADED for a
+    // retry, with no transition and no audit entry.
+    const { service, repository, auditLog } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () =>
+          assetRow({ status: VideoAssetStatus.UPLOADED }),
+        ),
+      },
+      extractor: {
+        probe: jest.fn(async () => {
+          throw new ExtractionInfrastructureError();
+        }),
+      },
+    });
+    await expect(service.validate(TENANT, 'asset-1')).rejects.toBeInstanceOf(
+      ServiceUnavailableException,
+    );
+    expect(repository.transitionStatus).not.toHaveBeenCalled();
+    expect(auditLog.record).not.toHaveBeenCalled();
+  });
+
   it('404s for another tenant’s asset (tenant-scoped lookup)', async () => {
     const { service, repository } = buildService({
       repository: { findByIdInternal: jest.fn(async () => null) },
@@ -524,6 +603,231 @@ describe('VideoAssetsService.validate', () => {
       NotFoundException,
     );
     expect((repository.findByIdInternal.mock.calls[0] as unknown as [string])[0]).toBe(TENANT);
+  });
+
+  it('409s validation of a QUARANTINED asset (screening is the enforced gate)', async () => {
+    const { service, repository, extractor } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () =>
+          assetRow({ status: VideoAssetStatus.QUARANTINED }),
+        ),
+      },
+    });
+    await expect(service.validate(TENANT, 'asset-1')).rejects.toBeInstanceOf(
+      ConflictException,
+    );
+    // The quarantined bytes were never touched and no transition happened.
+    expect(extractor.probe).not.toHaveBeenCalled();
+    expect(repository.transitionStatus).not.toHaveBeenCalled();
+  });
+});
+
+describe('VideoAssetsService.screen', () => {
+  const quarantined = () => assetRow({ status: VideoAssetStatus.QUARANTINED });
+
+  it('APPROVE transitions QUARANTINED → UPLOADED through the audited CAS machinery', async () => {
+    let entry: { reason?: string } | undefined;
+    const transitionStatus = jest.fn(
+      async (
+        _t: string,
+        _id: string,
+        _expected: unknown,
+        data: { status: VideoAssetStatus },
+        build: (b: unknown, a: unknown) => unknown,
+      ) => {
+        const after = assetRow({ ...data });
+        entry = build(quarantined(), after) as { reason?: string };
+        return after;
+      },
+    );
+    const { service, repository } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () => quarantined()),
+        transitionStatus,
+      },
+    });
+    const result = await service.screen(
+      TENANT,
+      'asset-1',
+      { decision: VideoScreeningDecision.APPROVE },
+      { id: 'u1', email: 'screener@x.io' },
+    );
+    expect((result as { status: VideoAssetStatus }).status).toBe(
+      VideoAssetStatus.UPLOADED,
+    );
+    const [, , expected, data] = repository.transitionStatus.mock
+      .calls[0] as unknown as [
+      string,
+      string,
+      VideoAssetStatus[],
+      { status: VideoAssetStatus; errorCode?: string },
+    ];
+    expect(expected).toEqual([VideoAssetStatus.QUARANTINED]);
+    expect(data.status).toBe(VideoAssetStatus.UPLOADED);
+    expect(data.errorCode).toBeUndefined();
+    expect(entry?.reason).toContain('screening approved');
+  });
+
+  it('APPROVE unlocks validation (the released asset probes normally)', async () => {
+    const findByIdInternal = jest
+      .fn()
+      .mockResolvedValueOnce(quarantined()) // screen() read
+      .mockResolvedValueOnce(assetRow({ status: VideoAssetStatus.UPLOADED })); // validate() read
+    const { service, extractor } = buildService({
+      repository: { findByIdInternal },
+    });
+    await service.screen(TENANT, 'asset-1', {
+      decision: VideoScreeningDecision.APPROVE,
+    });
+    await service.validate(TENANT, 'asset-1');
+    expect(extractor.probe).toHaveBeenCalledTimes(1);
+  });
+
+  it('REJECT removes the stored media and records the terminal transition', async () => {
+    let entry: { reason?: string } | undefined;
+    const transitionStatus = jest.fn(
+      async (
+        _t: string,
+        _id: string,
+        _expected: unknown,
+        data: { status: VideoAssetStatus },
+        build: (b: unknown, a: unknown) => unknown,
+      ) => {
+        const after = assetRow({ ...data });
+        entry = build(quarantined(), after) as { reason?: string };
+        return after;
+      },
+    );
+    const { service, storage, repository } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () => quarantined()),
+        transitionStatus,
+      },
+    });
+    const result = await service.screen(TENANT, 'asset-1', {
+      decision: VideoScreeningDecision.REJECT,
+      note: 'payment terminal visible in frame 3',
+    });
+    expect((result as { status: VideoAssetStatus }).status).toBe(
+      VideoAssetStatus.REJECTED,
+    );
+    // The asset directory (original + any files) is gone.
+    expect(storage.deletePrefix).toHaveBeenCalledWith(`${TENANT}/uuid-1`);
+    const [, , expected, data] = repository.transitionStatus.mock
+      .calls[0] as unknown as [
+      string,
+      string,
+      VideoAssetStatus[],
+      { status: VideoAssetStatus; errorCode: string },
+    ];
+    expect(expected).toEqual([VideoAssetStatus.QUARANTINED]);
+    expect(data.status).toBe(VideoAssetStatus.REJECTED);
+    expect(data.errorCode).toBe('SCREENING_REJECTED');
+    // The screened operator note rides in the audited record.
+    expect(entry?.reason).toContain('screening rejected');
+    expect(entry?.reason).toContain('payment terminal visible in frame 3');
+  });
+
+  it('REJECT retries a transient media-removal failure and still completes', async () => {
+    const deletePrefix = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('EBUSY'))
+      .mockResolvedValueOnce(undefined);
+    const { service, repository } = buildService({
+      storage: { deletePrefix },
+      repository: { findByIdInternal: jest.fn(async () => quarantined()) },
+    });
+    await service.screen(TENANT, 'asset-1', {
+      decision: VideoScreeningDecision.REJECT,
+    });
+    expect(deletePrefix).toHaveBeenCalledTimes(2);
+    expect(repository.transitionStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('REJECT escalates a persistent media-removal failure as 503 and stays QUARANTINED', async () => {
+    // The 503 fires BEFORE any transition, so the rejection is retryable
+    // through the same endpoint — bytes can never outlive a recorded
+    // rejection.
+    const deletePrefix = jest.fn(async () => {
+      throw new Error('EACCES');
+    });
+    const { service, repository } = buildService({
+      storage: { deletePrefix },
+      repository: { findByIdInternal: jest.fn(async () => quarantined()) },
+    });
+    await expect(
+      service.screen(TENANT, 'asset-1', {
+        decision: VideoScreeningDecision.REJECT,
+      }),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    // One retry, then escalation — never an unbounded loop.
+    expect(deletePrefix).toHaveBeenCalledTimes(2);
+    expect(repository.transitionStatus).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [VideoAssetStatus.UPLOADED],
+    [VideoAssetStatus.VALIDATED],
+    [VideoAssetStatus.READY],
+    [VideoAssetStatus.REJECTED],
+    [VideoAssetStatus.FAILED],
+  ])('409s any decision on a non-QUARANTINED asset (%s)', async (status) => {
+    const { service, storage, repository } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () => assetRow({ status })),
+      },
+    });
+    for (const decision of [
+      VideoScreeningDecision.APPROVE,
+      VideoScreeningDecision.REJECT,
+    ]) {
+      await expect(
+        service.screen(TENANT, 'asset-1', { decision }),
+      ).rejects.toBeInstanceOf(ConflictException);
+    }
+    expect(storage.deletePrefix).not.toHaveBeenCalled();
+    expect(repository.transitionStatus).not.toHaveBeenCalled();
+  });
+
+  it('404s an unknown asset', async () => {
+    const { service } = buildService({
+      repository: { findByIdInternal: jest.fn(async () => null) },
+    });
+    await expect(
+      service.screen(TENANT, 'nope', {
+        decision: VideoScreeningDecision.APPROVE,
+      }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('rejects a note carrying credential- or payment-bearing content BEFORE any read', async () => {
+    const { service, repository } = buildService();
+    for (const note of [
+      ['4111', '1111', '1111', '1111'].join(' '),
+      'password=hunter2',
+    ]) {
+      await expect(
+        service.screen(TENANT, 'asset-1', {
+          decision: VideoScreeningDecision.APPROVE,
+          note,
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
+    expect(repository.findByIdInternal).not.toHaveBeenCalled();
+  });
+
+  it('409s when the CAS loses to a concurrent decision', async () => {
+    const { service } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () => quarantined()),
+        transitionStatus: jest.fn(async () => null),
+      },
+    });
+    await expect(
+      service.screen(TENANT, 'asset-1', {
+        decision: VideoScreeningDecision.APPROVE,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
   });
 });
 
@@ -571,6 +875,22 @@ describe('VideoAssetsService crop & frame extraction', () => {
     expect(repository.transitionStatus).not.toHaveBeenCalled();
   });
 
+  it('maps an infrastructure failure during extraction to 503 WITHOUT failing the asset', async () => {
+    // Tooling killed/refused mid-extraction is transient, not a property
+    // of the video — no FAILED transition, no audit, a controlled 503.
+    const { service, repository } = buildService({
+      extractor: {
+        extractFrameAt: jest.fn(async () => {
+          throw new ExtractionInfrastructureError();
+        }),
+      },
+    });
+    await expect(
+      service.extractFrames(TENANT, 'asset-1', { timestampMs: 500 }),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    expect(repository.transitionStatus).not.toHaveBeenCalled();
+  });
+
   it('requires validation before extraction', async () => {
     const { service } = buildService({
       repository: {
@@ -582,6 +902,34 @@ describe('VideoAssetsService crop & frame extraction', () => {
     await expect(
       service.extractFrames(TENANT, 'asset-1', {}),
     ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('409s frame extraction AND crops on a QUARANTINED asset', async () => {
+    // Quarantine must hold at EVERY processing entry point — an unscreened
+    // clip's bytes are never decoded, sampled, or cropped.
+    const { service, extractor, storage } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () =>
+          assetRow({ status: VideoAssetStatus.QUARANTINED }),
+        ),
+      },
+    });
+    await expect(
+      service.extractFrames(TENANT, 'asset-1', {}),
+    ).rejects.toBeInstanceOf(ConflictException);
+    await expect(
+      service.createCrop(TENANT, 'asset-1', {
+        timestampMs: 1000,
+        x: 0,
+        y: 0,
+        width: 10,
+        height: 10,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(extractor.extractFrames).not.toHaveBeenCalled();
+    expect(extractor.extractFrameAt).not.toHaveBeenCalled();
+    expect(extractor.extractCrop).not.toHaveBeenCalled();
+    expect(storage.put).not.toHaveBeenCalled();
   });
 
   it('persists a CROP artifact with checksum, geometry, and reason', async () => {
@@ -692,6 +1040,13 @@ describe('extraction idempotency', () => {
       asset: assetRow({ status: VideoAssetStatus.READY }),
       artifacts: [artifactRow()],
       replayed: true as const,
+      requestFingerprint: cropFingerprint({
+        timestampMs: 1000,
+        x: 10,
+        y: 20,
+        width: 300,
+        height: 200,
+      }),
     };
     const { service, extractor, storage, repository } = buildService({
       repository: {
@@ -766,6 +1121,13 @@ describe('extraction idempotency', () => {
       asset: assetRow({ status: VideoAssetStatus.READY }),
       artifacts: [artifactRow()],
       replayed: true as const,
+      requestFingerprint: cropFingerprint({
+        timestampMs: 1000,
+        x: 0,
+        y: 0,
+        width: 10,
+        height: 10,
+      }),
     };
     const findExtractionReplay = jest
       .fn()
@@ -799,6 +1161,221 @@ describe('extraction idempotency', () => {
         idempotencyKey: `pan-${['4111', '1111', '1111', '1111'].join(' ')}`,
       }),
     ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('409s a same-key crop retry whose timestamp, box, or reason changed', async () => {
+    // The recorded batch answers the ORIGINAL request only: a reused key
+    // with any changed parameter must conflict, never silently hand back
+    // the old artifact as if it answered the new request.
+    const original = {
+      timestampMs: 1000,
+      x: 10,
+      y: 20,
+      width: 300,
+      height: 200,
+    };
+    const changed = [
+      { ...original, timestampMs: 2000 }, // changed timestamp
+      { ...original, x: 11 }, // changed box
+      { ...original, reason: VideoCropReason.SHELF_AUDIT }, // changed reason
+    ];
+    for (const dto of changed) {
+      const { service, extractor, storage, repository } = buildService({
+        repository: {
+          findExtractionReplay: jest.fn(async () => ({
+            asset: assetRow({ status: VideoAssetStatus.READY }),
+            artifacts: [artifactRow()],
+            replayed: true as const,
+            requestFingerprint: cropFingerprint(original),
+          })),
+        },
+      });
+      await expect(
+        service.createCrop(TENANT, 'asset-1', { ...dto, idempotencyKey: 'op-1' }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      // Nothing was extracted, staged, committed, or linked.
+      expect(extractor.extractCrop).not.toHaveBeenCalled();
+      expect(storage.put).not.toHaveBeenCalled();
+      expect(repository.createArtifactsBatch).not.toHaveBeenCalled();
+    }
+  });
+
+  it('409s a same-key frames retry whose timestamp, interval, or limit changed', async () => {
+    const framesReplay = () => ({
+      asset: assetRow({ status: VideoAssetStatus.READY }),
+      artifacts: [
+        artifactRow({ artifactType: VideoArtifactType.FRAME, cropX: null }),
+      ],
+      replayed: true as const,
+      // Original request: interval sampling with the defaults.
+      requestFingerprint: framesFingerprint(),
+    });
+    for (const dto of [
+      { intervalMs: 2000 }, // changed interval
+      { maxFrames: 10 }, // changed limit
+      { timestampMs: 0 }, // sampling → single-frame mode change
+    ]) {
+      const { service, extractor, storage, repository } = buildService({
+        repository: { findExtractionReplay: jest.fn(async () => framesReplay()) },
+      });
+      await expect(
+        service.extractFrames(TENANT, 'asset-1', {
+          ...dto,
+          idempotencyKey: 'op-1',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(extractor.extractFrames).not.toHaveBeenCalled();
+      expect(extractor.extractFrameAt).not.toHaveBeenCalled();
+      expect(storage.put).not.toHaveBeenCalled();
+      expect(repository.createArtifactsBatch).not.toHaveBeenCalled();
+    }
+  });
+
+  it('replays a same-key frames retry whose parameters are IDENTICAL (defaults applied)', async () => {
+    // Canonical means normalized: an omitted interval/limit and the same
+    // values written out explicitly are the SAME request.
+    const framesReplay = {
+      asset: assetRow({ status: VideoAssetStatus.READY }),
+      artifacts: [
+        artifactRow({ artifactType: VideoArtifactType.FRAME, cropX: null }),
+      ],
+      replayed: true as const,
+      requestFingerprint: framesFingerprint(),
+    };
+    const { service, extractor } = buildService({
+      repository: { findExtractionReplay: jest.fn(async () => framesReplay) },
+    });
+    const implicit = await service.extractFrames(TENANT, 'asset-1', {
+      idempotencyKey: 'op-1',
+    });
+    expect(implicit.replayed).toBe(true);
+    const explicit = await service.extractFrames(TENANT, 'asset-1', {
+      intervalMs: 1000,
+      maxFrames: 5,
+      idempotencyKey: 'op-1',
+    });
+    expect(explicit.replayed).toBe(true);
+    expect(extractor.extractFrames).not.toHaveBeenCalled();
+  });
+
+  it('fails CLOSED on a recorded batch with no fingerprint (pre-column row)', async () => {
+    // A legacy request row cannot prove the retried request is identical —
+    // it is rejected like a changed request, never replayed unverifiably.
+    const { service } = buildService({
+      repository: {
+        findExtractionReplay: jest.fn(async () => ({
+          asset: assetRow({ status: VideoAssetStatus.READY }),
+          artifacts: [artifactRow()],
+          replayed: true as const,
+          requestFingerprint: null,
+        })),
+      },
+    });
+    await expect(
+      service.createCrop(TENANT, 'asset-1', {
+        timestampMs: 1000,
+        x: 10,
+        y: 20,
+        width: 300,
+        height: 200,
+        idempotencyKey: 'legacy-op',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('verifies parameters on the IN-TRANSACTION replay path too', async () => {
+    // A concurrent batch that committed first inside the tx window replays
+    // through createArtifactsBatch itself — the same identical-request
+    // guard applies, and the loser's staged file is still cleaned up.
+    const { service, storage } = buildService({
+      repository: {
+        createArtifactsBatch: jest.fn(async () => ({
+          asset: assetRow({ status: VideoAssetStatus.READY }),
+          artifacts: [
+            artifactRow({ artifactType: VideoArtifactType.FRAME, cropX: null }),
+          ],
+          replayed: true,
+          requestFingerprint: framesFingerprint({ intervalMs: 2000 }),
+        })),
+      },
+    });
+    await expect(
+      service.extractFrames(TENANT, 'asset-1', { idempotencyKey: 'op-1' }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(storage.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('passes the canonical fingerprint to the atomic publish', async () => {
+    const { service, repository } = buildService();
+    await service.createCrop(TENANT, 'asset-1', {
+      timestampMs: 1000,
+      x: 10,
+      y: 20,
+      width: 300,
+      height: 200,
+      reason: VideoCropReason.PRODUCT_PICKUP,
+      idempotencyKey: 'op-1',
+    });
+    const call = repository.createArtifactsBatch.mock.calls[0] as unknown[];
+    expect(call[3]).toBe('op-1');
+    expect(call[7]).toBe(
+      cropFingerprint({
+        timestampMs: 1000,
+        x: 10,
+        y: 20,
+        width: 300,
+        height: 200,
+        reason: VideoCropReason.PRODUCT_PICKUP,
+      }),
+    );
+  });
+});
+
+describe('staged-artifact cleanup escalation', () => {
+  const cropDto = { timestampMs: 1000, x: 0, y: 0, width: 10, height: 10 };
+
+  it('retries a transient staged-file cleanup failure and still surfaces the ORIGINAL error', async () => {
+    // Publish failed, first delete throws, the retry succeeds: the caller
+    // sees the original failure — the cleanup hiccup was transient and is
+    // NOT escalated.
+    const del = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('EBUSY'))
+      .mockResolvedValueOnce(undefined);
+    const { service } = buildService({
+      storage: { delete: del },
+      repository: {
+        createArtifactsBatch: jest.fn(async () => {
+          throw new Error('db down');
+        }),
+      },
+    });
+    await expect(service.createCrop(TENANT, 'asset-1', cropDto)).rejects.toThrow(
+      'db down',
+    );
+    expect(del).toHaveBeenCalledTimes(2);
+  });
+
+  it('escalates a PERSISTENT staged-file cleanup failure as 503 (bounded attempts)', async () => {
+    // Publish failed AND both delete attempts failed: no row references
+    // the staged key, so silently reporting only the original error would
+    // strand orphaned media. The controlled 503 names the condition.
+    const del = jest.fn(async () => {
+      throw new Error('EACCES');
+    });
+    const { service } = buildService({
+      storage: { delete: del },
+      repository: {
+        createArtifactsBatch: jest.fn(async () => {
+          throw new Error('db down');
+        }),
+      },
+    });
+    await expect(
+      service.createCrop(TENANT, 'asset-1', cropDto),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    // One retry, then escalation — never an unbounded loop.
+    expect(del).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -978,6 +1555,54 @@ describe('VideoAssetsService.createInferenceJobFromCrop', () => {
     expect(result.replayed).toBe(true);
     expect(inference.create).not.toHaveBeenCalled();
     expect(inference.findById).toHaveBeenCalledWith(TENANT, 'job-9');
+  });
+
+  it('409s an already-linked replay that resolves to a DIFFERENT jobType', async () => {
+    // The linked job is PRODUCT_RECOGNITION; a retry explicitly requesting
+    // SHELF_AUDIT must not be silently handed the existing job.
+    const { service, inference, repository } = buildService({
+      repository: {
+        findArtifactById: jest.fn(async () =>
+          artifactRow({ inferenceJobId: 'job-9' }),
+        ),
+      },
+      inference: {
+        findById: jest.fn(async () => ({
+          id: 'job-9',
+          jobType: InferenceJobType.PRODUCT_RECOGNITION,
+        })),
+      },
+    });
+    await expect(
+      service.createInferenceJobFromCrop(TENANT, 'artifact-1', {
+        jobType: InferenceJobType.SHELF_AUDIT,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(inference.create).not.toHaveBeenCalled();
+    expect(repository.linkArtifactToInferenceJob).not.toHaveBeenCalled();
+  });
+
+  it('replays an already-linked crop when the retry resolves to the SAME jobType', async () => {
+    // Explicitly requesting the type the link already has (or omitting it
+    // so the resolution lands there — covered above) still replays.
+    const { service, inference } = buildService({
+      repository: {
+        findArtifactById: jest.fn(async () =>
+          artifactRow({ inferenceJobId: 'job-9' }),
+        ),
+      },
+      inference: {
+        findById: jest.fn(async () => ({
+          id: 'job-9',
+          jobType: InferenceJobType.PRODUCT_RECOGNITION,
+        })),
+      },
+    });
+    const result = await service.createInferenceJobFromCrop(TENANT, 'artifact-1', {
+      jobType: InferenceJobType.PRODUCT_RECOGNITION,
+    });
+    expect(result.replayed).toBe(true);
+    expect(inference.create).not.toHaveBeenCalled();
   });
 
   it('refuses crops whose source asset was deleted', async () => {

@@ -634,3 +634,39 @@ describe('video extraction request migration', () => {
     expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
   });
 });
+
+describe('video asset quarantine screening migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260727000004_video_asset_quarantine_screening',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('adds the QUARANTINED lifecycle value idempotently', () => {
+    expect(sql).toContain(
+      `ALTER TYPE "VideoAssetStatus" ADD VALUE IF NOT EXISTS 'QUARANTINED'`,
+    );
+  });
+
+  it('never USES the new enum value in the same transaction (PG 12+ rule)', () => {
+    // ADD VALUE inside a transaction is legal only while the new value is
+    // unused within it: no column default flip, no CHECK, no UPDATE here —
+    // the repository sets QUARANTINED explicitly at create time instead.
+    expect(sql).not.toMatch(/DEFAULT 'QUARANTINED'/);
+    expect(sql).not.toMatch(/UPDATE\s+"VideoAsset"/i);
+    expect(sql).not.toMatch(/ADD CONSTRAINT[^;]*QUARANTINED/);
+  });
+
+  it('backfills the screening permission (migrate deploy runs without seed)', () => {
+    expect(sql).toContain(`'video-asset:screen'`);
+    expect(sql).toContain('ON CONFLICT ("code") DO UPDATE SET');
+    expect(sql).not.toMatch(/DO UPDATE SET[^;]*"id"\s*=/);
+  });
+});

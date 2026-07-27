@@ -34,9 +34,14 @@ import {
   ExtractFramesDto,
 } from './dto/extract-frames.dto';
 import { QueryVideoAssetsDto } from './dto/query-video-assets.dto';
+import {
+  ScreenVideoAssetDto,
+  VideoScreeningDecision,
+} from './dto/screen-video-asset.dto';
 import { UploadVideoAssetDto } from './dto/upload-video-asset.dto';
 import {
   ExtractionFailedError,
+  ExtractionInfrastructureError,
   ExtractorUnavailableError,
   FrameUnavailableError,
   VideoFrameExtractorPort,
@@ -136,6 +141,40 @@ const REASON_TO_JOB_TYPE: Partial<Record<VideoCropReason, InferenceJobType>> = {
   [VideoCropReason.VLM_REVIEW]: InferenceJobType.VLM_REVIEW,
 };
 
+/**
+ * Canonical fingerprint of an extraction request's parameters: fixed
+ * operation tag, fixed field order, defaults applied, DTO-validated
+ * integers (so String() serialization is stable). Persisted with the
+ * request row in the SAME transaction as its batch and compared on EVERY
+ * replay path — an idempotency key replays ONLY the identical request; the
+ * same key with changed parameters is a controlled 409, never a silent
+ * replay of the old batch answering a different question.
+ */
+function framesRequestFingerprint(dto: ExtractFramesDto): string {
+  // timestampMs wins over interval sampling (mirroring the extraction
+  // branch below), so a supplied-but-ignored interval/limit can never
+  // change the fingerprint of a single-frame request.
+  return dto.timestampMs !== undefined
+    ? JSON.stringify({ op: 'FRAMES', timestampMs: dto.timestampMs })
+    : JSON.stringify({
+        op: 'FRAMES',
+        intervalMs: dto.intervalMs ?? DEFAULT_FRAME_INTERVAL_MS,
+        maxFrames: dto.maxFrames ?? DEFAULT_MAX_FRAMES,
+      });
+}
+
+function cropRequestFingerprint(dto: CreateVideoCropDto): string {
+  return JSON.stringify({
+    op: 'CROP',
+    timestampMs: dto.timestampMs,
+    x: dto.x,
+    y: dto.y,
+    width: dto.width,
+    height: dto.height,
+    reason: dto.reason ?? null,
+  });
+}
+
 @Injectable()
 export class VideoAssetsService {
   private readonly maxUploadBytes: number;
@@ -180,11 +219,12 @@ export class VideoAssetsService {
     if (!file || !file.buffer || file.size === 0) {
       throw new BadRequestException('A video file part named "file" is required');
     }
-    // Defense-in-depth re-check of the DTO-validated attestation: text
-    // screening cannot inspect PIXELS, so nothing is stored without the
-    // operator's explicit, audited declaration that the staged test clip's
-    // frames carry no payment-card or credential content (CV-based frame
-    // screening replaces this gate in a later phase).
+    // Defense-in-depth re-check of the DTO-validated attestation. The
+    // attestation proves nothing about the BYTES — the enforced control is
+    // that the asset lands QUARANTINED (set at the persistence layer) and
+    // stays non-processable until an audited screening decision releases
+    // it; the declaration is kept as an explicit, audited statement of
+    // intent on top of that gate.
     if (dto.attestNoSensitiveContent !== 'true') {
       throw new BadRequestException(
         'attestNoSensitiveContent must be "true": uploads are stored only ' +
@@ -285,10 +325,12 @@ export class VideoAssetsService {
             entityId: asset.id,
             after: asset,
             // The frame-content attestation is part of the audited record:
-            // storing happened only under this explicit declaration.
+            // storing happened only under this explicit declaration — and
+            // the asset is QUARANTINED until a screening decision releases it.
             reason:
-              'Test video uploaded (operator attested: no payment-card or ' +
-              'credential content in frames)',
+              'Test video uploaded and QUARANTINED pending frame-content ' +
+              'screening (operator attested: no payment-card or credential ' +
+              'content in frames)',
           }),
       );
     } catch (error) {
@@ -319,6 +361,24 @@ export class VideoAssetsService {
    * so the operator acts on it.
    */
   private async cleanupUploadDir(storageKey: string): Promise<void> {
+    await this.removeAssetMediaDir(
+      storageKey,
+      'The upload could not be recorded AND its media could not be ' +
+        'cleaned up; local video storage needs attention before ' +
+        'retrying',
+    );
+  }
+
+  /**
+   * Shared retry/escalate removal of an asset's media directory (the
+   * original plus any extracted artifacts): one retry for transient errors,
+   * then a controlled 503 with the caller's condition-specific message —
+   * a removal failure is never silently swallowed.
+   */
+  private async removeAssetMediaDir(
+    storageKey: string,
+    escalationMessage: string,
+  ): Promise<void> {
     const dir = storageKey.slice(0, storageKey.lastIndexOf('/'));
     try {
       await this.storage.deletePrefix(dir);
@@ -326,12 +386,37 @@ export class VideoAssetsService {
       try {
         await this.storage.deletePrefix(dir);
       } catch {
-        throw new ServiceUnavailableException(
-          'The upload could not be recorded AND its media could not be ' +
-            'cleaned up; local video storage needs attention before ' +
-            'retrying',
-        );
+        throw new ServiceUnavailableException(escalationMessage);
       }
+    }
+  }
+
+  /**
+   * Cleanup of staged artifact files that will never get rows (the atomic
+   * publish failed) or that lost a concurrent-replay race. Same policy as
+   * cleanupUploadDir: a cleanup failure is NEVER swallowed — no artifact
+   * row references these keys, so an ignored failure would strand untracked
+   * media on disk. One retry per file, then a controlled 503 naming the
+   * orphan condition. Successfully deleted keys are consumed from the list,
+   * so attempts stay bounded even if a caller re-enters after escalation.
+   */
+  private async cleanupStagedArtifacts(staged: string[]): Promise<void> {
+    while (staged.length > 0) {
+      const storageKey = staged[0];
+      try {
+        await this.storage.delete(storageKey);
+      } catch {
+        try {
+          await this.storage.delete(storageKey);
+        } catch {
+          throw new ServiceUnavailableException(
+            'The extraction left staged artifact files that could not be ' +
+              'cleaned up; local video storage needs attention before ' +
+              'retrying',
+          );
+        }
+      }
+      staged.shift();
     }
   }
 
@@ -434,6 +519,16 @@ export class VideoAssetsService {
     ) {
       return this.findById(tenantId, id);
     }
+    if (internal.status === VideoAssetStatus.QUARANTINED) {
+      // Quarantine is the ENFORCED frame-content control (the upload
+      // attestation is defense-in-depth only): no processing entry point —
+      // validate included — may touch the bytes before an audited
+      // screening decision releases the asset.
+      throw new ConflictException(
+        'Video asset is QUARANTINED pending frame-content screening; an ' +
+          'audited screening decision must APPROVE it before validation',
+      );
+    }
     if (internal.status !== VideoAssetStatus.UPLOADED) {
       throw new ConflictException(
         `Video asset is ${internal.status} and cannot be validated`,
@@ -445,6 +540,13 @@ export class VideoAssetsService {
       probe = await this.extractor.probe(internal.storageKey);
     } catch (error) {
       if (error instanceof ExtractorUnavailableError) {
+        throw new ServiceUnavailableException(error.message);
+      }
+      if (error instanceof ExtractionInfrastructureError) {
+        // The probe TOOLING could not run to completion (killed, refused,
+        // or over-buffered) — that says nothing about the video, so the
+        // asset stays UPLOADED for a retry: no REJECTED transition, no
+        // audit entry, just a controlled 503.
         throw new ServiceUnavailableException(error.message);
       }
       const rejected = await this.repository.transitionStatus(
@@ -498,6 +600,117 @@ export class VideoAssetsService {
   }
 
   /**
+   * The audited frame-content screening decision for a QUARANTINED upload —
+   * the ENFORCED control the upload attestation only complements (an
+   * attestation proves nothing about the bytes). APPROVE releases the asset
+   * for processing (QUARANTINED → UPLOADED); REJECT removes the stored
+   * media with the same retry/escalate policy as every other cleanup and
+   * parks the metadata row as evidence (QUARANTINED → REJECTED, stable
+   * error code). Any decision on a non-QUARANTINED asset is a controlled
+   * 409. A later phase plugs an automated CV frame screener into this same
+   * step; the manual decision is the MVP.
+   */
+  async screen(
+    tenantId: string,
+    id: string,
+    dto: ScreenVideoAssetDto,
+    actor?: AuditActor,
+  ): Promise<VideoAssetView> {
+    assertPlainId('id', id);
+    if (dto.note !== undefined) {
+      // The note lands verbatim in the audit trail (same policy as Phase 7
+      // review reasons): opaque, single-line, and secret-/payment-free.
+      assertPlainId('note', dto.note);
+      if (containsSensitiveValue(dto.note) || carriesLikelyPan(dto.note)) {
+        throw new BadRequestException(
+          'note must not contain credential- or payment-bearing content',
+        );
+      }
+    }
+    const internal = await this.repository.findByIdInternal(tenantId, id);
+    if (!internal) {
+      throw new NotFoundException(`Video asset "${id}" not found`);
+    }
+    if (internal.status !== VideoAssetStatus.QUARANTINED) {
+      throw new ConflictException(
+        `Video asset is ${internal.status}; only QUARANTINED assets accept ` +
+          'a screening decision',
+      );
+    }
+    const noteSuffix = dto.note ? `; note: ${dto.note}` : '';
+
+    if (dto.decision === VideoScreeningDecision.APPROVE) {
+      const approved = await this.repository.transitionStatus(
+        tenantId,
+        id,
+        [VideoAssetStatus.QUARANTINED],
+        { status: VideoAssetStatus.UPLOADED },
+        (before, after) =>
+          this.auditEntry(tenantId, actor, {
+            action: AuditAction.UPDATE,
+            entityType: 'VideoAsset',
+            entityId: id,
+            before,
+            after,
+            reason:
+              'Frame-content screening approved: quarantined upload ' +
+              `released for processing${noteSuffix}`,
+          }),
+      );
+      if (!approved) {
+        // CAS lost — a concurrent decision (or delete) resolved first.
+        throw new ConflictException(
+          'The video asset changed concurrently; re-read it before ' +
+            'screening again',
+        );
+      }
+      return approved;
+    }
+
+    // REJECT: the stored media goes FIRST (retry once, then a controlled
+    // 503 that leaves the asset QUARANTINED so the rejection is retryable),
+    // then the audited terminal transition. A crash between the two leaves
+    // a QUARANTINED row whose retried REJECT re-runs the (idempotent)
+    // removal and completes the transition — bytes can never outlive a
+    // recorded rejection.
+    await this.removeAssetMediaDir(
+      internal.storageKey,
+      'The screening rejection could not remove the stored media; local ' +
+        'video storage needs attention before retrying',
+    );
+    const rejected = await this.repository.transitionStatus(
+      tenantId,
+      id,
+      [VideoAssetStatus.QUARANTINED],
+      {
+        status: VideoAssetStatus.REJECTED,
+        errorCode: VIDEO_ERROR_CODES.SCREENING_REJECTED,
+        errorMessage:
+          'Frame-content screening rejected this upload; the stored media ' +
+          'was removed',
+      },
+      (before, after) =>
+        this.auditEntry(tenantId, actor, {
+          action: AuditAction.UPDATE,
+          entityType: 'VideoAsset',
+          entityId: id,
+          before,
+          after,
+          reason:
+            'Frame-content screening rejected: media removed, metadata ' +
+            `kept as evidence${noteSuffix}`,
+        }),
+    );
+    if (!rejected) {
+      throw new ConflictException(
+        'The video asset changed concurrently; re-read it before screening ' +
+          'again',
+      );
+    }
+    return rejected;
+  }
+
+  /**
    * Extract full frames (single timestamp, or interval sampling with a hard
    * cap) as FRAME artifacts, then mark the asset READY. Requires a
    * VALIDATED/READY asset (probe metadata bounds every timestamp); a FAILED
@@ -514,6 +727,7 @@ export class VideoAssetsService {
     replayed: boolean;
   }> {
     assertOpaqueKey('idempotencyKey', dto.idempotencyKey);
+    const requestFingerprint = framesRequestFingerprint(dto);
     // Replay BEFORE extracting: a committed batch whose response was lost
     // must return its recorded artifacts without re-running extraction or
     // staging new files.
@@ -531,6 +745,12 @@ export class VideoAssetsService {
             'This idempotency key was used for a different operation type',
           );
         }
+        // Same key, same asset — but the replay is honored ONLY when the
+        // request is IDENTICAL (timestamp/interval/limit unchanged).
+        this.assertReplayMatchesRequest(
+          replay.requestFingerprint,
+          requestFingerprint,
+        );
         return replay;
       }
     }
@@ -567,17 +787,23 @@ export class VideoAssetsService {
       images.map((image) => ({ artifactType: VideoArtifactType.FRAME, image })),
       'Frames extracted',
       dto.idempotencyKey,
+      requestFingerprint,
     );
     // The in-transaction replay path can surface a batch too — same
-    // operation-type guard as the pre-check above.
-    if (
-      published.replayed &&
-      published.artifacts.some(
-        (artifact) => artifact.artifactType !== VideoArtifactType.FRAME,
-      )
-    ) {
-      throw new ConflictException(
-        'This idempotency key was used for a different operation type',
+    // operation-type and identical-parameters guards as the pre-check.
+    if (published.replayed) {
+      if (
+        published.artifacts.some(
+          (artifact) => artifact.artifactType !== VideoArtifactType.FRAME,
+        )
+      ) {
+        throw new ConflictException(
+          'This idempotency key was used for a different operation type',
+        );
+      }
+      this.assertReplayMatchesRequest(
+        published.requestFingerprint,
+        requestFingerprint,
       );
     }
     return published;
@@ -599,6 +825,7 @@ export class VideoAssetsService {
     replayed: boolean;
   }> {
     assertOpaqueKey('idempotencyKey', dto.idempotencyKey);
+    const requestFingerprint = cropRequestFingerprint(dto);
     if (dto.idempotencyKey) {
       const replay = await this.replayExtraction(tenantId, id, dto.idempotencyKey);
       if (replay) {
@@ -612,6 +839,12 @@ export class VideoAssetsService {
             'This idempotency key was used for a different operation type',
           );
         }
+        // Same key, same asset — but the replay is honored ONLY when the
+        // request is IDENTICAL (timestamp/box/reason unchanged).
+        this.assertReplayMatchesRequest(
+          replay.requestFingerprint,
+          requestFingerprint,
+        );
         return {
           asset: replay.asset,
           artifact: replay.artifacts[0],
@@ -640,7 +873,7 @@ export class VideoAssetsService {
       throw await this.mapExtractionError(tenantId, id, actor, error);
     }
 
-    const { asset, artifacts, replayed } = await this.persistArtifactsBatch(
+    const published = await this.persistArtifactsBatch(
       tenantId,
       internal.storageKey,
       id,
@@ -655,14 +888,21 @@ export class VideoAssetsService {
       ],
       'Crop extracted',
       dto.idempotencyKey,
+      requestFingerprint,
     );
-    if (
-      replayed &&
-      (artifacts.length !== 1 ||
-        artifacts[0].artifactType !== VideoArtifactType.CROP)
-    ) {
-      throw new ConflictException(
-        'This idempotency key was used for a different operation type',
+    const { asset, artifacts, replayed } = published;
+    if (replayed) {
+      if (
+        artifacts.length !== 1 ||
+        artifacts[0].artifactType !== VideoArtifactType.CROP
+      ) {
+        throw new ConflictException(
+          'This idempotency key was used for a different operation type',
+        );
+      }
+      this.assertReplayMatchesRequest(
+        published.requestFingerprint,
+        requestFingerprint,
       );
     }
     return { asset, artifact: artifacts[0], replayed };
@@ -724,11 +964,25 @@ export class VideoAssetsService {
         'Only CROP artifacts can create inference jobs',
       );
     }
+    // Resolve the requested job type BEFORE any replay of an existing link:
+    // a retry that (explicitly or via its resolved default) asks for a
+    // DIFFERENT jobType than the linked job must be a 409, never silently
+    // handed the existing job as if it answered the new request.
+    const jobType =
+      dto.jobType ??
+      (artifact.reason ? REASON_TO_JOB_TYPE[artifact.reason] : undefined) ??
+      InferenceJobType.PRODUCT_RECOGNITION;
     if (artifact.inferenceJobId) {
       const job = await this.inferenceJobsService.findById(
         tenantId,
         artifact.inferenceJobId,
       );
+      if (job.jobType !== jobType) {
+        throw new ConflictException(
+          `This crop is already linked to a ${job.jobType} inference job; ` +
+            'a retry must resolve to the same job type',
+        );
+      }
       return { artifact, job, replayed: true };
     }
     const asset = await this.repository.findById(tenantId, artifact.videoAssetId);
@@ -737,11 +991,6 @@ export class VideoAssetsService {
         'The source video asset was deleted; this crop cannot create a job',
       );
     }
-
-    const jobType =
-      dto.jobType ??
-      (artifact.reason ? REASON_TO_JOB_TYPE[artifact.reason] : undefined) ??
-      InferenceJobType.PRODUCT_RECOGNITION;
 
     // The COMPLETE server-derived descriptor — also the comparison baseline
     // for any replayed job below.
@@ -810,13 +1059,20 @@ export class VideoAssetsService {
         }),
     );
     if (linked === 'already-linked' || linked === null) {
-      // Concurrent creation stamped first — replay ITS link.
+      // Concurrent creation stamped first — replay ITS link, but only when
+      // it resolves to the SAME job type this request asked for.
       const current = await this.findArtifactById(tenantId, artifactId);
       if (current.inferenceJobId) {
         const existing = await this.inferenceJobsService.findById(
           tenantId,
           current.inferenceJobId,
         );
+        if (existing.jobType !== jobType) {
+          throw new ConflictException(
+            `This crop is already linked to a ${existing.jobType} inference ` +
+              'job; a retry must resolve to the same job type',
+          );
+        }
         return { artifact: current, job: existing, replayed: true };
       }
       throw new ConflictException('The crop artifact changed concurrently');
@@ -946,6 +1202,7 @@ export class VideoAssetsService {
     asset: VideoAssetView;
     artifacts: VideoArtifactView[];
     replayed: true;
+    requestFingerprint?: string | null;
   } | null> {
     const replay = await this.repository.findExtractionReplay(
       tenantId,
@@ -960,11 +1217,39 @@ export class VideoAssetsService {
     return replay;
   }
 
+  /**
+   * A recorded batch answers ONLY the identical request: the stored
+   * canonical fingerprint must equal the incoming one. FAIL CLOSED — a
+   * missing recorded fingerprint (rows from before it was persisted) cannot
+   * prove the retried request is the same one, so it is rejected the same
+   * way as a changed request rather than replaying unverifiably.
+   */
+  private assertReplayMatchesRequest(
+    stored: string | null | undefined,
+    requested: string,
+  ): void {
+    if ((stored ?? null) !== requested) {
+      throw new ConflictException(
+        'This idempotency key was already used for a request with different ' +
+          'parameters',
+      );
+    }
+  }
+
   private async requireProcessable(tenantId: string, id: string) {
     assertPlainId('id', id);
     const internal = await this.repository.findByIdInternal(tenantId, id);
     if (!internal) {
       throw new NotFoundException(`Video asset "${id}" not found`);
+    }
+    if (internal.status === VideoAssetStatus.QUARANTINED) {
+      // Quarantined bytes are NOT processable — the audited screening
+      // decision (not the upload attestation) is what stands between a
+      // stored clip and any frame/crop extraction.
+      throw new ConflictException(
+        'Video asset is QUARANTINED pending frame-content screening; an ' +
+          'audited screening decision must APPROVE it before extraction',
+      );
     }
     if (
       internal.status !== VideoAssetStatus.VALIDATED &&
@@ -1036,10 +1321,12 @@ export class VideoAssetsService {
     }[],
     reason: string,
     idempotencyKey?: string,
+    requestFingerprint?: string,
   ): Promise<{
     asset: VideoAssetView;
     artifacts: VideoArtifactView[];
     replayed: boolean;
+    requestFingerprint?: string | null;
   }> {
     // Adapter-independent memory ceiling for the retained batch.
     const totalBytes = inputs.reduce(
@@ -1106,6 +1393,7 @@ export class VideoAssetsService {
             after,
             reason,
           }),
+        requestFingerprint,
       );
       if (published === 'key-conflict') {
         throw new ConflictException(
@@ -1119,19 +1407,19 @@ export class VideoAssetsService {
         );
       }
       if (published.replayed) {
-        // A concurrent identical request committed first inside the tx
-        // window — its batch is the result; our staged files are surplus.
-        for (const storageKey of staged) {
-          await this.storage.delete(storageKey).catch(() => undefined);
-        }
+        // A concurrent request committed first inside the tx window — its
+        // batch is the result (the caller still verifies it answers THIS
+        // request); our staged files are surplus and must not linger.
+        await this.cleanupStagedArtifacts(staged);
       }
       return published;
     } catch (error) {
       // Nothing was published (the batch is all-or-none) — remove every
-      // staged file so a retry starts clean.
-      for (const storageKey of staged) {
-        await this.storage.delete(storageKey).catch(() => undefined);
-      }
+      // staged file so a retry starts clean. A cleanup failure ESCALATES
+      // (same policy as cleanupUploadDir): no row references these keys,
+      // so silently keeping only the original error would strand orphaned
+      // media on disk with nothing able to find it again.
+      await this.cleanupStagedArtifacts(staged);
       // Two concurrent firsts racing the same key: the loser's request-row
       // insert hits the (tenantId, idempotencyKey) unique and its whole
       // batch rolls back — replay the winner's committed batch. If the
@@ -1175,6 +1463,12 @@ export class VideoAssetsService {
       return new BadRequestException(
         'No frame is decodable at the requested timestamp; try an earlier position',
       );
+    }
+    if (error instanceof ExtractionInfrastructureError) {
+      // The extraction TOOLING was killed or refused mid-run — transient
+      // and NOT a property of the video: no FAILED transition, no audit,
+      // a controlled 503 so the caller retries.
+      return new ServiceUnavailableException(error.message);
     }
     if (error instanceof ExtractionFailedError) {
       await this.repository.transitionStatus(
