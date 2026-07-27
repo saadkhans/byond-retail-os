@@ -7,6 +7,7 @@ import {
   ExtractionFailedError,
   ExtractorUnavailableError,
   FrameExtractionOptions,
+  FrameUnavailableError,
   VideoFrameExtractorPort,
   VideoProbeResult,
 } from './video-frame-extractor.port';
@@ -129,12 +130,19 @@ interface ProbeStream {
   width?: number;
   height?: number;
   r_frame_rate?: string;
+  avg_frame_rate?: string;
   duration?: string;
+  side_data_list?: { rotation?: number }[];
 }
 
 interface ProbeOutput {
   streams?: ProbeStream[];
   format?: { duration?: string };
+}
+
+function parseRate(rate: string | undefined): number {
+  const [num, den] = (rate ?? '').split('/').map(Number);
+  return num && den ? num / den : Number.NaN;
 }
 
 export function parseProbeOutput(stdout: string): VideoProbeResult {
@@ -148,14 +156,36 @@ export function parseProbeOutput(stdout: string): VideoProbeResult {
   const durationSeconds = Number(
     stream?.duration ?? parsed.format?.duration ?? Number.NaN,
   );
-  const width = stream?.width ?? 0;
-  const height = stream?.height ?? 0;
-  const [num, den] = (stream?.r_frame_rate ?? '').split('/').map(Number);
-  const fps = num && den ? num / den : Number.NaN;
+  // Rotation side-data: phone portrait videos store landscape coded
+  // dimensions plus a ±90° rotation, and ffmpeg AUTOROTATES its output —
+  // the probe must report the DISPLAY geometry or every crop-box bound and
+  // artifact dimension would be validated against the wrong axes.
+  const rotation = Math.abs(
+    stream?.side_data_list?.find(
+      (data) => typeof data.rotation === 'number',
+    )?.rotation ?? 0,
+  );
+  const swapAxes = rotation % 180 === 90;
+  const width = (swapAxes ? stream?.height : stream?.width) ?? 0;
+  const height = (swapAxes ? stream?.width : stream?.height) ?? 0;
+  // avg_frame_rate is the honest rate for variable-frame-rate sources
+  // (screen recordings, MediaRecorder output); r_frame_rate is the
+  // container TICK rate there and can read 1000+ fps, which would bounce
+  // off the sanity cap and reject a legitimate clip. Fall back to
+  // r_frame_rate when avg is absent/degenerate ("0/0").
+  const avgFps = parseRate(stream?.avg_frame_rate);
+  const fps =
+    Number.isFinite(avgFps) && avgFps > 0
+      ? avgFps
+      : parseRate(stream?.r_frame_rate);
   const durationMs = Math.round(durationSeconds * 1000);
   if (
     !Number.isFinite(durationSeconds) ||
     durationSeconds <= 0 ||
+    // A positive sub-0.5 ms duration ROUNDS to 0, which the DB CHECK
+    // (durationMs > 0) would turn into an uncontrolled 500 — reject the
+    // rounded value, not just the raw seconds.
+    durationMs <= 0 ||
     durationMs > MAX_PROBE_DURATION_MS ||
     !Number.isInteger(width) ||
     width <= 0 ||
@@ -176,16 +206,19 @@ export function parseProbeOutput(stdout: string): VideoProbeResult {
 type RunCommand = (
   binary: string,
   args: string[],
+  maxOutputBytes: number,
 ) => Promise<{ stdout: Buffer }>;
 
-const defaultRunCommand: RunCommand = (binary, args) =>
+const defaultRunCommand: RunCommand = (binary, args, maxOutputBytes) =>
   new Promise((resolvePromise, rejectPromise) => {
     execFile(
       binary,
       args,
       {
         encoding: 'buffer',
-        maxBuffer: MAX_OUTPUT_BYTES,
+        // The caller passes the REMAINING request budget, so a single
+        // invocation can never allocate past the aggregate ceiling.
+        maxBuffer: maxOutputBytes,
         timeout: COMMAND_TIMEOUT_MS,
         windowsHide: true,
         // No shell: arguments reach the binary as a vector, so no value can
@@ -220,9 +253,13 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
     super();
   }
 
-  private async run(binary: string, args: string[]): Promise<Buffer> {
+  private async run(
+    binary: string,
+    args: string[],
+    maxOutputBytes: number,
+  ): Promise<Buffer> {
     try {
-      const { stdout } = await this.runCommand(binary, args);
+      const { stdout } = await this.runCommand(binary, args, maxOutputBytes);
       return stdout;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -236,6 +273,7 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
     const stdout = await this.run(
       FFPROBE_BINARY,
       buildProbeArgs(this.storage.internalPathFor(storageKey)),
+      MAX_OUTPUT_BYTES,
     );
     return parseProbeOutput(stdout.toString('utf8'));
   }
@@ -255,29 +293,64 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
       timestampMs < probe.durationMs && frames.length < options.maxFrames;
       timestampMs += options.intervalMs
     ) {
-      const frame = await this.extractFrameAt(storageKey, probe, timestampMs);
-      totalBytes += frame.data.length;
-      // Request-wide budget: per-invocation maxBuffer bounds one frame, not
-      // the retained batch.
-      if (totalBytes > MAX_TOTAL_EXTRACTION_BYTES) {
+      // The budget is enforced BEFORE the next decode, not after: the
+      // remaining allowance becomes the invocation's maxBuffer, so no
+      // decode can even transiently allocate past the aggregate ceiling.
+      const remaining = MAX_TOTAL_EXTRACTION_BYTES - totalBytes;
+      if (remaining <= 0) {
         throw new ExtractionFailedError();
       }
+      let frame: ExtractedImage;
+      try {
+        frame = await this.frameAt(
+          storageKey,
+          probe,
+          timestampMs,
+          Math.min(MAX_OUTPUT_BYTES, remaining),
+        );
+      } catch (error) {
+        // Real containers report durations slightly past the last decodable
+        // frame — end-of-stream mid-sampling is a NORMAL end condition, not
+        // a batch failure. Only an empty FIRST frame means the video is
+        // genuinely unreadable at the requested positions.
+        if (error instanceof FrameUnavailableError && frames.length > 0) {
+          break;
+        }
+        throw error;
+      }
+      // Backstop for injected runners that ignore maxOutputBytes.
+      if (frame.data.length > remaining) {
+        throw new ExtractionFailedError();
+      }
+      totalBytes += frame.data.length;
       frames.push(frame);
     }
     return frames;
   }
 
-  async extractFrameAt(
+  extractFrameAt(
     storageKey: string,
     probe: VideoProbeResult,
     timestampMs: number,
   ): Promise<ExtractedImage> {
+    return this.frameAt(storageKey, probe, timestampMs, MAX_OUTPUT_BYTES);
+  }
+
+  private async frameAt(
+    storageKey: string,
+    probe: VideoProbeResult,
+    timestampMs: number,
+    maxOutputBytes: number,
+  ): Promise<ExtractedImage> {
     const data = await this.run(
       FFMPEG_BINARY,
       buildFrameArgs(this.storage.internalPathFor(storageKey), timestampMs),
+      maxOutputBytes,
     );
     if (data.length === 0) {
-      throw new ExtractionFailedError();
+      // The command succeeded but decoded nothing — the position is past
+      // the last decodable frame, not a broken video.
+      throw new FrameUnavailableError();
     }
     return {
       data,
@@ -298,9 +371,10 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
     const data = await this.run(
       FFMPEG_BINARY,
       buildCropArgs(this.storage.internalPathFor(storageKey), timestampMs, box),
+      MAX_OUTPUT_BYTES,
     );
     if (data.length === 0) {
-      throw new ExtractionFailedError();
+      throw new FrameUnavailableError();
     }
     return {
       data,

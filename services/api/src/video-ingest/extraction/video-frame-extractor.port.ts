@@ -56,6 +56,23 @@ export class ExtractionFailedError extends Error {
   }
 }
 
+/**
+ * Controlled failure: the video is fine but NO frame is decodable at the
+ * requested position (a timestamp inside the reported duration can still
+ * land after the last decodable frame — real containers routinely report a
+ * duration a few hundred ms past the final sample). Distinct from
+ * ExtractionFailedError so callers can degrade gracefully: interval
+ * sampling stops at end-of-stream instead of failing the whole batch, and
+ * an explicit-timestamp request maps to a controlled 400 WITHOUT marking
+ * the asset FAILED.
+ */
+export class FrameUnavailableError extends Error {
+  constructor() {
+    super('No frame is decodable at the requested position');
+    this.name = 'FrameUnavailableError';
+  }
+}
+
 export abstract class VideoFrameExtractorPort {
   /** Opaque adapter key recorded nowhere yet — identifies the strategy. */
   abstract readonly kind: string;

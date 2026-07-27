@@ -1,6 +1,13 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsInt, Max, Min } from 'class-validator';
+import {
+  IsInt,
+  IsString,
+  Max,
+  MaxLength,
+  Min,
+  MinLength,
+} from 'class-validator';
 import {
   IsOptionalNonNull,
   toNumberRejectingBlank,
@@ -54,4 +61,16 @@ export class ExtractFramesDto {
   @Min(0)
   @Max(MAX_TIMESTAMP_MS)
   timestampMs?: number;
+
+  @ApiPropertyOptional({
+    maxLength: 100,
+    description:
+      'Tenant-scoped idempotency key: retrying a committed extraction ' +
+      'REPLAYS its artifacts (append-only rows are never duplicated).',
+  })
+  @IsOptionalNonNull()
+  @IsString()
+  @MinLength(1)
+  @MaxLength(100)
+  idempotencyKey?: string;
 }

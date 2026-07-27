@@ -219,8 +219,9 @@ model Tenant {
   inferenceResults    InferenceResult[]
   inferenceCandidates InferenceCandidate[]
 
-  videoAssets    VideoAsset[]
-  videoArtifacts VideoArtifact[]
+  videoAssets             VideoAsset[]
+  videoArtifacts          VideoArtifact[]
+  videoExtractionRequests VideoExtractionRequest[]
 }
 
 model User {
@@ -1682,6 +1683,7 @@ model VideoAsset {
   session    CheckoutSession? @relation(fields: [sessionId], references: [id], onDelete: Restrict)
   uploadedBy User?            @relation("VideoAssetUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
   artifacts  VideoArtifact[]
+  extractionRequests VideoExtractionRequest[]
 
   @@unique([id, tenantId])
   @@index([tenantId, createdAt(sort: Desc), id(sort: Desc)])
@@ -1730,4 +1732,27 @@ model VideoArtifact {
   @@unique([id, tenantId])
   @@index([tenantId, videoAssetId, createdAt])
   @@index([tenantId, createdAt(sort: Desc), id(sort: Desc)])
+}
+
+// One extraction request (frames batch or manual crop) per tenant-scoped
+// idempotency key. Artifact rows are append-only, so retrying a committed
+// batch whose HTTP response was lost must REPLAY the recorded artifacts —
+// never extract and append again. The row stores only ids (no media, no
+// storage keys) and is written in the SAME transaction as its batch.
+model VideoExtractionRequest {
+  id             String   @id @default(cuid())
+  tenantId       String
+  videoAssetId   String
+  idempotencyKey String
+  // The artifact ids the committed batch produced, in creation order —
+  // replay resolves them through the tenant-scoped artifact reads.
+  artifactIds    Json
+  createdAt      DateTime @default(now())
+
+  tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  videoAsset VideoAsset @relation(fields: [videoAssetId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, videoAssetId])
 }

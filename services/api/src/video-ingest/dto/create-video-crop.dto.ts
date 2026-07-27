@@ -1,7 +1,15 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { VideoCropReason } from '@prisma/client';
 import { Transform } from 'class-transformer';
-import { IsEnum, IsInt, Max, Min } from 'class-validator';
+import {
+  IsEnum,
+  IsInt,
+  IsString,
+  Max,
+  MaxLength,
+  Min,
+  MinLength,
+} from 'class-validator';
 import {
   IsOptionalNonNull,
   toNumberRejectingBlank,
@@ -70,4 +78,16 @@ export class CreateVideoCropDto {
   @IsOptionalNonNull()
   @IsEnum(VideoCropReason)
   reason?: VideoCropReason;
+
+  @ApiPropertyOptional({
+    maxLength: 100,
+    description:
+      'Tenant-scoped idempotency key: retrying a committed crop REPLAYS ' +
+      'its artifact (append-only rows are never duplicated).',
+  })
+  @IsOptionalNonNull()
+  @IsString()
+  @MinLength(1)
+  @MaxLength(100)
+  idempotencyKey?: string;
 }

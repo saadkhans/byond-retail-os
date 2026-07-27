@@ -162,7 +162,11 @@ export class VideoAssetsController {
     @Param('id') id: string,
     @Body() dto: ExtractFramesDto,
     @CurrentUser() actor: RequestContext,
-  ): Promise<{ asset: VideoAssetView; artifacts: VideoArtifactView[] }> {
+  ): Promise<{
+    asset: VideoAssetView;
+    artifacts: VideoArtifactView[];
+    replayed: boolean;
+  }> {
     return this.assetsService.extractFrames(tenantId, id, dto, {
       id: actor.userId,
       email: actor.email,
@@ -186,7 +190,11 @@ export class VideoAssetsController {
     @Param('id') id: string,
     @Body() dto: CreateVideoCropDto,
     @CurrentUser() actor: RequestContext,
-  ): Promise<{ asset: VideoAssetView; artifact: VideoArtifactView }> {
+  ): Promise<{
+    asset: VideoAssetView;
+    artifact: VideoArtifactView;
+    replayed: boolean;
+  }> {
     return this.assetsService.createCrop(tenantId, id, dto, {
       id: actor.userId,
       email: actor.email,

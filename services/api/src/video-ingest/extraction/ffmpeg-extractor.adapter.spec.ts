@@ -12,6 +12,7 @@ import {
 import {
   ExtractionFailedError,
   ExtractorUnavailableError,
+  FrameUnavailableError,
 } from './video-frame-extractor.port';
 
 /**
@@ -145,6 +146,82 @@ describe('parseProbeOutput', () => {
     expect(
       parseProbeOutput(probe({ duration: '3600', width: 7680, height: 4320 })),
     ).toMatchObject({ durationMs: 3_600_000, width: 7680 });
+    // Sub-millisecond durations ROUND to 0 and must reject (the DB CHECK
+    // requires durationMs > 0 — an accepted 0 would 500 at persistence).
+    expect(() => parseProbeOutput(probe({ duration: '0.0001' }))).toThrow(
+      ExtractionFailedError,
+    );
+  });
+
+  it('prefers avg_frame_rate so VFR sources are not bounced off the fps cap', () => {
+    // Screen recordings / MediaRecorder output report the container TICK
+    // rate in r_frame_rate (can read 1000+); avg_frame_rate carries the
+    // honest rate. A legitimate VFR clip must probe fine.
+    const vfr = parseProbeOutput(
+      JSON.stringify({
+        streams: [
+          {
+            width: 1280,
+            height: 720,
+            r_frame_rate: '90000/1',
+            avg_frame_rate: '2997/100',
+            duration: '10.0',
+          },
+        ],
+      }),
+    );
+    expect(vfr.fps).toBeCloseTo(29.97, 2);
+    // Degenerate avg ("0/0") falls back to r_frame_rate.
+    const cfr = parseProbeOutput(
+      JSON.stringify({
+        streams: [
+          {
+            width: 1280,
+            height: 720,
+            r_frame_rate: '30/1',
+            avg_frame_rate: '0/0',
+            duration: '10.0',
+          },
+        ],
+      }),
+    );
+    expect(cfr.fps).toBe(30);
+  });
+
+  it('reports DISPLAY geometry for rotated (portrait phone) videos', () => {
+    // Phones store landscape coded dimensions + a ±90° rotation side-data;
+    // ffmpeg autorotates extraction output, so the probe must report the
+    // rotated axes or crop bounds validate against the wrong dimensions.
+    const portrait = parseProbeOutput(
+      JSON.stringify({
+        streams: [
+          {
+            width: 1920,
+            height: 1080,
+            r_frame_rate: '30/1',
+            duration: '10.0',
+            side_data_list: [{ rotation: -90 }],
+          },
+        ],
+      }),
+    );
+    expect(portrait.width).toBe(1080);
+    expect(portrait.height).toBe(1920);
+    // 180° keeps the axes.
+    const upsideDown = parseProbeOutput(
+      JSON.stringify({
+        streams: [
+          {
+            width: 1920,
+            height: 1080,
+            r_frame_rate: '30/1',
+            duration: '10.0',
+            side_data_list: [{ rotation: 180 }],
+          },
+        ],
+      }),
+    );
+    expect(upsideDown.width).toBe(1920);
   });
 });
 
@@ -234,7 +311,7 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
     ).rejects.toBeInstanceOf(ExtractionFailedError);
   });
 
-  it('rejects empty command output instead of persisting empty artifacts', async () => {
+  it('maps empty output at an explicit timestamp to FrameUnavailable (not batch failure)', async () => {
     const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
       Promise.resolve({ stdout: Buffer.alloc(0) }),
     );
@@ -244,6 +321,53 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
         { durationMs: 10_000, width: 100, height: 100, fps: 30 },
         0,
       ),
+    ).rejects.toBeInstanceOf(FrameUnavailableError);
+  });
+
+  it('treats end-of-stream mid-sampling as a normal stop, not a batch failure', async () => {
+    // Containers routinely report a duration slightly past the last
+    // decodable frame; sampling must return what it got.
+    let call = 0;
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () => {
+      call += 1;
+      return Promise.resolve({
+        stdout: call <= 2 ? Buffer.from('png') : Buffer.alloc(0),
+      });
+    });
+    const frames = await extractor.extractFrames(
+      'a/original.mp4',
+      { durationMs: 10_000, width: 100, height: 100, fps: 30 },
+      { intervalMs: 3000, maxFrames: 10, startMs: 0 },
+    );
+    expect(frames.map((f) => f.timestampMs)).toEqual([0, 3000]);
+  });
+
+  it('forwards the SHRINKING remaining budget once the pool drops below the per-frame cap', async () => {
+    // Reverting the budget-before-decode fix (passing a constant maxBuffer)
+    // must fail this test: with 48 MiB frames against the 128 MiB pool, the
+    // third invocation's allowance must be the 32 MiB remainder — not the
+    // full per-frame cap.
+    const frameBytes = 48 * 1024 * 1024;
+    const budgets: number[] = [];
+    const frame = Buffer.alloc(frameBytes);
+    const extractor = new FfmpegVideoFrameExtractor(
+      storageStub,
+      (_binary, _args, maxOutputBytes) => {
+        budgets.push(maxOutputBytes);
+        return Promise.resolve({ stdout: frame });
+      },
+    );
+    // Third frame (48 MiB) exceeds its 32 MiB allowance via the runner
+    // backstop — the batch fails rather than blowing the pool.
+    await expect(
+      extractor.extractFrames(
+        'a/original.mp4',
+        { durationMs: 20_000, width: 100, height: 100, fps: 30 },
+        { intervalMs: 1000, maxFrames: 10, startMs: 0 },
+      ),
     ).rejects.toBeInstanceOf(ExtractionFailedError);
+    expect(budgets.length).toBe(3);
+    expect(budgets[2]).toBe(MAX_TOTAL_EXTRACTION_BYTES - 2 * frameBytes);
+    expect(budgets[2]).toBeLessThan(budgets[0]);
   });
 });

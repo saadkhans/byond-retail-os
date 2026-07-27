@@ -1,4 +1,13 @@
-import { chmod, mkdir, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import {
+  chmod,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { isAbsolute, resolve, sep } from 'node:path';
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -95,6 +104,12 @@ export class LocalVideoStorageAdapter extends VideoStoragePort {
 
   async put(storageKey: string, data: Buffer): Promise<void> {
     const target = this.resolveWithinRoot(storageKey);
+    // Atomic publish via temp-file + rename: a write that fails partway
+    // (ENOSPC, ...) must never leave a half-written object under the FINAL
+    // key — callers record keys only after put succeeds, so a partial
+    // target would otherwise be unreachable garbage no retry cleans up.
+    // rename() on the same directory is atomic on POSIX and NTFS.
+    const temp = `${target}.tmp-${randomUUID()}`;
     await this.guarded(async () => {
       // recursive mkdir applies the mode to every directory it CREATES; a
       // pre-existing directory (e.g. a root provisioned with a broader
@@ -104,8 +119,14 @@ export class LocalVideoStorageAdapter extends VideoStoragePort {
       const parent = resolve(target, '..');
       await mkdir(parent, { recursive: true, mode: DIR_MODE });
       await chmod(parent, DIR_MODE).catch(() => undefined);
-      await writeFile(target, data, { mode: FILE_MODE });
-      await chmod(target, FILE_MODE).catch(() => undefined);
+      try {
+        await writeFile(temp, data, { mode: FILE_MODE, flag: 'wx' });
+        await chmod(temp, FILE_MODE).catch(() => undefined);
+        await rename(temp, target);
+      } catch (error) {
+        await unlink(temp).catch(() => undefined);
+        throw error;
+      }
     });
   }
 

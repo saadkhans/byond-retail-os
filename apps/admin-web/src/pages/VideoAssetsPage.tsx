@@ -239,18 +239,27 @@ export function VideoAssetDetailPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  // Extract-frames form.
+  // Extract-frames form. The idempotency key is generated once per logical
+  // submission and rotated only after confirmed success (same pattern as
+  // InferenceJobsPage): a retried/failed submit REPLAYS the committed batch
+  // instead of appending duplicate append-only artifacts.
   const [intervalMs, setIntervalMs] = useState('1000');
   const [maxFrames, setMaxFrames] = useState('5');
   const [frameTimestampMs, setFrameTimestampMs] = useState('');
+  const [frameIdempotencyKey, setFrameIdempotencyKey] = useState(() =>
+    crypto.randomUUID(),
+  );
 
-  // Crop form.
+  // Crop form (same idempotency-key rotation).
   const [cropTimestampMs, setCropTimestampMs] = useState('0');
   const [cropX, setCropX] = useState('0');
   const [cropY, setCropY] = useState('0');
   const [cropWidth, setCropWidth] = useState('');
   const [cropHeight, setCropHeight] = useState('');
   const [cropReason, setCropReason] = useState('');
+  const [cropIdempotencyKey, setCropIdempotencyKey] = useState(() =>
+    crypto.randomUUID(),
+  );
 
   const asset = useLoad<VideoAsset>(() => api(`/video-assets/${id}`), [
     id,
@@ -286,15 +295,17 @@ export function VideoAssetDetailPage() {
     await run(async () => {
       const single = frameTimestampMs.trim();
       const body = single
-        ? { timestampMs: Number(single) }
+        ? { timestampMs: Number(single), idempotencyKey: frameIdempotencyKey }
         : {
             ...(intervalMs.trim() ? { intervalMs: Number(intervalMs) } : {}),
             ...(maxFrames.trim() ? { maxFrames: Number(maxFrames) } : {}),
+            idempotencyKey: frameIdempotencyKey,
           };
       await api(`/video-assets/${id}/extract-frames`, {
         method: 'POST',
         body,
       });
+      setFrameIdempotencyKey(crypto.randomUUID());
     });
   }
 
@@ -314,8 +325,10 @@ export function VideoAssetDetailPage() {
           width: Number(cropWidth),
           height: Number(cropHeight),
           ...(cropReason ? { reason: cropReason } : {}),
+          idempotencyKey: cropIdempotencyKey,
         },
       });
+      setCropIdempotencyKey(crypto.randomUUID());
     });
   }
 

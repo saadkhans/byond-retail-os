@@ -101,10 +101,15 @@ class EnvironmentVariables {
   VIDEO_STORAGE_ROOT?: string;
 
   // Upload size ceiling in bytes. Conservative default (50 MiB) — Phase 10
-  // ingests short controlled test clips, not production footage.
+  // ingests short controlled test clips, not production footage. HARD upper
+  // bound (256 MiB): uploads buffer in memory, so an unbounded value would
+  // let one request hold gigabytes of heap, and anything above the
+  // PostgreSQL signed-Int range would overflow VideoAsset.sizeBytes after
+  // the bytes were already stored. A deployment typo fails at boot instead.
   @IsOptional()
   @IsInt()
   @Min(1)
+  @Max(268_435_456)
   VIDEO_MAX_UPLOAD_BYTES?: number;
 
   // Opt-in switch for the OPTIONAL local system ffmpeg binary adapter. Off

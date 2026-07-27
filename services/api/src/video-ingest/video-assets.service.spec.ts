@@ -14,6 +14,7 @@ import {
 } from '@prisma/client';
 import {
   ExtractionFailedError,
+  FrameUnavailableError,
 } from './extraction/video-frame-extractor.port';
 import {
   UploadedVideoFile,
@@ -134,6 +135,7 @@ function buildService(overrides: {
         _t: string,
         videoAssetId: string,
         _expected: unknown,
+        _idempotencyKey: string | undefined,
         items: Record<string, unknown>[],
         buildArtifactAudit: (a: unknown) => unknown,
         buildAssetAudit: (b: unknown, a: unknown) => unknown,
@@ -149,9 +151,10 @@ function buildService(overrides: {
         });
         const asset = assetRow({ status: VideoAssetStatus.READY });
         buildAssetAudit(assetRow(), asset);
-        return { asset, artifacts };
+        return { asset, artifacts, replayed: false };
       },
     ),
+    findExtractionReplay: jest.fn(async () => null),
     findArtifactById: jest.fn(async () => artifactRow()),
     listArtifacts: jest.fn(async () => [artifactRow()]),
     listArtifactStorageKeys: jest.fn(async () => []),
@@ -200,13 +203,31 @@ function buildService(overrides: {
     ...overrides.extractor,
   };
   const inference = {
-    // Echo the dto so the service's replayed-job descriptor verification
-    // sees a job that genuinely references the requested crop.
-    create: jest.fn(async (_t: string, dto: { jobType: InferenceJobType; inputDescriptor: unknown }) => ({
-      id: 'job-1',
-      jobType: dto.jobType,
-      inputDescriptor: dto.inputDescriptor,
-    })),
+    // Echo the dto so the service's replayed-job verification sees a job
+    // whose FULL descriptor and context genuinely reference the crop.
+    create: jest.fn(
+      async (
+        _t: string,
+        dto: {
+          jobType: InferenceJobType;
+          inputDescriptor: unknown;
+          sourceId?: string;
+          locationId?: string;
+          unitId?: string;
+          deviceId?: string;
+          sessionId?: string;
+        },
+      ) => ({
+        id: 'job-1',
+        jobType: dto.jobType,
+        inputDescriptor: dto.inputDescriptor,
+        sourceId: dto.sourceId ?? null,
+        locationId: dto.locationId ?? null,
+        unitId: dto.unitId ?? null,
+        deviceId: dto.deviceId ?? null,
+        sessionId: dto.sessionId ?? null,
+      }),
+    ),
     findById: jest.fn(async () => ({ id: 'job-1' })),
     ...overrides.inference,
   };
@@ -289,6 +310,21 @@ describe('VideoAssetsService.upload', () => {
     await expect(
       service.upload(TENANT, uploadFile({ originalname, mimetype }), {}),
     ).rejects.toBeInstanceOf(BadRequestException);
+    expect(storage.put).not.toHaveBeenCalled();
+  });
+
+  it('rejects uploads whose PAYLOAD carries credential- or payment-bearing text', async () => {
+    const { service, storage } = buildService();
+    for (const embedded of [
+      'password=hunter2-in-metadata',
+      ['4111', '1111', '1111', '1111'].join(' '),
+      ['4111', '1111', '1111', '1111'].join('_'),
+    ]) {
+      const buffer = Buffer.concat([mp4Buffer(), Buffer.from(embedded, 'ascii')]);
+      await expect(
+        service.upload(TENANT, uploadFile({ buffer, size: buffer.length }), {}),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
     expect(storage.put).not.toHaveBeenCalled();
   });
 
@@ -449,6 +485,23 @@ describe('VideoAssetsService crop & frame extraction', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 
+  it('maps an unavailable frame to a 400 WITHOUT failing the asset', async () => {
+    // A timestamp inside the reported duration can land past the last
+    // decodable frame — that is a caller-input problem, not a broken video.
+    const { service, repository } = buildService({
+      extractor: {
+        extractFrameAt: jest.fn(async () => {
+          throw new FrameUnavailableError();
+        }),
+      },
+    });
+    await expect(
+      service.extractFrames(TENANT, 'asset-1', { timestampMs: 9_999 }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    // No FAILED transition was recorded.
+    expect(repository.transitionStatus).not.toHaveBeenCalled();
+  });
+
   it('requires validation before extraction', async () => {
     const { service } = buildService({
       repository: {
@@ -473,11 +526,12 @@ describe('VideoAssetsService crop & frame extraction', () => {
       reason: VideoCropReason.PRODUCT_PICKUP,
     });
     expect(artifact.artifactType).toBe(VideoArtifactType.CROP);
-    const [, , , items] = repository.createArtifactsBatch.mock
+    const [, , , , items] = repository.createArtifactsBatch.mock
       .calls[0] as unknown as [
       string,
       string,
       VideoAssetStatus[],
+      string | undefined,
       {
         cropX: number;
         cropWidth: number;
@@ -560,6 +614,147 @@ describe('VideoAssetsService crop & frame extraction', () => {
       }),
     ).rejects.toBeInstanceOf(ConflictException);
     expect(storage.put).not.toHaveBeenCalled();
+  });
+});
+
+describe('extraction idempotency', () => {
+  it('replays a committed request WITHOUT re-running extraction', async () => {
+    const replayResult = {
+      asset: assetRow({ status: VideoAssetStatus.READY }),
+      artifacts: [artifactRow()],
+      replayed: true as const,
+    };
+    const { service, extractor, storage, repository } = buildService({
+      repository: {
+        findExtractionReplay: jest.fn(async () => replayResult),
+      },
+    });
+    const result = await service.createCrop(TENANT, 'asset-1', {
+      timestampMs: 1000,
+      x: 10,
+      y: 20,
+      width: 300,
+      height: 200,
+      idempotencyKey: 'op-1',
+    });
+    expect(result.replayed).toBe(true);
+    expect(extractor.extractCrop).not.toHaveBeenCalled();
+    expect(storage.put).not.toHaveBeenCalled();
+    expect(repository.createArtifactsBatch).not.toHaveBeenCalled();
+  });
+
+  it('409s a key whose committed batch is a DIFFERENT operation type', async () => {
+    // A frames-batch key replayed through POST /crops must not hand back an
+    // arbitrary FRAME artifact as "the crop".
+    const framesReplay = {
+      asset: assetRow({ status: VideoAssetStatus.READY }),
+      artifacts: [
+        artifactRow({ artifactType: VideoArtifactType.FRAME, cropX: null }),
+        artifactRow({ id: 'artifact-2', artifactType: VideoArtifactType.FRAME, cropX: null }),
+      ],
+      replayed: true as const,
+    };
+    const { service } = buildService({
+      repository: { findExtractionReplay: jest.fn(async () => framesReplay) },
+    });
+    await expect(
+      service.createCrop(TENANT, 'asset-1', {
+        timestampMs: 1000,
+        x: 0,
+        y: 0,
+        width: 10,
+        height: 10,
+        idempotencyKey: 'frames-op-key',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    // And the reverse: a crop key replayed through extract-frames.
+    const cropReplay = {
+      asset: assetRow({ status: VideoAssetStatus.READY }),
+      artifacts: [artifactRow()],
+      replayed: true as const,
+    };
+    const { service: service2 } = buildService({
+      repository: { findExtractionReplay: jest.fn(async () => cropReplay) },
+    });
+    await expect(
+      service2.extractFrames(TENANT, 'asset-1', { idempotencyKey: 'crop-op-key' }),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('409s a key already used for a different asset', async () => {
+    const { service } = buildService({
+      repository: {
+        findExtractionReplay: jest.fn(async () => 'key-conflict' as const),
+      },
+    });
+    await expect(
+      service.extractFrames(TENANT, 'asset-1', { idempotencyKey: 'op-1' }),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('replays the winner when two firsts race the same key (P2002)', async () => {
+    const replayResult = {
+      asset: assetRow({ status: VideoAssetStatus.READY }),
+      artifacts: [artifactRow()],
+      replayed: true as const,
+    };
+    const findExtractionReplay = jest
+      .fn()
+      .mockResolvedValueOnce(null) // pre-check: nothing committed yet
+      .mockResolvedValueOnce(replayResult); // after P2002: the winner's batch
+    const { service, storage } = buildService({
+      repository: {
+        findExtractionReplay,
+        createArtifactsBatch: jest.fn(async () => {
+          throw Object.assign(new Error('unique'), { code: 'P2002' });
+        }),
+      },
+    });
+    const result = await service.createCrop(TENANT, 'asset-1', {
+      timestampMs: 1000,
+      x: 0,
+      y: 0,
+      width: 10,
+      height: 10,
+      idempotencyKey: 'op-1',
+    });
+    expect(result.replayed).toBe(true);
+    // The loser's staged file was cleaned up.
+    expect(storage.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects idempotency keys carrying sensitive content', async () => {
+    const { service } = buildService();
+    await expect(
+      service.extractFrames(TENANT, 'asset-1', {
+        idempotencyKey: `pan-${['4111', '1111', '1111', '1111'].join(' ')}`,
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+});
+
+describe('plain-id validation on reads', () => {
+  it('rejects control characters in route ids and list filters with 400', async () => {
+    const { service, repository } = buildService();
+    await expect(service.findById(TENANT, 'a\u0000b')).rejects.toBeInstanceOf(
+      BadRequestException,
+    );
+    await expect(
+      service.findArtifactById(TENANT, 'a\u0000b'),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    await expect(service.delete(TENANT, 'a\u0000b')).rejects.toBeInstanceOf(
+      BadRequestException,
+    );
+    await expect(
+      service.createInferenceJobFromCrop(TENANT, 'a\u0000b', {}),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    await expect(
+      service.list(TENANT, { sessionId: 'a\u0000b' }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    // Nothing reached the persistence layer.
+    expect(repository.findById).not.toHaveBeenCalled();
+    expect(repository.findArtifactById).not.toHaveBeenCalled();
+    expect(repository.list).not.toHaveBeenCalled();
   });
 });
 

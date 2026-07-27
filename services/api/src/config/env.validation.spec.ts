@@ -31,6 +31,34 @@ describe('validateEnv', () => {
     ).toThrow(/JWT_SECRET/);
   });
 
+  describe('VIDEO_MAX_UPLOAD_BYTES bounds (Phase 10)', () => {
+    it('accepts the default-sized and maximum values', () => {
+      expect(() =>
+        validateEnv({ ...validConfig, VIDEO_MAX_UPLOAD_BYTES: '52428800' }),
+      ).not.toThrow();
+      expect(() =>
+        validateEnv({ ...validConfig, VIDEO_MAX_UPLOAD_BYTES: '268435456' }),
+      ).not.toThrow();
+    });
+
+    it('rejects values above the 256 MiB heap-safety cap at boot', () => {
+      // Uploads buffer in memory and sizeBytes is a signed 32-bit column: a
+      // deployment typo (extra zero) must fail at boot, not at runtime.
+      expect(() =>
+        validateEnv({ ...validConfig, VIDEO_MAX_UPLOAD_BYTES: '268435457' }),
+      ).toThrow(/VIDEO_MAX_UPLOAD_BYTES/);
+      expect(() =>
+        validateEnv({ ...validConfig, VIDEO_MAX_UPLOAD_BYTES: '2147483648' }),
+      ).toThrow(/VIDEO_MAX_UPLOAD_BYTES/);
+    });
+
+    it('rejects non-positive values', () => {
+      expect(() =>
+        validateEnv({ ...validConfig, VIDEO_MAX_UPLOAD_BYTES: '0' }),
+      ).toThrow(/VIDEO_MAX_UPLOAD_BYTES/);
+    });
+  });
+
   describe('placeholder secrets are rejected in EVERY environment', () => {
     const placeholderSecrets = [
       'local-dev-only-placeholder-jwt-secret-change-me', // old .env.example value

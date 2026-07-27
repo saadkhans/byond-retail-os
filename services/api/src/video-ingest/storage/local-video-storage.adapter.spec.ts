@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { ConfigService } from '@nestjs/config';
@@ -36,6 +36,11 @@ describe('LocalVideoStorageAdapter', () => {
     expect(adapter.internalPathFor(key).startsWith(resolve(root) + sep)).toBe(
       true,
     );
+    // Atomic temp-file publish leaves NO temp artifacts behind — the
+    // directory contains exactly the published object.
+    expect(readdirSync(join(root, 'tenant-1', 'asset-1'))).toEqual([
+      'original.mp4',
+    ]);
   });
 
   it.each([

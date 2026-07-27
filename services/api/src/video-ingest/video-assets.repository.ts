@@ -9,6 +9,10 @@ import {
   AuditEntry,
   AuditLogService,
 } from '../common/audit/audit-log.service';
+import {
+  deviceAdvisoryLockKey,
+  unitAdvisoryLockKey,
+} from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
 import { TenantScopedRepository } from '../prisma/tenant-scoped.repository';
 
@@ -90,6 +94,7 @@ export type AssetReferenceRejection =
   | 'unit-location-mismatch'
   | 'device-not-found'
   | 'device-unit-mismatch'
+  | 'device-location-mismatch'
   | 'session-not-found'
   | 'session-unit-mismatch'
   | 'session-location-mismatch';
@@ -122,11 +127,20 @@ export class VideoAssetsRepository extends TenantScopedRepository {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
       // Context references must form ONE consistent hierarchy — the same
-      // pairwise rules PrismaInferenceQueue.enqueue() enforces (unit in the
-      // store, device on the unit, session on the unit and store).
-      // Composite same-tenant FKs only pin each reference's TENANT; without
-      // these checks an asset could bind a unit from another store and its
-      // crops would forever fail at inference-job creation.
+      // rules PrismaInferenceQueue.enqueue() enforces (unit in the store,
+      // device on the unit, session on the unit and store), EXTENDED so
+      // omitted intermediates cannot launder a mismatch: the device's unit
+      // and store are resolved and compared even when unitId/locationId
+      // were not supplied. Composite same-tenant FKs only pin each
+      // reference's TENANT; without these checks an asset could bind a
+      // unit from another store and its crops would forever fail at
+      // inference-job creation.
+      //
+      // Serialization: the SAME advisory locks (unit first, then device —
+      // lock order matters, mirroring enqueue/checkout) that
+      // UnitsRepository/DevicesRepository mutations take, held through the
+      // insert, so a concurrent reassignment cannot land between these
+      // reads and the asset row.
       if (data.locationId) {
         const location = await tx.location.findFirst({
           where: { id: data.locationId, tenantId: scopedTenantId },
@@ -138,6 +152,10 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       }
       let unitLocationId: string | null = null;
       if (data.unitId) {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${unitAdvisoryLockKey(
+          scopedTenantId,
+          data.unitId,
+        )}))`;
         const unit = await tx.retailUnit.findFirst({
           where: { id: data.unitId, tenantId: scopedTenantId },
           select: { id: true, locationId: true },
@@ -150,17 +168,38 @@ export class VideoAssetsRepository extends TenantScopedRepository {
         }
         unitLocationId = unit.locationId;
       }
+      // Effective bindings accumulate as references resolve; every later
+      // reference must agree with them.
+      let effectiveUnitId: string | null = data.unitId ?? null;
+      let effectiveLocationId: string | null =
+        data.locationId ?? unitLocationId;
       if (data.deviceId) {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceAdvisoryLockKey(
+          scopedTenantId,
+          data.deviceId,
+        )}))`;
         const device = await tx.device.findFirst({
           where: { id: data.deviceId, tenantId: scopedTenantId },
-          select: { id: true, unitId: true },
+          select: {
+            id: true,
+            unitId: true,
+            unit: { select: { locationId: true } },
+          },
         });
         if (!device) {
           return 'device-not-found' as const;
         }
-        if (data.unitId && device.unitId !== data.unitId) {
+        if (effectiveUnitId && device.unitId !== effectiveUnitId) {
           return 'device-unit-mismatch' as const;
         }
+        if (
+          effectiveLocationId &&
+          device.unit.locationId !== effectiveLocationId
+        ) {
+          return 'device-location-mismatch' as const;
+        }
+        effectiveUnitId = effectiveUnitId ?? device.unitId;
+        effectiveLocationId = effectiveLocationId ?? device.unit.locationId;
       }
       if (data.sessionId) {
         const session = await tx.checkoutSession.findFirst({
@@ -170,10 +209,9 @@ export class VideoAssetsRepository extends TenantScopedRepository {
         if (!session) {
           return 'session-not-found' as const;
         }
-        if (data.unitId && session.unitId !== data.unitId) {
+        if (effectiveUnitId && session.unitId !== effectiveUnitId) {
           return 'session-unit-mismatch' as const;
         }
-        const effectiveLocationId = data.locationId ?? unitLocationId;
         if (effectiveLocationId && session.locationId !== effectiveLocationId) {
           return 'session-location-mismatch' as const;
         }
@@ -336,18 +374,69 @@ export class VideoAssetsRepository extends TenantScopedRepository {
   }
 
   /**
+   * Replay lookup for a committed extraction request (idempotency key):
+   * returns the recorded batch — current asset view + the artifacts the
+   * original transaction produced — or null when no request with this key
+   * exists. 'key-conflict' when the key exists but belongs to a DIFFERENT
+   * asset (a reused key must never replay another asset's batch).
+   */
+  async findExtractionReplay(
+    tenantId: string,
+    videoAssetId: string,
+    idempotencyKey: string,
+  ): Promise<
+    | { asset: VideoAssetView; artifacts: VideoArtifactView[]; replayed: true }
+    | 'key-conflict'
+    | null
+  > {
+    const scopedTenantId = this.requireTenantId(tenantId);
+    const request = await this.prisma.videoExtractionRequest.findFirst({
+      where: { tenantId: scopedTenantId, idempotencyKey },
+    });
+    if (!request) {
+      return null;
+    }
+    if (request.videoAssetId !== videoAssetId) {
+      return 'key-conflict' as const;
+    }
+    const asset = await this.findById(tenantId, videoAssetId);
+    if (!asset) {
+      return null;
+    }
+    const ids = (request.artifactIds as string[]) ?? [];
+    const artifacts = await this.prisma.videoArtifact.findMany({
+      where: this.scope(tenantId, { id: { in: ids } }),
+      select: VIDEO_ARTIFACT_SELECT,
+    });
+    // Preserve the original creation order recorded on the request.
+    const byId = new Map(artifacts.map((artifact) => [artifact.id, artifact]));
+    return {
+      asset,
+      artifacts: ids
+        .map((id) => byId.get(id))
+        .filter((artifact): artifact is VideoArtifactView => Boolean(artifact)),
+      replayed: true,
+    };
+  }
+
+  /**
    * The WHOLE extraction result commits as ONE transaction: every artifact
-   * row, every artifact audit entry, and the asset's guarded status flip to
-   * READY either all land or none do. Artifact rows are append-only, so a
-   * partially-committed batch could never be cleaned up — atomic publish is
-   * the only shape that keeps a failed request retryable without
-   * duplicating committed artifacts. Returns null when the asset is gone or
-   * its status left the expected set (CAS lost) — the caller re-reads.
+   * row, every artifact audit entry, the asset's guarded status flip to
+   * READY, and (when an idempotency key was supplied) the extraction-
+   * request row that makes the batch REPLAYABLE — all land or none do.
+   * Artifact rows are append-only, so a partially-committed batch could
+   * never be cleaned up, and a retried request must replay, not re-append.
+   * Returns null when the asset is gone or its status left the expected set
+   * (CAS lost); a pre-existing identical key is replayed inside the same
+   * transaction ('key-conflict' when the key belongs to another asset).
+   * Two concurrent firsts race on the (tenantId, idempotencyKey) unique —
+   * the loser's P2002 rolls its batch back and the caller replays.
    */
   createArtifactsBatch(
     tenantId: string,
     videoAssetId: string,
     expectedStatuses: VideoAssetStatus[],
+    idempotencyKey: string | undefined,
     items: {
       artifactType: VideoArtifactType;
       reason?: VideoCropReason;
@@ -369,9 +458,45 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       before: VideoAssetView,
       after: VideoAssetView,
     ) => AuditEntry,
-  ): Promise<{ asset: VideoAssetView; artifacts: VideoArtifactView[] } | null> {
+  ): Promise<
+    | { asset: VideoAssetView; artifacts: VideoArtifactView[]; replayed: boolean }
+    | 'key-conflict'
+    | null
+  > {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
+      if (idempotencyKey) {
+        const existing = await tx.videoExtractionRequest.findFirst({
+          where: { tenantId: scopedTenantId, idempotencyKey },
+        });
+        if (existing) {
+          if (existing.videoAssetId !== videoAssetId) {
+            return 'key-conflict' as const;
+          }
+          const asset = await tx.videoAsset.findFirst({
+            where: { id: videoAssetId, tenantId: scopedTenantId, deletedAt: null },
+            select: VIDEO_ASSET_SELECT,
+          });
+          if (!asset) {
+            return null;
+          }
+          const ids = (existing.artifactIds as string[]) ?? [];
+          const found = await tx.videoArtifact.findMany({
+            where: { tenantId: scopedTenantId, id: { in: ids } },
+            select: VIDEO_ARTIFACT_SELECT,
+          });
+          const byId = new Map(found.map((artifact) => [artifact.id, artifact]));
+          return {
+            asset,
+            artifacts: ids
+              .map((id) => byId.get(id))
+              .filter((artifact): artifact is VideoArtifactView =>
+                Boolean(artifact),
+              ),
+            replayed: true,
+          };
+        }
+      }
       const before = await tx.videoAsset.findFirst({
         where: { id: videoAssetId, tenantId: scopedTenantId, deletedAt: null },
         select: VIDEO_ASSET_SELECT,
@@ -402,21 +527,39 @@ export class VideoAssetsRepository extends TenantScopedRepository {
         await this.auditLog.record(buildArtifactAuditEntry(created), tx);
         artifacts.push(created);
       }
+      if (idempotencyKey) {
+        // Same transaction as the batch: the request row and its artifacts
+        // are indivisible, so a replay can never observe half a batch.
+        await tx.videoExtractionRequest.create({
+          data: {
+            tenantId: scopedTenantId,
+            videoAssetId,
+            idempotencyKey,
+            artifactIds: artifacts.map((artifact) => artifact.id),
+          },
+        });
+      }
       const after = await tx.videoAsset.findFirstOrThrow({
         where: { id: videoAssetId, tenantId: scopedTenantId },
         select: VIDEO_ASSET_SELECT,
       });
       await this.auditLog.record(buildAssetAuditEntry(before, after), tx);
-      return { asset: after, artifacts };
+      return { asset: after, artifacts, replayed: false };
     });
   }
 
+  /**
+   * Artifact reads are scoped through a NON-DELETED parent: after
+   * `DELETE /video-assets/:id`, the documented deletion boundary applies to
+   * the asset's artifacts too — no metadata exposure, no inference-job
+   * replay from a deleted asset's crops.
+   */
   findArtifactById(
     tenantId: string,
     id: string,
   ): Promise<VideoArtifactView | null> {
     return this.prisma.videoArtifact.findFirst({
-      where: this.scope(tenantId, { id }),
+      where: this.scope(tenantId, { id, videoAsset: { deletedAt: null } }),
       select: VIDEO_ARTIFACT_SELECT,
     });
   }
@@ -426,20 +569,12 @@ export class VideoAssetsRepository extends TenantScopedRepository {
     videoAssetId: string,
   ): Promise<VideoArtifactView[]> {
     return this.prisma.videoArtifact.findMany({
-      where: this.scope(tenantId, { videoAssetId }),
+      where: this.scope(tenantId, {
+        videoAssetId,
+        videoAsset: { deletedAt: null },
+      }),
       select: VIDEO_ARTIFACT_SELECT,
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-    });
-  }
-
-  /** Internal: artifact storage keys for an asset (delete cleanup). */
-  listArtifactStorageKeys(
-    tenantId: string,
-    videoAssetId: string,
-  ): Promise<{ storageKey: string }[]> {
-    return this.prisma.videoArtifact.findMany({
-      where: this.scope(tenantId, { videoAssetId }),
-      select: { storageKey: true },
     });
   }
 
@@ -461,7 +596,13 @@ export class VideoAssetsRepository extends TenantScopedRepository {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
       const before = await tx.videoArtifact.findFirst({
-        where: { id: artifactId, tenantId: scopedTenantId },
+        // Deleted-parent scoping here too: a deleted asset's crop can
+        // neither link nor replay a job.
+        where: {
+          id: artifactId,
+          tenantId: scopedTenantId,
+          videoAsset: { deletedAt: null },
+        },
         select: VIDEO_ARTIFACT_SELECT,
       });
       if (!before) {

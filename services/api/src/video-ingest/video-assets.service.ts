@@ -22,6 +22,7 @@ import {
   AuditLogService,
   SYSTEM_ACTOR_EMAIL,
 } from '../common/audit/audit-log.service';
+import { containsSensitiveValue } from '../common/sensitive-keys';
 import { InferenceJobsService } from '../inference/inference-jobs.service';
 import { InferenceJobDetail } from '../inference/inference-jobs.repository';
 import { PlatformModulesService } from '../platform-modules/platform-modules.service';
@@ -37,10 +38,12 @@ import { UploadVideoAssetDto } from './dto/upload-video-asset.dto';
 import {
   ExtractionFailedError,
   ExtractorUnavailableError,
+  FrameUnavailableError,
   VideoFrameExtractorPort,
   VideoProbeResult,
 } from './extraction/video-frame-extractor.port';
 import {
+  bufferCarriesSensitiveText,
   fileExtensionOf,
   filenameCarriesSensitiveContent,
   isAllowedVideoUpload,
@@ -49,7 +52,10 @@ import {
   sanitizeOriginalFilename,
   VIDEO_ERROR_CODES,
 } from './media-safety';
-import { VideoStoragePort } from './storage/video-storage.port';
+import {
+  VideoStorageOperationError,
+  VideoStoragePort,
+} from './storage/video-storage.port';
 import {
   AssetReferenceRejection,
   VideoArtifactView,
@@ -84,11 +90,28 @@ function prismaErrorCode(error: unknown): string | undefined {
 // eslint-disable-next-line no-control-regex -- matching control chars IS the guard
 const CONTROL_CHARACTERS = /[\x00-\x1f\x7f]/;
 
-/** Reference ids must be opaque single-line values: a NUL would surface as
- * an uncontrolled Prisma 500 before the FK could reject it. */
+/**
+ * EVERY externally-supplied identifier — upload references, route :id
+ * params (Express percent-decodes them, so "/video-assets/%00" arrives as
+ * a NUL), list filters, and idempotency keys — must be an opaque
+ * single-line value: a NUL would surface as an uncontrolled Prisma 500
+ * before any query could reject it, and other control characters have no
+ * business in ids, reflected errors, or audit entity ids.
+ */
 function assertPlainId(field: string, value: string | undefined): void {
   if (value !== undefined && CONTROL_CHARACTERS.test(value)) {
     throw new BadRequestException(`${field} must not contain control characters`);
+  }
+}
+
+/** Idempotency keys are PERSISTED verbatim — opaque AND secret-free. */
+function assertOpaqueKey(field: string, value: string | undefined): void {
+  assertPlainId(field, value);
+  if (value !== undefined && containsSensitiveValue(value)) {
+    throw new BadRequestException(
+      `${field} must be an opaque value and must not contain credential- ` +
+        `or payment-bearing content`,
+    );
   }
 }
 
@@ -181,6 +204,17 @@ export class VideoAssetsService {
         'File content does not match the declared video container',
       );
     }
+    // Payload-level screen: text embedded in the container (metadata atoms,
+    // subtitle tracks, XMP/ID3) must not smuggle a PAN or credential into
+    // durable storage. Frame-VISIBLE content is not decodable without real
+    // CV (explicitly out of Phase 10 scope) — the operational control there
+    // is staged, controlled TEST clips only (README guidance) plus
+    // local-only, never-served storage; later CV phases add frame review.
+    if (bufferCarriesSensitiveText(file.buffer)) {
+      throw new BadRequestException(
+        'Video content carries credential- or payment-bearing text and was rejected',
+      );
+    }
     // The multipart layer already enforces this limit; re-checking keeps the
     // invariant local (and covers any future non-multipart ingest path).
     if (file.size > this.maxUploadBytes || file.buffer.length > this.maxUploadBytes) {
@@ -193,7 +227,15 @@ export class VideoAssetsService {
     // Server-generated key: tenant / random UUID / fixed name. The client's
     // filename NEVER participates (only its allowlisted extension).
     const storageKey = `${tenantId}/${randomUUID()}/original${extension}`;
-    await this.storage.put(storageKey, file.buffer);
+    try {
+      await this.storage.put(storageKey, file.buffer);
+    } catch (error) {
+      if (error instanceof VideoStorageOperationError) {
+        // Environmental (disk full, permissions) — 503, not a caller error.
+        throw new ServiceUnavailableException(error.message);
+      }
+      throw error;
+    }
     let result: VideoAssetView | AssetReferenceRejection;
     try {
       result = await this.repository.createAsset(
@@ -257,6 +299,8 @@ export class VideoAssetsService {
         return `Device "${dto.deviceId}" not found`;
       case 'device-unit-mismatch':
         return `Device "${dto.deviceId}" is not attached to unit "${dto.unitId}"`;
+      case 'device-location-mismatch':
+        return `Device "${dto.deviceId}" is not in store "${dto.locationId}"`;
       case 'session-not-found':
         return `Session "${dto.sessionId}" not found`;
       case 'session-unit-mismatch':
@@ -275,6 +319,8 @@ export class VideoAssetsService {
     skip: number;
     take: number;
   }> {
+    assertPlainId('sessionId', query.sessionId);
+    assertPlainId('locationId', query.locationId);
     const skip = query.skip ?? 0;
     const take = query.take ?? 25;
     const { items, total } = await this.repository.list(tenantId, {
@@ -288,6 +334,7 @@ export class VideoAssetsService {
   }
 
   async findById(tenantId: string, id: string): Promise<VideoAssetView> {
+    assertPlainId('id', id);
     const asset = await this.repository.findById(tenantId, id);
     if (!asset) {
       throw new NotFoundException(`Video asset "${id}" not found`);
@@ -307,6 +354,7 @@ export class VideoAssetsService {
     tenantId: string,
     artifactId: string,
   ): Promise<VideoArtifactView> {
+    assertPlainId('id', artifactId);
     const artifact = await this.repository.findArtifactById(tenantId, artifactId);
     if (!artifact) {
       throw new NotFoundException(`Video artifact "${artifactId}" not found`);
@@ -324,6 +372,7 @@ export class VideoAssetsService {
     id: string,
     actor?: AuditActor,
   ): Promise<VideoAssetView> {
+    assertPlainId('id', id);
     const internal = await this.repository.findByIdInternal(tenantId, id);
     if (!internal) {
       throw new NotFoundException(`Video asset "${id}" not found`);
@@ -408,7 +457,32 @@ export class VideoAssetsService {
     id: string,
     dto: ExtractFramesDto,
     actor?: AuditActor,
-  ): Promise<{ asset: VideoAssetView; artifacts: VideoArtifactView[] }> {
+  ): Promise<{
+    asset: VideoAssetView;
+    artifacts: VideoArtifactView[];
+    replayed: boolean;
+  }> {
+    assertOpaqueKey('idempotencyKey', dto.idempotencyKey);
+    // Replay BEFORE extracting: a committed batch whose response was lost
+    // must return its recorded artifacts without re-running extraction or
+    // staging new files.
+    if (dto.idempotencyKey) {
+      const replay = await this.replayExtraction(tenantId, id, dto.idempotencyKey);
+      if (replay) {
+        // A key from a CROP request must not replay into the frames
+        // endpoint — the recorded batch is a different operation.
+        if (
+          replay.artifacts.some(
+            (artifact) => artifact.artifactType !== VideoArtifactType.FRAME,
+          )
+        ) {
+          throw new ConflictException(
+            'This idempotency key was used for a different operation type',
+          );
+        }
+        return replay;
+      }
+    }
     const internal = await this.requireProcessable(tenantId, id);
     const probe = this.probeFromRow(internal);
 
@@ -434,15 +508,28 @@ export class VideoAssetsService {
       throw await this.mapExtractionError(tenantId, id, actor, error);
     }
 
-    const { asset, artifacts } = await this.persistArtifactsBatch(
+    const published = await this.persistArtifactsBatch(
       tenantId,
       internal.storageKey,
       id,
       actor,
       images.map((image) => ({ artifactType: VideoArtifactType.FRAME, image })),
       'Frames extracted',
+      dto.idempotencyKey,
     );
-    return { asset, artifacts };
+    // The in-transaction replay path can surface a batch too — same
+    // operation-type guard as the pre-check above.
+    if (
+      published.replayed &&
+      published.artifacts.some(
+        (artifact) => artifact.artifactType !== VideoArtifactType.FRAME,
+      )
+    ) {
+      throw new ConflictException(
+        'This idempotency key was used for a different operation type',
+      );
+    }
+    return published;
   }
 
   /**
@@ -455,7 +542,32 @@ export class VideoAssetsService {
     id: string,
     dto: CreateVideoCropDto,
     actor?: AuditActor,
-  ): Promise<{ asset: VideoAssetView; artifact: VideoArtifactView }> {
+  ): Promise<{
+    asset: VideoAssetView;
+    artifact: VideoArtifactView;
+    replayed: boolean;
+  }> {
+    assertOpaqueKey('idempotencyKey', dto.idempotencyKey);
+    if (dto.idempotencyKey) {
+      const replay = await this.replayExtraction(tenantId, id, dto.idempotencyKey);
+      if (replay) {
+        // A key from an extract-frames request must not replay into the
+        // crop endpoint (wrong operation → wrong artifact shape).
+        if (
+          replay.artifacts.length !== 1 ||
+          replay.artifacts[0].artifactType !== VideoArtifactType.CROP
+        ) {
+          throw new ConflictException(
+            'This idempotency key was used for a different operation type',
+          );
+        }
+        return {
+          asset: replay.asset,
+          artifact: replay.artifacts[0],
+          replayed: true,
+        };
+      }
+    }
     const internal = await this.requireProcessable(tenantId, id);
     const probe = this.probeFromRow(internal);
     this.assertTimestampInRange(dto.timestampMs, probe.durationMs);
@@ -477,7 +589,7 @@ export class VideoAssetsService {
       throw await this.mapExtractionError(tenantId, id, actor, error);
     }
 
-    const { asset, artifacts } = await this.persistArtifactsBatch(
+    const { asset, artifacts, replayed } = await this.persistArtifactsBatch(
       tenantId,
       internal.storageKey,
       id,
@@ -491,8 +603,18 @@ export class VideoAssetsService {
         },
       ],
       'Crop extracted',
+      dto.idempotencyKey,
     );
-    return { asset, artifact: artifacts[0] };
+    if (
+      replayed &&
+      (artifacts.length !== 1 ||
+        artifacts[0].artifactType !== VideoArtifactType.CROP)
+    ) {
+      throw new ConflictException(
+        'This idempotency key was used for a different operation type',
+      );
+    }
+    return { asset, artifact: artifacts[0], replayed };
   }
 
   /**
@@ -511,6 +633,9 @@ export class VideoAssetsService {
     job: InferenceJobDetail;
     replayed: boolean;
   }> {
+    // Before ANY read or audit write: the id lands in queries and in the
+    // denial audit's entityId, so control characters are rejected first.
+    assertPlainId('id', artifactId);
     // This route is gated by `video-ingest` for its own callers; job
     // creation is an `inference` capability — so re-check `inference`
     // FIRST (before the already-linked replay too), or a tenant with
@@ -565,6 +690,24 @@ export class VideoAssetsService {
       (artifact.reason ? REASON_TO_JOB_TYPE[artifact.reason] : undefined) ??
       InferenceJobType.PRODUCT_RECOGNITION;
 
+    // The COMPLETE server-derived descriptor — also the comparison baseline
+    // for any replayed job below.
+    const expectedDescriptor: Record<string, unknown> = {
+      artifactType: 'VIDEO_CROP',
+      videoAssetId: artifact.videoAssetId,
+      cropArtifactId: artifact.id,
+      timestampMs: artifact.timestampMs,
+      cropBox: {
+        x: artifact.cropX,
+        y: artifact.cropY,
+        width: artifact.cropWidth,
+        height: artifact.cropHeight,
+      },
+      ...(asset.deviceId ? { sourceDeviceId: asset.deviceId } : {}),
+      ...(asset.locationId ? { locationRef: asset.locationId } : {}),
+      ...(asset.unitId ? { unitRef: asset.unitId } : {}),
+    };
+
     const job = await this.inferenceJobsService.create(
       tenantId,
       {
@@ -577,21 +720,7 @@ export class VideoAssetsService {
         sourceId: `video-crop:${artifact.id}`,
         // SAFE descriptor: opaque ids and integers only — never bytes,
         // storage keys, paths, or URLs (Phase 9 screens it again).
-        inputDescriptor: {
-          artifactType: 'VIDEO_CROP',
-          videoAssetId: artifact.videoAssetId,
-          cropArtifactId: artifact.id,
-          timestampMs: artifact.timestampMs,
-          cropBox: {
-            x: artifact.cropX,
-            y: artifact.cropY,
-            width: artifact.cropWidth,
-            height: artifact.cropHeight,
-          },
-          ...(asset.deviceId ? { sourceDeviceId: asset.deviceId } : {}),
-          ...(asset.locationId ? { locationRef: asset.locationId } : {}),
-          ...(asset.unitId ? { unitRef: asset.unitId } : {}),
-        },
+        inputDescriptor: expectedDescriptor,
         // ALWAYS the derived key (never client-tunable): at-least-once
         // retries replay THIS crop's job and can never collide with another
         // crop's key.
@@ -601,15 +730,12 @@ export class VideoAssetsService {
     );
     // Idempotency keys are tenant-scoped and first-writer-wins: a caller
     // holding inference:manage could have squatted `video-crop:<id>` with a
-    // direct Phase 9 create, making our create REPLAY that unrelated job.
-    // Never link a job whose descriptor does not reference exactly this
-    // crop — lineage integrity beats availability here.
-    const descriptor = job.inputDescriptor as Record<string, unknown> | null;
-    if (
-      !descriptor ||
-      descriptor['cropArtifactId'] !== artifact.id ||
-      descriptor['videoAssetId'] !== artifact.videoAssetId
-    ) {
+    // direct Phase 9 create carrying the right ids but a fabricated
+    // timestamp, crop box, artifact type, or context — and our create would
+    // REPLAY that job. The COMPLETE server-derived descriptor AND the job's
+    // source/context bindings must match before the one-shot link is
+    // stamped; lineage integrity beats availability here.
+    if (!this.jobMatchesCrop(job, expectedDescriptor, asset)) {
       throw new ConflictException(
         'The idempotency key for this crop is already used by an unrelated ' +
           'inference job; the crop was not linked',
@@ -660,6 +786,7 @@ export class VideoAssetsService {
     id: string,
     actor?: AuditActor,
   ): Promise<{ deleted: true }> {
+    assertPlainId('id', id);
     const internal = await this.repository.findByIdInternalIncludingDeleted(
       tenantId,
       id,
@@ -690,13 +817,90 @@ export class VideoAssetsService {
       0,
       internal.storageKey.lastIndexOf('/'),
     );
-    await this.storage.deletePrefix(assetDir);
+    try {
+      await this.storage.deletePrefix(assetDir);
+    } catch (error) {
+      if (error instanceof VideoStorageOperationError) {
+        // The soft-delete is already durable; the file cleanup is
+        // retryable via this same idempotent endpoint — 503, not 500.
+        throw new ServiceUnavailableException(error.message);
+      }
+      throw error;
+    }
     return { deleted: true };
   }
 
   // -------------------------------------------------------------------------
 
+  /**
+   * A job may link to a crop ONLY when its persisted descriptor deep-equals
+   * the complete server-derived descriptor AND its source/context bindings
+   * are the ones this crop's asset would have produced. Field-by-field —
+   * a squatter controlling any single field is rejected.
+   */
+  private jobMatchesCrop(
+    job: InferenceJobDetail,
+    expectedDescriptor: Record<string, unknown>,
+    asset: VideoAssetView,
+  ): boolean {
+    const descriptor = job.inputDescriptor as Record<string, unknown> | null;
+    if (!descriptor) {
+      return false;
+    }
+    const expectedBox = expectedDescriptor.cropBox as Record<string, unknown>;
+    const box = descriptor.cropBox as Record<string, unknown> | undefined;
+    const descriptorKeys = Object.keys(descriptor).sort();
+    const expectedKeys = Object.keys(expectedDescriptor).sort();
+    return (
+      descriptorKeys.length === expectedKeys.length &&
+      descriptorKeys.every((key, index) => key === expectedKeys[index]) &&
+      descriptor.artifactType === expectedDescriptor.artifactType &&
+      descriptor.videoAssetId === expectedDescriptor.videoAssetId &&
+      descriptor.cropArtifactId === expectedDescriptor.cropArtifactId &&
+      descriptor.timestampMs === expectedDescriptor.timestampMs &&
+      Boolean(box) &&
+      box?.x === expectedBox.x &&
+      box?.y === expectedBox.y &&
+      box?.width === expectedBox.width &&
+      box?.height === expectedBox.height &&
+      (descriptor.sourceDeviceId ?? null) ===
+        (expectedDescriptor.sourceDeviceId ?? null) &&
+      (descriptor.locationRef ?? null) ===
+        (expectedDescriptor.locationRef ?? null) &&
+      (descriptor.unitRef ?? null) === (expectedDescriptor.unitRef ?? null) &&
+      job.sourceId === `video-crop:${expectedDescriptor.cropArtifactId as string}` &&
+      (job.locationId ?? null) === (asset.locationId ?? null) &&
+      (job.unitId ?? null) === (asset.unitId ?? null) &&
+      (job.deviceId ?? null) === (asset.deviceId ?? null) &&
+      (job.sessionId ?? null) === (asset.sessionId ?? null)
+    );
+  }
+
+  /** Replay a committed extraction request, or map a cross-asset key. */
+  private async replayExtraction(
+    tenantId: string,
+    videoAssetId: string,
+    idempotencyKey: string,
+  ): Promise<{
+    asset: VideoAssetView;
+    artifacts: VideoArtifactView[];
+    replayed: true;
+  } | null> {
+    const replay = await this.repository.findExtractionReplay(
+      tenantId,
+      videoAssetId,
+      idempotencyKey,
+    );
+    if (replay === 'key-conflict') {
+      throw new ConflictException(
+        'This idempotency key was already used for a different video asset',
+      );
+    }
+    return replay;
+  }
+
   private async requireProcessable(tenantId: string, id: string) {
+    assertPlainId('id', id);
     const internal = await this.repository.findByIdInternal(tenantId, id);
     if (!internal) {
       throw new NotFoundException(`Video asset "${id}" not found`);
@@ -770,7 +974,12 @@ export class VideoAssetsService {
       crop?: { x: number; y: number; width: number; height: number };
     }[],
     reason: string,
-  ): Promise<{ asset: VideoAssetView; artifacts: VideoArtifactView[] }> {
+    idempotencyKey?: string,
+  ): Promise<{
+    asset: VideoAssetView;
+    artifacts: VideoArtifactView[];
+    replayed: boolean;
+  }> {
     // Adapter-independent memory ceiling for the retained batch.
     const totalBytes = inputs.reduce(
       (sum, input) => sum + input.image.data.length,
@@ -817,6 +1026,7 @@ export class VideoAssetsService {
           VideoAssetStatus.READY,
           VideoAssetStatus.FAILED,
         ],
+        idempotencyKey,
         items,
         (artifact) =>
           this.auditEntry(tenantId, actor, {
@@ -836,11 +1046,23 @@ export class VideoAssetsService {
             reason,
           }),
       );
+      if (published === 'key-conflict') {
+        throw new ConflictException(
+          'This idempotency key was already used for a different video asset',
+        );
+      }
       if (!published) {
         // CAS lost (concurrent transition or delete) — nothing committed.
         throw new ConflictException(
           'The video asset changed concurrently; retry the extraction',
         );
+      }
+      if (published.replayed) {
+        // A concurrent identical request committed first inside the tx
+        // window — its batch is the result; our staged files are surplus.
+        for (const storageKey of staged) {
+          await this.storage.delete(storageKey).catch(() => undefined);
+        }
       }
       return published;
     } catch (error) {
@@ -848,6 +1070,28 @@ export class VideoAssetsService {
       // staged file so a retry starts clean.
       for (const storageKey of staged) {
         await this.storage.delete(storageKey).catch(() => undefined);
+      }
+      // Two concurrent firsts racing the same key: the loser's request-row
+      // insert hits the (tenantId, idempotencyKey) unique and its whole
+      // batch rolls back — replay the winner's committed batch. If the
+      // replay finds nothing (winner's asset deleted in the same window),
+      // surface a CONTROLLED conflict, never the raw Prisma error.
+      if (prismaErrorCode(error) === 'P2002' && idempotencyKey) {
+        const replay = await this.replayExtraction(
+          tenantId,
+          videoAssetId,
+          idempotencyKey,
+        );
+        if (replay) {
+          return replay;
+        }
+        throw new ConflictException(
+          'The video asset changed concurrently; retry the extraction',
+        );
+      }
+      // Storage failures are environmental, not caller errors.
+      if (error instanceof VideoStorageOperationError) {
+        throw new ServiceUnavailableException(error.message);
       }
       throw error;
     }
@@ -862,6 +1106,14 @@ export class VideoAssetsService {
     if (error instanceof ExtractorUnavailableError) {
       // Environmental, not a property of the video — no status change.
       return new ServiceUnavailableException(error.message);
+    }
+    if (error instanceof FrameUnavailableError) {
+      // The VIDEO is fine — the requested position is past the last
+      // decodable frame (container durations routinely overshoot). A
+      // controlled 400, and the asset does NOT flip to FAILED.
+      return new BadRequestException(
+        'No frame is decodable at the requested timestamp; try an earlier position',
+      );
     }
     if (error instanceof ExtractionFailedError) {
       await this.repository.transitionStatus(

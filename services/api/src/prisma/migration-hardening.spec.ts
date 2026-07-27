@@ -594,3 +594,43 @@ describe('video ingest module backfill migration', () => {
     }
   });
 });
+
+describe('video extraction request migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260727000002_video_extraction_request',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('makes extraction requests replayable via a tenant-scoped unique key', () => {
+    expect(sql).toContain('VideoExtractionRequest_tenantId_idempotencyKey_key');
+    expect(sql).toContain(
+      'ON "VideoExtractionRequest"("tenantId", "idempotencyKey")',
+    );
+  });
+
+  it('enforces same-tenant asset references with a composite foreign key', () => {
+    expect(sql).toContain('VideoExtractionRequest_asset_same_tenant_fkey');
+  });
+
+  it('is append-only at the database level', () => {
+    expect(sql).toContain(
+      'CREATE FUNCTION prevent_video_extraction_request_mutation()',
+    );
+    expect(sql).toContain('BEFORE UPDATE OR DELETE ON "VideoExtractionRequest"');
+    expect(sql).toContain('BEFORE TRUNCATE ON "VideoExtractionRequest"');
+  });
+
+  it('stores ids only and never cascades deletes', () => {
+    // No media, storage-key, or URL columns exist on the request table.
+    expect(sql).not.toMatch(/"[^"\n]*(storageKey|url|media)[^"\n]*" TEXT/i);
+    expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
+  });
+});
