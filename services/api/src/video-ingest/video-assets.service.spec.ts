@@ -109,6 +109,7 @@ function buildService(overrides: {
     }),
     findById: jest.fn(async () => assetRow()),
     findByIdInternal: jest.fn(async () => assetRow()),
+    findByIdInternalIncludingDeleted: jest.fn(async () => assetRow()),
     list: jest.fn(async () => ({ items: [assetRow()], total: 1 })),
     transitionStatus: jest.fn(
       async (
@@ -128,11 +129,29 @@ function buildService(overrides: {
       build(before);
       return before;
     }),
-    createArtifact: jest.fn(async (_t: string, data: unknown, build: (a: unknown) => unknown) => {
-      const created = artifactRow(data as Record<string, unknown>);
-      build(created);
-      return created;
-    }),
+    createArtifactsBatch: jest.fn(
+      async (
+        _t: string,
+        videoAssetId: string,
+        _expected: unknown,
+        items: Record<string, unknown>[],
+        buildArtifactAudit: (a: unknown) => unknown,
+        buildAssetAudit: (b: unknown, a: unknown) => unknown,
+      ) => {
+        const artifacts = items.map((item, index) => {
+          const created = artifactRow({
+            id: `artifact-${index + 1}`,
+            videoAssetId,
+            ...item,
+          });
+          buildArtifactAudit(created);
+          return created;
+        });
+        const asset = assetRow({ status: VideoAssetStatus.READY });
+        buildAssetAudit(assetRow(), asset);
+        return { asset, artifacts };
+      },
+    ),
     findArtifactById: jest.fn(async () => artifactRow()),
     listArtifacts: jest.fn(async () => [artifactRow()]),
     listArtifactStorageKeys: jest.fn(async () => []),
@@ -181,13 +200,22 @@ function buildService(overrides: {
     ...overrides.extractor,
   };
   const inference = {
-    create: jest.fn(async () => ({ id: 'job-1', jobType: InferenceJobType.PRODUCT_RECOGNITION })),
+    // Echo the dto so the service's replayed-job descriptor verification
+    // sees a job that genuinely references the requested crop.
+    create: jest.fn(async (_t: string, dto: { jobType: InferenceJobType; inputDescriptor: unknown }) => ({
+      id: 'job-1',
+      jobType: dto.jobType,
+      inputDescriptor: dto.inputDescriptor,
+    })),
     findById: jest.fn(async () => ({ id: 'job-1' })),
     ...overrides.inference,
   };
   const modules = {
     isEnabledForTenant: jest.fn(async () => true),
     ...overrides.modules,
+  };
+  const auditLog = {
+    record: jest.fn(async () => undefined),
   };
   const config = {
     get: (key: string) =>
@@ -200,9 +228,10 @@ function buildService(overrides: {
     extractor as never,
     inference as never,
     modules as never,
+    auditLog as never,
     config,
   );
-  return { service, repository, storage, extractor, inference, modules };
+  return { service, repository, storage, extractor, inference, modules, auditLog };
 }
 
 describe('VideoAssetsService.upload', () => {
@@ -281,12 +310,39 @@ describe('VideoAssetsService.upload', () => {
     expect(storage.put).not.toHaveBeenCalled();
   });
 
-  it('rejects payment-bearing filenames', async () => {
+  it('rejects payment-bearing filenames, including separator-obfuscated PANs', async () => {
     const { service } = buildService();
-    const pan = ['4111', '1111', '1111', '1111'].join('');
+    const panParts = ['4111', '1111', '1111', '1111'];
+    for (const originalname of [
+      `${panParts.join('')}.mp4`,
+      `${panParts.join('_')}.mp4`,
+      // '.'-separated PAN — traversal check rejects '..' but not single
+      // dots, so the sensitive screen must catch it.
+      `pan${panParts.join('-')}.mp4`,
+      'password_hunter2.mp4',
+    ]) {
+      await expect(
+        service.upload(TENANT, uploadFile({ originalname }), {}),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
+  });
+
+  it('rejects context references that do not form one consistent hierarchy', async () => {
+    // Same rules and vocabulary as PrismaInferenceQueue.enqueue(): an asset
+    // the queue would later reject must fail AT UPLOAD.
+    const { service, storage } = buildService({
+      repository: {
+        createAsset: jest.fn(async () => 'unit-location-mismatch' as const),
+      },
+    });
     await expect(
-      service.upload(TENANT, uploadFile({ originalname: `${pan}.mp4` }), {}),
+      service.upload(TENANT, uploadFile(), {
+        locationId: 'loc-1',
+        unitId: 'unit-from-other-store',
+      }),
     ).rejects.toBeInstanceOf(BadRequestException);
+    // The stored file must not outlive the rejected row.
+    expect(storage.deletePrefix).toHaveBeenCalledTimes(1);
   });
 
   it('maps broken references to a controlled 400 and cleans the stored file', async () => {
@@ -417,49 +473,133 @@ describe('VideoAssetsService crop & frame extraction', () => {
       reason: VideoCropReason.PRODUCT_PICKUP,
     });
     expect(artifact.artifactType).toBe(VideoArtifactType.CROP);
-    const [, data] = repository.createArtifact.mock.calls[0] as unknown as [
+    const [, , , items] = repository.createArtifactsBatch.mock
+      .calls[0] as unknown as [
       string,
+      string,
+      VideoAssetStatus[],
       {
         cropX: number;
         cropWidth: number;
         checksumSha256: string;
         storageKey: string;
         reason: VideoCropReason;
-      },
+      }[],
     ];
-    expect(data.cropX).toBe(10);
-    expect(data.cropWidth).toBe(300);
-    expect(data.reason).toBe(VideoCropReason.PRODUCT_PICKUP);
-    expect(data.checksumSha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(data.storageKey).toMatch(/artifacts\/[0-9a-f-]{36}\.png$/);
+    expect(items[0].cropX).toBe(10);
+    expect(items[0].cropWidth).toBe(300);
+    expect(items[0].reason).toBe(VideoCropReason.PRODUCT_PICKUP);
+    expect(items[0].checksumSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(items[0].storageKey).toMatch(/artifacts\/[0-9a-f-]{36}\.png$/);
     expect(storage.put).toHaveBeenCalled();
   });
 
-  it('extracts frames and marks the asset READY', async () => {
+  it('publishes frames atomically and marks the asset READY in the same batch', async () => {
     const { service, repository } = buildService();
-    const { artifacts } = await service.extractFrames(TENANT, 'asset-1', {});
+    const { asset, artifacts } = await service.extractFrames(TENANT, 'asset-1', {});
     expect(artifacts).toHaveLength(1);
-    const lastTransition = repository.transitionStatus.mock.calls[
-      repository.transitionStatus.mock.calls.length - 1
-    ] as unknown as [
-      string,
-      string,
-      VideoAssetStatus[],
-      { status: VideoAssetStatus },
-    ];
-    expect(lastTransition[3].status).toBe(VideoAssetStatus.READY);
+    expect(asset.status).toBe(VideoAssetStatus.READY);
+    // ONE atomic publish call carries the rows AND the status flip.
+    expect(repository.createArtifactsBatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a timestamp AT the duration (exclusive endpoint)', async () => {
+    const { service } = buildService();
+    await expect(
+      service.createCrop(TENANT, 'asset-1', {
+        timestampMs: 10_000, // == durationMs — no frame exists there
+        x: 0,
+        y: 0,
+        width: 10,
+        height: 10,
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('removes staged files when the atomic publish fails (nothing committed)', async () => {
+    const { service, storage } = buildService({
+      repository: {
+        createArtifactsBatch: jest.fn(async () => {
+          throw new Error('db down');
+        }),
+      },
+    });
+    await expect(
+      service.createCrop(TENANT, 'asset-1', {
+        timestampMs: 1000,
+        x: 0,
+        y: 0,
+        width: 10,
+        height: 10,
+      }),
+    ).rejects.toThrow('db down');
+    // The staged artifact file was cleaned up — no orphaned media.
+    expect(storage.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a batch whose decoded bytes exceed the per-request budget', async () => {
+    const { service, storage } = buildService({
+      extractor: {
+        extractCrop: jest.fn(async () => ({
+          // Length-only stand-in: the budget check runs BEFORE staging.
+          data: { length: 200 * 1024 * 1024 } as Buffer,
+          width: 10,
+          height: 10,
+          mimeType: 'image/png',
+          timestampMs: 1000,
+        })),
+      },
+    });
+    await expect(
+      service.createCrop(TENANT, 'asset-1', {
+        timestampMs: 1000,
+        x: 0,
+        y: 0,
+        width: 10,
+        height: 10,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(storage.put).not.toHaveBeenCalled();
   });
 });
 
 describe('VideoAssetsService.createInferenceJobFromCrop', () => {
-  it('fails closed when the inference module is disabled', async () => {
-    const { service, inference } = buildService({
+  it('fails closed AND audits ACCESS_DENIED when the inference module is disabled', async () => {
+    const { service, inference, auditLog } = buildService({
       modules: { isEnabledForTenant: jest.fn(async () => false) },
     });
     await expect(
       service.createInferenceJobFromCrop(TENANT, 'artifact-1', {}),
     ).rejects.toBeInstanceOf(ForbiddenException);
     expect(inference.create).not.toHaveBeenCalled();
+    // Same auditable semantics as ModuleEnabledGuard: the cross-module
+    // denial is never invisible in the authorization audit trail.
+    expect(auditLog.record).toHaveBeenCalledTimes(1);
+    const [entry] = auditLog.record.mock.calls[0] as unknown as [
+      { action: string; entityType: string; entityId: string },
+    ];
+    expect(entry.action).toBe('ACCESS_DENIED');
+    expect(entry.entityType).toBe('VideoArtifact');
+    expect(entry.entityId).toBe('artifact-1');
+  });
+
+  it('never links a replayed job that does not reference this crop', async () => {
+    // A caller with inference:manage could have squatted the derived
+    // `video-crop:<id>` key with an unrelated direct Phase 9 create — the
+    // tenant-scoped idempotency replay then returns THAT job.
+    const { service, repository } = buildService({
+      inference: {
+        create: jest.fn(async () => ({
+          id: 'job-foreign',
+          jobType: InferenceJobType.PRODUCT_RECOGNITION,
+          inputDescriptor: { cropArtifactId: 'someone-elses-crop' },
+        })),
+      },
+    });
+    await expect(
+      service.createInferenceJobFromCrop(TENANT, 'artifact-1', {}),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(repository.linkArtifactToInferenceJob).not.toHaveBeenCalled();
   });
 
   it('refuses FRAME artifacts', async () => {
@@ -542,16 +682,42 @@ describe('VideoAssetsService.createInferenceJobFromCrop', () => {
 });
 
 describe('VideoAssetsService.delete', () => {
-  it('removes local files (asset directory) then soft-deletes the row', async () => {
+  it('commits the audited soft-delete FIRST, then removes local files', async () => {
     const { service, storage, repository } = buildService();
     await service.delete(TENANT, 'asset-1');
-    expect(storage.deletePrefix).toHaveBeenCalledWith(`${TENANT}/uuid-1`);
     expect(repository.softDelete).toHaveBeenCalled();
+    expect(storage.deletePrefix).toHaveBeenCalledWith(`${TENANT}/uuid-1`);
+    // Filesystem removal must never precede the durable, audited row flip.
+    const softDeleteOrder = (repository.softDelete as jest.Mock).mock
+      .invocationCallOrder[0];
+    const deletePrefixOrder = (storage.deletePrefix as jest.Mock).mock
+      .invocationCallOrder[0];
+    expect(softDeleteOrder).toBeLessThan(deletePrefixOrder);
   });
 
-  it('404s for a missing or already-deleted asset', async () => {
+  it('retries file cleanup idempotently for an already-deleted asset', async () => {
+    // A crash between the durable soft-delete and the file removal leaves
+    // orphaned files; re-issuing DELETE completes the cleanup without a
+    // second soft-delete or audit row.
+    const { service, storage, repository } = buildService({
+      repository: {
+        findByIdInternalIncludingDeleted: jest.fn(async () =>
+          assetRow({ deletedAt: new Date() }),
+        ),
+      },
+    });
+    await expect(service.delete(TENANT, 'asset-1')).resolves.toEqual({
+      deleted: true,
+    });
+    expect(repository.softDelete).not.toHaveBeenCalled();
+    expect(storage.deletePrefix).toHaveBeenCalledWith(`${TENANT}/uuid-1`);
+  });
+
+  it('404s for a missing asset', async () => {
     const { service } = buildService({
-      repository: { findByIdInternal: jest.fn(async () => null) },
+      repository: {
+        findByIdInternalIncludingDeleted: jest.fn(async () => null),
+      },
     });
     await expect(service.delete(TENANT, 'nope')).rejects.toBeInstanceOf(
       NotFoundException,

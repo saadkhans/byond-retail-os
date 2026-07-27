@@ -78,6 +78,22 @@ export type VideoArtifactView = Prisma.VideoArtifactGetPayload<{
 
 export type LinkArtifactRejection = 'already-linked';
 
+/**
+ * Upload reference-consistency rejections — the SAME vocabulary (and the
+ * same rules) as PrismaInferenceQueue.enqueue(): an asset whose context the
+ * queue would later reject must fail AT UPLOAD, not when its crops try to
+ * connect to Phase 9.
+ */
+export type AssetReferenceRejection =
+  | 'location-not-found'
+  | 'unit-not-found'
+  | 'unit-location-mismatch'
+  | 'device-not-found'
+  | 'device-unit-mismatch'
+  | 'session-not-found'
+  | 'session-unit-mismatch'
+  | 'session-location-mismatch';
+
 @Injectable()
 export class VideoAssetsRepository extends TenantScopedRepository {
   constructor(
@@ -102,9 +118,66 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       uploadedById?: string;
     },
     buildAuditEntry: (asset: VideoAssetView) => AuditEntry,
-  ): Promise<VideoAssetView> {
+  ): Promise<VideoAssetView | AssetReferenceRejection> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
+      // Context references must form ONE consistent hierarchy — the same
+      // pairwise rules PrismaInferenceQueue.enqueue() enforces (unit in the
+      // store, device on the unit, session on the unit and store).
+      // Composite same-tenant FKs only pin each reference's TENANT; without
+      // these checks an asset could bind a unit from another store and its
+      // crops would forever fail at inference-job creation.
+      if (data.locationId) {
+        const location = await tx.location.findFirst({
+          where: { id: data.locationId, tenantId: scopedTenantId },
+          select: { id: true },
+        });
+        if (!location) {
+          return 'location-not-found' as const;
+        }
+      }
+      let unitLocationId: string | null = null;
+      if (data.unitId) {
+        const unit = await tx.retailUnit.findFirst({
+          where: { id: data.unitId, tenantId: scopedTenantId },
+          select: { id: true, locationId: true },
+        });
+        if (!unit) {
+          return 'unit-not-found' as const;
+        }
+        if (data.locationId && unit.locationId !== data.locationId) {
+          return 'unit-location-mismatch' as const;
+        }
+        unitLocationId = unit.locationId;
+      }
+      if (data.deviceId) {
+        const device = await tx.device.findFirst({
+          where: { id: data.deviceId, tenantId: scopedTenantId },
+          select: { id: true, unitId: true },
+        });
+        if (!device) {
+          return 'device-not-found' as const;
+        }
+        if (data.unitId && device.unitId !== data.unitId) {
+          return 'device-unit-mismatch' as const;
+        }
+      }
+      if (data.sessionId) {
+        const session = await tx.checkoutSession.findFirst({
+          where: { id: data.sessionId, tenantId: scopedTenantId },
+          select: { id: true, unitId: true, locationId: true },
+        });
+        if (!session) {
+          return 'session-not-found' as const;
+        }
+        if (data.unitId && session.unitId !== data.unitId) {
+          return 'session-unit-mismatch' as const;
+        }
+        const effectiveLocationId = data.locationId ?? unitLocationId;
+        if (effectiveLocationId && session.locationId !== effectiveLocationId) {
+          return 'session-location-mismatch' as const;
+        }
+      }
       const created = await tx.videoAsset.create({
         data: { ...data, tenantId: scopedTenantId },
         select: VIDEO_ASSET_SELECT,
@@ -126,6 +199,17 @@ export class VideoAssetsRepository extends TenantScopedRepository {
   findByIdInternal(tenantId: string, id: string) {
     return this.prisma.videoAsset.findFirst({
       where: this.scope(tenantId, { id, deletedAt: null }),
+    });
+  }
+
+  /**
+   * Internal, INCLUDING soft-deleted rows — the delete flow only: a delete
+   * whose file cleanup failed AFTER the durable soft-delete must be
+   * retryable, and the retry needs the (already-deleted) row's storage key.
+   */
+  findByIdInternalIncludingDeleted(tenantId: string, id: string) {
+    return this.prisma.videoAsset.findFirst({
+      where: this.scope(tenantId, { id }),
     });
   }
 
@@ -251,10 +335,20 @@ export class VideoAssetsRepository extends TenantScopedRepository {
     });
   }
 
-  createArtifact(
+  /**
+   * The WHOLE extraction result commits as ONE transaction: every artifact
+   * row, every artifact audit entry, and the asset's guarded status flip to
+   * READY either all land or none do. Artifact rows are append-only, so a
+   * partially-committed batch could never be cleaned up — atomic publish is
+   * the only shape that keeps a failed request retryable without
+   * duplicating committed artifacts. Returns null when the asset is gone or
+   * its status left the expected set (CAS lost) — the caller re-reads.
+   */
+  createArtifactsBatch(
     tenantId: string,
-    data: {
-      videoAssetId: string;
+    videoAssetId: string,
+    expectedStatuses: VideoAssetStatus[],
+    items: {
       artifactType: VideoArtifactType;
       reason?: VideoCropReason;
       timestampMs: number;
@@ -269,17 +363,51 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       checksumSha256: string;
       storageKey: string;
       createdById?: string;
-    },
-    buildAuditEntry: (artifact: VideoArtifactView) => AuditEntry,
-  ): Promise<VideoArtifactView> {
+    }[],
+    buildArtifactAuditEntry: (artifact: VideoArtifactView) => AuditEntry,
+    buildAssetAuditEntry: (
+      before: VideoAssetView,
+      after: VideoAssetView,
+    ) => AuditEntry,
+  ): Promise<{ asset: VideoAssetView; artifacts: VideoArtifactView[] } | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
-      const created = await tx.videoArtifact.create({
-        data: { ...data, tenantId: scopedTenantId },
-        select: VIDEO_ARTIFACT_SELECT,
+      const before = await tx.videoAsset.findFirst({
+        where: { id: videoAssetId, tenantId: scopedTenantId, deletedAt: null },
+        select: VIDEO_ASSET_SELECT,
       });
-      await this.auditLog.record(buildAuditEntry(created), tx);
-      return created;
+      if (!before || !expectedStatuses.includes(before.status)) {
+        return null;
+      }
+      const flipped = await tx.videoAsset.updateMany({
+        where: {
+          id: videoAssetId,
+          tenantId: scopedTenantId,
+          deletedAt: null,
+          status: { in: expectedStatuses },
+        },
+        // Clearing the error is REQUIRED when recovering from FAILED (the
+        // status/error CHECK constraint ties them together).
+        data: { status: VideoAssetStatus.READY, errorCode: null, errorMessage: null },
+      });
+      if (flipped.count === 0) {
+        return null;
+      }
+      const artifacts: VideoArtifactView[] = [];
+      for (const item of items) {
+        const created = await tx.videoArtifact.create({
+          data: { ...item, videoAssetId, tenantId: scopedTenantId },
+          select: VIDEO_ARTIFACT_SELECT,
+        });
+        await this.auditLog.record(buildArtifactAuditEntry(created), tx);
+        artifacts.push(created);
+      }
+      const after = await tx.videoAsset.findFirstOrThrow({
+        where: { id: videoAssetId, tenantId: scopedTenantId },
+        select: VIDEO_ASSET_SELECT,
+      });
+      await this.auditLog.record(buildAssetAuditEntry(before, after), tx);
+      return { asset: after, artifacts };
     });
   }
 

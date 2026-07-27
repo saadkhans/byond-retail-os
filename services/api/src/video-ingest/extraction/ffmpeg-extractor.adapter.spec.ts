@@ -1,9 +1,12 @@
-import { VideoStoragePort } from '../storage/video-storage.port';
+import { LocalVideoStorageAdapter } from '../storage/local-video-storage.adapter';
 import {
   buildCropArgs,
   buildFrameArgs,
   buildProbeArgs,
   FfmpegVideoFrameExtractor,
+  MAX_PROBE_DIMENSION,
+  MAX_PROBE_DURATION_MS,
+  MAX_TOTAL_EXTRACTION_BYTES,
   parseProbeOutput,
 } from './ffmpeg-extractor.adapter';
 import {
@@ -17,9 +20,11 @@ import {
  * argument vectors built ONLY from validated integers and the confined
  * internal path, and controlled errors that never echo stderr or paths.
  */
+// The CONCRETE local adapter type (path capability lives there, not on the
+// provider-neutral VideoStoragePort).
 const storageStub = {
   internalPathFor: (key: string) => `/confined/root/${key}`,
-} as unknown as VideoStoragePort;
+} as unknown as LocalVideoStorageAdapter;
 
 describe('argument builders', () => {
   it('builds probe args as a fixed vector ending in the internal path', () => {
@@ -109,6 +114,38 @@ describe('parseProbeOutput', () => {
       expect(() => parseProbeOutput(bad)).toThrow(ExtractionFailedError);
     }
   });
+
+  it('bounds attacker-supplied probe metadata (duration, geometry, pixels, fps)', () => {
+    const probe = (overrides: Record<string, unknown>) =>
+      JSON.stringify({
+        streams: [
+          {
+            width: 1920,
+            height: 1080,
+            r_frame_rate: '30/1',
+            duration: '12.5',
+            ...overrides,
+          },
+        ],
+      });
+    // A tiny crafted container can CLAIM any metadata: oversized duration
+    // would overflow the PG Int column, oversized geometry would balloon
+    // later full-frame decodes. All controlled rejections.
+    for (const bad of [
+      probe({ duration: String(MAX_PROBE_DURATION_MS / 1000 + 1) }),
+      probe({ width: MAX_PROBE_DIMENSION + 1 }),
+      probe({ height: MAX_PROBE_DIMENSION + 1 }),
+      probe({ width: 16_000, height: 16_000 }), // per-axis ok, pixels not
+      probe({ r_frame_rate: '100000/1' }),
+      probe({ duration: '2147483648' }),
+    ]) {
+      expect(() => parseProbeOutput(bad)).toThrow(ExtractionFailedError);
+    }
+    // Boundary values stay accepted.
+    expect(
+      parseProbeOutput(probe({ duration: '3600', width: 7680, height: 4320 })),
+    ).toMatchObject({ durationMs: 3_600_000, width: 7680 });
+  });
 });
 
 describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
@@ -165,6 +202,36 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
         '/confined/root/a/original.mp4',
       );
     }
+  });
+
+  it('samples strictly BEFORE the duration (exclusive endpoint)', async () => {
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.resolve({ stdout: Buffer.from('png') }),
+    );
+    const frames = await extractor.extractFrames(
+      'a/original.mp4',
+      { durationMs: 10_000, width: 100, height: 100, fps: 30 },
+      { intervalMs: 5000, maxFrames: 30, startMs: 0 },
+    );
+    // 0, 5000 — 10000 is the exclusive endpoint (no frame exists there).
+    expect(frames.map((f) => f.timestampMs)).toEqual([0, 5000]);
+  });
+
+  it('enforces a request-wide decoded-byte budget across frames', async () => {
+    // Each mocked frame is ~half the budget; the third invocation would
+    // exceed it. The per-invocation maxBuffer cannot catch this — only the
+    // aggregate budget does.
+    const bigFrame = Buffer.alloc(Math.ceil(MAX_TOTAL_EXTRACTION_BYTES / 2) + 1);
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.resolve({ stdout: bigFrame }),
+    );
+    await expect(
+      extractor.extractFrames(
+        'a/original.mp4',
+        { durationMs: 10_000, width: 100, height: 100, fps: 30 },
+        { intervalMs: 1000, maxFrames: 10, startMs: 0 },
+      ),
+    ).rejects.toBeInstanceOf(ExtractionFailedError);
   });
 
   it('rejects empty command output instead of persisting empty artifacts', async () => {

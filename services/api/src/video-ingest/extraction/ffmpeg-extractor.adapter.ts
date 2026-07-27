@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { Injectable } from '@nestjs/common';
-import { VideoStoragePort } from '../storage/video-storage.port';
+import { LocalVideoStorageAdapter } from '../storage/local-video-storage.adapter';
 import {
   CropBox,
   ExtractedImage,
@@ -23,6 +23,24 @@ const FFPROBE_BINARY = 'ffprobe';
 // cap exists so a hostile container cannot balloon the parent process.
 const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 const COMMAND_TIMEOUT_MS = 30_000;
+
+// Request-wide decoded-byte budget for multi-frame extraction: the
+// per-invocation maxBuffer bounds ONE frame, but a maxFrames batch retains
+// every decoded frame until the service persists the batch — without an
+// aggregate cap a valid request could hold maxFrames × MAX_OUTPUT_BYTES in
+// heap at once.
+export const MAX_TOTAL_EXTRACTION_BYTES = 128 * 1024 * 1024;
+
+// Probe ceilings for controlled TEST clips. ffprobe output is derived from
+// attacker-supplied container metadata: without upper bounds a tiny crafted
+// upload can claim an arbitrarily large duration (overflowing the
+// PostgreSQL Int column → uncontrolled 500) or absurd geometry that makes
+// later full-frame decodes consume extreme memory. Anything outside these
+// generous-for-test-footage limits is a controlled rejection.
+export const MAX_PROBE_DURATION_MS = 3_600_000; // 1 hour
+export const MAX_PROBE_DIMENSION = 16_384;
+export const MAX_PROBE_PIXELS = 33_177_600; // 7680×4320 (8K)
+export const MAX_PROBE_FPS = 240;
 
 /** Integers only — a non-integer here means a validation layer was skipped. */
 function assertBoundedInt(value: number, field: string): number {
@@ -134,24 +152,25 @@ export function parseProbeOutput(stdout: string): VideoProbeResult {
   const height = stream?.height ?? 0;
   const [num, den] = (stream?.r_frame_rate ?? '').split('/').map(Number);
   const fps = num && den ? num / den : Number.NaN;
+  const durationMs = Math.round(durationSeconds * 1000);
   if (
     !Number.isFinite(durationSeconds) ||
     durationSeconds <= 0 ||
+    durationMs > MAX_PROBE_DURATION_MS ||
     !Number.isInteger(width) ||
     width <= 0 ||
+    width > MAX_PROBE_DIMENSION ||
     !Number.isInteger(height) ||
     height <= 0 ||
+    height > MAX_PROBE_DIMENSION ||
+    width * height > MAX_PROBE_PIXELS ||
     !Number.isFinite(fps) ||
-    fps <= 0
+    fps <= 0 ||
+    fps > MAX_PROBE_FPS
   ) {
     throw new ExtractionFailedError();
   }
-  return {
-    durationMs: Math.round(durationSeconds * 1000),
-    width,
-    height,
-    fps,
-  };
+  return { durationMs, width, height, fps };
 }
 
 type RunCommand = (
@@ -193,7 +212,9 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
   readonly kind = FFMPEG_EXTRACTOR_KIND;
 
   constructor(
-    private readonly storage: VideoStoragePort,
+    // The CONCRETE local adapter, not the neutral port: only local storage
+    // has filesystem paths, and this adapter is local-only by definition.
+    private readonly storage: LocalVideoStorageAdapter,
     private readonly runCommand: RunCommand = defaultRunCommand,
   ) {
     super();
@@ -225,12 +246,23 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
     options: FrameExtractionOptions,
   ): Promise<ExtractedImage[]> {
     const frames: ExtractedImage[] = [];
+    let totalBytes = 0;
+    // Duration is an EXCLUSIVE endpoint (no frame exists at durationMs) —
+    // strictly-less keeps sampling provider-consistent with the simulated
+    // adapter and off the empty-output failure path.
     for (
       let timestampMs = options.startMs;
-      timestampMs <= probe.durationMs && frames.length < options.maxFrames;
+      timestampMs < probe.durationMs && frames.length < options.maxFrames;
       timestampMs += options.intervalMs
     ) {
-      frames.push(await this.extractFrameAt(storageKey, probe, timestampMs));
+      const frame = await this.extractFrameAt(storageKey, probe, timestampMs);
+      totalBytes += frame.data.length;
+      // Request-wide budget: per-invocation maxBuffer bounds one frame, not
+      // the retained batch.
+      if (totalBytes > MAX_TOTAL_EXTRACTION_BYTES) {
+        throw new ExtractionFailedError();
+      }
+      frames.push(frame);
     }
     return frames;
   }

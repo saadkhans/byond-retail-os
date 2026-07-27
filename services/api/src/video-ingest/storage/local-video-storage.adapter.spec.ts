@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { ConfigService } from '@nestjs/config';
+import { VideoStorageOperationError } from './video-storage.port';
 import {
   InvalidStorageKeyError,
   LocalVideoStorageAdapter,
@@ -75,6 +76,22 @@ describe('LocalVideoStorageAdapter', () => {
     await expect(
       adapter.delete('tenant-1/asset-1/missing.mp4'),
     ).resolves.toBeUndefined();
+  });
+
+  it('maps filesystem failures to a controlled error that never carries a path', async () => {
+    // Reading a key that does not exist surfaces a raw ENOENT from the fs
+    // layer — whose message embeds the absolute resolved path. The adapter
+    // must swallow it into the generic, path-free storage error.
+    let caught: Error | undefined;
+    try {
+      await adapter.read('tenant-1/asset-1/missing.mp4');
+    } catch (error) {
+      caught = error as Error;
+    }
+    expect(caught).toBeInstanceOf(VideoStorageOperationError);
+    expect(caught?.message).toBe('Video storage operation failed');
+    expect(caught?.message).not.toContain(root);
+    expect(caught?.message).not.toContain('missing.mp4');
   });
 
   it('deletePrefix removes an asset directory but refuses the root itself', async () => {

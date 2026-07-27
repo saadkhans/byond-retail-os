@@ -19,9 +19,9 @@ import {
 import {
   AuditActor,
   AuditEntry,
+  AuditLogService,
   SYSTEM_ACTOR_EMAIL,
 } from '../common/audit/audit-log.service';
-import { containsSensitiveValue } from '../common/sensitive-keys';
 import { InferenceJobsService } from '../inference/inference-jobs.service';
 import { InferenceJobDetail } from '../inference/inference-jobs.repository';
 import { PlatformModulesService } from '../platform-modules/platform-modules.service';
@@ -42,6 +42,7 @@ import {
 } from './extraction/video-frame-extractor.port';
 import {
   fileExtensionOf,
+  filenameCarriesSensitiveContent,
   isAllowedVideoUpload,
   isUnsafeUploadFilename,
   looksLikeVideoContent,
@@ -50,12 +51,20 @@ import {
 } from './media-safety';
 import { VideoStoragePort } from './storage/video-storage.port';
 import {
+  AssetReferenceRejection,
   VideoArtifactView,
   VideoAssetsRepository,
   VideoAssetView,
 } from './video-assets.repository';
 
 export const DEFAULT_MAX_UPLOAD_BYTES = 52_428_800; // 50 MiB — test clips only.
+
+/**
+ * Request-wide ceiling on decoded artifact bytes retained before the batch
+ * persists — adapter-independent defense (the optional binary adapter also
+ * enforces its own budget while looping).
+ */
+export const MAX_TOTAL_ARTIFACT_BYTES = 128 * 1024 * 1024;
 
 /** Uploaded file shape (multer memory mode) — declared locally so the
  * service depends on the CONTRACT, not on multer types. */
@@ -100,6 +109,7 @@ export class VideoAssetsService {
     private readonly extractor: VideoFrameExtractorPort,
     private readonly inferenceJobsService: InferenceJobsService,
     private readonly platformModulesService: PlatformModulesService,
+    private readonly auditLog: AuditLogService,
     config: ConfigService,
   ) {
     const configured = config.get<string>('VIDEO_MAX_UPLOAD_BYTES');
@@ -147,8 +157,14 @@ export class VideoAssetsService {
     }
     const sanitized = sanitizeOriginalFilename(file.originalname);
     // A filename is persisted verbatim-ish metadata: credential- or
-    // payment-bearing names must never reach a database row.
-    if (containsSensitiveValue(sanitized)) {
+    // payment-bearing names must never reach a database row. The RAW name
+    // is screened with the filename-specific policy (separators normalized
+    // away first), so "4111_1111_1111_1111.mp4" or "password_hunter2.mp4"
+    // cannot smuggle a PAN or credential past the space/dash detectors.
+    if (
+      filenameCarriesSensitiveContent(file.originalname) ||
+      filenameCarriesSensitiveContent(sanitized)
+    ) {
       throw new BadRequestException(
         'Filename must not contain credential- or payment-bearing content',
       );
@@ -178,8 +194,9 @@ export class VideoAssetsService {
     // filename NEVER participates (only its allowlisted extension).
     const storageKey = `${tenantId}/${randomUUID()}/original${extension}`;
     await this.storage.put(storageKey, file.buffer);
+    let result: VideoAssetView | AssetReferenceRejection;
     try {
-      return await this.repository.createAsset(
+      result = await this.repository.createAsset(
         tenantId,
         {
           locationId: dto.locationId,
@@ -213,6 +230,39 @@ export class VideoAssetsService {
         );
       }
       throw error;
+    }
+    if (typeof result === 'string') {
+      // Hierarchy rejection (same vocabulary as inference enqueue) — the
+      // stored file must not outlive the rejected row.
+      await this.storage
+        .deletePrefix(storageKey.slice(0, storageKey.lastIndexOf('/')))
+        .catch(() => undefined);
+      throw new BadRequestException(this.referenceRejectionMessage(result, dto));
+    }
+    return result;
+  }
+
+  private referenceRejectionMessage(
+    rejection: AssetReferenceRejection,
+    dto: UploadVideoAssetDto,
+  ): string {
+    switch (rejection) {
+      case 'location-not-found':
+        return `Store "${dto.locationId}" not found`;
+      case 'unit-not-found':
+        return `Unit "${dto.unitId}" not found`;
+      case 'unit-location-mismatch':
+        return `Unit "${dto.unitId}" does not belong to store "${dto.locationId}"`;
+      case 'device-not-found':
+        return `Device "${dto.deviceId}" not found`;
+      case 'device-unit-mismatch':
+        return `Device "${dto.deviceId}" is not attached to unit "${dto.unitId}"`;
+      case 'session-not-found':
+        return `Session "${dto.sessionId}" not found`;
+      case 'session-unit-mismatch':
+        return `Session "${dto.sessionId}" is not on unit "${dto.unitId}"`;
+      case 'session-location-mismatch':
+        return `Session "${dto.sessionId}" is not in the asset's store`;
     }
   }
 
@@ -384,17 +434,14 @@ export class VideoAssetsService {
       throw await this.mapExtractionError(tenantId, id, actor, error);
     }
 
-    const artifacts: VideoArtifactView[] = [];
-    for (const image of images) {
-      artifacts.push(
-        await this.persistArtifact(tenantId, internal.storageKey, id, actor, {
-          artifactType: VideoArtifactType.FRAME,
-          image,
-        }),
-      );
-    }
-
-    const asset = await this.markReady(tenantId, id, actor, 'Frames extracted');
+    const { asset, artifacts } = await this.persistArtifactsBatch(
+      tenantId,
+      internal.storageKey,
+      id,
+      actor,
+      images.map((image) => ({ artifactType: VideoArtifactType.FRAME, image })),
+      'Frames extracted',
+    );
     return { asset, artifacts };
   }
 
@@ -430,20 +477,22 @@ export class VideoAssetsService {
       throw await this.mapExtractionError(tenantId, id, actor, error);
     }
 
-    const artifact = await this.persistArtifact(
+    const { asset, artifacts } = await this.persistArtifactsBatch(
       tenantId,
       internal.storageKey,
       id,
       actor,
-      {
-        artifactType: VideoArtifactType.CROP,
-        image,
-        reason: dto.reason,
-        crop: { x: dto.x, y: dto.y, width: dto.width, height: dto.height },
-      },
+      [
+        {
+          artifactType: VideoArtifactType.CROP,
+          image,
+          reason: dto.reason,
+          crop: { x: dto.x, y: dto.y, width: dto.width, height: dto.height },
+        },
+      ],
+      'Crop extracted',
     );
-    const asset = await this.markReady(tenantId, id, actor, 'Crop extracted');
-    return { asset, artifact };
+    return { asset, artifact: artifacts[0] };
   }
 
   /**
@@ -466,12 +515,25 @@ export class VideoAssetsService {
     // creation is an `inference` capability — so re-check `inference`
     // FIRST (before the already-linked replay too), or a tenant with
     // inference disabled could keep creating or reading jobs through the
-    // video back door. Fails closed, same semantics as ModuleEnabledGuard.
+    // video back door. Fails closed with the SAME auditable semantics as
+    // ModuleEnabledGuard: the denial is recorded as ACCESS_DENIED before
+    // the generic 403, so crossing a disabled module boundary is never
+    // invisible in the authorization audit trail.
     const inferenceEnabled = await this.platformModulesService.isEnabledForTenant(
       tenantId,
       'inference',
     );
     if (!inferenceEnabled) {
+      await this.auditLog.record(
+        this.auditEntry(tenantId, actor, {
+          action: AuditAction.ACCESS_DENIED,
+          entityType: 'VideoArtifact',
+          entityId: artifactId,
+          reason:
+            'Inference-job creation denied: module "inference" is not ' +
+            'enabled for this tenant',
+        }),
+      );
       throw new ForbiddenException(
         'The inference module is not enabled for this tenant, so an ' +
           'inference job cannot be created from this crop',
@@ -530,11 +592,29 @@ export class VideoAssetsService {
           ...(asset.locationId ? { locationRef: asset.locationId } : {}),
           ...(asset.unitId ? { unitRef: asset.unitId } : {}),
         },
-        // Default derived key: at-least-once retries replay the SAME job.
-        idempotencyKey: dto.idempotencyKey ?? `video-crop:${artifact.id}`,
+        // ALWAYS the derived key (never client-tunable): at-least-once
+        // retries replay THIS crop's job and can never collide with another
+        // crop's key.
+        idempotencyKey: `video-crop:${artifact.id}`,
       },
       actor,
     );
+    // Idempotency keys are tenant-scoped and first-writer-wins: a caller
+    // holding inference:manage could have squatted `video-crop:<id>` with a
+    // direct Phase 9 create, making our create REPLAY that unrelated job.
+    // Never link a job whose descriptor does not reference exactly this
+    // crop — lineage integrity beats availability here.
+    const descriptor = job.inputDescriptor as Record<string, unknown> | null;
+    if (
+      !descriptor ||
+      descriptor['cropArtifactId'] !== artifact.id ||
+      descriptor['videoAssetId'] !== artifact.videoAssetId
+    ) {
+      throw new ConflictException(
+        'The idempotency key for this crop is already used by an unrelated ' +
+          'inference job; the crop was not linked',
+      );
+    }
 
     const linked = await this.repository.linkArtifactToInferenceJob(
       tenantId,
@@ -566,18 +646,44 @@ export class VideoAssetsService {
   }
 
   /**
-   * Delete: local files first (idempotent), then the soft-delete stamp.
-   * Metadata is KEPT (audit lineage; artifacts are append-only) — only the
-   * media bytes are removed. A deleted asset 404s on every read.
+   * Delete: the DURABLE, AUDITED soft-delete commits FIRST; only then are
+   * the local files removed. Filesystem removal can therefore never precede
+   * the audited transition — a crash between the two leaves a soft-deleted
+   * row with orphaned files, and because the endpoint is IDEMPOTENT over
+   * already-deleted assets (it re-runs the file cleanup and succeeds), a
+   * retry completes the removal. Metadata is KEPT (audit lineage; artifacts
+   * are append-only) — only the media bytes are removed. A deleted asset
+   * 404s on every ordinary read.
    */
   async delete(
     tenantId: string,
     id: string,
     actor?: AuditActor,
   ): Promise<{ deleted: true }> {
-    const internal = await this.repository.findByIdInternal(tenantId, id);
+    const internal = await this.repository.findByIdInternalIncludingDeleted(
+      tenantId,
+      id,
+    );
     if (!internal) {
       throw new NotFoundException(`Video asset "${id}" not found`);
+    }
+    if (!internal.deletedAt) {
+      const marked = await this.repository.softDelete(
+        tenantId,
+        id,
+        (before) =>
+          this.auditEntry(tenantId, actor, {
+            action: AuditAction.DELETE,
+            entityType: 'VideoAsset',
+            entityId: id,
+            before,
+            reason: 'Video asset deleted (local media removed, metadata kept)',
+          }),
+      );
+      if (!marked) {
+        // Lost a race with another delete — the row is durably deleted;
+        // fall through to the idempotent file cleanup.
+      }
     }
     // The asset directory holds the original AND every extracted artifact.
     const assetDir = internal.storageKey.slice(
@@ -585,21 +691,6 @@ export class VideoAssetsService {
       internal.storageKey.lastIndexOf('/'),
     );
     await this.storage.deletePrefix(assetDir);
-    const marked = await this.repository.softDelete(
-      tenantId,
-      id,
-      (before) =>
-        this.auditEntry(tenantId, actor, {
-          action: AuditAction.DELETE,
-          entityType: 'VideoAsset',
-          entityId: id,
-          before,
-          reason: 'Video asset deleted (local media removed, metadata kept)',
-        }),
-    );
-    if (!marked) {
-      throw new NotFoundException(`Video asset "${id}" not found`);
-    }
     return { deleted: true };
   }
 
@@ -643,19 +734,30 @@ export class VideoAssetsService {
   }
 
   private assertTimestampInRange(timestampMs: number, durationMs: number): void {
-    if (timestampMs > durationMs) {
+    // Duration is an EXCLUSIVE endpoint: no frame exists AT durationMs, and
+    // accepting it would make the same request succeed on the simulated
+    // adapter and fail on a real one. Strictly-less only.
+    if (timestampMs >= durationMs) {
       throw new BadRequestException(
-        `timestampMs ${timestampMs} is outside the video duration (${durationMs} ms)`,
+        `timestampMs ${timestampMs} is outside the video duration (${durationMs} ms, exclusive)`,
       );
     }
   }
 
-  private async persistArtifact(
+  /**
+   * Atomic publish of an extraction batch: files are staged to storage
+   * first, then every artifact row, artifact audit entry, and the asset's
+   * READY flip commit as ONE transaction. On ANY failure the staged files
+   * are removed — append-only artifact rows mean a partial batch could
+   * never be cleaned up, so no row may commit unless all of them do; a
+   * failed request retries without duplicating committed artifacts.
+   */
+  private async persistArtifactsBatch(
     tenantId: string,
     assetStorageKey: string,
     videoAssetId: string,
     actor: AuditActor | undefined,
-    input: {
+    inputs: {
       artifactType: VideoArtifactType;
       image: {
         data: Buffer;
@@ -666,16 +768,29 @@ export class VideoAssetsService {
       };
       reason?: VideoCropReason;
       crop?: { x: number; y: number; width: number; height: number };
-    },
-  ): Promise<VideoArtifactView> {
+    }[],
+    reason: string,
+  ): Promise<{ asset: VideoAssetView; artifacts: VideoArtifactView[] }> {
+    // Adapter-independent memory ceiling for the retained batch.
+    const totalBytes = inputs.reduce(
+      (sum, input) => sum + input.image.data.length,
+      0,
+    );
+    if (totalBytes > MAX_TOTAL_ARTIFACT_BYTES) {
+      throw new ConflictException(
+        'Extraction output exceeds the per-request artifact size budget',
+      );
+    }
+
     const assetDir = assetStorageKey.slice(0, assetStorageKey.lastIndexOf('/'));
-    const storageKey = `${assetDir}/artifacts/${randomUUID()}.png`;
-    await this.storage.put(storageKey, input.image.data);
+    const staged: string[] = [];
     try {
-      return await this.repository.createArtifact(
-        tenantId,
-        {
-          videoAssetId,
+      const items = [];
+      for (const input of inputs) {
+        const storageKey = `${assetDir}/artifacts/${randomUUID()}.png`;
+        await this.storage.put(storageKey, input.image.data);
+        staged.push(storageKey);
+        items.push({
           artifactType: input.artifactType,
           reason: input.reason,
           timestampMs: input.image.timestampMs,
@@ -692,50 +807,50 @@ export class VideoAssetsService {
             .digest('hex'),
           storageKey,
           createdById: actor?.id,
-        },
+        });
+      }
+      const published = await this.repository.createArtifactsBatch(
+        tenantId,
+        videoAssetId,
+        [
+          VideoAssetStatus.VALIDATED,
+          VideoAssetStatus.READY,
+          VideoAssetStatus.FAILED,
+        ],
+        items,
         (artifact) =>
           this.auditEntry(tenantId, actor, {
             action: AuditAction.CREATE,
             entityType: 'VideoArtifact',
             entityId: artifact.id,
             after: artifact,
-            reason: `${input.artifactType} artifact extracted`,
+            reason: `${artifact.artifactType} artifact extracted`,
+          }),
+        (before, after) =>
+          this.auditEntry(tenantId, actor, {
+            action: AuditAction.UPDATE,
+            entityType: 'VideoAsset',
+            entityId: videoAssetId,
+            before,
+            after,
+            reason,
           }),
       );
+      if (!published) {
+        // CAS lost (concurrent transition or delete) — nothing committed.
+        throw new ConflictException(
+          'The video asset changed concurrently; retry the extraction',
+        );
+      }
+      return published;
     } catch (error) {
-      await this.storage.delete(storageKey).catch(() => undefined);
+      // Nothing was published (the batch is all-or-none) — remove every
+      // staged file so a retry starts clean.
+      for (const storageKey of staged) {
+        await this.storage.delete(storageKey).catch(() => undefined);
+      }
       throw error;
     }
-  }
-
-  private async markReady(
-    tenantId: string,
-    id: string,
-    actor: AuditActor | undefined,
-    reason: string,
-  ): Promise<VideoAssetView> {
-    const ready = await this.repository.transitionStatus(
-      tenantId,
-      id,
-      [
-        VideoAssetStatus.VALIDATED,
-        VideoAssetStatus.READY,
-        VideoAssetStatus.FAILED,
-      ],
-      // Clearing the error is REQUIRED when recovering from FAILED (the
-      // status/error CHECK constraint ties them together).
-      { status: VideoAssetStatus.READY, errorCode: null, errorMessage: null },
-      (before, after) =>
-        this.auditEntry(tenantId, actor, {
-          action: AuditAction.UPDATE,
-          entityType: 'VideoAsset',
-          entityId: id,
-          before,
-          after,
-          reason,
-        }),
-    );
-    return ready ?? this.findById(tenantId, id);
   }
 
   private async mapExtractionError(

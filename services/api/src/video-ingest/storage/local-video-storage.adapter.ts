@@ -1,8 +1,11 @@
-import { mkdir, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import { isAbsolute, resolve, sep } from 'node:path';
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { VideoStoragePort } from './video-storage.port';
+import {
+  VideoStorageOperationError,
+  VideoStoragePort,
+} from './video-storage.port';
 
 /**
  * Storage keys are server-generated (tenant id / random UUID / fixed names),
@@ -10,6 +13,13 @@ import { VideoStoragePort } from './video-storage.port';
  * outside it means a code path built a key from user input — refuse.
  */
 const SAFE_KEY = /^[A-Za-z0-9][A-Za-z0-9/._-]*$/;
+
+// Service-account-only modes: directories 0o700, media files 0o600. Tenant
+// media on a shared dev host or mounted volume must not be world-readable
+// even though the API exposes no media route. No-ops on Windows (Node maps
+// them onto ACL-less semantics), enforced on POSIX hosts.
+const DIR_MODE = 0o700;
+const FILE_MODE = 0o600;
 
 export class InvalidStorageKeyError extends Error {
   constructor() {
@@ -25,7 +35,10 @@ export class InvalidStorageKeyError extends Error {
  * (VIDEO_STORAGE_ROOT, default ".local/video-ingest" next to the repo
  * root). Every operation re-verifies that the resolved path stays INSIDE
  * the root — a key that escapes (traversal, absolute path, drive letter)
- * throws before any filesystem call.
+ * throws before any filesystem call — and every underlying filesystem
+ * failure is mapped to a controlled, PATH-FREE VideoStorageOperationError
+ * (raw fs errors embed absolute paths, which must never reach logs or
+ * clients).
  */
 @Injectable()
 export class LocalVideoStorageAdapter extends VideoStoragePort {
@@ -68,24 +81,48 @@ export class LocalVideoStorageAdapter extends VideoStoragePort {
     return resolved;
   }
 
+  /** Path-free failure mapping — see VideoStorageOperationError. */
+  private async guarded<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (error instanceof InvalidStorageKeyError) {
+        throw error;
+      }
+      throw new VideoStorageOperationError();
+    }
+  }
+
   async put(storageKey: string, data: Buffer): Promise<void> {
     const target = this.resolveWithinRoot(storageKey);
-    await mkdir(resolve(target, '..'), { recursive: true });
-    await writeFile(target, data);
+    await this.guarded(async () => {
+      // recursive mkdir applies the mode to every directory it CREATES; a
+      // pre-existing directory (e.g. a root provisioned with a broader
+      // umask) is tightened explicitly. chmod failures on exotic mounts
+      // must not lose the write — permissions are best-effort hardening on
+      // top of the gitignored, non-served root.
+      const parent = resolve(target, '..');
+      await mkdir(parent, { recursive: true, mode: DIR_MODE });
+      await chmod(parent, DIR_MODE).catch(() => undefined);
+      await writeFile(target, data, { mode: FILE_MODE });
+      await chmod(target, FILE_MODE).catch(() => undefined);
+    });
   }
 
   async read(storageKey: string): Promise<Buffer> {
-    return readFile(this.resolveWithinRoot(storageKey));
+    const target = this.resolveWithinRoot(storageKey);
+    return this.guarded(() => readFile(target));
   }
 
   async delete(storageKey: string): Promise<void> {
-    await unlink(this.resolveWithinRoot(storageKey)).catch(
-      (error: NodeJS.ErrnoException) => {
+    const target = this.resolveWithinRoot(storageKey);
+    await this.guarded(async () => {
+      await unlink(target).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== 'ENOENT') {
           throw error;
         }
-      },
-    );
+      });
+    });
   }
 
   async deletePrefix(storageKeyPrefix: string): Promise<void> {
@@ -94,9 +131,17 @@ export class LocalVideoStorageAdapter extends VideoStoragePort {
     if (target === this.root) {
       throw new InvalidStorageKeyError();
     }
-    await rm(target, { recursive: true, force: true });
+    await this.guarded(() => rm(target, { recursive: true, force: true }));
   }
 
+  /**
+   * Absolute filesystem path for a key — a capability of THIS local
+   * adapter, deliberately NOT part of VideoStoragePort (an object-store
+   * adapter has no local paths; the port stays provider-neutral). Used only
+   * by the optional local system-binary extractor, which must hand the OS a
+   * real path. The result must never leave the process: not in API
+   * responses, not in error messages, not in audit rows.
+   */
   internalPathFor(storageKey: string): string {
     return this.resolveWithinRoot(storageKey);
   }

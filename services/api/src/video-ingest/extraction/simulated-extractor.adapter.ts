@@ -59,9 +59,12 @@ export class SimulatedVideoFrameExtractor extends VideoFrameExtractorPort {
   ): Promise<ExtractedImage[]> {
     void storageKey;
     const frames: ExtractedImage[] = [];
+    // Duration is an EXCLUSIVE endpoint (no frame exists at durationMs) —
+    // strictly-less keeps the simulated adapter consistent with real
+    // extraction, where a seek to the duration returns no output.
     for (
       let timestampMs = options.startMs;
-      timestampMs <= probe.durationMs && frames.length < options.maxFrames;
+      timestampMs < probe.durationMs && frames.length < options.maxFrames;
       timestampMs += options.intervalMs
     ) {
       frames.push(this.placeholderImage(probe.width, probe.height, timestampMs));

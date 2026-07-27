@@ -37,6 +37,17 @@ describe('SimulatedVideoFrameExtractor', () => {
     expect(frames.map((f) => f.timestampMs)).toEqual([0, 4000, 8000]);
   });
 
+  it('treats the duration as an EXCLUSIVE endpoint (no frame at durationMs)', async () => {
+    const frames = await extractor.extractFrames('k', SIMULATED_PROBE, {
+      intervalMs: 5000,
+      maxFrames: 30,
+      startMs: 0,
+    });
+    // 0, 5000 — 10000 IS the duration; real extraction has no frame there,
+    // and the simulated adapter must behave identically.
+    expect(frames.map((f) => f.timestampMs)).toEqual([0, 5000]);
+  });
+
   it('extracts a single frame at a timestamp', async () => {
     const frame = await extractor.extractFrameAt('k', SIMULATED_PROBE, 2500);
     expect(frame.timestampMs).toBe(2500);

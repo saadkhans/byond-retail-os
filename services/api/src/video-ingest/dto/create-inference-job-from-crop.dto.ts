@@ -1,15 +1,7 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { InferenceJobType } from '@prisma/client';
 import { Transform } from 'class-transformer';
-import {
-  IsEnum,
-  IsInt,
-  IsString,
-  Max,
-  MaxLength,
-  Min,
-  MinLength,
-} from 'class-validator';
+import { IsEnum, IsInt, Max, Min } from 'class-validator';
 import {
   IsOptionalNonNull,
   toNumberRejectingBlank,
@@ -19,7 +11,11 @@ import {
  * Creates a Phase 9 inference job from a CROP artifact. The job's input
  * descriptor is built SERVER-SIDE (artifact/asset ids, timestamp, crop box
  * — opaque references only, screened by the Phase 9 policy); the client
- * only tunes job type, priority, and idempotency.
+ * only tunes job type and priority. The idempotency key is NOT
+ * client-tunable: it is always derived from the crop artifact id, so a
+ * shared or squatted key can never replay an UNRELATED job into this
+ * crop's one-shot link (the service additionally verifies any replayed
+ * job's descriptor really references this crop before linking).
  */
 export class CreateInferenceJobFromCropDto {
   @ApiPropertyOptional({
@@ -40,16 +36,4 @@ export class CreateInferenceJobFromCropDto {
   @Min(0)
   @Max(1000)
   priority?: number;
-
-  @ApiPropertyOptional({
-    maxLength: 100,
-    description:
-      'Tenant-scoped idempotency key for the Phase 9 job; defaults to a ' +
-      'key derived from the crop artifact id, so retries replay the same job.',
-  })
-  @IsOptionalNonNull()
-  @IsString()
-  @MinLength(1)
-  @MaxLength(100)
-  idempotencyKey?: string;
 }

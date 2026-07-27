@@ -1,5 +1,6 @@
 import {
   fileExtensionOf,
+  filenameCarriesSensitiveContent,
   isAllowedVideoUpload,
   isUnsafeUploadFilename,
   looksLikeVideoContent,
@@ -41,6 +42,32 @@ describe('media-safety', () => {
       const long = `${'a'.repeat(300)}.mp4`;
       expect(sanitizeOriginalFilename(long).length).toBe(160);
       expect(sanitizeOriginalFilename(long).endsWith('.mp4')).toBe(true);
+    });
+  });
+
+  describe('filenameCarriesSensitiveContent', () => {
+    it.each([
+      // PANs hidden behind filename separators the shared space/dash
+      // detector cannot see — normalized away before screening.
+      ['4111_1111_1111_1111.mp4'],
+      ['4111.1111.1111.1111.mp4'],
+      ['4111-1111-1111-1111.mp4'],
+      ['4111 1111 1111 1111.mp4'],
+      // Credential-channel tokens: the neighboring token IS the secret.
+      ['password_hunter2.mp4'],
+      ['api_key_prod.mp4'],
+      ['secret-recording.mp4'],
+    ])('rejects %p', (name) => {
+      expect(filenameCarriesSensitiveContent(name)).toBe(true);
+    });
+
+    it.each([
+      ['clip.mp4'],
+      ['shelf_test-01.mov'],
+      ['pickup_2026-07-27_cam3.mp4'],
+      ['1234_5678.mp4'], // digits, but no PAN
+    ])('accepts %p', (name) => {
+      expect(filenameCarriesSensitiveContent(name)).toBe(false);
     });
   });
 

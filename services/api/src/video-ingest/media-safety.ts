@@ -1,3 +1,8 @@
+import {
+  containsSensitiveValue,
+  isSensitiveKey,
+} from '../common/sensitive-keys';
+
 /**
  * Phase 10 upload-safety policy: controlled TEST videos only. A closed
  * allowlist of container types (extension + declared MIME + magic bytes),
@@ -86,6 +91,45 @@ export function isAllowedVideoUpload(
   const allowedMimes = ALLOWED_CONTAINERS.get(extension);
   return (
     allowedMimes !== undefined && allowedMimes.includes(mimeType.toLowerCase())
+  );
+}
+
+/**
+ * Filename-specific sensitive-content policy. The shared value screen
+ * recognizes PAN grouping by space/dash and `key=value` credential shapes,
+ * but filenames use OTHER separators ("4111_1111_1111_1111.mp4",
+ * "4111.1111.1111.1111.mp4", "password_hunter2.mp4"). Every accepted
+ * separator is therefore normalized away before screening:
+ *   1. the raw name and a digits-preserving variant (separators stripped)
+ *      run through the shared credential/PAN value screen, so a PAN split
+ *      by ANY separator collapses to a contiguous match;
+ *   2. each alphanumeric token is classified with the shared sensitive-KEY
+ *      list, so a credential-channel word (password, secret, token, cvv,
+ *      ...) in a filename is rejected outright — its neighboring token is
+ *      the secret and matches no value shape. Deliberate overbreadth for a
+ *      reject-on-write policy on operator-supplied TEST clips.
+ */
+export function filenameCarriesSensitiveContent(filename: string): boolean {
+  const separatorsStripped = filename.replace(/[^A-Za-z0-9]+/g, '');
+  const separatorsSpaced = filename.replace(/[^A-Za-z0-9]+/g, ' ').trim();
+  if (
+    [filename, separatorsStripped, separatorsSpaced].some(
+      containsSensitiveValue,
+    )
+  ) {
+    return true;
+  }
+  const tokens = filename
+    .split(/[^A-Za-z0-9]+/)
+    .filter((token) => token.length > 0);
+  // Single tokens ("password", "secret", "cvv") AND adjacent pairs joined
+  // ("api"+"key" → apikey, "client"+"secret" → clientsecret) — separator
+  // splitting must not launder a two-word credential channel.
+  return tokens.some(
+    (token, index) =>
+      isSensitiveKey(token) ||
+      (index + 1 < tokens.length &&
+        isSensitiveKey(token + tokens[index + 1])),
   );
 }
 

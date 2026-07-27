@@ -27,7 +27,11 @@ import { VideoCropsController } from './video-crops.controller';
   imports: [
     // Multipart uploads buffer in memory (no multer disk temp files with
     // uncontrolled names) and are size-capped at the transport layer; the
-    // service re-checks the same limit and all content rules.
+    // service re-checks the same limit and all content rules. EVERY parser
+    // dimension is bounded — not just the file: unbounded non-file fields
+    // or parts would otherwise exhaust the heap before DTO whitelisting
+    // runs. The upload carries one file plus four optional short id fields,
+    // so these caps are generous for the contract while denying abuse.
     MulterModule.registerAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => {
@@ -36,7 +40,17 @@ import { VideoCropsController } from './video-crops.controller';
           Number.isInteger(configured) && configured > 0
             ? configured
             : DEFAULT_MAX_UPLOAD_BYTES;
-        return { limits: { fileSize, files: 1 } };
+        return {
+          limits: {
+            fileSize,
+            files: 1,
+            fields: 8,
+            parts: 10,
+            fieldSize: 2048,
+            fieldNameSize: 128,
+            headerPairs: 100,
+          },
+        };
       },
     }),
     InferenceModule,
@@ -47,17 +61,25 @@ import { VideoCropsController } from './video-crops.controller';
     VideoAssetsService,
     VideoAssetsRepository,
     SimulatedVideoFrameExtractor,
-    { provide: VideoStoragePort, useClass: LocalVideoStorageAdapter },
+    LocalVideoStorageAdapter,
+    // The port stays provider-neutral (bytes + keys only); the optional
+    // system-binary extractor needs the CONCRETE local adapter for its
+    // path capability, so both tokens resolve to one instance.
+    { provide: VideoStoragePort, useExisting: LocalVideoStorageAdapter },
     {
       provide: VideoFrameExtractorPort,
-      inject: [ConfigService, SimulatedVideoFrameExtractor, VideoStoragePort],
+      inject: [
+        ConfigService,
+        SimulatedVideoFrameExtractor,
+        LocalVideoStorageAdapter,
+      ],
       useFactory: (
         config: ConfigService,
         simulated: SimulatedVideoFrameExtractor,
-        storage: VideoStoragePort,
+        localStorage: LocalVideoStorageAdapter,
       ) =>
         config.get<string>('VIDEO_FFMPEG_ENABLED')?.toLowerCase() === 'true'
-          ? new FfmpegVideoFrameExtractor(storage)
+          ? new FfmpegVideoFrameExtractor(localStorage)
           : simulated,
     },
   ],
