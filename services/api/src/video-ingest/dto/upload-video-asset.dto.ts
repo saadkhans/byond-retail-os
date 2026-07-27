@@ -1,5 +1,5 @@
-import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsString, MinLength } from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { IsString, Matches, MinLength } from 'class-validator';
 import { IsOptionalNonNull } from '../../common/validation';
 
 /**
@@ -10,6 +10,24 @@ import { IsOptionalNonNull } from '../../common/validation';
  * storage keys are server-generated.
  */
 export class UploadVideoAssetDto {
+  @ApiProperty({
+    description:
+      'REQUIRED operator attestation that this is a staged, controlled ' +
+      'TEST clip whose frames contain no payment-card or credential ' +
+      'content. Text screening cannot inspect pixels, and raw card data ' +
+      'must never reach storage — until CV-based frame screening ships, ' +
+      'storing is gated on this explicit, audited declaration. Must be ' +
+      'the literal string "true".',
+  })
+  @IsString()
+  @Matches(/^true$/, {
+    message:
+      'attestNoSensitiveContent must be "true": uploads are stored only ' +
+      'with an explicit attestation that the staged test clip contains no ' +
+      'payment-card or credential content in its frames',
+  })
+  attestNoSensitiveContent!: string;
+
   @ApiPropertyOptional({ description: 'Store (location) the clip was shot in.' })
   @IsOptionalNonNull()
   @IsString()

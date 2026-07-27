@@ -49,11 +49,25 @@ describe('media-safety', () => {
   describe('filenameCarriesSensitiveContent', () => {
     it.each([
       // PANs hidden behind filename separators the shared space/dash
-      // detector cannot see — normalized away before screening.
+      // detector cannot see — grouping-aware detection catches them.
       ['4111_1111_1111_1111.mp4'],
       ['4111.1111.1111.1111.mp4'],
       ['4111-1111-1111-1111.mp4'],
       ['4111 1111 1111 1111.mp4'],
+      // NONCANONICAL groupings: separator placement never launders a PAN.
+      ['41111111-11111111.mp4'],
+      ['4-111111111111111.mp4'],
+      ['41111_11111_111111.mp4'],
+      // Many-group shapes: digit pairs and single digits.
+      ['41-11-11-11-11-11-11-11.mp4'],
+      ['4_1_1_1_1_1_1_1_1_1_1_1_1_1_1_1.mp4'],
+      // Decoy digit groups around the card never launder it.
+      ['4111-1111-1111-1111-9.mp4'],
+      ['99-4111-1111-1111-1111.mp4'],
+      // ... not even behind a separator CHANGE.
+      ['4111-1111-1111-1111.5.mp4'],
+      // Contiguous.
+      ['4111111111111111.mp4'],
       // Credential-channel tokens: the neighboring token IS the secret.
       ['password_hunter2.mp4'],
       ['api_key_prod.mp4'],
@@ -66,6 +80,7 @@ describe('media-safety', () => {
       ['clip.mp4'],
       ['shelf_test-01.mov'],
       ['pickup_2026-07-27_cam3.mp4'],
+      ['shot_2026-07-27-11-33-47.mp4'], // ISO datetime — timestamp semantics
       ['1234_5678.mp4'], // digits, but no PAN
     ])('accepts %p', (name) => {
       expect(filenameCarriesSensitiveContent(name)).toBe(false);
@@ -107,6 +122,59 @@ describe('media-safety', () => {
         noise,
       ]);
       expect(bufferCarriesSensitiveText(payload)).toBe(true);
+    });
+
+    it('finds SHORT credential fragments (cvv=123) below the old run floor', () => {
+      // A 7-char run must still reach the credential screen — CVVs are
+      // explicitly classified and the run floor must not discard them.
+      for (const fragment of ['cvv=123', 'pin=9876', 'cvc=00']) {
+        const payload = Buffer.concat([
+          noise,
+          Buffer.alloc(2),
+          Buffer.from(fragment, 'ascii'),
+          Buffer.alloc(2),
+          noise,
+        ]);
+        expect(bufferCarriesSensitiveText(payload)).toBe(true);
+      }
+    });
+
+    it('finds noncanonically grouped PANs in metadata text', () => {
+      for (const pan of [
+        '41111111-11111111',
+        '4111111111111111',
+        '41111_11111_111111',
+        '41 11 11 11 11 11 11 11', // digit pairs, > 7 groups
+        '4111-1111-1111-1111-9', // trailing decoy digit group
+        '4111-1111-1111-1111.5', // decoy behind a separator change
+      ]) {
+        const payload = Buffer.concat([
+          noise,
+          Buffer.alloc(2),
+          Buffer.from(`ref ${pan} end`, 'ascii'),
+          Buffer.alloc(2),
+          noise,
+        ]);
+        expect(bufferCarriesSensitiveText(payload)).toBe(true);
+      }
+    });
+
+    it('accepts calendar timestamps and epoch-ms values (semantic exemption)', () => {
+      // Encoder/creation metadata carries 14-digit datetimes and 13-digit
+      // epoch milliseconds — Luhn-valid ones must NOT be treated as PANs.
+      for (const value of [
+        'modify_date 20260701003531',
+        'stamp 20260701_003531',
+        'creation 1753612345678',
+        'shoot 2026-07-27-11-33-47', // ISO datetime, consistent separator
+      ]) {
+        const payload = Buffer.concat([
+          Buffer.alloc(2),
+          Buffer.from(value, 'ascii'),
+          Buffer.alloc(2),
+        ]);
+        expect(bufferCarriesSensitiveText(payload)).toBe(false);
+      }
     });
 
     it.each([
@@ -188,6 +256,23 @@ describe('media-safety', () => {
       const be = Buffer.from('  password=hunter2  ', 'utf16le').swap16();
       const payload = Buffer.concat([noise, Buffer.alloc(2), be, noise]);
       expect(bufferCarriesSensitiveText(payload)).toBe(true);
+    });
+
+    it('finds SHORT UTF-16-encoded credential fragments (cvv=123)', () => {
+      // The 7-char CVV fragment must survive the printable-run floor in the
+      // UTF-16 views too, not only in the latin1 view.
+      const le = Buffer.from('cvv=123', 'utf16le');
+      const lePayload = Buffer.concat([
+        noise,
+        Buffer.alloc(2),
+        le,
+        Buffer.alloc(2),
+        noise,
+      ]);
+      expect(bufferCarriesSensitiveText(lePayload)).toBe(true);
+      const be = Buffer.from('  cvv=123  ', 'utf16le').swap16();
+      const bePayload = Buffer.concat([noise, Buffer.alloc(2), be, noise]);
+      expect(bufferCarriesSensitiveText(bePayload)).toBe(true);
     });
   });
 

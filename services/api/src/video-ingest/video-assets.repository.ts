@@ -131,16 +131,43 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       // device on the unit, session on the unit and store), EXTENDED so
       // omitted intermediates cannot launder a mismatch: the device's unit
       // and store are resolved and compared even when unitId/locationId
-      // were not supplied. Composite same-tenant FKs only pin each
-      // reference's TENANT; without these checks an asset could bind a
-      // unit from another store and its crops would forever fail at
-      // inference-job creation.
+      // were not supplied, and the DERIVED bindings are PERSISTED (a
+      // device-only upload lands with its unit and store filled in, so
+      // downstream inference-job → VisionEvent conversion — which requires
+      // both — can complete). Composite same-tenant FKs only pin each
+      // reference's TENANT.
       //
-      // Serialization: the SAME advisory locks (unit first, then device —
-      // lock order matters, mirroring enqueue/checkout) that
+      // Serialization: the SAME advisory locks (unit FIRST, then device —
+      // canonical order, mirroring enqueue/checkout) that
       // UnitsRepository/DevicesRepository mutations take, held through the
-      // insert, so a concurrent reassignment cannot land between these
-      // reads and the asset row.
+      // insert. When the unit is only DERIVABLE from the device, a
+      // preliminary UNLOCKED device read learns the unit id so the locks
+      // can still be taken in canonical order; the locked re-read then
+      // verifies the device did not move in between (controlled rejection,
+      // caller retries).
+      let lockUnitId = data.unitId ?? null;
+      if (data.deviceId && !lockUnitId) {
+        const preliminary = await tx.device.findFirst({
+          where: { id: data.deviceId, tenantId: scopedTenantId },
+          select: { unitId: true },
+        });
+        if (!preliminary) {
+          return 'device-not-found' as const;
+        }
+        lockUnitId = preliminary.unitId;
+      }
+      if (lockUnitId) {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${unitAdvisoryLockKey(
+          scopedTenantId,
+          lockUnitId,
+        )}))`;
+      }
+      if (data.deviceId) {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceAdvisoryLockKey(
+          scopedTenantId,
+          data.deviceId,
+        )}))`;
+      }
       if (data.locationId) {
         const location = await tx.location.findFirst({
           where: { id: data.locationId, tenantId: scopedTenantId },
@@ -152,10 +179,6 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       }
       let unitLocationId: string | null = null;
       if (data.unitId) {
-        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${unitAdvisoryLockKey(
-          scopedTenantId,
-          data.unitId,
-        )}))`;
         const unit = await tx.retailUnit.findFirst({
           where: { id: data.unitId, tenantId: scopedTenantId },
           select: { id: true, locationId: true },
@@ -169,15 +192,11 @@ export class VideoAssetsRepository extends TenantScopedRepository {
         unitLocationId = unit.locationId;
       }
       // Effective bindings accumulate as references resolve; every later
-      // reference must agree with them.
+      // reference must agree with them, and they are what gets PERSISTED.
       let effectiveUnitId: string | null = data.unitId ?? null;
       let effectiveLocationId: string | null =
         data.locationId ?? unitLocationId;
       if (data.deviceId) {
-        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceAdvisoryLockKey(
-          scopedTenantId,
-          data.deviceId,
-        )}))`;
         const device = await tx.device.findFirst({
           where: { id: data.deviceId, tenantId: scopedTenantId },
           select: {
@@ -189,7 +208,9 @@ export class VideoAssetsRepository extends TenantScopedRepository {
         if (!device) {
           return 'device-not-found' as const;
         }
-        if (effectiveUnitId && device.unitId !== effectiveUnitId) {
+        // Covers both the explicit-unit mismatch AND a device that moved
+        // between the preliminary read and the locked re-read.
+        if (lockUnitId && device.unitId !== lockUnitId) {
           return 'device-unit-mismatch' as const;
         }
         if (
@@ -215,9 +236,17 @@ export class VideoAssetsRepository extends TenantScopedRepository {
         if (effectiveLocationId && session.locationId !== effectiveLocationId) {
           return 'session-location-mismatch' as const;
         }
+        // A session-only upload still yields a complete persisted context.
+        effectiveUnitId = effectiveUnitId ?? session.unitId;
+        effectiveLocationId = effectiveLocationId ?? session.locationId;
       }
       const created = await tx.videoAsset.create({
-        data: { ...data, tenantId: scopedTenantId },
+        data: {
+          ...data,
+          unitId: effectiveUnitId ?? undefined,
+          locationId: effectiveLocationId ?? undefined,
+          tenantId: scopedTenantId,
+        },
         select: VIDEO_ASSET_SELECT,
       });
       await this.auditLog.record(buildAuditEntry(created), tx);

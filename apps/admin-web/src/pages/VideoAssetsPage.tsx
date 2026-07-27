@@ -66,6 +66,7 @@ export function VideoAssetsPage() {
   const [unitId, setUnitId] = useState('');
   const [deviceId, setDeviceId] = useState('');
   const [sessionId, setSessionId] = useState('');
+  const [attested, setAttested] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
 
@@ -85,11 +86,21 @@ export function VideoAssetsPage() {
       setUploadError('Choose a test video file first.');
       return;
     }
+    if (!attested) {
+      setUploadError(
+        'Confirm the attestation: the staged test clip must contain no ' +
+          'payment-card or credential content in its frames.',
+      );
+      return;
+    }
     setUploading(true);
     setUploadError(null);
     try {
       const formData = new FormData();
       formData.append('file', file);
+      // Required, audited operator attestation — the API refuses to store
+      // without it (text screening cannot inspect pixels).
+      formData.append('attestNoSensitiveContent', 'true');
       if (locationId.trim()) {
         formData.append('locationId', locationId.trim());
       }
@@ -148,7 +159,25 @@ export function VideoAssetsPage() {
           value={sessionId}
           onChange={(e) => setSessionId(e.target.value)}
         />
-        <button className="primary" type="submit" disabled={uploading}>
+        <label
+          style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}
+          title={
+            'Required attestation: the API refuses to store a clip without ' +
+            'it. Text screening cannot inspect pixels.'
+          }
+        >
+          <input
+            type="checkbox"
+            checked={attested}
+            onChange={(e) => setAttested(e.target.checked)}
+          />
+          Staged test clip — no card/credential content in frames
+        </label>
+        <button
+          className="primary"
+          type="submit"
+          disabled={uploading || !attested}
+        >
           {uploading ? 'Uploading…' : 'Upload test video'}
         </button>
       </form>

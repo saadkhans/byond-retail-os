@@ -44,6 +44,7 @@ import {
 } from './extraction/video-frame-extractor.port';
 import {
   bufferCarriesSensitiveText,
+  carriesLikelyPan,
   fileExtensionOf,
   filenameCarriesSensitiveContent,
   isAllowedVideoUpload,
@@ -115,6 +116,19 @@ function assertOpaqueKey(field: string, value: string | undefined): void {
   }
 }
 
+/**
+ * An EXISTENCE-BLIND audit entry (recorded before any lookup resolved the
+ * id) persists attacker-controlled text as its entityId — a PAN or
+ * credential smuggled as a URL path segment must be redacted, never stored
+ * verbatim (AGENTS.md payments invariant). Resolved ids are server data
+ * and stay readable.
+ */
+function safeAuditEntityId(id: string): string {
+  return containsSensitiveValue(id) || carriesLikelyPan(id)
+    ? '[REDACTED]'
+    : id;
+}
+
 /** Crop reason → default Phase 9 job type (closed 1:1 where one exists). */
 const REASON_TO_JOB_TYPE: Partial<Record<VideoCropReason, InferenceJobType>> = {
   [VideoCropReason.SHELF_AUDIT]: InferenceJobType.SHELF_AUDIT,
@@ -165,6 +179,18 @@ export class VideoAssetsService {
   ): Promise<VideoAssetView> {
     if (!file || !file.buffer || file.size === 0) {
       throw new BadRequestException('A video file part named "file" is required');
+    }
+    // Defense-in-depth re-check of the DTO-validated attestation: text
+    // screening cannot inspect PIXELS, so nothing is stored without the
+    // operator's explicit, audited declaration that the staged test clip's
+    // frames carry no payment-card or credential content (CV-based frame
+    // screening replaces this gate in a later phase).
+    if (dto.attestNoSensitiveContent !== 'true') {
+      throw new BadRequestException(
+        'attestNoSensitiveContent must be "true": uploads are stored only ' +
+          'with an explicit attestation that the staged test clip contains ' +
+          'no payment-card or credential content in its frames',
+      );
     }
     assertPlainId('locationId', dto.locationId);
     assertPlainId('unitId', dto.unitId);
@@ -258,14 +284,16 @@ export class VideoAssetsService {
             entityType: 'VideoAsset',
             entityId: asset.id,
             after: asset,
-            reason: 'Test video uploaded',
+            // The frame-content attestation is part of the audited record:
+            // storing happened only under this explicit declaration.
+            reason:
+              'Test video uploaded (operator attested: no payment-card or ' +
+              'credential content in frames)',
           }),
       );
     } catch (error) {
       // The DB row failed — never leave an orphaned file behind.
-      await this.storage
-        .deletePrefix(storageKey.slice(0, storageKey.lastIndexOf('/')))
-        .catch(() => undefined);
+      await this.cleanupUploadDir(storageKey);
       if (prismaErrorCode(error) === 'P2003') {
         throw new BadRequestException(
           'A referenced store, unit, device, or session does not exist in this tenant',
@@ -276,12 +304,35 @@ export class VideoAssetsService {
     if (typeof result === 'string') {
       // Hierarchy rejection (same vocabulary as inference enqueue) — the
       // stored file must not outlive the rejected row.
-      await this.storage
-        .deletePrefix(storageKey.slice(0, storageKey.lastIndexOf('/')))
-        .catch(() => undefined);
+      await this.cleanupUploadDir(storageKey);
       throw new BadRequestException(this.referenceRejectionMessage(result, dto));
     }
     return result;
+  }
+
+  /**
+   * Cleanup of a stored upload whose row never landed. A cleanup failure is
+   * NEVER swallowed: no row references the generated key, so an ignored
+   * failure would strand untracked media on disk with nothing able to find
+   * it again. One retry for transient errors, then a controlled 503 that
+   * names the condition (media left behind under the local storage root)
+   * so the operator acts on it.
+   */
+  private async cleanupUploadDir(storageKey: string): Promise<void> {
+    const dir = storageKey.slice(0, storageKey.lastIndexOf('/'));
+    try {
+      await this.storage.deletePrefix(dir);
+    } catch {
+      try {
+        await this.storage.deletePrefix(dir);
+      } catch {
+        throw new ServiceUnavailableException(
+          'The upload could not be recorded AND its media could not be ' +
+            'cleaned up; local video storage needs attention before ' +
+            'retrying',
+        );
+      }
+    }
   }
 
   private referenceRejectionMessage(
@@ -653,7 +704,9 @@ export class VideoAssetsService {
         this.auditEntry(tenantId, actor, {
           action: AuditAction.ACCESS_DENIED,
           entityType: 'VideoArtifact',
-          entityId: artifactId,
+          // Existence-blind: the id was never resolved, so a sensitive
+          // value in the path segment is redacted before persistence.
+          entityId: safeAuditEntityId(artifactId),
           reason:
             'Inference-job creation denied: module "inference" is not ' +
             'enabled for this tenant',
@@ -735,7 +788,7 @@ export class VideoAssetsService {
     // REPLAY that job. The COMPLETE server-derived descriptor AND the job's
     // source/context bindings must match before the one-shot link is
     // stamped; lineage integrity beats availability here.
-    if (!this.jobMatchesCrop(job, expectedDescriptor, asset)) {
+    if (!this.jobMatchesCrop(job, expectedDescriptor, asset, jobType)) {
       throw new ConflictException(
         'The idempotency key for this crop is already used by an unrelated ' +
           'inference job; the crop was not linked',
@@ -842,7 +895,15 @@ export class VideoAssetsService {
     job: InferenceJobDetail,
     expectedDescriptor: Record<string, unknown>,
     asset: VideoAssetView,
+    expectedJobType: InferenceJobType,
   ): boolean {
+    // A preclaimed job with the right descriptor but a DIFFERENT job type
+    // would permanently link the crop to the wrong operation (an OCR crop
+    // to product recognition). Retries must therefore request the same
+    // jobType the original creation resolved to.
+    if (job.jobType !== expectedJobType) {
+      return false;
+    }
     const descriptor = job.inputDescriptor as Record<string, unknown> | null;
     if (!descriptor) {
       return false;

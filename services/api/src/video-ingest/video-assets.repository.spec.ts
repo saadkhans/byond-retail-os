@@ -230,6 +230,93 @@ describe('VideoAssetsRepository.createAsset hierarchy validation', () => {
     );
     // Unit lock first, then device lock — same order as enqueue/checkout.
     expect(tx.$queryRaw).toHaveBeenCalledTimes(2);
+    // $queryRaw is a tagged template: interpolated values follow the
+    // strings array, so calls[n][1] is the advisory-lock key.
+    expect(tx.$queryRaw.mock.calls[0][1]).toBe(`retail-unit:${TENANT}:unit-1`);
+    expect(tx.$queryRaw.mock.calls[1][1]).toBe(`device:${TENANT}:device-1`);
+  });
+
+  it('PERSISTS the derived unit/store for a device-only upload (locks both)', async () => {
+    // Validation deriving the hierarchy but inserting nulls would strand
+    // the asset: inference-job → VisionEvent conversion requires store +
+    // unit. The derived bindings must land in the row, and the DERIVED
+    // unit must be locked (canonical unit-then-device order via the
+    // preliminary device read).
+    const tx = makeTx();
+    const { repository } = makeRepository(tx);
+    await repository.createAsset(
+      TENANT,
+      { ...baseAssetData, deviceId: 'device-1' },
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+    );
+    const [{ data }] = tx.videoAsset.create.mock.calls[0] as unknown as [
+      { data: { unitId: string; locationId: string } },
+    ];
+    expect(data.unitId).toBe('unit-1');
+    expect(data.locationId).toBe('loc-1');
+    // Preliminary device read + locked re-read, plus BOTH advisory locks —
+    // DERIVED unit first, then device (canonical order).
+    expect(tx.device.findFirst).toHaveBeenCalledTimes(2);
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(2);
+    expect(tx.$queryRaw.mock.calls[0][1]).toBe(`retail-unit:${TENANT}:unit-1`);
+    expect(tx.$queryRaw.mock.calls[1][1]).toBe(`device:${TENANT}:device-1`);
+  });
+
+  it('locks the DERIVED unit and persists it for a device+store upload without unitId', async () => {
+    // Finding 2 flow: deviceId + locationId, no unitId. The device's unit
+    // must be advisory-locked BEFORE its locationId is read/compared, so a
+    // concurrent UnitsRepository.update() (which moves a unit's store under
+    // the same unit lock) cannot re-home the unit between the comparison
+    // and the insert — and the derived unitId must land on the row.
+    const tx = makeTx();
+    const { repository } = makeRepository(tx);
+    await repository.createAsset(
+      TENANT,
+      { ...baseAssetData, locationId: 'loc-1', deviceId: 'device-1' },
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+    );
+    // The unit lock precedes the LOCKED device re-read that reads
+    // unit.locationId (the preliminary read only learns the unit id).
+    expect(tx.$queryRaw.mock.calls[0][1]).toBe(`retail-unit:${TENANT}:unit-1`);
+    expect(tx.$queryRaw.mock.calls[1][1]).toBe(`device:${TENANT}:device-1`);
+    const [{ data }] = tx.videoAsset.create.mock.calls[0] as unknown as [
+      { data: { unitId: string; locationId: string } },
+    ];
+    expect(data.unitId).toBe('unit-1');
+    expect(data.locationId).toBe('loc-1');
+  });
+
+  it('rejects a device that moved units between the preliminary read and the locks', async () => {
+    const tx = makeTx();
+    tx.device.findFirst
+      .mockResolvedValueOnce({ unitId: 'unit-1' }) // preliminary
+      .mockResolvedValueOnce({
+        id: 'device-1',
+        unitId: 'unit-MOVED',
+        unit: { locationId: 'loc-9' },
+      }); // locked re-read
+    const { repository } = makeRepository(tx);
+    const result = await repository.createAsset(
+      TENANT,
+      { ...baseAssetData, deviceId: 'device-1' },
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+    );
+    expect(result).toBe('device-unit-mismatch');
+  });
+
+  it('PERSISTS the session-derived unit/store for a session-only upload', async () => {
+    const tx = makeTx();
+    const { repository } = makeRepository(tx);
+    await repository.createAsset(
+      TENANT,
+      { ...baseAssetData, sessionId: 'session-1' },
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+    );
+    const [{ data }] = tx.videoAsset.create.mock.calls[0] as unknown as [
+      { data: { unitId: string; locationId: string } },
+    ];
+    expect(data.unitId).toBe('unit-1');
+    expect(data.locationId).toBe('loc-1');
   });
 
   it('creates the row and audits when the hierarchy is consistent', async () => {

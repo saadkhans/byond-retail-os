@@ -4,6 +4,7 @@ import {
   ForbiddenException,
   NotFoundException,
   PayloadTooLargeException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -22,6 +23,9 @@ import {
 } from './video-assets.service';
 
 const TENANT = 'tenant-1';
+
+// Required upload attestation (frame-content gate) — see UploadVideoAssetDto.
+const ATTEST = { attestNoSensitiveContent: 'true' };
 
 function mp4Buffer(): Buffer {
   return Buffer.concat([
@@ -258,7 +262,7 @@ function buildService(overrides: {
 describe('VideoAssetsService.upload', () => {
   it('stores the file under a server-generated key and records the checksum', async () => {
     const { service, repository, storage } = buildService();
-    await service.upload(TENANT, uploadFile(), {}, { id: 'u1', email: 'u@x.io' });
+    await service.upload(TENANT, uploadFile(), { ...ATTEST }, { id: 'u1', email: 'u@x.io' });
 
     expect(storage.put).toHaveBeenCalledTimes(1);
     const [key] = storage.put.mock.calls[0] as unknown as [string, Buffer];
@@ -275,9 +279,28 @@ describe('VideoAssetsService.upload', () => {
 
   it('rejects a missing file part', async () => {
     const { service } = buildService();
-    await expect(service.upload(TENANT, undefined, {})).rejects.toBeInstanceOf(
+    await expect(service.upload(TENANT, undefined, { ...ATTEST })).rejects.toBeInstanceOf(
       BadRequestException,
     );
+  });
+
+  it('refuses to store WITHOUT the frame-content attestation', async () => {
+    // Text screening cannot inspect pixels: nothing reaches storage unless
+    // the operator explicitly attested the staged clip's frames carry no
+    // payment-card/credential content.
+    const { service, storage, repository } = buildService();
+    for (const dto of [
+      { attestNoSensitiveContent: '' },
+      { attestNoSensitiveContent: 'false' },
+      { attestNoSensitiveContent: 'TRUE ' },
+      {} as { attestNoSensitiveContent: string },
+    ]) {
+      await expect(
+        service.upload(TENANT, uploadFile(), dto),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
+    expect(storage.put).not.toHaveBeenCalled();
+    expect(repository.createAsset).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -288,14 +311,14 @@ describe('VideoAssetsService.upload', () => {
   ])('rejects traversal-shaped filename %p', async (originalname) => {
     const { service, storage } = buildService();
     await expect(
-      service.upload(TENANT, uploadFile({ originalname }), {}),
+      service.upload(TENANT, uploadFile({ originalname }), { ...ATTEST }),
     ).rejects.toBeInstanceOf(BadRequestException);
     expect(storage.put).not.toHaveBeenCalled();
   });
 
   it('sanitizes awkward-but-safe filenames for display', async () => {
     const { service, repository } = buildService();
-    await service.upload(TENANT, uploadFile({ originalname: 'my clip (1).mp4' }), {});
+    await service.upload(TENANT, uploadFile({ originalname: 'my clip (1).mp4' }), { ...ATTEST });
     const [, data] = repository.createAsset.mock.calls[0] as unknown as [string, { originalFilename: string }];
     expect(data.originalFilename).toBe('my_clip__1_.mp4');
   });
@@ -308,7 +331,7 @@ describe('VideoAssetsService.upload', () => {
   ])('rejects unsupported upload %p (%p)', async (originalname, mimetype) => {
     const { service, storage } = buildService();
     await expect(
-      service.upload(TENANT, uploadFile({ originalname, mimetype }), {}),
+      service.upload(TENANT, uploadFile({ originalname, mimetype }), { ...ATTEST }),
     ).rejects.toBeInstanceOf(BadRequestException);
     expect(storage.put).not.toHaveBeenCalled();
   });
@@ -322,7 +345,7 @@ describe('VideoAssetsService.upload', () => {
     ]) {
       const buffer = Buffer.concat([mp4Buffer(), Buffer.from(embedded, 'ascii')]);
       await expect(
-        service.upload(TENANT, uploadFile({ buffer, size: buffer.length }), {}),
+        service.upload(TENANT, uploadFile({ buffer, size: buffer.length }), { ...ATTEST }),
       ).rejects.toBeInstanceOf(BadRequestException);
     }
     expect(storage.put).not.toHaveBeenCalled();
@@ -332,7 +355,7 @@ describe('VideoAssetsService.upload', () => {
     const { service, storage } = buildService();
     const script = Buffer.from('#!/bin/sh\necho pwned\n'.padEnd(64, ' '), 'ascii');
     await expect(
-      service.upload(TENANT, uploadFile({ buffer: script, size: script.length }), {}),
+      service.upload(TENANT, uploadFile({ buffer: script, size: script.length }), { ...ATTEST }),
     ).rejects.toBeInstanceOf(BadRequestException);
     expect(storage.put).not.toHaveBeenCalled();
   });
@@ -341,7 +364,7 @@ describe('VideoAssetsService.upload', () => {
     const { service, storage } = buildService({ maxUploadBytes: '64' });
     const big = Buffer.concat([mp4Buffer(), Buffer.alloc(128)]);
     await expect(
-      service.upload(TENANT, uploadFile({ buffer: big, size: big.length }), {}),
+      service.upload(TENANT, uploadFile({ buffer: big, size: big.length }), { ...ATTEST }),
     ).rejects.toBeInstanceOf(PayloadTooLargeException);
     expect(storage.put).not.toHaveBeenCalled();
   });
@@ -358,9 +381,54 @@ describe('VideoAssetsService.upload', () => {
       'password_hunter2.mp4',
     ]) {
       await expect(
-        service.upload(TENANT, uploadFile({ originalname }), {}),
+        service.upload(TENANT, uploadFile({ originalname }), { ...ATTEST }),
       ).rejects.toBeInstanceOf(BadRequestException);
     }
+  });
+
+  it('retries a transient cleanup failure and still surfaces the ORIGINAL error', async () => {
+    // File stored, row failed (broken FK), first deletePrefix throws, the
+    // retry succeeds: the caller sees the controlled 400 for the broken
+    // reference — the cleanup failure was transient and is NOT escalated.
+    const deletePrefix = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('EBUSY'))
+      .mockResolvedValueOnce(undefined);
+    const { service } = buildService({
+      storage: { deletePrefix },
+      repository: {
+        createAsset: jest.fn(async () => {
+          throw Object.assign(new Error('fk'), { code: 'P2003' });
+        }),
+      },
+    });
+    await expect(
+      service.upload(TENANT, uploadFile(), { ...ATTEST, unitId: 'missing-unit' }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(deletePrefix).toHaveBeenCalledTimes(2);
+  });
+
+  it('escalates a PERSISTENT cleanup failure as 503 instead of discarding it', async () => {
+    // Row creation failed AND both cleanup attempts failed: no asset row
+    // references the generated key, so silently ignoring the failure would
+    // strand untracked media on disk. The controlled 503 names the
+    // condition so the operator acts on it.
+    const deletePrefix = jest.fn(async () => {
+      throw new Error('EACCES');
+    });
+    const { service } = buildService({
+      storage: { deletePrefix },
+      repository: {
+        createAsset: jest.fn(async () => {
+          throw Object.assign(new Error('fk'), { code: 'P2003' });
+        }),
+      },
+    });
+    await expect(
+      service.upload(TENANT, uploadFile(), { ...ATTEST }),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    // One retry, then escalation — never an unbounded loop.
+    expect(deletePrefix).toHaveBeenCalledTimes(2);
   });
 
   it('rejects context references that do not form one consistent hierarchy', async () => {
@@ -373,6 +441,7 @@ describe('VideoAssetsService.upload', () => {
     });
     await expect(
       service.upload(TENANT, uploadFile(), {
+        ...ATTEST,
         locationId: 'loc-1',
         unitId: 'unit-from-other-store',
       }),
@@ -390,7 +459,7 @@ describe('VideoAssetsService.upload', () => {
       },
     });
     await expect(
-      service.upload(TENANT, uploadFile(), { unitId: 'other-tenant-unit' }),
+      service.upload(TENANT, uploadFile(), { ...ATTEST, unitId: 'other-tenant-unit' }),
     ).rejects.toBeInstanceOf(BadRequestException);
     expect(storage.deletePrefix).toHaveBeenCalledTimes(1);
   });
@@ -776,6 +845,51 @@ describe('VideoAssetsService.createInferenceJobFromCrop', () => {
     expect(entry.action).toBe('ACCESS_DENIED');
     expect(entry.entityType).toBe('VideoArtifact');
     expect(entry.entityId).toBe('artifact-1');
+  });
+
+  it('REDACTS a sensitive path-segment id in the existence-blind denial audit', async () => {
+    // /video-crops/<PAN>/inference-job with the module disabled records an
+    // audit entry BEFORE any lookup — the attacker-controlled id must not
+    // land verbatim (AGENTS.md payments invariant).
+    const { service, auditLog } = buildService({
+      modules: { isEnabledForTenant: jest.fn(async () => false) },
+    });
+    const pan = ['4111', '1111', '1111', '1111'].join('');
+    await expect(
+      service.createInferenceJobFromCrop(TENANT, pan, {}),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    const [entry] = auditLog.record.mock.calls[0] as unknown as [
+      { entityId: string },
+    ];
+    expect(entry.entityId).toBe('[REDACTED]');
+  });
+
+  it('never links a replayed job whose jobType differs from the request', async () => {
+    // A preclaimed job with the right descriptor/context but a DIFFERENT
+    // jobType would bind the crop to the wrong operation.
+    const { service, repository } = buildService({
+      inference: {
+        create: jest.fn(async (_t: string, dto: { inputDescriptor: unknown; sourceId?: string }) => ({
+          id: 'job-1',
+          jobType: InferenceJobType.PRODUCT_RECOGNITION, // request resolves SHELF_AUDIT below
+          inputDescriptor: dto.inputDescriptor,
+          sourceId: dto.sourceId ?? null,
+          locationId: null,
+          unitId: null,
+          deviceId: null,
+          sessionId: null,
+        })),
+      },
+      repository: {
+        findArtifactById: jest.fn(async () =>
+          artifactRow({ reason: VideoCropReason.SHELF_AUDIT }),
+        ),
+      },
+    });
+    await expect(
+      service.createInferenceJobFromCrop(TENANT, 'artifact-1', {}),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(repository.linkArtifactToInferenceJob).not.toHaveBeenCalled();
   });
 
   it('never links a replayed job that does not reference this crop', async () => {

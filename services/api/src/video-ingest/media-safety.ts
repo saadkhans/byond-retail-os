@@ -97,51 +97,125 @@ export function isAllowedVideoUpload(
 }
 
 /**
- * PAN detection tuned for REAL-WORLD text (filenames, container metadata):
- * a card number appears either as a contiguous 13-19 digit run or as digit
- * GROUPS in a KNOWN card grouping (4-4-4-4, 4-6-5, ...) joined by ONE
- * consistent separator ("4111_1111_1111_1111", "4111.1111.1111.1111").
- * Deliberately NOT a strip-all-separators join and NOT an any-separator
- * digit chain: those fabricate Luhn-valid runs from timestamped camera
- * filenames (VID_20260701_003531 → 10% Luhn hit rate) and from ISO 6709
- * GPS strings in phone-video metadata (-26.2050-67.9749+14.431/) —
- * deterministically rejecting ~1 in 10 legitimate real test clips. Date/
- * time groupings (8-6, 8-9) and coordinate shapes (mixed separators,
- * 2/3-digit groups) never match a card grouping, while every standard PAN
- * grouping still Luhn-tests.
+ * PAN detection tuned for REAL-WORLD text (filenames, container metadata).
+ * COVERAGE: every 13-19 digit sequence that is contiguous OR split by ONE
+ * consistent separator — whatever the grouping (4-4-4-4, 8-8, 4-6-5, an
+ * arbitrary split like 41111111-11111111, digit pairs, even single digits)
+ * — is digit-joined and Luhn-tested. Within a separated chain EVERY window
+ * of consecutive groups whose joined digits are PAN-length is tested, so
+ * decoy digit groups before/after a card (4111-1111-1111-1111-9) never
+ * launder it either. Separator placement never launders raw card data.
+ * PRECISION: the two digit shapes that saturate real video uploads are
+ * exempted SEMANTICALLY, not by grouping-shape allowlists:
+ *   - calendar timestamps (VID_20260701_003531, modify dates, 20260701003531
+ *     contiguous) — a valid YYYYMMDD[HHMMSS[mmm]] reading is a timestamp,
+ *     not a card;
+ *   - epoch milliseconds (13-digit 20xx-era values in encoder metadata).
+ * Mixed-separator chains (ISO 6709 GPS: -26.2050-67.9749+14.431/) break at
+ * every separator CHANGE into short consistent sub-runs that never reach
+ * 13 digits. This keeps the documented ~10% Luhn false-positive rejection
+ * of real camera clips fixed while closing the noncanonical-grouping gap.
  */
 const CONTIGUOUS_PAN = /(?<!\d)\d{13,19}(?!\d)/g;
-const GROUPED_PAN = /(?<!\d)\d{1,6}(?:([^0-9A-Za-z])\d{1,6}){2,5}(?!\d)/g;
-const PAN_GROUP_SHAPES = new Set([
-  '4,4,4,4', // 16 — Visa/MC/Discover
-  '4,4,4,1', // 13 — legacy Visa grouping variant
-  '4,3,3,3', // 13 — legacy Visa
-  '4,6,4', // 14 — Diners
-  '4,6,5', // 15 — Amex
-  '4,4,4,4,1', // 17
-  '4,4,4,4,2', // 18
-  '4,4,4,4,3', // 19
-]);
+// Up to 26 separator-joined digit groups: covers a 19-digit PAN split into
+// single digits (19 groups) with margin for decoy groups around it.
+const GROUPED_PAN = /(?<!\d)\d{1,19}(?:([^0-9A-Za-z])\d{1,19}){1,25}(?!\d)/g;
+
+/** YYYYMMDD[HHMMSS[mmm]] with real calendar/clock semantics (13-17 digits). */
+function isPlausibleTimestampDigits(digits: string): boolean {
+  if (digits.length < 13 || digits.length > 17) {
+    return false;
+  }
+  // 13-digit epoch milliseconds: encoder/creation metadata for the
+  // 2001-2099 era (0.98e12 .. 4.1e12).
+  if (digits.length === 13) {
+    const epochMs = Number(digits);
+    if (epochMs >= 978_307_200_000 && epochMs <= 4_102_444_800_000) {
+      return true;
+    }
+  }
+  if (digits.length < 14) {
+    return false;
+  }
+  const year = Number(digits.slice(0, 4));
+  const month = Number(digits.slice(4, 6));
+  const day = Number(digits.slice(6, 8));
+  const hour = Number(digits.slice(8, 10));
+  const minute = Number(digits.slice(10, 12));
+  const second = Number(digits.slice(12, 14));
+  return (
+    year >= 1970 &&
+    year <= 2099 &&
+    month >= 1 &&
+    month <= 12 &&
+    day >= 1 &&
+    day <= 31 &&
+    hour < 24 &&
+    minute < 60 &&
+    second < 60
+  );
+}
+
+function isLuhnValidPanDigits(digits: string): boolean {
+  return (
+    digits.length >= 13 &&
+    digits.length <= 19 &&
+    !isPlausibleTimestampDigits(digits) &&
+    containsPaymentCardValue(digits)
+  );
+}
 
 export function carriesLikelyPan(text: string): boolean {
   for (const candidate of text.match(CONTIGUOUS_PAN) ?? []) {
-    if (containsPaymentCardValue(candidate)) {
+    if (isLuhnValidPanDigits(candidate)) {
       return true;
     }
   }
   for (const candidate of text.match(GROUPED_PAN) ?? []) {
-    const separators = new Set(candidate.match(/[^0-9]/g) ?? []);
-    if (separators.size !== 1) {
-      continue; // mixed separators — coordinates/prose, never a card
+    // Split into digit groups and the single-char separators between them:
+    // parts alternate group, separator, group, ... (regex guarantees the
+    // candidate starts and ends with a digit).
+    const parts = candidate.split(/([^0-9])/);
+    const groups: string[] = [];
+    const seps: string[] = [];
+    for (let index = 0; index < parts.length; index += 1) {
+      (index % 2 === 0 ? groups : seps).push(parts[index]);
     }
-    const groups = candidate
-      .split(/[^0-9]/)
-      .filter((group) => group.length > 0);
-    if (!PAN_GROUP_SHAPES.has(groups.map((group) => group.length).join(','))) {
-      continue; // date/time/coordinate grouping, not a card grouping
+    // Only groups joined by ONE consistent separator form a card candidate;
+    // a separator CHANGE breaks the chain (ISO 6709 GPS coordinates mix
+    // '.', '-', '+' and decompose into short sub-runs that never reach 13
+    // digits). Each maximal consistent run is then window-scanned, so a
+    // dashed PAN survives a dotted decoy group appended to the chain.
+    let runStart = 0;
+    for (let index = 1; index <= seps.length; index += 1) {
+      if (index === seps.length || seps[index] !== seps[index - 1]) {
+        if (groupWindowsCarryPan(groups.slice(runStart, index + 1))) {
+          return true;
+        }
+        runStart = index;
+      }
     }
-    if (containsPaymentCardValue(groups.join(''))) {
-      return true;
+  }
+  return false;
+}
+
+/**
+ * Luhn-tests EVERY window of consecutive digit groups whose joined digits
+ * are PAN-length (13-19): a card padded with decoy digit groups, or split
+ * into many small groups, must not hide behind the full join being
+ * over-length or Luhn-invalid. Timestamp semantics apply per window.
+ */
+function groupWindowsCarryPan(groups: readonly string[]): boolean {
+  for (let start = 0; start < groups.length; start += 1) {
+    let digits = '';
+    for (let end = start; end < groups.length; end += 1) {
+      digits += groups[end];
+      if (digits.length > 19) {
+        break;
+      }
+      if (digits.length >= 13 && isLuhnValidPanDigits(digits)) {
+        return true;
+      }
     }
   }
   return false;
@@ -192,9 +266,12 @@ export function filenameCarriesSensitiveContent(filename: string): boolean {
 const PAYLOAD_SCAN_CHUNK_BYTES = 1024 * 1024;
 const PAYLOAD_SCAN_OVERLAP_BYTES = 256;
 // Printable ASCII runs of at least this length are treated as embedded
-// text; shorter runs are overwhelmingly codec noise.
-const MIN_PRINTABLE_RUN = 8;
-const PRINTABLE_RUN = /[\x20-\x7e]{8,}/g;
+// text; shorter runs are overwhelmingly codec noise. The floor is FIVE, not
+// eight: the shortest credential fragment the shared screen classifies is
+// `cvv=1`/`pin=1` (5 chars) — a higher floor would discard `cvv=123` before
+// containsCredentialValue ever saw it.
+const MIN_PRINTABLE_RUN = 5;
+const PRINTABLE_RUN = /[\x20-\x7e]{5,}/g;
 
 /**
  * Payload-level sensitive-text screen: container METADATA (title/comment
