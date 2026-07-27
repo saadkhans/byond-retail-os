@@ -89,6 +89,32 @@ class EnvironmentVariables {
   @IsOptional()
   @IsEnum(NodeEnv)
   NODE_ENV?: NodeEnv;
+
+  // Phase 10 — local/dev video storage ONLY. The root is a server-side
+  // directory (relative paths resolve against the API working directory);
+  // uploaded test videos and extracted frame/crop artifacts live under it
+  // behind server-generated keys. It is never exposed through the API and
+  // never accepts user-supplied paths.
+  @IsOptional()
+  @IsString()
+  @MinLength(1)
+  VIDEO_STORAGE_ROOT?: string;
+
+  // Upload size ceiling in bytes. Conservative default (50 MiB) — Phase 10
+  // ingests short controlled test clips, not production footage.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  VIDEO_MAX_UPLOAD_BYTES?: number;
+
+  // Opt-in switch for the OPTIONAL local system ffmpeg binary adapter. Off
+  // by default: the simulated extractor serves dev/test without any media
+  // tooling installed, and CI never shells out.
+  @IsOptional()
+  @Matches(/^(true|false)$/i, {
+    message: 'VIDEO_FFMPEG_ENABLED must be true or false',
+  })
+  VIDEO_FFMPEG_ENABLED?: string;
 }
 
 // Placeholder markers — banned in EVERY environment (staging and preview

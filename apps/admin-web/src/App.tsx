@@ -34,6 +34,10 @@ import {
 import { StoreDetailPage, StoresPage } from './pages/StoresPage';
 import { UnitDetailPage, UnitsPage } from './pages/UnitsPage';
 import {
+  VideoAssetDetailPage,
+  VideoAssetsPage,
+} from './pages/VideoAssetsPage';
+import {
   VisionEventDetailPage,
   VisionEventsPage,
 } from './pages/VisionEventsPage';
@@ -71,6 +75,7 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/reconciliation">Reconciliation</NavLink>
         <NavLink to="/vision-events">CV events</NavLink>
         <NavLink to="/inference">Inference jobs</NavLink>
+        <NavLink to="/video-assets">Test videos</NavLink>
         <div className="spacer" />
         <div className="who">{user?.email}</div>
         <button onClick={() => void logout()}>Sign out</button>
@@ -137,6 +142,11 @@ export function App() {
                     <Route
                       path="inference/:id"
                       element={<InferenceJobDetailPage />}
+                    />
+                    <Route path="video-assets" element={<VideoAssetsPage />} />
+                    <Route
+                      path="video-assets/:id"
+                      element={<VideoAssetDetailPage />}
                     />
                     <Route path="*" element={<Navigate to="/" replace />} />
                   </Routes>

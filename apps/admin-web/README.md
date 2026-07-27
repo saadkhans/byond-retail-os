@@ -10,6 +10,11 @@ orders are vendor-neutral placeholders for future CV/VLM adapters.
 Inference jobs (Phase 9) add a provider-neutral queue view with a simulated
 create → start → complete/fail flow and conversion into a CV event — no real
 model runs and no raw media, only safe descriptors.
+Test videos (Phase 10) add controlled test-clip upload (allowlisted
+containers, conservative size limit), validate/extract-frames/manual-crop
+actions, an artifacts view, and per-crop inference-job creation linking into
+the Phase 9 queue — metadata only: no video preview, no download URLs, and
+no storage paths exist in the API by design.
 Deliberately unpolished — the scope is visibility, not UI product work.
 
 ## Run locally

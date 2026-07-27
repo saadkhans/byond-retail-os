@@ -75,6 +75,47 @@ export async function api<T>(
   return (await response.json()) as T;
 }
 
+/**
+ * Multipart upload variant of api(): the browser sets the Content-Type
+ * (with boundary) itself, so no explicit header is sent. Same Bearer token
+ * and error envelope handling as api().
+ */
+export async function apiUpload<T>(
+  path: string,
+  formData: FormData,
+): Promise<T> {
+  const headers: Record<string, string> = {};
+  const token = getToken();
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      method: 'POST',
+      headers,
+      body: formData,
+    });
+  } catch {
+    throw new ApiError(0, `Cannot reach the API at ${API_BASE_URL}`);
+  }
+  if (!response.ok) {
+    let message = `${response.status} ${response.statusText}`;
+    try {
+      const body = (await response.json()) as { message?: string | string[] };
+      if (body.message) {
+        message = Array.isArray(body.message)
+          ? body.message.join('; ')
+          : body.message;
+      }
+    } catch {
+      // Non-JSON error body — keep the status line.
+    }
+    throw new ApiError(response.status, message);
+  }
+  return (await response.json()) as T;
+}
+
 /** Standard paginated list envelope used by the search endpoints. */
 export interface Paginated<T> {
   items: T[];
@@ -556,4 +597,75 @@ export interface Order extends EvidenceRefs {
   createdAt: string;
   updatedAt: string;
   lines?: OrderLine[];
+}
+
+// Phase 10 — controlled test-video ingestion & crop extraction. Rows are
+// METADATA + internal references only: there is deliberately NO storageKey,
+// download URL, or media byte field anywhere in these shapes — the API
+// never exposes storage locations, and crops feed Phase 9 inference jobs
+// by opaque id.
+export type VideoAssetStatus =
+  | 'UPLOADED'
+  | 'VALIDATED'
+  | 'REJECTED'
+  | 'PROCESSING'
+  | 'READY'
+  | 'FAILED';
+
+export type VideoArtifactType = 'FRAME' | 'CROP';
+
+export type VideoCropReason =
+  | 'PRODUCT_PICKUP'
+  | 'PRODUCT_RETURN'
+  | 'SHELF_AUDIT'
+  | 'CART_INSERTION'
+  | 'OCR_REVIEW'
+  | 'VLM_REVIEW';
+
+export interface VideoAsset {
+  id: string;
+  tenantId: string;
+  locationId: string | null;
+  unitId: string | null;
+  deviceId: string | null;
+  sessionId: string | null;
+  originalFilename: string;
+  mimeType: string;
+  sizeBytes: number;
+  durationMs: number | null;
+  width: number | null;
+  height: number | null;
+  fps: number | null;
+  status: VideoAssetStatus;
+  checksumSha256: string;
+  errorCode: string | null;
+  errorMessage: string | null;
+  uploadedById: string | null;
+  deletedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  location?: { id: string; name: string; code: string } | null;
+  unit?: { id: string; name: string; code: string } | null;
+  session?: { id: string; status: CheckoutSessionStatus } | null;
+}
+
+export interface VideoArtifact {
+  id: string;
+  tenantId: string;
+  videoAssetId: string;
+  artifactType: VideoArtifactType;
+  reason: VideoCropReason | null;
+  timestampMs: number;
+  cropX: number | null;
+  cropY: number | null;
+  cropWidth: number | null;
+  cropHeight: number | null;
+  width: number;
+  height: number;
+  mimeType: string;
+  sizeBytes: number;
+  checksumSha256: string;
+  inferenceJobId: string | null;
+  createdById: string | null;
+  createdAt: string;
 }

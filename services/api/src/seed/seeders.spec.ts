@@ -22,8 +22,10 @@ describe('permission catalog', () => {
   });
 
   it('uses the resource:action code format', () => {
+    // Kebab-case resources are allowed (Phase 10 `video-asset:*`), matching
+    // the kebab-case module codes (`video-ingest`); actions stay one word.
     for (const permission of PERMISSION_CATALOG) {
-      expect(permission.code).toMatch(/^[a-z]+:[a-z]+$/);
+      expect(permission.code).toMatch(/^[a-z]+(?:-[a-z]+)*:[a-z]+$/);
     }
   });
 });
@@ -34,9 +36,10 @@ describe('platform module catalog', () => {
     expect(new Set(codes).size).toBe(codes.length);
   });
 
-  it('default-enables core plus the shipped inventory, devices, checkout, payments, cv, and inference modules', () => {
+  it('default-enables core plus the shipped inventory, devices, checkout, payments, cv, inference, and video-ingest modules', () => {
     // inventory (Phase 3), devices (Phase 4), checkout (Phase 5), payments
-    // (Phase 6), cv (Phase 7), and inference (Phase 9) are default-enabled so
+    // (Phase 6), cv (Phase 7), inference (Phase 9), and video-ingest
+    // (Phase 10) are default-enabled so
     // their routes are reachable for every new tenant (the only enable
     // endpoint is tenant-scoped and needs a
     // module:manage tenant user, which a brand-new tenant does not yet have).
@@ -48,6 +51,7 @@ describe('platform module catalog', () => {
       'payments',
       'cv',
       'inference',
+      'video-ingest',
     ]);
   });
 
@@ -68,7 +72,8 @@ describe('platform module catalog', () => {
     // payments (intents, simulated auth/capture, reconciliation): Phase 6;
     // cv (vision events, evidence bundle lineage, review → basket flow):
     // Phase 7; inference (jobs, queue foundation, simulated adapter):
-    // Phase 9.
+    // Phase 9; video-ingest (test video upload, frame/crop extraction
+    // contracts): Phase 10.
     expect(active).toEqual([
       'core',
       'inventory',
@@ -77,6 +82,7 @@ describe('platform module catalog', () => {
       'payments',
       'cv',
       'inference',
+      'video-ingest',
     ]);
   });
 

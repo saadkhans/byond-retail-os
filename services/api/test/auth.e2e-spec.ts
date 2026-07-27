@@ -189,6 +189,7 @@ describe('Auth & RBAC (e2e, no live database)', () => {
           { id: 'module-payments', code: 'payments', isActive: true },
           { id: 'module-cv', code: 'cv', isActive: true },
           { id: 'module-inference', code: 'inference', isActive: true },
+          { id: 'module-video-ingest', code: 'video-ingest', isActive: true },
         ];
         const requested = (where?.code as { in?: string[] } | undefined)?.in;
         return requested

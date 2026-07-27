@@ -28,5 +28,9 @@ import { PrismaInferenceQueue } from './queue/prisma-inference-queue';
     InferenceAdapterRegistry,
     { provide: InferenceQueuePort, useClass: PrismaInferenceQueue },
   ],
+  // Phase 10 creates inference jobs from crop artifacts through the SAME
+  // service contract (screening, idempotency, queue semantics) — never by
+  // writing job rows directly.
+  exports: [InferenceJobsService],
 })
 export class InferenceModule {}

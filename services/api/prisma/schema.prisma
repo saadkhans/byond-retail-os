@@ -218,6 +218,9 @@ model Tenant {
   inferenceJobs       InferenceJob[]
   inferenceResults    InferenceResult[]
   inferenceCandidates InferenceCandidate[]
+
+  videoAssets    VideoAsset[]
+  videoArtifacts VideoArtifact[]
 }
 
 model User {
@@ -257,6 +260,9 @@ model User {
   paymentReconciliationCreated PaymentReconciliationRecord[] @relation("PaymentReconciliationActor")
 
   inferenceJobsCreated InferenceJob[] @relation("InferenceJobActor")
+
+  videoAssetsUploaded   VideoAsset[]    @relation("VideoAssetUploader")
+  videoArtifactsCreated VideoArtifact[] @relation("VideoArtifactActor")
 
   // Composite FK target for same-tenant creator constraints (id alone is
   // already unique; this adds nothing semantically, only an FK anchor).
@@ -348,6 +354,7 @@ model Location {
   orders             Order[]
   visionEvents       VisionEvent[]
   inferenceJobs      InferenceJob[]
+  videoAssets        VideoAsset[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -567,6 +574,7 @@ model RetailUnit {
   orders           Order[]
   visionEvents     VisionEvent[]
   inferenceJobs    InferenceJob[]
+  videoAssets      VideoAsset[]
 
   @@unique([tenantId, code])
   // Enables composite same-tenant FKs (devices must reference a unit of the
@@ -611,6 +619,7 @@ model Device {
   checkoutSessions CheckoutSession[]
   visionEvents     VisionEvent[]
   inferenceJobs    InferenceJob[]
+  videoAssets      VideoAsset[]
 
   @@unique([tenantId, serialNumber])
   @@unique([id, tenantId])
@@ -764,6 +773,7 @@ model CheckoutSession {
   visionEvents   VisionEvent[]
   paymentIntents PaymentIntent[]
   inferenceJobs  InferenceJob[]
+  videoAssets    VideoAsset[]
 
   // Enables composite same-tenant FKs (lines/orders must reference a session
   // of the SAME tenant) — mirrors the Phase 3/4 hardening pattern.
@@ -1525,6 +1535,7 @@ model InferenceJob {
   visionEvent VisionEvent?     @relation(fields: [visionEventId], references: [id], onDelete: Restrict)
   createdBy   User?            @relation("InferenceJobActor", fields: [createdById], references: [id], onDelete: Restrict)
   result InferenceResult?
+  videoArtifacts VideoArtifact[]
 
   @@unique([id, tenantId])
   @@unique([tenantId, idempotencyKey])
@@ -1592,4 +1603,131 @@ model InferenceCandidate {
   @@unique([id, tenantId])
   @@unique([tenantId, resultId, rank])
   @@unique([tenantId, resultId, sku])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10 — Video ingestion & crop extraction (controlled TEST videos only).
+// Rows carry METADATA + an INTERNAL storage key only: raw media bytes never
+// enter the database, no public/signed URLs exist, and the storage key is
+// never exposed through the API. Local/dev storage adapter only — production
+// camera runtime, streaming, and real model execution are later phases.
+// ---------------------------------------------------------------------------
+
+enum VideoAssetStatus {
+  UPLOADED
+  VALIDATED
+  REJECTED
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum VideoArtifactType {
+  FRAME
+  CROP
+}
+
+// Why a crop/frame was extracted — a closed vocabulary (mirrors the Phase 9
+// job types plus shelf/cart context) so free text can never leak into it.
+enum VideoCropReason {
+  PRODUCT_PICKUP
+  PRODUCT_RETURN
+  SHELF_AUDIT
+  CART_INSERTION
+  OCR_REVIEW
+  VLM_REVIEW
+}
+
+// A controlled test video uploaded for the Phase 9 inference pipeline.
+// Lifecycle: UPLOADED → VALIDATED → PROCESSING → READY (or REJECTED/FAILED).
+// Soft delete: deletedAt marks the row; the local file is removed and the
+// metadata row is kept for audit lineage (artifacts keep their references).
+model VideoAsset {
+  id       String @id @default(cuid())
+  tenantId String
+  // Optional store/unit/device/session context, same binding rules as
+  // Phase 9 inference jobs (all same-tenant, composite FKs in migration SQL).
+  locationId String?
+  unitId     String?
+  deviceId   String?
+  sessionId  String?
+  // Sanitized original filename (basename only, safe charset) — display only,
+  // NEVER used to build storage paths.
+  originalFilename String
+  mimeType         String
+  sizeBytes        Int
+  // Probed metadata (null until a probe/validate ran).
+  durationMs Int?
+  width      Int?
+  height     Int?
+  fps        Float?
+  status VideoAssetStatus @default(UPLOADED)
+  // INTERNAL storage key relative to the configured local storage root
+  // (opaque, server-generated). Never exposed in API responses and never
+  // user-supplied.
+  storageKey     String
+  checksumSha256 String
+  // Safe, stable failure information (UPPER_SNAKE code + screened message).
+  errorCode    String?
+  errorMessage String?
+  uploadedById String?
+  deletedAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  tenant     Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location   Location?        @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit       RetailUnit?      @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  device     Device?          @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  session    CheckoutSession? @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  uploadedBy User?            @relation("VideoAssetUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
+  artifacts  VideoArtifact[]
+
+  @@unique([id, tenantId])
+  @@index([tenantId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([tenantId, status])
+  @@index([tenantId, sessionId])
+}
+
+// A frame or crop extracted from a VideoAsset. Internal reference only —
+// like the asset, the row carries metadata + an internal storage key, never
+// media bytes or a download URL. Append-only (triggers in migration SQL)
+// except the one-shot inferenceJobId link set when a Phase 9 job is created
+// from a crop.
+model VideoArtifact {
+  id           String @id @default(cuid())
+  tenantId     String
+  videoAssetId String
+  artifactType VideoArtifactType
+  reason       VideoCropReason?
+  // Position in the source video.
+  timestampMs Int
+  // Crop box within the source frame (CROP only; null for full FRAMEs).
+  cropX      Int?
+  cropY      Int?
+  cropWidth  Int?
+  cropHeight Int?
+  // Output dimensions of the extracted artifact.
+  width     Int
+  height    Int
+  mimeType  String
+  sizeBytes Int
+  checksumSha256 String
+  // INTERNAL storage key relative to the configured local storage root —
+  // never exposed in API responses.
+  storageKey String
+  // Set once when a Phase 9 inference job is created from this crop; the
+  // job's input descriptor references this artifact BY ID only.
+  inferenceJobId String?
+  createdById    String?
+  createdAt      DateTime @default(now())
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  videoAsset   VideoAsset    @relation(fields: [videoAssetId], references: [id], onDelete: Restrict)
+  inferenceJob InferenceJob? @relation(fields: [inferenceJobId], references: [id], onDelete: Restrict)
+  createdBy    User?         @relation("VideoArtifactActor", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@index([tenantId, videoAssetId, createdAt])
+  @@index([tenantId, createdAt(sort: Desc), id(sort: Desc)])
 }

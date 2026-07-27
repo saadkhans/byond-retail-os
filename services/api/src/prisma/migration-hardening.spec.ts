@@ -475,3 +475,122 @@ describe('checkout line soft-delete migration hardening', () => {
     expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
   });
 });
+
+describe('video ingest migration hardening', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260727000000_video_ingest',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('makes extraction artifacts append-only (one-shot inference link excepted)', () => {
+    expect(sql).toContain('CREATE FUNCTION prevent_video_artifact_mutation()');
+    expect(sql).toContain('BEFORE UPDATE OR DELETE ON "VideoArtifact"');
+    expect(sql).toContain('BEFORE TRUNCATE ON "VideoArtifact"');
+    // The single allowed mutation: setting inferenceJobId on a row that does
+    // not carry one yet, with every other column bit-identical.
+    expect(sql).toContain('OLD."inferenceJobId" IS NULL');
+    expect(sql).toContain('NEW."inferenceJobId" IS NOT NULL');
+    expect(sql).toContain('NEW."checksumSha256" = OLD."checksumSha256"');
+    expect(sql).toContain('NEW."storageKey" = OLD."storageKey"');
+  });
+
+  it('constrains sizes, probed metadata, and crop boxes with CHECK constraints', () => {
+    expect(sql).toContain('VideoAsset_sizeBytes_positive_check');
+    expect(sql).toContain('CHECK ("sizeBytes" > 0)');
+    expect(sql).toContain('VideoAsset_durationMs_positive_check');
+    expect(sql).toContain('VideoAsset_dimensions_positive_check');
+    expect(sql).toContain('VideoAsset_fps_positive_check');
+    expect(sql).toContain('VideoArtifact_sizeBytes_positive_check');
+    expect(sql).toContain('VideoArtifact_timestampMs_nonnegative_check');
+    expect(sql).toContain('VideoArtifact_dimensions_positive_check');
+    // A CROP always carries a complete, in-range crop box; a FRAME never
+    // carries one.
+    expect(sql).toContain('VideoArtifact_crop_box_check');
+    expect(sql).toContain(`"artifactType" = 'CROP' AND "cropX" IS NOT NULL`);
+    expect(sql).toContain(`"artifactType" = 'FRAME' AND "cropX" IS NULL`);
+  });
+
+  it('keeps error codes coherent with terminal statuses', () => {
+    expect(sql).toContain('VideoAsset_error_only_terminal_check');
+    expect(sql).toContain(
+      `CHECK (("errorCode" IS NOT NULL) = ("status" IN ('REJECTED', 'FAILED')))`,
+    );
+  });
+
+  it('enforces same-tenant references with composite foreign keys', () => {
+    for (const constraint of [
+      'VideoAsset_location_same_tenant_fkey',
+      'VideoAsset_unit_same_tenant_fkey',
+      'VideoAsset_device_same_tenant_fkey',
+      'VideoAsset_session_same_tenant_fkey',
+      'VideoAsset_uploader_same_tenant_fkey',
+      'VideoArtifact_asset_same_tenant_fkey',
+      'VideoArtifact_job_same_tenant_fkey',
+      'VideoArtifact_creator_same_tenant_fkey',
+    ]) {
+      expect(sql).toContain(constraint);
+    }
+  });
+
+  it('stores internal storage keys and checksums, never URLs', () => {
+    expect(sql).toContain('"storageKey" TEXT NOT NULL');
+    expect(sql).toContain('"checksumSha256" TEXT NOT NULL');
+    // No public/signed URL columns exist in the video tables (comments may
+    // mention URLs; quoted identifiers must not).
+    expect(sql).not.toMatch(/"[^"\n]*url[^"\n]*"/i);
+  });
+
+  it('never cascades deletes into video tables', () => {
+    expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
+  });
+});
+
+describe('video ingest module backfill migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260727000001_video_ingest_module_backfill',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('activates a pre-existing video-ingest module row instead of leaving it inactive', () => {
+    expect(sql).toContain('ON CONFLICT ("code") DO UPDATE SET');
+    expect(sql).toContain('"isActive" = true');
+    expect(sql).not.toMatch(/DO UPDATE SET[^;]*"id"\s*=/);
+  });
+
+  it('is idempotent and never overwrites a tenant admin choice', () => {
+    expect(sql).toContain('ON CONFLICT ("tenantId", "moduleId") DO NOTHING');
+    expect(sql).not.toMatch(/ON CONFLICT \("tenantId", "moduleId"\) DO UPDATE/);
+  });
+
+  it('enables video-ingest for every pre-existing tenant with deterministic ids', () => {
+    expect(sql).toContain(`'tm-' || md5(t."id" || ':video-ingest')`);
+    expect(sql).toContain(`WHERE pm."code" = 'video-ingest'`);
+  });
+
+  it('backfills the video-asset permission catalog rows (migrate deploy runs without seed)', () => {
+    for (const code of [
+      'video-asset:read',
+      'video-asset:manage',
+      'video-asset:process',
+      'video-asset:delete',
+    ]) {
+      expect(sql).toContain(`'${code}'`);
+    }
+  });
+});
