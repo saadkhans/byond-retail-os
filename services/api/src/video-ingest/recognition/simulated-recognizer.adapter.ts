@@ -9,8 +9,9 @@ export const SIMULATED_RECOGNIZER_KIND = 'simulated';
  * and honestly declares readsRealPixels=false, so the pre-storage frame
  * screen refuses to treat its empty result as a pass (an upload screened
  * by an adapter that never looked at the pixels would be a blind pass).
- * Dev/test flows that need uploads without real tooling opt in explicitly
- * via VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS instead.
+ * There is NO bypass: uploads fail closed (controlled 503) in every
+ * environment until real tooling (VIDEO_FFMPEG_ENABLED + VIDEO_OCR_ENABLED)
+ * is configured — the payment-data invariant has no dev/test exception.
  */
 @Injectable()
 export class SimulatedFrameTextRecognizer extends FrameTextRecognizerPort {

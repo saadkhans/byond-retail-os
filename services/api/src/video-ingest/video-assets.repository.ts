@@ -336,6 +336,62 @@ export class VideoAssetsRepository extends TenantScopedRepository {
     });
   }
 
+  /**
+   * Advisory-lock-guarded liveness read for the upload publish path: takes
+   * the SAME per-asset advisory lock as softDelete/transitionStatus, then
+   * reads the row's deletedAt. Because a concurrent DELETE holds that lock
+   * through its soft-delete commit, a 'live' answer means no delete had
+   * committed at the moment of the read — the upload uses it to SHRINK
+   * (not close) the window in which its media write can race a delete's
+   * file cleanup. The publish CAS stays the authority for the race; this
+   * transaction is ONLY the locked read — the lock is never held across
+   * any file I/O.
+   */
+  assetLivenessUnderLock(
+    tenantId: string,
+    id: string,
+  ): Promise<'live' | 'deleted' | 'missing'> {
+    const scopedTenantId = this.requireTenantId(tenantId);
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${videoAssetAdvisoryLockKey(
+        scopedTenantId,
+        id,
+      )}))`;
+      const row = await tx.videoAsset.findFirst({
+        where: { id, tenantId: scopedTenantId },
+        select: { deletedAt: true },
+      });
+      if (!row) {
+        return 'missing' as const;
+      }
+      return row.deletedAt ? ('deleted' as const) : ('live' as const);
+    });
+  }
+
+  /**
+   * Which of the given storage keys are referenced by a COMMITTED artifact
+   * row (tenant-scoped; soft-deleted parents included — their rows still
+   * own their files until the delete flow removes the whole asset prefix).
+   * Staged-artifact cleanup consults this before deleting: artifact staging
+   * keys are DETERMINISTIC per request, so a failed or replayed attempt's
+   * staged keys can be the very keys an earlier committed batch recorded —
+   * deleting those would destroy media that live rows reference. Internal
+   * only: the keys never leave the persistence/service layer.
+   */
+  async listArtifactStorageKeys(
+    tenantId: string,
+    storageKeys: string[],
+  ): Promise<string[]> {
+    if (storageKeys.length === 0) {
+      return [];
+    }
+    const rows = await this.prisma.videoArtifact.findMany({
+      where: this.scope(tenantId, { storageKey: { in: storageKeys } }),
+      select: { storageKey: true },
+    });
+    return rows.map((row) => row.storageKey);
+  }
+
   async list(
     tenantId: string,
     filters: {

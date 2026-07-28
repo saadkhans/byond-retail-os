@@ -1,17 +1,9 @@
-import {
-  chmod,
-  mkdtemp,
-  readdir,
-  rm,
-  stat,
-  writeFile,
-} from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { LocalVideoStorageAdapter } from '../storage/local-video-storage.adapter';
 import {
   buildCropArgs,
   buildFrameArgs,
+  buildFramesPerSecondArgs,
   buildProbeArgs,
   classifyCommandError,
   FfmpegVideoFrameExtractor,
@@ -20,16 +12,14 @@ import {
   MAX_PROBE_DURATION_MS,
   MAX_TOTAL_EXTRACTION_BYTES,
   parseProbeOutput,
-  SCRATCH_ABANDONED_AFTER_MS,
-  SCRATCH_DIR_PREFIX,
-  SCRATCH_SWEEP_MAX_DIRS,
+  splitConcatenatedPngStream,
+  UNSTREAMABLE_CONTAINER_MESSAGE,
 } from './ffmpeg-extractor.adapter';
 
-// The scratch-file logic never touches the real filesystem in tests: the
-// fs layer is mocked wholesale (the storage adapter import shares the
-// module but no test here performs storage I/O). readdir defaults to an
-// EMPTY tmpdir so the crash-recovery sweep is a no-op unless a test
-// configures it.
+// The adapter must NEVER touch the filesystem — the buffer-inspection path
+// is in-memory only (stdin/pipes, no scratch files). The fs layer stays
+// mocked wholesale (the storage adapter import shares the module) so the
+// specs can ASSERT that no fs call is ever made by the inspection path.
 jest.mock('node:fs/promises', () => ({
   chmod: jest.fn(async () => undefined),
   mkdir: jest.fn(async () => undefined),
@@ -491,283 +481,332 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
     expect(frames.map((f) => f.timestampMs)).toEqual([0, 3000]);
   });
 
-  describe('inspectBuffer (pre-storage screening scratch file)', () => {
-    const probeJson = JSON.stringify({
-      streams: [
-        { width: 1280, height: 720, r_frame_rate: '30/1', duration: '10.0' },
-      ],
-    });
-    const scratchDir = join(tmpdir(), `${SCRATCH_DIR_PREFIX}abc123`);
-    const scratchPath = join(scratchDir, 'inspect.media');
+  describe('inspectBuffer (fully in-memory stdin inspection)', () => {
+    const PNG_SIG = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    ]);
+    /** A synthetic "PNG": the real signature + a distinct filler byte. */
+    const fakePng = (marker: number, size = 32) =>
+      Buffer.concat([PNG_SIG, Buffer.alloc(size - PNG_SIG.length, marker)]);
+    const probeJson = (durationSeconds: string) =>
+      JSON.stringify({
+        streams: [
+          {
+            width: 1280,
+            height: 720,
+            r_frame_rate: '30/1',
+            duration: durationSeconds,
+          },
+        ],
+      });
+    interface RunnerCall {
+      binary: string;
+      args: string[];
+      maxOutputBytes: number;
+      stdin?: Buffer;
+    }
+    /** Runner answering ffprobe with probe JSON and ffmpeg with the given
+     *  stdout, recording every call INCLUDING the stdin payload. */
+    const recordingRunner =
+      (calls: RunnerCall[], ffmpegStdout: Buffer, durationSeconds = '10.0') =>
+      (
+        binary: string,
+        args: string[],
+        maxOutputBytes: number,
+        stdin?: Buffer,
+      ) => {
+        calls.push({ binary, args, maxOutputBytes, stdin });
+        return Promise.resolve({
+          stdout:
+            binary === 'ffprobe'
+              ? Buffer.from(probeJson(durationSeconds))
+              : ffmpegStdout,
+        });
+      };
 
-    beforeEach(() => {
-      (mkdtemp as jest.Mock)
-        .mockReset()
-        .mockImplementation(async (prefix: string) => `${prefix}abc123`);
-      (writeFile as jest.Mock).mockReset().mockResolvedValue(undefined);
-      (rm as jest.Mock).mockReset().mockResolvedValue(undefined);
-      (chmod as jest.Mock).mockReset().mockResolvedValue(undefined);
-      // Empty tmpdir → the crash-recovery sweep is a no-op in these tests.
-      (readdir as jest.Mock).mockReset().mockResolvedValue([]);
-      (stat as jest.Mock).mockReset().mockResolvedValue({});
-    });
-
-    it('writes the buffer to an OS-tempdir scratch file (0600, wx), probes THERE, and close() removes the tree', async () => {
-      const calls: { binary: string; args: string[] }[] = [];
+    it('probes from stdin with the EXACT upload buffer and never touches the filesystem', async () => {
+      const calls: RunnerCall[] = [];
       const extractor = new FfmpegVideoFrameExtractor(
         storageStub,
-        (binary, args) => {
-          calls.push({ binary, args });
-          return Promise.resolve({
-            stdout:
-              binary === 'ffprobe'
-                ? Buffer.from(probeJson)
-                : Buffer.from('png'),
-          });
-        },
+        recordingRunner(calls, fakePng(1)),
       );
-      const data = Buffer.from('unscreened-bytes');
+      const data = Buffer.from('unscreened-card-bearing-bytes');
       const session = await extractor.inspectBuffer(data);
-      // Scratch lives in the OS temp dir — NEVER under the storage root.
-      expect(mkdtemp).toHaveBeenCalledWith(join(tmpdir(), SCRATCH_DIR_PREFIX));
-      expect(writeFile).toHaveBeenCalledWith(scratchPath, data, {
-        mode: 0o600,
-        flag: 'wx',
-      });
-      expect(chmod).toHaveBeenCalledWith(scratchDir, 0o700);
-      expect(session.probe.durationMs).toBe(10_000);
-      // The probe ran against the scratch path, not any storage key.
-      expect(calls[0].args[calls[0].args.length - 1]).toBe(scratchPath);
-      // Frame extraction reads the SAME scratch path.
-      const frame = await session.extractFrameAt(1000);
-      expect(frame.timestampMs).toBe(1000);
-      expect(calls[1].args[calls[1].args.indexOf('-i') + 1]).toBe(scratchPath);
-      // close() removes the whole scratch tree — idempotently.
+      // Opening runs NO tooling; the first probe() does.
+      expect(calls).toHaveLength(0);
+      const probe = await session.probe();
+      expect(probe.durationMs).toBe(10_000);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].binary).toBe('ffprobe');
+      // The input is pipe:0 — no path argument anywhere in the vector.
+      expect(calls[0].args[calls[0].args.length - 1]).toBe('pipe:0');
+      // The child received the exact unscreened buffer on stdin.
+      expect(calls[0].stdin).toBe(data);
+      // Memoized: a second probe() never re-runs the tool.
+      await session.probe();
+      expect(calls).toHaveLength(1);
+      // NOTHING was ever materialized on disk.
+      expect(mkdtemp).not.toHaveBeenCalled();
+      expect(writeFile).not.toHaveBeenCalled();
+      expect(rm).not.toHaveBeenCalled();
       await session.close();
-      expect(rm).toHaveBeenCalledWith(scratchDir, {
-        recursive: true,
-        force: true,
-      });
-      await session.close();
-      expect(rm).toHaveBeenCalledTimes(1);
+      expect(mkdtemp).not.toHaveBeenCalled();
+      expect(writeFile).not.toHaveBeenCalled();
     });
 
-    it('removes the scratch tree when the probe itself fails (no session to close)', async () => {
-      const exitFailure = Object.assign(new Error('exit 1'), { code: 1 });
+    it('fails CLOSED on an unstreamable container: controlled content error, no stderr/path echo', async () => {
+      // A non-faststart MP4 (moov at the end) cannot be probed from a
+      // pipe: ffprobe RUNS and exits nonzero. That is a CONTENT failure —
+      // the service rejects the upload rather than ever spooling the
+      // unscreened bytes to disk (the documented fail-closed cost; test
+      // clips must be encoded streamable, +faststart).
+      const exitFailure = Object.assign(
+        new Error('ffprobe exited 1: moov atom not found /secret/upload.mp4'),
+        { code: 1, killed: false, signal: null },
+      );
       const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
         Promise.reject(exitFailure),
       );
-      await expect(
-        extractor.inspectBuffer(Buffer.from('x')),
-      ).rejects.toBeInstanceOf(ExtractionFailedError);
-      expect(rm).toHaveBeenCalledTimes(1);
-      expect(rm).toHaveBeenCalledWith(scratchDir, {
-        recursive: true,
-        force: true,
-      });
-    });
-
-    it('maps a scratch-write failure to a controlled infrastructure error and never echoes the path', async () => {
-      (writeFile as jest.Mock).mockRejectedValueOnce(
-        Object.assign(new Error("ENOSPC: no space, write '/tmp/secret'"), {
-          code: 'ENOSPC',
-        }),
-      );
-      const runner = jest.fn(() =>
-        Promise.resolve({ stdout: Buffer.from(probeJson) }),
-      );
-      const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
-      const error: Error = await extractor
-        .inspectBuffer(Buffer.from('x'))
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      const error: Error = await session
+        .probe()
         .then(() => {
           throw new Error('expected rejection');
         })
         .catch((caught: Error) => caught);
-      expect(error).toBeInstanceOf(ExtractionInfrastructureError);
-      expect(error.message).not.toContain('/tmp');
-      expect(error.message).not.toContain('ENOSPC');
-      // No probe ran, and the partial scratch tree was still removed.
-      expect(runner).not.toHaveBeenCalled();
-      expect(rm).toHaveBeenCalledTimes(1);
+      expect(error).toBeInstanceOf(ExtractionFailedError);
+      expect(error.message).toBe(UNSTREAMABLE_CONTAINER_MESSAGE);
+      expect(error.message).not.toContain('moov');
+      expect(error.message).not.toContain('/secret');
+      await session.close();
     });
 
-    it('retries a failed scratch removal once, then surfaces the infrastructure classification', async () => {
-      (rm as jest.Mock).mockRejectedValue(new Error('EBUSY'));
-      const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
-        Promise.resolve({ stdout: Buffer.from(probeJson) }),
+    it('splits the single-pass fps=1 PNG stdout into N ordered frames, fed from stdin', async () => {
+      const calls: RunnerCall[] = [];
+      const stream = Buffer.concat([fakePng(1), fakePng(2), fakePng(3)]);
+      const extractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        recordingRunner(calls, stream, '3.0'),
+      );
+      const data = Buffer.from('unscreened');
+      const session = await extractor.inspectBuffer(data);
+      const frames = await session.extractFramesPerSecond({
+        maxBytesPerFrame: 1024,
+      });
+      expect(frames).toHaveLength(3);
+      // Ordered, each signature-led, carrying the original filler bytes.
+      frames.forEach((frame, i) => {
+        expect(frame.subarray(0, 8).equals(PNG_SIG)).toBe(true);
+        expect(frame[8]).toBe(i + 1);
+      });
+      // ONE ffmpeg pass (after the memoized probe), reading stdin, fps=1,
+      // PNGs to stdout — no path anywhere in the vector.
+      expect(calls).toHaveLength(2);
+      const ffmpegCall = calls[1];
+      expect(ffmpegCall.binary).toBe('ffmpeg');
+      expect(ffmpegCall.args).toEqual(buildFramesPerSecondArgs());
+      expect(ffmpegCall.args).toContain('fps=1');
+      expect(ffmpegCall.args[ffmpegCall.args.indexOf('-i') + 1]).toBe(
+        'pipe:0',
+      );
+      expect(ffmpegCall.stdin).toBe(data);
+      expect(mkdtemp).not.toHaveBeenCalled();
+      expect(writeFile).not.toHaveBeenCalled();
+      await session.close();
+    });
+
+    it('sizes the exec maxBuffer as ceil(duration)×perFrame, clamped by the aggregate ceiling', async () => {
+      const calls: RunnerCall[] = [];
+      const extractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        recordingRunner(calls, fakePng(1), '10.0'),
       );
       const session = await extractor.inspectBuffer(Buffer.from('x'));
-      await expect(session.close()).rejects.toBeInstanceOf(
+      await session.extractFramesPerSecond({ maxBytesPerFrame: 1000 });
+      // 10 expected frames × 1000 B budget.
+      expect(calls[1].maxOutputBytes).toBe(10_000);
+      await session.close();
+
+      // A long clip at the full per-frame ceiling clamps to the aggregate
+      // multi-frame ceiling, never beyond it.
+      const longCalls: RunnerCall[] = [];
+      const longExtractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        recordingRunner(longCalls, fakePng(1), '3600'),
+      );
+      const longSession = await longExtractor.inspectBuffer(Buffer.from('x'));
+      await longSession.extractFramesPerSecond({
+        maxBytesPerFrame: MAX_OUTPUT_BYTES,
+      });
+      expect(longCalls[1].maxOutputBytes).toBe(MAX_TOTAL_EXTRACTION_BYTES);
+      await longSession.close();
+    });
+
+    it('throws FrameExceedsBudgetError when a split frame overruns the per-frame budget', async () => {
+      const stream = Buffer.concat([fakePng(1, 32), fakePng(2, 128)]);
+      const extractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        recordingRunner([], stream, '2.0'),
+      );
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      await expect(
+        session.extractFramesPerSecond({ maxBytesPerFrame: 64 }),
+      ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
+      await session.close();
+    });
+
+    it('throws FrameUnavailableError ONLY when a successful exec yields zero frames', async () => {
+      const extractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        recordingRunner([], Buffer.alloc(0)),
+      );
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      await expect(
+        session.extractFramesPerSecond({ maxBytesPerFrame: 1024 }),
+      ).rejects.toBeInstanceOf(FrameUnavailableError);
+      await session.close();
+    });
+
+    it('returns FEWER frames than the probed duration expects AS-IS (service decides completeness)', async () => {
+      // 10 s clip → 10 expected; the decoder legitimately yielded 3.
+      const stream = Buffer.concat([fakePng(1), fakePng(2), fakePng(3)]);
+      const extractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        recordingRunner([], stream, '10.0'),
+      );
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      const frames = await session.extractFramesPerSecond({
+        maxBytesPerFrame: 1024,
+      });
+      expect(frames).toHaveLength(3);
+      await session.close();
+    });
+
+    it('maps a BUDGET-derived exec-cap overflow to FrameExceedsBudgetError, a ceiling overflow to infrastructure', async () => {
+      const overflow = Object.assign(
+        new RangeError('stdout maxBuffer length exceeded'),
+        { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' },
+      );
+      const runnerFor = (durationSeconds: string) => (binary: string) =>
+        binary === 'ffprobe'
+          ? Promise.resolve({
+              stdout: Buffer.from(probeJson(durationSeconds)),
+            })
+          : Promise.reject(overflow);
+      // 10 s × 1000 B cap sits below the aggregate ceiling → the caller's
+      // budget is what fired, a skip-this-upload verdict for the caller.
+      const budget = new FfmpegVideoFrameExtractor(
+        storageStub,
+        runnerFor('10.0'),
+      );
+      const budgetSession = await budget.inspectBuffer(Buffer.from('x'));
+      await expect(
+        budgetSession.extractFramesPerSecond({ maxBytesPerFrame: 1000 }),
+      ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
+      await budgetSession.close();
+      // At the clamped aggregate ceiling the overflow is the adapter's OWN
+      // cap → infrastructure, exactly as on the storage-key paths.
+      const ceiling = new FfmpegVideoFrameExtractor(
+        storageStub,
+        runnerFor('3600'),
+      );
+      const ceilingSession = await ceiling.inspectBuffer(Buffer.from('x'));
+      await expect(
+        ceilingSession.extractFramesPerSecond({
+          maxBytesPerFrame: MAX_OUTPUT_BYTES,
+        }),
+      ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+      await ceilingSession.close();
+    });
+
+    it('keeps timeout/kill/errno infrastructure classification on both stdin paths', async () => {
+      const timeoutKill = Object.assign(new Error('killed'), {
+        killed: true,
+        signal: 'SIGTERM',
+      });
+      // Probe path.
+      const probeKilled = new FfmpegVideoFrameExtractor(storageStub, () =>
+        Promise.reject(timeoutKill),
+      );
+      const killedSession = await probeKilled.inspectBuffer(Buffer.from('x'));
+      await expect(killedSession.probe()).rejects.toBeInstanceOf(
         ExtractionInfrastructureError,
       );
-      expect(rm).toHaveBeenCalledTimes(2);
+      await killedSession.close();
+      // Frame path (probe succeeds, the decode is refused by the OS).
+      for (const errno of ['EACCES', 'ENOMEM']) {
+        const spawnError = Object.assign(new Error(`spawn ${errno}`), {
+          code: errno,
+        });
+        const extractor = new FfmpegVideoFrameExtractor(
+          storageStub,
+          (binary: string) =>
+            binary === 'ffprobe'
+              ? Promise.resolve({ stdout: Buffer.from(probeJson('10.0')) })
+              : Promise.reject(spawnError),
+        );
+        const session = await extractor.inspectBuffer(Buffer.from('x'));
+        await expect(
+          session.extractFramesPerSecond({ maxBytesPerFrame: 1024 }),
+        ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+        await session.close();
+      }
+    });
+
+    it('rejects a degenerate per-frame budget WITHOUT running any tooling', async () => {
+      const runner = jest.fn(() =>
+        Promise.resolve({ stdout: Buffer.from(probeJson('10.0')) }),
+      );
+      const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      for (const maxBytesPerFrame of [0, -1, 1.5, Number.NaN]) {
+        await expect(
+          session.extractFramesPerSecond({ maxBytesPerFrame }),
+        ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
+      }
+      expect(runner).not.toHaveBeenCalled();
+      await session.close();
+    });
+
+    it('close() is idempotent; a closed session fails controlled, never touching tooling or disk', async () => {
+      const runner = jest.fn(() =>
+        Promise.resolve({ stdout: Buffer.from(probeJson('10.0')) }),
+      );
+      const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      await expect(session.close()).resolves.toBeUndefined();
+      await expect(session.close()).resolves.toBeUndefined();
+      await expect(session.probe()).rejects.toBeInstanceOf(
+        ExtractionFailedError,
+      );
+      await expect(
+        session.extractFramesPerSecond({ maxBytesPerFrame: 1024 }),
+      ).rejects.toBeInstanceOf(ExtractionFailedError);
+      expect(runner).not.toHaveBeenCalled();
+      expect(mkdtemp).not.toHaveBeenCalled();
+      expect(writeFile).not.toHaveBeenCalled();
     });
   });
 
-  describe('crash-recovery scavenger for abandoned scratch dirs', () => {
-    // A crash / SIGKILL / host restart between the scratch write and
-    // close() strands the dir forever; the adapter reclaims such dirs
-    // lazily — an awaited sweep before each new session's dir is created.
-    const probeJson = JSON.stringify({
-      streams: [
-        { width: 1280, height: 720, r_frame_rate: '30/1', duration: '10.0' },
-      ],
-    });
-    const staleName = `${SCRATCH_DIR_PREFIX}stale111`;
-    const staleName2 = `${SCRATCH_DIR_PREFIX}stale222`;
-    const freshName = `${SCRATCH_DIR_PREFIX}fresh333`;
-    const stalePath = join(tmpdir(), staleName);
-    const stalePath2 = join(tmpdir(), staleName2);
-    const freshPath = join(tmpdir(), freshName);
-    const staleStats = () => ({
-      mtimeMs: Date.now() - SCRATCH_ABANDONED_AFTER_MS - 60_000,
-    });
-    const freshStats = () => ({ mtimeMs: Date.now() });
-    const workingRunner = () =>
-      Promise.resolve({ stdout: Buffer.from(probeJson) });
+  describe('splitConcatenatedPngStream', () => {
+    const PNG_SIG = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    ]);
 
-    beforeEach(() => {
-      (mkdtemp as jest.Mock)
-        .mockReset()
-        .mockImplementation(async (prefix: string) => `${prefix}abc123`);
-      (writeFile as jest.Mock).mockReset().mockResolvedValue(undefined);
-      (rm as jest.Mock).mockReset().mockResolvedValue(undefined);
-      (chmod as jest.Mock).mockReset().mockResolvedValue(undefined);
-      (readdir as jest.Mock).mockReset().mockResolvedValue([]);
-      (stat as jest.Mock).mockReset().mockResolvedValue({});
+    it('splits a concatenated stream into ordered, signature-led frames', () => {
+      const a = Buffer.concat([PNG_SIG, Buffer.from([1, 1, 1])]);
+      const b = Buffer.concat([PNG_SIG, Buffer.from([2])]);
+      const c = Buffer.concat([PNG_SIG, Buffer.from([3, 3])]);
+      const frames = splitConcatenatedPngStream(Buffer.concat([a, b, c]));
+      expect(frames).toHaveLength(3);
+      expect(frames[0].equals(a)).toBe(true);
+      expect(frames[1].equals(b)).toBe(true);
+      expect(frames[2].equals(c)).toBe(true);
     });
 
-    it('removes an ABANDONED (stale-mtime) scratch dir before creating the new session dir', async () => {
-      (readdir as jest.Mock).mockResolvedValue([staleName]);
-      (stat as jest.Mock).mockResolvedValue(staleStats());
-      const extractor = new FfmpegVideoFrameExtractor(
-        storageStub,
-        workingRunner,
-      );
-      const session = await extractor.inspectBuffer(Buffer.from('x'));
-      expect(readdir).toHaveBeenCalledWith(tmpdir());
-      expect(stat).toHaveBeenCalledWith(stalePath);
-      expect(rm).toHaveBeenCalledWith(stalePath, {
-        recursive: true,
-        force: true,
-      });
-      // The sweep ran BEFORE the live session's own dir existed, so the
-      // live dir can never be a sweep candidate.
-      expect((rm as jest.Mock).mock.invocationCallOrder[0]).toBeLessThan(
-        (mkdtemp as jest.Mock).mock.invocationCallOrder[0],
-      );
-      await session.close();
-    });
-
-    it('never removes a FRESH (recent-mtime) scratch dir — a live concurrent session', async () => {
-      (readdir as jest.Mock).mockResolvedValue([freshName]);
-      (stat as jest.Mock).mockResolvedValue(freshStats());
-      const extractor = new FfmpegVideoFrameExtractor(
-        storageStub,
-        workingRunner,
-      );
-      const session = await extractor.inspectBuffer(Buffer.from('x'));
-      expect(stat).toHaveBeenCalledWith(freshPath);
-      expect(rm).not.toHaveBeenCalled();
-      // The only removal ever issued is the session's own close().
-      await session.close();
-      expect(rm).toHaveBeenCalledTimes(1);
-      expect(rm).not.toHaveBeenCalledWith(freshPath, expect.anything());
-    });
-
-    it('leaves non-matching tmpdir entries untouched (never stats or removes them)', async () => {
-      (readdir as jest.Mock).mockResolvedValue([
-        'systemd-private-xyz',
-        'byond-video-crops', // near miss: not the scratch prefix
-        staleName,
-      ]);
-      (stat as jest.Mock).mockResolvedValue(staleStats());
-      const extractor = new FfmpegVideoFrameExtractor(
-        storageStub,
-        workingRunner,
-      );
-      const session = await extractor.inspectBuffer(Buffer.from('x'));
-      expect(stat).toHaveBeenCalledTimes(1);
-      expect(stat).toHaveBeenCalledWith(stalePath);
-      expect(rm).toHaveBeenCalledTimes(1);
-      expect(rm).toHaveBeenCalledWith(stalePath, {
-        recursive: true,
-        force: true,
-      });
-      await session.close();
-    });
-
-    it('swallows a per-dir removal failure — the upload proceeds and OTHER stale dirs still go', async () => {
-      (readdir as jest.Mock).mockResolvedValue([staleName, staleName2]);
-      (stat as jest.Mock).mockResolvedValue(staleStats());
-      (rm as jest.Mock).mockImplementation(async (path: string) => {
-        if (path === stalePath) {
-          throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' });
-        }
-      });
-      const extractor = new FfmpegVideoFrameExtractor(
-        storageStub,
-        workingRunner,
-      );
-      // The inspection itself succeeds despite the failed removal.
-      const session = await extractor.inspectBuffer(Buffer.from('x'));
-      expect(session.probe.durationMs).toBe(10_000);
-      expect(rm).toHaveBeenCalledWith(stalePath, {
-        recursive: true,
-        force: true,
-      });
-      expect(rm).toHaveBeenCalledWith(stalePath2, {
-        recursive: true,
-        force: true,
-      });
-      await session.close();
-    });
-
-    it('tolerates a readdir failure — the sweep never fails the inspection', async () => {
-      (readdir as jest.Mock).mockRejectedValue(
-        Object.assign(new Error('EACCES'), { code: 'EACCES' }),
-      );
-      const extractor = new FfmpegVideoFrameExtractor(
-        storageStub,
-        workingRunner,
-      );
-      const session = await extractor.inspectBuffer(Buffer.from('x'));
-      expect(session.probe.durationMs).toBe(10_000);
-      await session.close();
-    });
-
-    it('runs the sweep before EVERY inspectBuffer call', async () => {
-      const extractor = new FfmpegVideoFrameExtractor(
-        storageStub,
-        workingRunner,
-      );
-      const first = await extractor.inspectBuffer(Buffer.from('x'));
-      await first.close();
-      const second = await extractor.inspectBuffer(Buffer.from('y'));
-      await second.close();
-      expect(readdir).toHaveBeenCalledTimes(2);
-      // Each sweep preceded its own session's mkdtemp.
-      const readdirOrders = (readdir as jest.Mock).mock.invocationCallOrder;
-      const mkdtempOrders = (mkdtemp as jest.Mock).mock.invocationCallOrder;
-      expect(readdirOrders[0]).toBeLessThan(mkdtempOrders[0]);
-      expect(readdirOrders[1]).toBeLessThan(mkdtempOrders[1]);
-    });
-
-    it('caps the entries examined per sweep to bound upload latency', async () => {
-      const names = Array.from(
-        { length: SCRATCH_SWEEP_MAX_DIRS + 10 },
-        (_, i) => `${SCRATCH_DIR_PREFIX}old${i}`,
-      );
-      (readdir as jest.Mock).mockResolvedValue(names);
-      (stat as jest.Mock).mockResolvedValue(staleStats());
-      const extractor = new FfmpegVideoFrameExtractor(
-        storageStub,
-        workingRunner,
-      );
-      const session = await extractor.inspectBuffer(Buffer.from('x'));
-      expect(stat).toHaveBeenCalledTimes(SCRATCH_SWEEP_MAX_DIRS);
-      expect(rm).toHaveBeenCalledTimes(SCRATCH_SWEEP_MAX_DIRS);
-      await session.close();
+    it('returns no frames for empty or signature-free bytes', () => {
+      expect(splitConcatenatedPngStream(Buffer.alloc(0))).toEqual([]);
+      expect(splitConcatenatedPngStream(Buffer.from('not a png'))).toEqual([]);
     });
   });
 

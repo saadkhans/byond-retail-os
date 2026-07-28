@@ -95,10 +95,9 @@ import { VideoCropsController } from './video-crops.controller';
     // Frame-text recognizer selection, mirroring the extractor factory:
     // the simulated adapter (default) declares readsRealPixels=false, so
     // the PRE-STORAGE frame screen refuses to treat its empty result as a
-    // pass — uploads then fail closed (controlled 503) unless the operator
-    // explicitly set VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS for a
-    // non-production/simulated environment. Production must run with
-    // VIDEO_OCR_ENABLED=true (and VIDEO_FFMPEG_ENABLED=true).
+    // pass — uploads then fail closed (controlled 503) in EVERY environment;
+    // there is no bypass. Uploads require VIDEO_OCR_ENABLED=true (and
+    // VIDEO_FFMPEG_ENABLED=true).
     {
       provide: FrameTextRecognizerPort,
       inject: [ConfigService, SimulatedFrameTextRecognizer],

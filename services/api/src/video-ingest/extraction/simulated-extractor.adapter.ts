@@ -64,14 +64,34 @@ export class SimulatedVideoFrameExtractor extends VideoFrameExtractorPort {
     // Trivial by design: the simulated adapter never reads real bytes
     // (readsRealBytes=false already makes the pre-storage screen refuse to
     // treat its output as a real screen), so the session is the
-    // deterministic probe plus placeholder frames and a no-op close — no
-    // scratch file exists to clean up.
+    // deterministic probe plus one placeholder PNG per started second and
+    // a no-op close — fully in-memory, nothing ever touches disk.
     void data;
-    const probe = { ...SIMULATED_PROBE };
     return Promise.resolve({
-      probe,
-      extractFrameAt: (timestampMs, options) =>
-        this.extractFrameAt('in-memory', probe, timestampMs, options),
+      probe: () => Promise.resolve({ ...SIMULATED_PROBE }),
+      extractFramesPerSecond: (options: { maxBytesPerFrame: number }) => {
+        // Same budget contract as the real adapter: a degenerate cap fits
+        // no frame, and any frame over the cap is the budget verdict.
+        if (
+          !Number.isInteger(options.maxBytesPerFrame) ||
+          options.maxBytesPerFrame <= 0
+        ) {
+          return Promise.reject(new FrameExceedsBudgetError());
+        }
+        const frames = Array.from(
+          { length: Math.ceil(SIMULATED_PROBE.durationMs / 1000) },
+          (_, second) =>
+            this.placeholderImage(
+              SIMULATED_PROBE.width,
+              SIMULATED_PROBE.height,
+              second * 1000,
+            ).data,
+        );
+        if (frames.some((frame) => frame.length > options.maxBytesPerFrame)) {
+          return Promise.reject(new FrameExceedsBudgetError());
+        }
+        return Promise.resolve(frames);
+      },
       close: () => Promise.resolve(),
     });
   }

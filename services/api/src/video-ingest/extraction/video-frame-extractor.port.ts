@@ -48,10 +48,15 @@ export class ExtractorUnavailableError extends Error {
   }
 }
 
-/** Controlled failure: the source could not be read as a video. */
+/**
+ * Controlled failure: the source could not be read as a video. The optional
+ * message MUST be a fixed, controlled string (never interpolated stderr,
+ * paths, or metadata) — used by the in-memory inspection path to say the
+ * container layout is unstreamable without echoing anything attacker-tinted.
+ */
 export class ExtractionFailedError extends Error {
-  constructor() {
-    super('The video could not be processed');
+  constructor(message = 'The video could not be processed') {
+    super(message);
     this.name = 'ExtractionFailedError';
   }
 }
@@ -122,29 +127,40 @@ export interface ExtractFrameAtOptions {
  * One IN-MEMORY inspection of unstored bytes — the seam behind the
  * pre-storage upload frame screen. The session is opened from a Buffer
  * (never a storage key: the whole point is that the unscreened bytes have
- * NOT touched durable storage and never will before the screen passes),
- * exposes the probe result plus frame extraction over the same bytes, and
- * MUST be closed in every path. An implementation that needs a real file
- * (a system-binary adapter) materializes an EPHEMERAL scratch file outside
- * durable storage and removes it on close(); a close failure surfaces as
- * the adapter's infrastructure classification so callers fail closed
- * rather than leaving unscreened bytes behind. A crash that skips close()
- * entirely (SIGKILL, host restart) is recovered lazily: such an adapter
- * sweeps its own abandoned scratch dirs before opening the next session.
+ * NOT touched durable storage) and is IN-MEMORY ONLY: no implementation may
+ * materialize the unscreened bytes on ANY disk — not the storage root, not
+ * an OS temp dir. A system-binary adapter feeds the bytes to its tooling
+ * over stdin/pipes; when pipe-based decoding cannot handle a container
+ * layout (a non-faststart MP4 with the moov atom at the end cannot be
+ * probed from a pipe), the inspection FAILS CLOSED with a controlled
+ * ExtractionFailedError — the service rejects the upload rather than ever
+ * writing unscreened bytes to disk. close() releases the in-memory
+ * references and is trivially idempotent (there is no disk state to
+ * recover; a crash leaks nothing).
  */
 export interface BufferInspectionSession {
-  /** Probe of the in-memory bytes (already validated/bounded). */
-  readonly probe: VideoProbeResult;
+  /** Probe the in-memory bytes. Memoized: repeated calls never re-run the
+   *  tooling. Failure classification matches the storage-key probe, except
+   *  that a tool-ran-and-refused outcome is reported as a controlled
+   *  unstreamable/unsupported-container content failure. */
+  probe(): Promise<VideoProbeResult>;
 
-  /** Extract one frame from the inspected bytes (same error contract as
-   *  extractFrameAt: FrameUnavailableError past the last decodable frame,
-   *  budget/infrastructure/content errors as on the storage-key path). */
-  extractFrameAt(
-    timestampMs: number,
-    options?: ExtractFrameAtOptions,
-  ): Promise<ExtractedImage>;
+  /**
+   * Decode ONE frame per started second from t=0 (fps=1) in a single pass
+   * over the in-memory bytes, returning the encoded frames in order.
+   * Enforces options.maxBytesPerFrame per frame (violation →
+   * FrameExceedsBudgetError) and an aggregate output cap derived from the
+   * probed duration. A successful decode yielding FEWER frames than
+   * ceil(durationMs/1000) returns what it yielded — completeness is the
+   * SERVICE's verdict; only zero frames from a successful decode is
+   * FrameUnavailableError. Infrastructure failures classify exactly as on
+   * the storage-key paths.
+   */
+  extractFramesPerSecond(options: {
+    maxBytesPerFrame: number;
+  }): Promise<Buffer[]>;
 
-  /** Release every ephemeral resource. Idempotent; MUST run in every
+  /** Release every in-memory reference. Idempotent; MUST run in every
    *  path (success, screening hit, and failure alike). */
   close(): Promise<void>;
 }
@@ -168,10 +184,9 @@ export abstract class VideoFrameExtractorPort {
 
   /**
    * Open an inspection session over IN-MEMORY bytes that must not reach
-   * durable storage before screening (see BufferInspectionSession). A
-   * probe failure inside the open cleans up any ephemeral resources
-   * before rethrowing — the caller only owns close() once the session
-   * exists.
+   * ANY disk before screening (see BufferInspectionSession). Opening never
+   * runs tooling — the first probe()/extract call does — so the caller
+   * always owns close() once the session exists.
    */
   abstract inspectBuffer(data: Buffer): Promise<BufferInspectionSession>;
 

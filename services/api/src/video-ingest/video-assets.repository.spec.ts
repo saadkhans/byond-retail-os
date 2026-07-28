@@ -923,6 +923,79 @@ describe('VideoAssetsRepository.recordMediaRemovalCompleted', () => {
   });
 });
 
+describe('VideoAssetsRepository.assetLivenessUnderLock', () => {
+  it('takes the SAME asset advisory lock BEFORE the read and reports a live asset', async () => {
+    // The upload's pre-put liveness check serializes with softDelete on
+    // this lock: a 'live' answer means no delete had committed at the
+    // moment of the read.
+    const tx = makeTx();
+    tx.videoAsset.findFirst.mockResolvedValue({ deletedAt: null });
+    const { repository } = makeRepository(tx);
+    await expect(
+      repository.assetLivenessUnderLock(TENANT, 'asset-1'),
+    ).resolves.toBe('live');
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(tx.$queryRaw.mock.calls[0][1]).toBe(`video-asset:${TENANT}:asset-1`);
+    expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      tx.videoAsset.findFirst.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('reports deleted and missing rows honestly (soft-deleted rows are still READ — no deletedAt filter)', async () => {
+    const tx = makeTx();
+    tx.videoAsset.findFirst
+      .mockResolvedValueOnce({ deletedAt: new Date() })
+      .mockResolvedValueOnce(null);
+    const { repository } = makeRepository(tx);
+    await expect(
+      repository.assetLivenessUnderLock(TENANT, 'asset-1'),
+    ).resolves.toBe('deleted');
+    await expect(
+      repository.assetLivenessUnderLock(TENANT, 'asset-1'),
+    ).resolves.toBe('missing');
+    // Deliberately NO deletedAt filter in the where: the whole point is
+    // to SEE a committed soft-delete, not to have it filtered into
+    // "missing" ambiguity.
+    const [{ where }] = tx.videoAsset.findFirst.mock.calls[0] as unknown as [
+      { where: Record<string, unknown> },
+    ];
+    expect(where).toEqual({ id: 'asset-1', tenantId: TENANT });
+  });
+});
+
+describe('VideoAssetsRepository.listArtifactStorageKeys', () => {
+  it('returns only committed rows’ keys, tenant-scoped, and skips the query entirely for an empty list', async () => {
+    // Staged-artifact cleanup consults this before deleting: deterministic
+    // staging keys can be the very keys an earlier committed batch
+    // recorded, and those must never be deleted.
+    const tx = makeTx();
+    const { repository, prisma } = makeRepository(tx);
+    const committedKey = 'tenant-1/u/artifacts/aa11/0.png';
+    const stagedKeys = [committedKey, 'tenant-1/u/artifacts/aa11/1.png'];
+    (prisma.videoArtifact.findMany as jest.Mock).mockResolvedValue([
+      { storageKey: committedKey },
+    ]);
+    await expect(
+      repository.listArtifactStorageKeys(TENANT, stagedKeys),
+    ).resolves.toEqual([committedKey]);
+    const [{ where, select }] = prisma.videoArtifact.findMany.mock
+      .calls[0] as unknown as [
+      { where: Record<string, unknown>; select: Record<string, unknown> },
+    ];
+    // Tenant-scoped, key-limited, and reading NOTHING but the key column.
+    expect(where).toEqual({
+      tenantId: TENANT,
+      storageKey: { in: stagedKeys },
+    });
+    expect(select).toEqual({ storageKey: true });
+    // Empty input never issues a query (an `in: []` scan is pointless).
+    await expect(
+      repository.listArtifactStorageKeys(TENANT, []),
+    ).resolves.toEqual([]);
+    expect(prisma.videoArtifact.findMany).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('VideoAssetsRepository.listLinkedInferenceJobs', () => {
   it('enumerates linked job ids with status, deduped, WITHOUT a non-deleted-parent filter', async () => {
     // The delete flow runs AFTER the soft-delete committed (and on

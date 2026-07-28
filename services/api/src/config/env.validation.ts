@@ -133,21 +133,31 @@ class EnvironmentVariables {
   })
   VIDEO_OCR_ENABLED?: string;
 
-  // DEVELOPMENT/TEST-ONLY escape hatch (deliberately alarming name):
-  // permits uploads WITHOUT the pre-storage frame screen when the
-  // extractor/recognizer toolchain cannot perform it. Strict boolean like
-  // the other Phase 10 flags — and declared for the same whitelist
-  // reason. The ban outside dev/test is ENFORCED, not advisory:
-  // assertScreeningBypassAllowed below fails startup unless NODE_ENV is
-  // EXPLICITLY development or test (an UNSET NODE_ENV fails too — a
-  // production deploy that simply omits NODE_ENV must never boot
-  // unscreened), and the video-ingest service additionally honors its
-  // runtime read only under an explicit development/test NODE_ENV.
+  // UNSUPPORTED — the historical unscreened-upload bypass is GONE in every
+  // environment. The variable stays DECLARED (whitelist compatibility:
+  // env files that carry it as false/unset must still boot), but
+  // assertScreeningBypassUnsupported below FAILS startup whenever it is
+  // true — development, test, and production alike: the payment invariant
+  // (raw media is never persisted before screening) has no dev/test
+  // exception.
   @IsOptional()
   @Matches(/^(true|false)$/i, {
     message: 'VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS must be true or false',
   })
   VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS?: string;
+
+  // Ceiling on the probed duration (ms) eligible for the mandatory
+  // pre-storage upload frame screen: EVERY started second of an upload is
+  // OCR-screened at 1 fps before any byte reaches durable storage, so
+  // this bounds the synchronous upload request. Longer clips are a
+  // controlled 400 BEFORE any storage write. Default 30000 (30 s);
+  // bounds 1 s .. 5 min so a deployment typo fails at boot instead of
+  // making uploads either unscreenable or unboundedly slow.
+  @IsOptional()
+  @IsInt()
+  @Min(1000)
+  @Max(300_000)
+  VIDEO_MAX_SCREENING_DURATION_MS?: number;
 }
 
 // Placeholder markers — banned in EVERY environment (staging and preview
@@ -215,34 +225,21 @@ export function assertJwtSecretUsable(secret: string): void {
 }
 
 /**
- * Cross-field startup rule (same post-validate idiom as
- * assertJwtSecretUsable): the pre-storage upload-screening bypass is
- * permitted ONLY when NODE_ENV is EXPLICITLY 'development' or 'test'.
- * Every other NODE_ENV — 'production' AND unset alike — fails AT BOOT
- * with an actionable message instead of silently accepting unscreened
- * media: production deployments routinely omit NODE_ENV, and "unset means
- * non-production" would let exactly those deployments boot with the
- * bypass live. (NODE_ENV itself is enum-validated upstream, so the only
- * values that can reach this check are development, test, production, or
- * unset.) The video-ingest service mirrors the same rule at runtime as
- * defense-in-depth.
+ * Startup rule (same post-validate idiom as assertJwtSecretUsable): the
+ * pre-storage upload-screening bypass is NOT SUPPORTED — in ANY
+ * environment. The payment invariant that raw media is never persisted
+ * before screening has no development/test exception, so a config that
+ * asks for unscreened uploads fails AT BOOT everywhere; the variable
+ * remains declared only so env files carrying it as false/unset keep
+ * booting. The video-ingest service no longer reads the flag at all.
  */
-export function assertScreeningBypassAllowed(
-  nodeEnv: NodeEnv | undefined,
+export function assertScreeningBypassUnsupported(
   bypass: string | undefined,
 ): void {
-  if (bypass?.toLowerCase() !== 'true') {
-    return;
-  }
-  if (nodeEnv !== NodeEnv.Development && nodeEnv !== NodeEnv.Test) {
+  if (bypass?.toLowerCase() === 'true') {
     throw new Error(
-      'VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS is permitted only when ' +
-        "NODE_ENV is explicitly 'development' or 'test' (it is currently " +
-        `${nodeEnv ?? 'unset'}): the pre-storage upload screening bypass ` +
-        'is strictly non-production and an unset NODE_ENV must be treated ' +
-        'as production — unset the bypass and configure ' +
-        'VIDEO_FFMPEG_ENABLED=true and VIDEO_OCR_ENABLED=true so every ' +
-        'upload is frame-screened before storage',
+      'VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS is not supported because ' +
+        'raw media cannot be persisted before screening.',
     );
   }
 }
@@ -263,8 +260,7 @@ export function validateEnv(
     throw new Error(`Invalid environment configuration: ${properties}`);
   }
   assertJwtSecretUsable(validated.JWT_SECRET);
-  assertScreeningBypassAllowed(
-    validated.NODE_ENV,
+  assertScreeningBypassUnsupported(
     validated.VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS,
   );
   return validated;

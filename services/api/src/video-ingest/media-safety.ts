@@ -359,24 +359,40 @@ export function filenameCarriesSensitiveContent(filename: string): boolean {
   );
 }
 
-// Chunked scan parameters for the payload text screen below. Separated
-// digit chains are now scanned WITHOUT a group cap, so the chunk overlap is
-// the effective length bound on a boundary-straddling chain: the overlap
-// must comfortably exceed every PAN grouping we expect to catch, including
-// multi-character separator runs. 2 KiB covers a 19-digit PAN whose 18
-// separators are each ~100 characters of padding (and, in the UTF-16 views,
-// ~1 KiB of UTF-16 text), far past any single-character-separated grouping
-// or KEY_VALUE credential fragment. Chunk boundaries are handled at the
-// BYTE level: every decode view (latin1, both UTF-16LE offsets) is produced
-// from the chunk + overlap bytes, and BOTH the printable-run credential
-// screen and the full-view PAN chain scan below operate on those views, so
-// the overlap bound applies uniformly no matter which scan detects the
-// content. (A sensitive run stretched past 2 KiB COULD still straddle a
-// boundary undetected — an accepted bound: chunks are 1 MiB, so the
-// straddle window is ~0.2% of positions, and every non-straddling
-// occurrence still rejects.)
+// Chunked scan parameters for the payload text screen below. Chunks are
+// 1 MiB. At each chunk boundary a CONTENT-AWARE CARRY is prepended to the
+// NEXT chunk (replacing the earlier fixed 2 KiB overlap appended to the
+// previous one): the carry is the longest suffix of the bytes before the
+// boundary that could still be part of a separated digit chain. The
+// backward scan carries every byte that is NOT an ASCII letter — digits,
+// punctuation, whitespace, control bytes, the 0x00 interleave of UTF-16
+// ASCII text, and every byte of a multi-byte UTF-8 separator (all >= 0x80)
+// — because GROUPED_PAN's separator class is "not an ASCII alphanumeric":
+// in every decode view only an ASCII letter breaks a digit chain, so a
+// suffix containing no letter byte is exactly the region a straddling
+// chain could extend through. The carry is capped at 64 KiB (memory and
+// rescan bound) and FLOORED at the old 2 KiB overlap: the floor covers
+// printable-run credential fragments such as "password hunter2" — whose
+// LETTERS stop the content-aware scan but whose whole run fits far inside
+// 2 KiB — and UTF-16 straddles generally. UTF-16 parity: prepending an
+// ODD-length carry flips the UTF-16 byte alignment of the concatenated
+// text relative to the raw chunk, which is safe because BOTH UTF-16LE byte
+// offsets are always decoded and scanned — a straddling UTF-16 string
+// lands on the correct alignment in one of the two views whatever the
+// carry length. The carried region is rescanned once per boundary (<=
+// 64 KiB per 1 MiB chunk — bounded, ~6% extra in the worst case, ~0.2%
+// typical).
+// RESIDUALS: (1) only a SINGLE digit chain stretched across MORE than
+// 64 KiB of separators straddling a boundary can now evade the carry — a
+// 16-digit PAN spread over >64 KiB of padding is beyond any realistic
+// container metadata (the earlier fixed-overlap residual was 2 KiB);
+// (2) exotic UTF-16 separators whose code-unit bytes coincide with ASCII
+// letters (e.g. U+2041 = 0x41 0x20 LE) stop the backward scan early — the
+// 2 KiB floor still covers those within its bound, and non-straddling
+// occurrences always reject.
 const PAYLOAD_SCAN_CHUNK_BYTES = 1024 * 1024;
 const PAYLOAD_SCAN_OVERLAP_BYTES = 2048;
+const PAYLOAD_SCAN_CARRY_MAX_BYTES = 64 * 1024;
 // Printable ASCII runs of at least this length are treated as embedded
 // text; shorter runs are overwhelmingly codec noise. The floor is FIVE, not
 // eight: the shortest credential fragment the shared screen classifies is
@@ -385,14 +401,38 @@ const PAYLOAD_SCAN_OVERLAP_BYTES = 2048;
 const MIN_PRINTABLE_RUN = 5;
 const PRINTABLE_RUN = /[\x20-\x7e]{5,}/g;
 
+/** ASCII A-Z / a-z — the only bytes that break a digit chain in every view. */
+function isAsciiLetterByte(byte: number): boolean {
+  return (byte >= 0x41 && byte <= 0x5a) || (byte >= 0x61 && byte <= 0x7a);
+}
+
+/**
+ * Content-aware boundary carry (see the parameter doc above): the number of
+ * bytes immediately BEFORE `boundary` to prepend to the next chunk. Scans
+ * backward while bytes are chain-relevant (not an ASCII letter), capped at
+ * PAYLOAD_SCAN_CARRY_MAX_BYTES, floored at PAYLOAD_SCAN_OVERLAP_BYTES, and
+ * never past the start of the buffer.
+ */
+function boundaryCarryBytes(buffer: Buffer, boundary: number): number {
+  let carried = 0;
+  while (
+    carried < PAYLOAD_SCAN_CARRY_MAX_BYTES &&
+    carried < boundary &&
+    !isAsciiLetterByte(buffer[boundary - 1 - carried])
+  ) {
+    carried += 1;
+  }
+  return Math.min(boundary, Math.max(carried, PAYLOAD_SCAN_OVERLAP_BYTES));
+}
+
 /**
  * Payload-level sensitive-text screen: container METADATA (title/comment
  * atoms, subtitle tracks, XMP/ID3 text) is plain bytes inside the upload,
  * so a PAN or credential embedded there would otherwise reach durable
  * storage having passed every filename/magic check. Printable ASCII/UTF-8
- * runs are extracted chunk-by-chunk (bounded memory, boundary overlap) and
- * screened with the shared credential/PAN detectors — both raw and with
- * separators stripped, so grouped digits match too.
+ * runs are extracted chunk-by-chunk (bounded memory, content-aware boundary
+ * carry) and screened with the shared credential/PAN detectors — both raw
+ * and with separators stripped, so grouped digits match too.
  *
  * PAN chains are ADDITIONALLY windowed over each FULL decoded view, not
  * only inside printable-ASCII runs: separators outside printable ASCII —
@@ -405,12 +445,36 @@ const PRINTABLE_RUN = /[\x20-\x7e]{5,}/g;
  * the decoded-text level every such run, whatever bytes produced it, chains
  * digit groups exactly like a dash does — in every view.
  *
+ * SPACED credential labels are ALSO screened over each full decoded view:
+ * a label split from its value by a REAL line break in the raw bytes
+ * ("cvv\n123", "password\nhunter2" inside a comment/subtitle atom) lands
+ * in two separate printable runs, so the run-level screen alone would
+ * never see the pair. Only the two spaced-label detectors run at full-view
+ * level — fused labels, key=value fragments, and secret tokens are
+ * contiguous printable tokens already covered by the run screen.
+ * FALSE-POSITIVE SURFACE (assessed): a binary FP needs the exact letter
+ * bytes of a label (case-insensitive 'cvv'/'pin'/... = (2/256)^3 per
+ * position) followed by \s bytes (~14/256, incl. 0xA0→NBSP in latin1) and
+ * a digit (10/256) — about 1e-9 per byte per 3-letter label, ~6e-9 across
+ * all labels, i.e. roughly one expected hit per ~50-100 MiB of uniformly
+ * random (compressed-video-entropy) bytes per view; the UTF-16 views are
+ * far rarer (letters need interleaved 0x00 high bytes). For bounded,
+ * controlled TEST clips that is well under one expected FP per upload —
+ * accepted reject-on-write overbreadth, same policy as Luhn-valid
+ * timestamps (a false reject means re-encode/strip metadata).
+ *
  * Both single-byte text (ASCII/UTF-8/latin1) AND UTF-16 text are screened:
  * MP4 ilst data atoms (type 2) and ID3v2 frames (encoding 0x01) store text
  * as UTF-16, where every ASCII code unit pairs with a 0x00 byte — a latin1
  * decode alone would never see it. Each chunk is additionally decoded as
  * UTF-16LE at both byte offsets, which also covers UTF-16BE ASCII (its
  * code units read as LE at the shifted offset).
+ *
+ * CHUNK BOUNDARIES use the content-aware carry documented at the scan
+ * parameters above: each chunk after the first is prepended with the
+ * longest letter-free suffix of the preceding bytes (floor 2 KiB, cap
+ * 64 KiB), so a separated PAN chain of ANY length up to 64 KiB straddling
+ * a 1 MiB boundary is decoded and scanned whole in the following chunk.
  *
  * SCOPE (documented limitation): this screens TEXT-ENCODED bytes. Sensitive
  * content that is only VISIBLE IN THE VIDEO FRAMES (a card filmed on
@@ -425,11 +489,13 @@ export function bufferCarriesSensitiveText(buffer: Buffer): boolean {
     offset < buffer.length;
     offset += PAYLOAD_SCAN_CHUNK_BYTES
   ) {
-    const end = Math.min(
-      buffer.length,
-      offset + PAYLOAD_SCAN_CHUNK_BYTES + PAYLOAD_SCAN_OVERLAP_BYTES,
-    );
-    const chunk = buffer.subarray(offset, end);
+    const end = Math.min(buffer.length, offset + PAYLOAD_SCAN_CHUNK_BYTES);
+    // Content-aware carry: prepend the longest letter-free suffix of the
+    // bytes before this chunk (floor 2 KiB, cap 64 KiB) so a separated
+    // digit chain straddling the boundary is seen whole. subarray is a
+    // view — the carry costs no copy, only a bounded rescan.
+    const carry = offset === 0 ? 0 : boundaryCarryBytes(buffer, offset);
+    const chunk = buffer.subarray(offset - carry, end);
     const views = [
       chunk.toString('latin1'),
       chunk.toString('utf16le'),
@@ -442,6 +508,22 @@ export function bufferCarriesSensitiveText(buffer: Buffer): boolean {
       // Linear: the chain regex is unambiguous and each window join is
       // abandoned past 19 digits.
       if (carriesLikelyPan(text)) {
+        return true;
+      }
+      // Full-view SPACED credential-label scan: a label split from its
+      // value by a REAL line break in raw bytes ("cvv\n123",
+      // "password\nhunter2") lands in TWO separate printable runs, so the
+      // run-level screen below never sees the pair — the spaced-label
+      // detectors must see the whole decoded view too. Only the two
+      // spaced rules run here: the fused-label, key=value, and secret-token
+      // shapes are single contiguous printable tokens and are already fully
+      // covered by the printable-run screen, so re-running the whole
+      // free-text predicate on binary views would only add FP surface.
+      // Linear: both regexes are single-pass with disjoint char classes.
+      if (
+        SPACED_NUMERIC_CREDENTIAL_LABEL.test(text) ||
+        SPACED_SECRET_LABEL.test(text)
+      ) {
         return true;
       }
       for (const run of text.match(PRINTABLE_RUN) ?? []) {

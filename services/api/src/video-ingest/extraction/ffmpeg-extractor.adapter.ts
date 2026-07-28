@@ -1,14 +1,4 @@
 import { execFile } from 'node:child_process';
-import {
-  chmod,
-  mkdtemp,
-  readdir,
-  rm,
-  stat,
-  writeFile,
-} from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { Injectable } from '@nestjs/common';
 import { LocalVideoStorageAdapter } from '../storage/local-video-storage.adapter';
 import {
@@ -34,32 +24,20 @@ export const FFMPEG_EXTRACTOR_KIND = 'ffmpeg';
 const FFMPEG_BINARY = 'ffmpeg';
 const FFPROBE_BINARY = 'ffprobe';
 
-// Ephemeral scratch location for BUFFER inspection (the pre-storage upload
-// screen): ffprobe/ffmpeg need a real file for reliable container probing,
-// so the in-memory bytes are written to a per-session directory in the OS
-// temp dir — deliberately OUTSIDE the durable storage root, with owner-only
-// modes (0o700 dir / 0o600 file) — and removed in every path. Scratch
-// paths never leak: every failure maps to the same controlled, path-free
-// errors as the storage-key paths.
-export const SCRATCH_DIR_PREFIX = 'byond-video-inspect-';
-const SCRATCH_FILE_NAME = 'inspect.media';
-const SCRATCH_DIR_MODE = 0o700;
-const SCRATCH_FILE_MODE = 0o600;
+// BUFFER inspection (the pre-storage upload screen) is IN-MEMORY ONLY: the
+// unscreened bytes are fed to ffprobe/ffmpeg over STDIN (pipe:0) and never
+// touch any disk — not the storage root, not the OS temp dir. The accepted
+// fail-closed cost: a container whose probing requires seeking (a
+// non-faststart MP4 with the moov atom at the end) cannot be read from a
+// pipe, and that inspection fails with a controlled content error — the
+// service rejects the upload instead of ever materializing card-bearing
+// bytes on disk. Test clips must be encoded streamable (+faststart).
+const PIPE_INPUT = 'pipe:0';
 
-// Crash-recovery scavenger threshold. Normal paths always remove the
-// scratch dir, but a process crash / SIGKILL / host restart between the
-// write and close() would strand it forever — so every inspectBuffer call
-// first sweeps abandoned SCRATCH_DIR_PREFIX dirs. 15 minutes is FAR beyond
-// any bounded live inspection (a session runs a handful of 30 s-capped
-// execs over at most a few frames), so a concurrent live session's dir can
-// never be swept, while a crashed process's dir is reclaimed on the next
-// upload attempt.
-export const SCRATCH_ABANDONED_AFTER_MS = 15 * 60 * 1000;
-
-// Entries examined per sweep are capped so a pathological tmpdir (or a
-// hostile local process minting prefix-matching dirs) cannot add unbounded
-// latency to an upload; anything beyond the cap waits for the next sweep.
-export const SCRATCH_SWEEP_MAX_DIRS = 50;
+// Controlled, FIXED message for the pipe-probe content failure above —
+// never interpolated with stderr, paths, or metadata.
+export const UNSTREAMABLE_CONTAINER_MESSAGE =
+  'The video container could not be read as a stream; re-encode it as a streamable (faststart) file';
 
 // Decoded PNG frames are bounded (a single 4K PNG is well under this); the
 // cap exists so a hostile container cannot balloon the parent process.
@@ -168,6 +146,61 @@ export function buildCropArgs(
   ];
 }
 
+/**
+ * Single-pass 1-frame-per-second decode of STDIN bytes to a concatenated
+ * PNG stream on stdout — the in-memory inspection's only frame path. No
+ * file path ever appears in the vector.
+ */
+export function buildFramesPerSecondArgs(): string[] {
+  return [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-i',
+    PIPE_INPUT,
+    '-vf',
+    'fps=1',
+    '-f',
+    'image2pipe',
+    '-vcodec',
+    'png',
+    'pipe:1',
+  ];
+}
+
+// PNG stream signature (89 50 4E 47 0D 0A 1A 0A): every PNG in the
+// image2pipe output starts with these eight bytes, and the sequence cannot
+// occur inside a well-formed PNG's chunk stream by accident often enough to
+// matter for splitting ffmpeg's own output.
+const PNG_SIGNATURE = Buffer.from([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+]);
+
+/**
+ * Split a concatenated-PNG stdout stream into individual PNG buffers by
+ * linear signature scan (no image dependencies). Bytes before the first
+ * signature — none in well-formed ffmpeg output — are ignored.
+ */
+export function splitConcatenatedPngStream(data: Buffer): Buffer[] {
+  const starts: number[] = [];
+  let offset = 0;
+  for (;;) {
+    const index = data.indexOf(PNG_SIGNATURE, offset);
+    if (index === -1) {
+      break;
+    }
+    starts.push(index);
+    offset = index + PNG_SIGNATURE.length;
+  }
+  return starts.map((start, i) =>
+    // subarray views the SAME allocation — each frame is copied out so a
+    // retained frame never pins the whole decoded stream in memory.
+    Buffer.from(
+      data.subarray(start, i + 1 < starts.length ? starts[i + 1] : data.length),
+    ),
+  );
+}
+
 interface ProbeStream {
   width?: number;
   height?: number;
@@ -249,6 +282,9 @@ type RunCommand = (
   binary: string,
   args: string[],
   maxOutputBytes: number,
+  /** When present, the child's ENTIRE stdin — the in-memory inspection
+   *  path feeds unscreened bytes this way so they never touch disk. */
+  stdin?: Buffer,
 ) => Promise<{ stdout: Buffer }>;
 
 /** Error shape execFile produces: exit failures carry a NUMERIC code, spawn/
@@ -312,9 +348,9 @@ export function classifyCommandError(error: unknown): Error {
   return new ExtractionFailedError();
 }
 
-const defaultRunCommand: RunCommand = (binary, args, maxOutputBytes) =>
+const defaultRunCommand: RunCommand = (binary, args, maxOutputBytes, stdin) =>
   new Promise((resolvePromise, rejectPromise) => {
-    execFile(
+    const child = execFile(
       binary,
       args,
       {
@@ -336,6 +372,15 @@ const defaultRunCommand: RunCommand = (binary, args, maxOutputBytes) =>
         resolvePromise({ stdout });
       },
     );
+    if (stdin !== undefined && child.stdin) {
+      // A child that exits before draining stdin (ffprobe stops reading
+      // once it has — or cannot get — what it needs) raises EPIPE here;
+      // swallowing it is CORRECT: the promise settles from the child's own
+      // outcome via the execFile callback, so classification follows the
+      // exit/kill/errno shape, never the pipe write.
+      child.stdin.on('error', () => undefined);
+      child.stdin.end(stdin);
+    }
   });
 
 /**
@@ -364,9 +409,15 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
     binary: string,
     args: string[],
     maxOutputBytes: number,
+    stdin?: Buffer,
   ): Promise<Buffer> {
     try {
-      const { stdout } = await this.runCommand(binary, args, maxOutputBytes);
+      const { stdout } = await this.runCommand(
+        binary,
+        args,
+        maxOutputBytes,
+        stdin,
+      );
       return stdout;
     } catch (error) {
       throw classifyCommandError(error);
@@ -531,135 +582,130 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
   }
 
   /**
-   * IN-MEMORY inspection for the pre-storage upload screen. ffprobe/ffmpeg
-   * need a real, SEEKABLE file — stdin feeding is deliberately not used
-   * because probing non-faststart MP4 containers (moov atom at the end)
-   * requires seeking, which a pipe cannot provide — so the buffer is
-   * written to an EPHEMERAL scratch file in the OS temp dir (0o700 dir /
-   * 0o600 file) — never under the durable storage root — probed there, and
-   * the whole scratch directory is removed in every path: on a probe
-   * failure before the session is returned, and by close() afterwards
-   * (retry once, then the existing infrastructure classification — the
-   * unscreened bytes are never silently left behind). Scratch write
-   * failures are environmental (ENOSPC, permissions), so they map to
-   * ExtractionInfrastructureError.
-   *
-   * Crash recovery: a crash between the write and close() would strand the
-   * scratch dir, so each call FIRST runs an awaited best-effort sweep of
-   * abandoned scratch dirs (see sweepAbandonedScratchDirs) — before this
-   * session's own dir even exists, so the sweep can never touch it.
+   * IN-MEMORY inspection for the pre-storage upload screen. The unscreened
+   * bytes NEVER touch any disk: ffprobe reads them from STDIN (pipe:0) and
+   * the single-pass fps=1 frame decode feeds the same buffer to ffmpeg's
+   * stdin, collecting PNG frames from stdout. A container whose probing
+   * requires seeking (non-faststart MP4, moov atom at the end) cannot be
+   * read from a pipe — the tool exits nonzero and the inspection FAILS
+   * CLOSED with a controlled unstreamable-container content error (the
+   * service rejects the upload). That is the documented, accepted cost of
+   * keeping card-bearing bytes off disk; infrastructure failures classify
+   * exactly as on the storage-key paths. Opening never runs tooling —
+   * probe() does, memoized — and close() only releases references, so it
+   * is trivially idempotent and a crash can leak nothing.
    */
-  async inspectBuffer(data: Buffer): Promise<BufferInspectionSession> {
-    // Awaited (not fire-and-forget) so "cleanup before accepting uploads"
-    // is literal; runs BEFORE mkdtemp so the live session's own dir is
-    // never a sweep candidate. Sweep failures never fail the inspection.
-    await this.sweepAbandonedScratchDirs();
-    let scratchDir: string | undefined;
-    let scratchPath: string;
-    try {
-      scratchDir = await mkdtemp(join(tmpdir(), SCRATCH_DIR_PREFIX));
-      // mkdtemp already creates 0o700 on POSIX; tighten explicitly and
-      // best-effort (exotic mounts must not lose the write) like the
-      // storage adapter does.
-      await chmod(scratchDir, SCRATCH_DIR_MODE).catch(() => undefined);
-      scratchPath = join(scratchDir, SCRATCH_FILE_NAME);
-      await writeFile(scratchPath, data, {
-        mode: SCRATCH_FILE_MODE,
-        flag: 'wx',
-      });
-    } catch {
-      if (scratchDir !== undefined) {
-        // Never leave a partial scratch tree; a persistent removal
-        // failure keeps the (correct) infrastructure classification.
-        await this.removeScratchDir(scratchDir);
-      }
-      throw new ExtractionInfrastructureError();
-    }
-    let probe: VideoProbeResult;
-    try {
-      const stdout = await this.run(
-        FFPROBE_BINARY,
-        buildProbeArgs(scratchPath),
-        MAX_OUTPUT_BYTES,
-      );
-      probe = parseProbeOutput(stdout.toString('utf8'));
-    } catch (error) {
-      // The caller never received a session, so the cleanup is ours. A
-      // removal failure escalates as ExtractionInfrastructureError from
-      // removeScratchDir (fail closed); otherwise the probe's own
-      // classification propagates.
-      await this.removeScratchDir(scratchDir);
-      throw error;
-    }
-    const dir = scratchDir;
-    let closed = false;
-    return {
-      probe,
-      extractFrameAt: (timestampMs, options) =>
-        this.frameAtPathWithOptions(scratchPath, probe, timestampMs, options),
-      close: async () => {
-        if (closed) {
-          return;
+  inspectBuffer(data: Buffer): Promise<BufferInspectionSession> {
+    let bytes: Buffer | null = data;
+    let memoizedProbe: Promise<VideoProbeResult> | undefined;
+
+    const probe = (): Promise<VideoProbeResult> => {
+      if (memoizedProbe === undefined) {
+        if (bytes === null) {
+          // Closed session: the bytes are gone, a controlled content
+          // failure (a caller bug, never an infrastructure retry).
+          return Promise.reject(new ExtractionFailedError());
         }
-        closed = true;
-        await this.removeScratchDir(dir);
-      },
+        // Memoized INCLUDING failure — the verdict on these bytes cannot
+        // change, so the tooling never re-runs for the same session.
+        memoizedProbe = this.probeFromStdin(bytes);
+      }
+      return memoizedProbe;
     };
-  }
 
-  /**
-   * LAZY crash-recovery scavenger for scratch dirs stranded by a process
-   * crash / SIGKILL / host restart mid-inspection. One readdir of the OS
-   * temp dir (cheap when there is nothing to do); only entries carrying
-   * the shared SCRATCH_DIR_PREFIX are considered, capped at
-   * SCRATCH_SWEEP_MAX_DIRS per sweep; a dir is removed only when its mtime
-   * is older than SCRATCH_ABANDONED_AFTER_MS, so a live concurrent
-   * session's dir is never a candidate. Everything is best-effort: a
-   * per-dir stat/removal failure is swallowed (it must not block the
-   * upload or the sweep of the remaining dirs), and the whole sweep is
-   * wrapped so even a readdir failure never fails the inspection. Removal
-   * relies on the same rm recursive+force semantics close() uses (safe on
-   * Windows). Nothing here ever surfaces a tmp path in an error.
-   */
-  private async sweepAbandonedScratchDirs(): Promise<void> {
-    try {
-      const tempRoot = tmpdir();
-      const entries = await readdir(tempRoot);
-      const candidates = entries
-        .filter((name) => name.startsWith(SCRATCH_DIR_PREFIX))
-        .slice(0, SCRATCH_SWEEP_MAX_DIRS);
-      const cutoff = Date.now() - SCRATCH_ABANDONED_AFTER_MS;
-      for (const name of candidates) {
-        const abandonedDir = join(tempRoot, name);
-        try {
-          const info = await stat(abandonedDir);
-          if (info.mtimeMs <= cutoff) {
-            await rm(abandonedDir, { recursive: true, force: true });
-          }
-        } catch {
-          // Best-effort per dir: one unreadable/unremovable entry must not
-          // block this upload or the sweep of the other dirs.
+    return Promise.resolve({
+      probe,
+      extractFramesPerSecond: async (options: { maxBytesPerFrame: number }) => {
+        // A degenerate per-frame budget (zero/negative/non-integer) can fit
+        // no frame at all — the budget verdict, decided before any exec.
+        if (
+          !Number.isInteger(options.maxBytesPerFrame) ||
+          options.maxBytesPerFrame <= 0
+        ) {
+          throw new FrameExceedsBudgetError();
         }
-      }
-    } catch {
-      // The sweep is opportunistic hygiene — a readdir failure (exotic
-      // tmpdir permissions) must never fail the live inspection.
-    }
+        // The caller cap never RAISES the adapter's own per-frame ceiling.
+        const perFrameCap = Math.min(MAX_OUTPUT_BYTES, options.maxBytesPerFrame);
+        const probed = await probe();
+        if (bytes === null) {
+          throw new ExtractionFailedError();
+        }
+        // One frame per STARTED second from t=0 → ceil(duration/1s) frames
+        // at most; the exec's maxBuffer is sized from that expectation and
+        // clamped by the aggregate multi-frame ceiling, so a hostile
+        // container can balloon neither one frame nor the whole pass.
+        const expectedFrames = Math.ceil(probed.durationMs / 1000);
+        const aggregateCap = Math.min(
+          expectedFrames * perFrameCap,
+          MAX_TOTAL_EXTRACTION_BYTES,
+        );
+        let stdout: Buffer;
+        try {
+          ({ stdout } = await this.runCommand(
+            FFMPEG_BINARY,
+            buildFramesPerSecondArgs(),
+            aggregateCap,
+            bytes,
+          ));
+        } catch (error) {
+          // A BUDGET-derived cap (below the adapter's own aggregate
+          // ceiling) that overflows is the caller's budget verdict, not an
+          // infrastructure failure — same discrimination as the
+          // storage-key frame path.
+          if (
+            aggregateCap < MAX_TOTAL_EXTRACTION_BYTES &&
+            isMaxBufferOverflow(error)
+          ) {
+            throw new FrameExceedsBudgetError();
+          }
+          throw classifyCommandError(error);
+        }
+        const frames = splitConcatenatedPngStream(stdout);
+        if (frames.length === 0) {
+          // The decode SUCCEEDED but yielded nothing — no decodable frame
+          // exists, not a broken tool.
+          throw new FrameUnavailableError();
+        }
+        for (const frame of frames) {
+          if (frame.length > perFrameCap) {
+            throw new FrameExceedsBudgetError();
+          }
+        }
+        // FEWER than expectedFrames is returned AS-IS: completeness is the
+        // service's verdict, never grounds for an adapter throw.
+        return frames;
+      },
+      close: () => {
+        // In-memory only: release the references (idempotent by nature —
+        // there is no disk state to remove and nothing a crash can leak).
+        bytes = null;
+        memoizedProbe = undefined;
+        return Promise.resolve();
+      },
+    });
   }
 
-  /** Retry-once scratch removal; a persistent failure means unscreened
-   *  bytes may linger, so it surfaces as an infrastructure failure
-   *  (controlled, path-free) instead of being swallowed. */
-  private async removeScratchDir(scratchDir: string): Promise<void> {
+  /** STDIN probe for the in-memory inspection: the tool running and
+   *  refusing the piped container (numeric exit — moov-at-end MP4s land
+   *  here) is the controlled unstreamable-container content failure;
+   *  spawn/timeout/errno/maxBuffer keep the standard classification. */
+  private async probeFromStdin(bytes: Buffer): Promise<VideoProbeResult> {
+    let stdout: Buffer;
     try {
-      await rm(scratchDir, { recursive: true, force: true });
-    } catch {
-      try {
-        await rm(scratchDir, { recursive: true, force: true });
-      } catch {
-        throw new ExtractionInfrastructureError();
+      ({ stdout } = await this.runCommand(
+        FFPROBE_BINARY,
+        buildProbeArgs(PIPE_INPUT),
+        MAX_OUTPUT_BYTES,
+        bytes,
+      ));
+    } catch (error) {
+      const classified = classifyCommandError(error);
+      if (classified instanceof ExtractionFailedError) {
+        throw new ExtractionFailedError(UNSTREAMABLE_CONTAINER_MESSAGE);
       }
+      throw classified;
     }
+    return parseProbeOutput(stdout.toString('utf8'));
   }
 
   async extractCrop(

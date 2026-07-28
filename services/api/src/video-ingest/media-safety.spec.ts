@@ -225,9 +225,13 @@ describe('media-safety', () => {
       // key=value / key: value credential fragments.
       ['operator note password=hunter2'],
       ['token: abc123 issued for retest'],
-      // Bare well-known secret tokens. Concatenated so no token-shaped
-      // literal appears in source (Gitleaks blocks even fake keys).
-      ['pasted ' + 'sk_live_' + 'abcdefghijklmnop' + ' by mistake'],
+      // NOTE (repo-owner directive): NO secret-looking provider-prefix
+      // fixtures in this file, even concatenated. Direct coverage for the
+      // containsKnownSecretToken branch (provider-prefixed tokens, JWTs)
+      // lives in src/common/sensitive-keys.spec.ts; this spec exercises
+      // the other branches with safe synthetic strings only.
+      ['credential token pin 9911'], // spaced numeric label, fused wording
+      ['fused csc998 read from keypad overlay'],
       // Fused credential label + value in one token.
       ['card read cvv123 during test'],
       ['keypad pin1234 visible'],
@@ -235,6 +239,11 @@ describe('media-safety', () => {
       ['card 4111 - 1111 - 1111 - 1111 visible in frame'],
       ['pan4111111111111111 seen on receipt'],
       ['ref 4000000000006 end'],
+      // Codex full-matrix vectors, direct at the free-text level (the
+      // filename/buffer specs cover the same shapes in their channels).
+      ['4111_1111_1111_1111'],
+      ['4111.1111.1111.1111'],
+      ['ref 04111111111111111000 end'], // PAN window inside an overlong run
       // 27-group P1 payload: the tail 16 single-digit groups join to the
       // Visa test PAN — the COMPLETE chain is windowed, no group cap.
       ['3-4-3-0-3-3-0-1-1-1-9-4-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1'],
@@ -257,6 +266,7 @@ describe('media-safety', () => {
       ['PASSWORD HUNTER2'],
       ['passwd hunter2'],
       ['pwd\nhunter2'], // OCR line break between label and value
+      ['password\nhunter2'], // full label form across an OCR line break
       // PINNED: a 6+ char token after 'password' rejects even when it is
       // prose — 'password=redacted'/'password: redacted' already reject
       // via the shared key=value screen, and the whitespace form mirrors
@@ -491,9 +501,9 @@ describe('media-safety', () => {
       // Subtitle/comment atoms can carry the same label-space-value shapes
       // OCR produces; spaces are printable, so the run reaches the shared
       // containsSensitiveFreeText screen intact. (A label split from its
-      // value by a REAL line break in raw bytes lands in two separate
-      // printable runs — that shape is covered at the free-text/OCR level,
-      // where the whole multi-line string is screened as one text.)
+      // value by a REAL line break in raw bytes is covered too — the
+      // spaced-label detectors also run over each FULL decoded view; see
+      // the line-break tests below.)
       for (const fragment of ['CVV 123', 'PIN  1234', 'password hunter2']) {
         const payload = Buffer.concat([
           noise,
@@ -504,6 +514,44 @@ describe('media-safety', () => {
         ]);
         expect(bufferCarriesSensitiveText(payload)).toBe(true);
       }
+    });
+
+    it('finds credential labels split from their values by REAL line breaks in metadata bytes', () => {
+      // A raw \n between label and value splits the pair into TWO printable
+      // runs ('note cvv' / '123 end'), neither of which the run-level
+      // screen rejects — the spaced-label detectors now run over each FULL
+      // decoded view, so the pair is seen across the line break.
+      for (const fragment of ['cvv\n123', 'password\nhunter2', 'pin\r\n1234']) {
+        const payload = Buffer.concat([
+          noise,
+          Buffer.alloc(2),
+          Buffer.from(`note ${fragment} end`, 'utf8'),
+          Buffer.alloc(2),
+          noise,
+        ]);
+        expect(bufferCarriesSensitiveText(payload)).toBe(true);
+      }
+    });
+
+    it('finds UTF-16 credential labels split from their values by a real newline', () => {
+      // In the latin1 view 'PIN\n1234' as UTF-16LE is P\0I\0N\0\n\0 1\0... —
+      // the 0x00 interleave breaks \s+digit adjacency, so ONLY the UTF-16
+      // views can catch it; this pins the spaced-label scan to every view,
+      // not just latin1.
+      const le = Buffer.from('PIN\n1234', 'utf16le');
+      const lePayload = Buffer.concat([
+        noise,
+        Buffer.alloc(2),
+        le,
+        Buffer.alloc(2),
+        noise,
+      ]);
+      expect(bufferCarriesSensitiveText(lePayload)).toBe(true);
+      // UTF-16BE (byte-swapped) lands on the odd-offset LE view; padding
+      // spaces keep the label's word boundary intact at either parity.
+      const be = Buffer.from('  password\nhunter2  ', 'utf16le').swap16();
+      const bePayload = Buffer.concat([noise, Buffer.alloc(2), be, noise]);
+      expect(bufferCarriesSensitiveText(bePayload)).toBe(true);
     });
 
     it.each([
@@ -606,6 +654,66 @@ describe('media-safety', () => {
         Buffer.alloc(64),
       ]);
       expect(bufferCarriesSensitiveText(payload)).toBe(true);
+    });
+
+    it('carries a >2 KiB separated PAN chain across the chunk boundary (content-aware carry)', () => {
+      // Codex "PAN split across payload chunks": four digit groups joined
+      // by 1500-dash separator runs — a 4516-byte chain, FAR past the old
+      // fixed 2 KiB overlap. Positioned with g1 800 bytes BEFORE the 1 MiB
+      // boundary: under the fixed overlap NEITHER view saw the chain whole
+      // (chunk 1 ended at boundary+2048, before g3 at boundary+2208;
+      // chunk 2 began at the boundary, after g1 — verified by position
+      // arithmetic). The content-aware carry walks back through the
+      // letter-free separator run, g1, and the NUL padding (cap 64 KiB)
+      // and prepends it, so the second chunk decodes the chain whole.
+      const chunk = 1024 * 1024;
+      const sep = '-'.repeat(1500);
+      const chain = ['4111', '1111', '1111', '1111'].join(sep);
+      expect(chain.length).toBe(4516);
+      const payload = Buffer.concat([
+        Buffer.alloc(chunk - 800), // NULs — not printable, not letters
+        Buffer.from(chain, 'ascii'),
+        Buffer.alloc(64),
+      ]);
+      expect(bufferCarriesSensitiveText(payload)).toBe(true);
+    });
+
+    it('accepts the same straddling chain shape when the digit join is Luhn-invalid', () => {
+      // Identical geometry, last group 1112: the 16-digit join fails Luhn,
+      // so being seen whole via the carry must NOT flip it to reject — the
+      // carry only widens visibility, never the verdict rules.
+      const chunk = 1024 * 1024;
+      const sep = '-'.repeat(1500);
+      const chain = ['4111', '1111', '1111', '1112'].join(sep);
+      const payload = Buffer.concat([
+        Buffer.alloc(chunk - 800),
+        Buffer.from(chain, 'ascii'),
+        Buffer.alloc(64),
+      ]);
+      expect(bufferCarriesSensitiveText(payload)).toBe(false);
+    });
+
+    it('a letter in the straddling separator run breaks the chain and the carry (content-aware accept)', () => {
+      // Same geometry as the reject case, but an ASCII letter sits in the
+      // separator run 100 bytes before the boundary. In every decode view
+      // the letter breaks the digit chain (g1 alone = 4 digits; g2..g4 =
+      // 12 digits — no 13-digit window exists), so this accepts; and the
+      // backward carry scan stops at that letter (only the 2 KiB floor is
+      // carried), proving the carry is content-aware rather than a blanket
+      // 64 KiB copy.
+      const chunk = 1024 * 1024;
+      const sep = '-'.repeat(1500);
+      const bytes = Buffer.from(
+        ['4111', '1111', '1111', '1111'].join(sep),
+        'ascii',
+      );
+      bytes[800 - 100] = 0x58; // 'X' replaces a dash 100 bytes pre-boundary
+      const payload = Buffer.concat([
+        Buffer.alloc(chunk - 800),
+        bytes,
+        Buffer.alloc(64),
+      ]);
+      expect(bufferCarriesSensitiveText(payload)).toBe(false);
     });
 
     it('accepts ordinary container bytes and harmless metadata', () => {

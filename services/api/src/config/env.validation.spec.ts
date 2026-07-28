@@ -91,17 +91,15 @@ describe('validateEnv', () => {
       },
     );
 
-    it.each(['development', 'test'])(
-      'preserves VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS=true when NODE_ENV=%s',
-      (nodeEnv) => {
-        const validated = validateEnv({
-          ...validConfig,
-          NODE_ENV: nodeEnv,
-          VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'true',
-        });
-        expect(validated.VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS).toBe('true');
-      },
-    );
+    it('still declares VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS (compatibility): false survives validation', () => {
+      // The flag is UNSUPPORTED (true fails startup everywhere) but stays
+      // declared so env files that carry it as false keep booting.
+      const validated = validateEnv({
+        ...validConfig,
+        VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'false',
+      });
+      expect(validated.VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS).toBe('false');
+    });
 
     it.each(['yes', '1', 'never'])(
       'rejects invalid VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS=%s at boot',
@@ -116,53 +114,13 @@ describe('validateEnv', () => {
     );
   });
 
-  describe('the screening bypass requires an EXPLICIT development/test NODE_ENV (startup failure otherwise)', () => {
-    it.each(['true', 'TRUE'])(
-      'fails validation when NODE_ENV=production and the bypass is %s',
-      (value) => {
-        expect(() =>
-          validateEnv({
-            ...validConfig,
-            NODE_ENV: 'production',
-            VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: value,
-          }),
-        ).toThrow(/strictly non-production/);
-      },
-    );
+  describe('VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS is UNSUPPORTED in every environment (startup failure when true)', () => {
+    const UNSUPPORTED_MESSAGE =
+      'VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS is not supported because ' +
+      'raw media cannot be persisted before screening.';
 
-    it('fails validation when NODE_ENV is UNSET and the bypass is true', () => {
-      // A production deploy that simply omits NODE_ENV must never boot
-      // with the bypass live — unset is treated as production, not as
-      // "non-production by default".
-      const { NODE_ENV: _omit, ...withoutNodeEnv } = validConfig;
-      expect(() =>
-        validateEnv({
-          ...withoutNodeEnv,
-          VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'true',
-        }),
-      ).toThrow(/explicitly 'development' or 'test'/);
-      expect(() =>
-        validateEnv({
-          ...withoutNodeEnv,
-          VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'true',
-        }),
-      ).toThrow(/unset/);
-    });
-
-    it('fails validation for a non-enum NODE_ENV (e.g. staging) with the bypass true', () => {
-      // 'staging' is rejected by the NODE_ENV enum validation itself — the
-      // bypass can never ride an unrecognized environment name past boot.
-      expect(() =>
-        validateEnv({
-          ...validConfig,
-          NODE_ENV: 'staging',
-          VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'true',
-        }),
-      ).toThrow(/NODE_ENV/);
-    });
-
-    it.each(['development', 'test'])(
-      'allows the bypass when NODE_ENV is explicitly %s',
+    it.each(['development', 'test', 'production'])(
+      'fails validation when NODE_ENV=%s and the flag is true — the payment invariant has no dev/test exception',
       (nodeEnv) => {
         expect(() =>
           validateEnv({
@@ -170,11 +128,46 @@ describe('validateEnv', () => {
             NODE_ENV: nodeEnv,
             VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'true',
           }),
+        ).toThrow(UNSUPPORTED_MESSAGE);
+      },
+    );
+
+    it('fails validation when NODE_ENV is UNSET and the flag is true', () => {
+      const { NODE_ENV: _omit, ...withoutNodeEnv } = validConfig;
+      expect(() =>
+        validateEnv({
+          ...withoutNodeEnv,
+          VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'true',
+        }),
+      ).toThrow(UNSUPPORTED_MESSAGE);
+    });
+
+    it('rejects the flag case-insensitively (TRUE)', () => {
+      expect(() =>
+        validateEnv({
+          ...validConfig,
+          VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'TRUE',
+        }),
+      ).toThrow(UNSUPPORTED_MESSAGE);
+    });
+
+    it.each(['development', 'test', 'production'])(
+      'accepts NODE_ENV=%s with the flag false or unset (declared-for-compatibility)',
+      (nodeEnv) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            NODE_ENV: nodeEnv,
+            VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'false',
+          }),
+        ).not.toThrow();
+        expect(() =>
+          validateEnv({ ...validConfig, NODE_ENV: nodeEnv }),
         ).not.toThrow();
       },
     );
 
-    it('accepts an unset NODE_ENV with the bypass false or unset', () => {
+    it('accepts an unset NODE_ENV with the flag false or unset', () => {
       const { NODE_ENV: _omit, ...withoutNodeEnv } = validConfig;
       expect(() =>
         validateEnv({
@@ -184,19 +177,55 @@ describe('validateEnv', () => {
       ).not.toThrow();
       expect(() => validateEnv({ ...withoutNodeEnv })).not.toThrow();
     });
+  });
 
-    it('accepts production with the bypass false or unset', () => {
-      expect(() =>
-        validateEnv({
-          ...validConfig,
-          NODE_ENV: 'production',
-          VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'false',
-        }),
-      ).not.toThrow();
-      expect(() =>
-        validateEnv({ ...validConfig, NODE_ENV: 'production' }),
-      ).not.toThrow();
+  describe('VIDEO_MAX_SCREENING_DURATION_MS bounds (Phase 10 pre-storage screen)', () => {
+    it('accepts the default and both boundary values', () => {
+      for (const value of ['30000', '1000', '300000']) {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            VIDEO_MAX_SCREENING_DURATION_MS: value,
+          }),
+        ).not.toThrow();
+      }
     });
+
+    it.each(['999', '0', '-1000'])(
+      'rejects sub-second value %s at boot',
+      (value) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            VIDEO_MAX_SCREENING_DURATION_MS: value,
+          }),
+        ).toThrow(/VIDEO_MAX_SCREENING_DURATION_MS/);
+      },
+    );
+
+    it.each(['300001', '3000000'])(
+      'rejects over-cap value %s at boot (bounds the synchronous upload screen)',
+      (value) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            VIDEO_MAX_SCREENING_DURATION_MS: value,
+          }),
+        ).toThrow(/VIDEO_MAX_SCREENING_DURATION_MS/);
+      },
+    );
+
+    it.each(['abc', '1500.5', ''])(
+      'rejects non-integer value %j at boot',
+      (value) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            VIDEO_MAX_SCREENING_DURATION_MS: value,
+          }),
+        ).toThrow(/VIDEO_MAX_SCREENING_DURATION_MS/);
+      },
+    );
   });
 
   describe('placeholder secrets are rejected in EVERY environment', () => {

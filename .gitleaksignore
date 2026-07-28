@@ -13,3 +13,10 @@ fee2aa7cd0bf091830ca84f85f13657f6ed865e3:ml/tests/test_dataset_manifest.py:aws-a
 # that introduced them. Not real credentials.
 a474033fff9eae0b715aeeeb3f318ef4aab11f8b:services/api/src/inference/inference-jobs.service.spec.ts:stripe-access-token:438
 a474033fff9eae0b715aeeeb3f318ef4aab11f8b:services/api/src/inference/inference-jobs.service.spec.ts:generic-api-key:467
+#
+# Fake Stripe-shaped TEST FIXTURE (Phase 10 media-safety free-text screening
+# test, proving such values are REJECTED before persistence). The literal was
+# removed from the source in a later commit (replaced by safe synthetic
+# fixtures); this entry only covers the historical commit that briefly
+# contained it. Not a real credential.
+a07518b6e7889859f2ff1a465eef7d1bb7085c62:services/api/src/video-ingest/media-safety.spec.ts:stripe-access-token:191
