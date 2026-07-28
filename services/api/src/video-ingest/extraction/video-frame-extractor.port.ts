@@ -118,6 +118,35 @@ export interface ExtractFrameAtOptions {
   maxBytes?: number;
 }
 
+/**
+ * One IN-MEMORY inspection of unstored bytes — the seam behind the
+ * pre-storage upload frame screen. The session is opened from a Buffer
+ * (never a storage key: the whole point is that the unscreened bytes have
+ * NOT touched durable storage and never will before the screen passes),
+ * exposes the probe result plus frame extraction over the same bytes, and
+ * MUST be closed in every path. An implementation that needs a real file
+ * (a system-binary adapter) materializes an EPHEMERAL scratch file outside
+ * durable storage and removes it on close(); a close failure surfaces as
+ * the adapter's infrastructure classification so callers fail closed
+ * rather than leaving unscreened bytes behind.
+ */
+export interface BufferInspectionSession {
+  /** Probe of the in-memory bytes (already validated/bounded). */
+  readonly probe: VideoProbeResult;
+
+  /** Extract one frame from the inspected bytes (same error contract as
+   *  extractFrameAt: FrameUnavailableError past the last decodable frame,
+   *  budget/infrastructure/content errors as on the storage-key path). */
+  extractFrameAt(
+    timestampMs: number,
+    options?: ExtractFrameAtOptions,
+  ): Promise<ExtractedImage>;
+
+  /** Release every ephemeral resource. Idempotent; MUST run in every
+   *  path (success, screening hit, and failure alike). */
+  close(): Promise<void>;
+}
+
 export abstract class VideoFrameExtractorPort {
   /** Opaque adapter key recorded nowhere yet — identifies the strategy. */
   abstract readonly kind: string;
@@ -134,6 +163,15 @@ export abstract class VideoFrameExtractorPort {
   abstract readonly readsRealBytes: boolean;
 
   abstract probe(storageKey: string): Promise<VideoProbeResult>;
+
+  /**
+   * Open an inspection session over IN-MEMORY bytes that must not reach
+   * durable storage before screening (see BufferInspectionSession). A
+   * probe failure inside the open cleans up any ephemeral resources
+   * before rethrowing — the caller only owns close() once the session
+   * exists.
+   */
+  abstract inspectBuffer(data: Buffer): Promise<BufferInspectionSession>;
 
   abstract extractFrames(
     storageKey: string,

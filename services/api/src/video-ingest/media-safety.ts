@@ -155,10 +155,15 @@ const CONTIGUOUS_DIGIT_RUN = /(?<!\d)\d{13,}(?!\d)/g;
 // (11 decoy single-digit groups + a 16-digit card split into single digits
 // = 27 groups) was never Luhn-tested. Each separator is a MAXIMAL run of
 // non-alphanumeric characters, so "4111 - 1111" chains exactly like
-// "4111-1111". The pattern is linear-time — the digit and separator
-// character classes are disjoint, so there is no backtracking ambiguity —
-// and the window scan below is O(groups x 7) because each window join is
-// abandoned past 19 digits.
+// "4111-1111". The separator class is "any code unit that is not an ASCII
+// alphanumeric": whitespace (space, tab, CR, LF), punctuation, AND every
+// non-ASCII code unit — em/en dash, bullet, NBSP, ideographic space, or the
+// individual bytes of a multi-byte UTF-8 separator seen through a latin1
+// decode — so separator choice never splits a chain; only ASCII letters or
+// end-of-digit-chain break it. The pattern is linear-time — the digit and
+// separator character classes are disjoint, so there is no backtracking
+// ambiguity — and the window scan below is O(groups x 7) because each
+// window join is abandoned past 19 digits.
 const GROUPED_PAN = /(?<!\d)\d+(?:[^0-9A-Za-z]+\d+)+(?!\d)/g;
 
 /** Pure Luhn verdict on an exact 13-19-digit window — no shape exemptions. */
@@ -298,10 +303,15 @@ export function filenameCarriesSensitiveContent(filename: string): boolean {
 // multi-character separator runs. 2 KiB covers a 19-digit PAN whose 18
 // separators are each ~100 characters of padding (and, in the UTF-16 views,
 // ~1 KiB of UTF-16 text), far past any single-character-separated grouping
-// or KEY_VALUE credential fragment. (A sensitive run stretched past 2 KiB
-// COULD still straddle a boundary undetected — an accepted bound: chunks
-// are 1 MiB, so the straddle window is ~0.2% of positions, and every
-// non-straddling occurrence still rejects.)
+// or KEY_VALUE credential fragment. Chunk boundaries are handled at the
+// BYTE level: every decode view (latin1, both UTF-16LE offsets) is produced
+// from the chunk + overlap bytes, and BOTH the printable-run credential
+// screen and the full-view PAN chain scan below operate on those views, so
+// the overlap bound applies uniformly no matter which scan detects the
+// content. (A sensitive run stretched past 2 KiB COULD still straddle a
+// boundary undetected — an accepted bound: chunks are 1 MiB, so the
+// straddle window is ~0.2% of positions, and every non-straddling
+// occurrence still rejects.)
 const PAYLOAD_SCAN_CHUNK_BYTES = 1024 * 1024;
 const PAYLOAD_SCAN_OVERLAP_BYTES = 2048;
 // Printable ASCII runs of at least this length are treated as embedded
@@ -320,6 +330,17 @@ const PRINTABLE_RUN = /[\x20-\x7e]{5,}/g;
  * runs are extracted chunk-by-chunk (bounded memory, boundary overlap) and
  * screened with the shared credential/PAN detectors — both raw and with
  * separators stripped, so grouped digits match too.
+ *
+ * PAN chains are ADDITIONALLY windowed over each FULL decoded view, not
+ * only inside printable-ASCII runs: separators outside printable ASCII —
+ * newlines/CR/tab, NUL interleave, and multi-byte UTF-8 separators such as
+ * em dashes or NBSP (which appear in the latin1 view as a short run of
+ * non-alphanumeric bytes between the digit groups) — would otherwise split
+ * a grouped PAN into sub-5-char digit fragments the printable-run
+ * extraction never surfaces (4111\n1111\n1111\n1111). GROUPED_PAN's
+ * separator class is "anything that is not an ASCII alphanumeric", so at
+ * the decoded-text level every such run, whatever bytes produced it, chains
+ * digit groups exactly like a dash does — in every view.
  *
  * Both single-byte text (ASCII/UTF-8/latin1) AND UTF-16 text are screened:
  * MP4 ilst data atoms (type 2) and ID3v2 frames (encoding 0x01) store text
@@ -352,6 +373,14 @@ export function bufferCarriesSensitiveText(buffer: Buffer): boolean {
       chunk.subarray(1).toString('utf16le'),
     ];
     for (const text of views) {
+      // Full-view PAN chain scan (see doc above): digit groups split by
+      // NON-printable or non-ASCII separators never form printable runs,
+      // so the grouped-PAN detector must see the whole decoded view.
+      // Linear: the chain regex is unambiguous and each window join is
+      // abandoned past 19 digits.
+      if (carriesLikelyPan(text)) {
+        return true;
+      }
       for (const run of text.match(PRINTABLE_RUN) ?? []) {
         if (run.length < MIN_PRINTABLE_RUN) {
           continue;

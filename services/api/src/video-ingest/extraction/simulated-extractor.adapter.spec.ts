@@ -18,6 +18,18 @@ describe('SimulatedVideoFrameExtractor', () => {
     expect(extractor.readsRealBytes).toBe(false);
   });
 
+  it('provides a trivial buffer-inspection session (deterministic probe, placeholder frames, no-op close)', async () => {
+    // The pre-storage screen refuses to TRUST this adapter anyway
+    // (readsRealBytes=false), but the contract must still hold so the
+    // module wires without special cases.
+    const session = await extractor.inspectBuffer(Buffer.from('ignored'));
+    expect(session.probe).toEqual(SIMULATED_PROBE);
+    const frame = await session.extractFrameAt(2500);
+    expect(frame.timestampMs).toBe(2500);
+    expect(frame.width).toBe(SIMULATED_PROBE.width);
+    await expect(session.close()).resolves.toBeUndefined();
+  });
+
   it('honors a caller-supplied maxBytes on extractFrameAt', async () => {
     const fits = await extractor.extractFrameAt('k', SIMULATED_PROBE, 0, {
       maxBytes: 1024,

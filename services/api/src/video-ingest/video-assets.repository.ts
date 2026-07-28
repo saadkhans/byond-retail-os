@@ -43,6 +43,12 @@ export const VIDEO_ASSET_SELECT = {
   checksumSha256: true,
   errorCode: true,
   errorMessage: true,
+  // Screening inspection evidence — server-stamped (never caller-supplied)
+  // and not sensitive: the timestamp/actor/frame-count of the audited
+  // real-media preview that the APPROVE decision requires.
+  screeningInspectedAt: true,
+  screeningInspectedBy: true,
+  screeningInspectedFrames: true,
   uploadedById: true,
   deletedAt: true,
   createdAt: true,
@@ -376,6 +382,11 @@ export class VideoAssetsRepository extends TenantScopedRepository {
    * preview-serve authorization can never interleave, which is what makes
    * the preview's final status re-read authoritative (a preview is never
    * audited/served for an asset whose terminal decision committed first).
+   * The optional `guard` runs INSIDE the locked transaction after the
+   * status re-read passed, with the CURRENT row: a controlled throw there
+   * vetoes the transition atomically (nothing written, nothing audited) —
+   * the APPROVE screening decision uses it to require inspection evidence
+   * that cannot go stale between a pre-check and the CAS.
    */
   transitionStatus(
     tenantId: string,
@@ -394,6 +405,7 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       before: VideoAssetView,
       after: VideoAssetView,
     ) => AuditEntry,
+    guard?: (before: VideoAssetView) => void,
   ): Promise<VideoAssetView | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
@@ -408,6 +420,7 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       if (!before || !expected.includes(before.status)) {
         return null;
       }
+      guard?.(before);
       const updated = await tx.videoAsset.updateMany({
         where: {
           id,
@@ -415,7 +428,18 @@ export class VideoAssetsRepository extends TenantScopedRepository {
           deletedAt: null,
           status: { in: expected },
         },
-        data,
+        data: {
+          ...data,
+          // Inspection evidence is SINGLE-USE and QUARANTINED-scoped:
+          // EVERY transition invalidates it — APPROVE consumes it,
+          // REJECT/FAILED make it moot, and a later QUARANTINED publish
+          // (fresh upload lifecycle) must start with no evidence. Clearing
+          // unconditionally on every transition is the simplest rule that
+          // can never leave stale evidence behind for a future approval.
+          screeningInspectedAt: null,
+          screeningInspectedBy: null,
+          screeningInspectedFrames: null,
+        },
       });
       if (updated.count === 0) {
         return null;
@@ -441,10 +465,22 @@ export class VideoAssetsRepository extends TenantScopedRepository {
    * unlink-while-open serving after a committed rejection). Returns the
    * observed status — the caller serves ONLY on QUARANTINED (no audit is
    * written otherwise) — or null when the asset is gone (deleted).
+   *
+   * When the serve is authorized AND at least one frame was actually
+   * served, the same transaction also STAMPS the inspection evidence the
+   * APPROVE screening decision requires (inspectedAt/By/Frames). This is
+   * the ONLY writer of that evidence: the service calls this method only
+   * from the screening preview, which 503s BEFORE any extraction when the
+   * configured extractor does not read real bytes — so evidence is
+   * structurally guaranteed to describe a real-media inspection. A preview
+   * whose every sample position was skipped (zero served frames) audits
+   * the READ but stamps NOTHING: an operator who saw no frames has
+   * inspected nothing.
    */
   authorizeScreeningPreviewServe(
     tenantId: string,
     id: string,
+    inspection: { actorId: string | null; servedFrameCount: number },
     buildAuditEntry: () => AuditEntry,
   ): Promise<VideoAssetStatus | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
@@ -464,6 +500,21 @@ export class VideoAssetsRepository extends TenantScopedRepository {
         // Not authorized — NO audit entry: nothing is served, so recording
         // a READ would fabricate a byte exposure that never happened.
         return current.status;
+      }
+      if (inspection.servedFrameCount > 0) {
+        await tx.videoAsset.updateMany({
+          where: {
+            id,
+            tenantId: scopedTenantId,
+            deletedAt: null,
+            status: VideoAssetStatus.QUARANTINED,
+          },
+          data: {
+            screeningInspectedAt: new Date(),
+            screeningInspectedBy: inspection.actorId,
+            screeningInspectedFrames: inspection.servedFrameCount,
+          },
+        });
       }
       await this.auditLog.record(buildAuditEntry(), tx);
       return current.status;
@@ -506,7 +557,14 @@ export class VideoAssetsRepository extends TenantScopedRepository {
    * Soft delete: stamps deletedAt (CAS on "not yet deleted") and audits.
    * The metadata row is KEPT for lineage — artifacts stay append-only and
    * their rows keep referencing the asset; only the local files go away
-   * (the service removes them after this commits).
+   * (the service removes them after this commits). Runs under the SAME
+   * asset advisory lock as `transitionStatus()` and
+   * `authorizeScreeningPreviewServe()`: deletion is a lifecycle exit, and
+   * without the lock a preview's final guarded authorization could re-read
+   * QUARANTINED, an unserialised delete could commit, and the preview
+   * would still write its READ audit and serve frames for an asset that
+   * is already deleted — the lock makes the preview guard cover deletion
+   * exactly as it covers screening decisions.
    */
   softDelete(
     tenantId: string,
@@ -515,6 +573,10 @@ export class VideoAssetsRepository extends TenantScopedRepository {
   ): Promise<VideoAssetView | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${videoAssetAdvisoryLockKey(
+        scopedTenantId,
+        id,
+      )}))`;
       const before = await tx.videoAsset.findFirst({
         where: { id, tenantId: scopedTenantId, deletedAt: null },
         select: VIDEO_ASSET_SELECT,
@@ -524,13 +586,56 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       }
       const updated = await tx.videoAsset.updateMany({
         where: { id, tenantId: scopedTenantId, deletedAt: null },
-        data: { deletedAt: new Date() },
+        data: {
+          deletedAt: new Date(),
+          // Same invalidation rule as transitionStatus(): a deleted asset
+          // can never be approved, so its inspection evidence is cleared —
+          // no dormant evidence survives any lifecycle exit.
+          screeningInspectedAt: null,
+          screeningInspectedBy: null,
+          screeningInspectedFrames: null,
+        },
       });
       if (updated.count === 0) {
         return null;
       }
       await this.auditLog.record(buildAuditEntry(before), tx);
       return before;
+    });
+  }
+
+  /**
+   * EXACTLY-ONCE record that an asset's media removal COMPLETED — the DB
+   * marker (not the storage adapter's "did anything exist" report) is the
+   * authority for the completion audit entry. One transaction: a
+   * compare-and-set on `mediaRemovedAt IS NULL` claims the completion, and
+   * ONLY the claiming caller writes the completion audit entry (same
+   * transaction — marker and evidence commit together or not at all).
+   * Every other caller — a concurrent removal replay, a retry after the
+   * bytes were already gone — observes count 0 and records NOTHING
+   * ('already-recorded'), so the promised exactly-once completion evidence
+   * holds under any interleaving of filesystem removals. Conversely, a
+   * replay whose bytes are ALREADY absent can still REPAIR a missing
+   * completion record (the earlier attempt removed the bytes but crashed
+   * before this transaction committed). Deliberately NO deletedAt filter:
+   * the delete-cleanup completion runs AFTER the soft-delete committed.
+   */
+  recordMediaRemovalCompleted(
+    tenantId: string,
+    id: string,
+    buildAuditEntry: () => AuditEntry,
+  ): Promise<'recorded' | 'already-recorded'> {
+    const scopedTenantId = this.requireTenantId(tenantId);
+    return this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.videoAsset.updateMany({
+        where: { id, tenantId: scopedTenantId, mediaRemovedAt: null },
+        data: { mediaRemovedAt: new Date() },
+      });
+      if (claimed.count === 0) {
+        return 'already-recorded' as const;
+      }
+      await this.auditLog.record(buildAuditEntry(), tx);
+      return 'recorded' as const;
     });
   }
 

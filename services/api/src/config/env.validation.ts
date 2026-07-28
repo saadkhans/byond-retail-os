@@ -120,6 +120,32 @@ class EnvironmentVariables {
     message: 'VIDEO_FFMPEG_ENABLED must be true or false',
   })
   VIDEO_FFMPEG_ENABLED?: string;
+
+  // Opt-in switch for the OPTIONAL local system OCR (frame-text
+  // recognition) binary adapter used by the pre-storage upload frame
+  // screen — same strict boolean idiom as VIDEO_FFMPEG_ENABLED. MUST be
+  // declared here: validateSync runs with whitelist:true, so an
+  // undeclared key is STRIPPED before ConfigService is constructed and
+  // the module would silently always select the simulated recognizer.
+  @IsOptional()
+  @Matches(/^(true|false)$/i, {
+    message: 'VIDEO_OCR_ENABLED must be true or false',
+  })
+  VIDEO_OCR_ENABLED?: string;
+
+  // NON-PRODUCTION-ONLY escape hatch (deliberately alarming name):
+  // permits uploads WITHOUT the pre-storage frame screen when the
+  // extractor/recognizer toolchain cannot perform it. Strict boolean like
+  // the other Phase 10 flags — and declared for the same whitelist
+  // reason. The production ban is ENFORCED, not advisory:
+  // assertScreeningBypassAllowed below fails startup when
+  // NODE_ENV=production sets this true, and the video-ingest service
+  // additionally forces its runtime read to false under production.
+  @IsOptional()
+  @Matches(/^(true|false)$/i, {
+    message: 'VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS must be true or false',
+  })
+  VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS?: string;
 }
 
 // Placeholder markers — banned in EVERY environment (staging and preview
@@ -186,6 +212,29 @@ export function assertJwtSecretUsable(secret: string): void {
   }
 }
 
+/**
+ * Cross-field startup rule (same post-validate idiom as
+ * assertJwtSecretUsable): the pre-storage upload-screening bypass is
+ * STRICTLY non-production. A production deployment that sets it fails AT
+ * BOOT with an actionable message instead of silently accepting unscreened
+ * media; the video-ingest service also forces its runtime read of the flag
+ * to false under production as defense-in-depth.
+ */
+export function assertScreeningBypassAllowed(
+  nodeEnv: NodeEnv | undefined,
+  bypass: string | undefined,
+): void {
+  if (nodeEnv === NodeEnv.Production && bypass?.toLowerCase() === 'true') {
+    throw new Error(
+      'VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS must not be enabled when ' +
+        'NODE_ENV=production: the pre-storage upload screening bypass is ' +
+        'strictly non-production — unset it and configure ' +
+        'VIDEO_FFMPEG_ENABLED=true and VIDEO_OCR_ENABLED=true so every ' +
+        'upload is frame-screened before storage',
+    );
+  }
+}
+
 export function validateEnv(
   config: Record<string, unknown>,
 ): EnvironmentVariables {
@@ -202,5 +251,9 @@ export function validateEnv(
     throw new Error(`Invalid environment configuration: ${properties}`);
   }
   assertJwtSecretUsable(validated.JWT_SECRET);
+  assertScreeningBypassAllowed(
+    validated.NODE_ENV,
+    validated.VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS,
+  );
   return validated;
 }

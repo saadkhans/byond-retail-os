@@ -574,7 +574,68 @@ describe('decision/preview serialization on the asset advisory lock', () => {
     expect(auditLog.record).toHaveBeenCalledTimes(1);
   });
 
-  it('authorizeScreeningPreviewServe takes the SAME lock, re-reads, and audits the QUARANTINED serve in one transaction', async () => {
+  it('transitionStatus clears the screening inspection evidence on EVERY transition', async () => {
+    // Finding D invalidation rule: evidence is single-use and
+    // QUARANTINED-scoped — approve consumes it, reject/publish/delete make
+    // it moot, and a later fresh QUARANTINED publish must start with none.
+    const tx = makeTx();
+    tx.videoAsset.findFirst.mockResolvedValue({
+      id: 'asset-1',
+      status: VideoAssetStatus.QUARANTINED,
+    });
+    const { repository } = makeRepository(tx);
+    await repository.transitionStatus(
+      TENANT,
+      'asset-1',
+      [VideoAssetStatus.QUARANTINED],
+      { status: VideoAssetStatus.UPLOADED },
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
+    );
+    const [{ data }] = tx.videoAsset.updateMany.mock.calls[0] as unknown as [
+      { data: Record<string, unknown> },
+    ];
+    expect(data.status).toBe(VideoAssetStatus.UPLOADED);
+    expect(data.screeningInspectedAt).toBeNull();
+    expect(data.screeningInspectedBy).toBeNull();
+    expect(data.screeningInspectedFrames).toBeNull();
+  });
+
+  it('transitionStatus runs the guard INSIDE the locked transaction — a guard veto writes and audits NOTHING', async () => {
+    // The APPROVE evidence gate rides this guard: it sees the CURRENT row
+    // under the advisory lock, and its controlled throw aborts the
+    // transaction before any update or audit.
+    const tx = makeTx();
+    tx.videoAsset.findFirst.mockResolvedValue({
+      id: 'asset-1',
+      status: VideoAssetStatus.QUARANTINED,
+      screeningInspectedAt: null,
+      screeningInspectedFrames: null,
+    });
+    const { repository, auditLog } = makeRepository(tx);
+    const guard = jest.fn(() => {
+      throw new Error('no inspection evidence');
+    });
+    await expect(
+      repository.transitionStatus(
+        TENANT,
+        'asset-1',
+        [VideoAssetStatus.QUARANTINED],
+        { status: VideoAssetStatus.UPLOADED },
+        () =>
+          ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
+        guard,
+      ),
+    ).rejects.toThrow('no inspection evidence');
+    // The guard saw the LOCKED re-read's row…
+    expect(guard).toHaveBeenCalledWith(
+      expect.objectContaining({ status: VideoAssetStatus.QUARANTINED }),
+    );
+    // …and its veto prevented both the write and the audit.
+    expect(tx.videoAsset.updateMany).not.toHaveBeenCalled();
+    expect(auditLog.record).not.toHaveBeenCalled();
+  });
+
+  it('authorizeScreeningPreviewServe takes the SAME lock, re-reads, audits the QUARANTINED serve, and STAMPS the inspection evidence in one transaction', async () => {
     const tx = makeTx();
     tx.videoAsset.findFirst.mockResolvedValue({
       status: VideoAssetStatus.QUARANTINED,
@@ -588,6 +649,7 @@ describe('decision/preview serialization on the asset advisory lock', () => {
     const result = await repository.authorizeScreeningPreviewServe(
       TENANT,
       'asset-1',
+      { actorId: 'screener-1', servedFrameCount: 6 },
       () => entry,
     );
     expect(result).toBe(VideoAssetStatus.QUARANTINED);
@@ -596,14 +658,47 @@ describe('decision/preview serialization on the asset advisory lock', () => {
     expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
       tx.videoAsset.findFirst.mock.invocationCallOrder[0],
     );
+    // Evidence stamped INSIDE the same guarded transaction, still CAS-ed on
+    // QUARANTINED (a decision cannot have interleaved under the lock).
+    expect(tx.videoAsset.updateMany).toHaveBeenCalledTimes(1);
+    const [{ where, data }] = tx.videoAsset.updateMany.mock
+      .calls[0] as unknown as [
+      { where: Record<string, unknown>; data: Record<string, unknown> },
+    ];
+    expect(where.status).toBe(VideoAssetStatus.QUARANTINED);
+    expect(where.deletedAt).toBeNull();
+    expect(data.screeningInspectedAt).toBeInstanceOf(Date);
+    expect(data.screeningInspectedBy).toBe('screener-1');
+    expect(data.screeningInspectedFrames).toBe(6);
     // The READ audit is written INSIDE the guarded transaction (tx handle).
     expect(auditLog.record).toHaveBeenCalledTimes(1);
     expect(auditLog.record).toHaveBeenCalledWith(entry, tx);
   });
 
-  it('authorizeScreeningPreviewServe reports a committed decision WITHOUT auditing', async () => {
+  it('authorizeScreeningPreviewServe stamps NO evidence for a zero-frame serve (audited, but nothing was inspected)', async () => {
+    // frameCount > 0 requirement: a preview whose every sample position was
+    // skipped served nothing — the READ is audited, but approval evidence
+    // must NOT exist (zero-frame evidence is impossible to create).
+    const tx = makeTx();
+    tx.videoAsset.findFirst.mockResolvedValue({
+      status: VideoAssetStatus.QUARANTINED,
+    });
+    const { repository, auditLog } = makeRepository(tx);
+    const result = await repository.authorizeScreeningPreviewServe(
+      TENANT,
+      'asset-1',
+      { actorId: 'screener-1', servedFrameCount: 0 },
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'READ' }) as never,
+    );
+    expect(result).toBe(VideoAssetStatus.QUARANTINED);
+    expect(tx.videoAsset.updateMany).not.toHaveBeenCalled();
+    expect(auditLog.record).toHaveBeenCalledTimes(1);
+  });
+
+  it('authorizeScreeningPreviewServe reports a committed decision WITHOUT auditing or stamping evidence', async () => {
     // A decision serialized ahead of the guard: the re-read sees the
-    // terminal status — no READ audit may be written (nothing is served).
+    // terminal status — no READ audit may be written (nothing is served)
+    // and no evidence may be stamped (the asset is no longer approvable).
     const tx = makeTx();
     tx.videoAsset.findFirst.mockResolvedValue({
       status: VideoAssetStatus.REJECTED,
@@ -612,22 +707,124 @@ describe('decision/preview serialization on the asset advisory lock', () => {
     const result = await repository.authorizeScreeningPreviewServe(
       TENANT,
       'asset-1',
+      { actorId: 'screener-1', servedFrameCount: 6 },
       () => ({ tenantId: TENANT, actorEmail: 'x', action: 'READ' }) as never,
     );
     expect(result).toBe(VideoAssetStatus.REJECTED);
     expect(auditLog.record).not.toHaveBeenCalled();
+    expect(tx.videoAsset.updateMany).not.toHaveBeenCalled();
   });
 
-  it('authorizeScreeningPreviewServe returns null for a deleted/missing asset WITHOUT auditing', async () => {
+  it('authorizeScreeningPreviewServe returns null for a deleted/missing asset WITHOUT auditing or stamping', async () => {
     const tx = makeTx();
     tx.videoAsset.findFirst.mockResolvedValue(null);
     const { repository, auditLog } = makeRepository(tx);
     const result = await repository.authorizeScreeningPreviewServe(
       TENANT,
       'asset-1',
+      { actorId: 'screener-1', servedFrameCount: 6 },
       () => ({ tenantId: TENANT, actorEmail: 'x', action: 'READ' }) as never,
     );
     expect(result).toBeNull();
+    expect(auditLog.record).not.toHaveBeenCalled();
+    expect(tx.videoAsset.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('softDelete clears the inspection evidence alongside the deletedAt stamp', async () => {
+    // Lifecycle-exit invalidation: a deleted asset can never be approved,
+    // so no dormant evidence survives the soft delete.
+    const tx = makeTx();
+    tx.videoAsset.findFirst.mockResolvedValue({
+      id: 'asset-1',
+      status: VideoAssetStatus.QUARANTINED,
+    });
+    const { repository } = makeRepository(tx);
+    await repository.softDelete(
+      TENANT,
+      'asset-1',
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'DELETE' }) as never,
+    );
+    const [{ data }] = tx.videoAsset.updateMany.mock.calls[0] as unknown as [
+      { data: Record<string, unknown> },
+    ];
+    expect(data.deletedAt).toBeInstanceOf(Date);
+    expect(data.screeningInspectedAt).toBeNull();
+    expect(data.screeningInspectedBy).toBeNull();
+    expect(data.screeningInspectedFrames).toBeNull();
+  });
+
+  it('softDelete takes the SAME asset advisory lock before its reads (deletion serializes with the preview guard)', async () => {
+    // Finding H regression pin: without the lock, a preview's final
+    // guarded authorization could re-read QUARANTINED, a concurrent
+    // delete could commit, and the preview would still audit its READ and
+    // serve frames for a deleted asset. Taking the lock FIRST makes the
+    // preview's guard cover deletion exactly as it covers decisions.
+    const tx = makeTx();
+    tx.videoAsset.findFirst.mockResolvedValue({
+      id: 'asset-1',
+      status: VideoAssetStatus.QUARANTINED,
+    });
+    const { repository } = makeRepository(tx);
+    await repository.softDelete(
+      TENANT,
+      'asset-1',
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'DELETE' }) as never,
+    );
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(tx.$queryRaw.mock.calls[0][1]).toBe(`video-asset:${TENANT}:asset-1`);
+    // The lock precedes the not-yet-deleted read (and thus the CAS).
+    expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      tx.videoAsset.findFirst.mock.invocationCallOrder[0],
+    );
+  });
+});
+
+describe('VideoAssetsRepository.recordMediaRemovalCompleted', () => {
+  // Findings I + K regression pins: the DB marker CAS — not the storage
+  // adapter's stat-then-rm report — is the exactly-once authority for the
+  // media-removal completion audit entry.
+  it('claims the marker and writes the completion audit in ONE transaction', async () => {
+    const tx = makeTx();
+    const { repository, auditLog } = makeRepository(tx);
+    const entry = {
+      tenantId: TENANT,
+      actorEmail: 'x',
+      action: 'DELETE',
+    } as never;
+    const result = await repository.recordMediaRemovalCompleted(
+      TENANT,
+      'asset-1',
+      () => entry,
+    );
+    expect(result).toBe('recorded');
+    const [{ where, data }] = tx.videoAsset.updateMany.mock
+      .calls[0] as unknown as [
+      { where: Record<string, unknown>; data: Record<string, unknown> },
+    ];
+    // The CAS predicate: only a not-yet-recorded removal can claim.
+    expect(where.tenantId).toBe(TENANT);
+    expect(where.id).toBe('asset-1');
+    expect(where.mediaRemovedAt).toBeNull();
+    expect(data.mediaRemovedAt).toBeInstanceOf(Date);
+    // The completion audit commits in the SAME transaction (tx handle).
+    expect(auditLog.record).toHaveBeenCalledTimes(1);
+    expect(auditLog.record).toHaveBeenCalledWith(entry, tx);
+  });
+
+  it('a second completion attempt loses the CAS and writes NO second audit', async () => {
+    // Two concurrent-ish removals (initial + idempotent replay) may both
+    // see bytes on disk — only the marker winner records completion; the
+    // loser reports already-recorded and the audit trail keeps exactly
+    // one completion entry.
+    const tx = makeTx();
+    tx.videoAsset.updateMany.mockResolvedValue({ count: 0 });
+    const { repository, auditLog } = makeRepository(tx);
+    const result = await repository.recordMediaRemovalCompleted(
+      TENANT,
+      'asset-1',
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'DELETE' }) as never,
+    );
+    expect(result).toBe('already-recorded');
     expect(auditLog.record).not.toHaveBeenCalled();
   });
 });

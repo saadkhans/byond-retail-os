@@ -1,7 +1,11 @@
 import { execFile } from 'node:child_process';
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Injectable } from '@nestjs/common';
 import { LocalVideoStorageAdapter } from '../storage/local-video-storage.adapter';
 import {
+  BufferInspectionSession,
   CropBox,
   ExtractedImage,
   ExtractFrameAtOptions,
@@ -22,6 +26,18 @@ export const FFMPEG_EXTRACTOR_KIND = 'ffmpeg';
 // VIDEO_FFMPEG_ENABLED=true; the simulated extractor is the default.
 const FFMPEG_BINARY = 'ffmpeg';
 const FFPROBE_BINARY = 'ffprobe';
+
+// Ephemeral scratch location for BUFFER inspection (the pre-storage upload
+// screen): ffprobe/ffmpeg need a real file for reliable container probing,
+// so the in-memory bytes are written to a per-session directory in the OS
+// temp dir — deliberately OUTSIDE the durable storage root, with owner-only
+// modes (0o700 dir / 0o600 file) — and removed in every path. Scratch
+// paths never leak: every failure maps to the same controlled, path-free
+// errors as the storage-key paths.
+export const SCRATCH_DIR_PREFIX = 'byond-video-inspect-';
+const SCRATCH_FILE_NAME = 'inspect.media';
+const SCRATCH_DIR_MODE = 0o700;
+const SCRATCH_FILE_MODE = 0o600;
 
 // Decoded PNG frames are bounded (a single 4K PNG is well under this); the
 // cap exists so a hostile container cannot balloon the parent process.
@@ -400,8 +416,23 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
     return frames;
   }
 
-  extractFrameAt(
+  async extractFrameAt(
     storageKey: string,
+    probe: VideoProbeResult,
+    timestampMs: number,
+    options?: ExtractFrameAtOptions,
+  ): Promise<ExtractedImage> {
+    return this.frameAtPathWithOptions(
+      this.storage.internalPathFor(storageKey),
+      probe,
+      timestampMs,
+      options,
+    );
+  }
+
+  /** Shared caller-budget handling for the storage-key and buffer paths. */
+  private frameAtPathWithOptions(
+    internalPath: string,
     probe: VideoProbeResult,
     timestampMs: number,
     options?: ExtractFrameAtOptions,
@@ -413,19 +444,33 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
       if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
         return Promise.reject(new FrameExceedsBudgetError());
       }
-      return this.frameAt(
-        storageKey,
+      return this.frameAtPath(
+        internalPath,
         probe,
         timestampMs,
         // The caller cap never RAISES the adapter's own ceiling.
         Math.min(MAX_OUTPUT_BYTES, maxBytes),
       );
     }
-    return this.frameAt(storageKey, probe, timestampMs, MAX_OUTPUT_BYTES);
+    return this.frameAtPath(internalPath, probe, timestampMs, MAX_OUTPUT_BYTES);
   }
 
-  private async frameAt(
+  private frameAt(
     storageKey: string,
+    probe: VideoProbeResult,
+    timestampMs: number,
+    maxOutputBytes: number,
+  ): Promise<ExtractedImage> {
+    return this.frameAtPath(
+      this.storage.internalPathFor(storageKey),
+      probe,
+      timestampMs,
+      maxOutputBytes,
+    );
+  }
+
+  private async frameAtPath(
+    internalPath: string,
     probe: VideoProbeResult,
     timestampMs: number,
     maxOutputBytes: number,
@@ -434,7 +479,7 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
     try {
       const { stdout } = await this.runCommand(
         FFMPEG_BINARY,
-        buildFrameArgs(this.storage.internalPathFor(storageKey), timestampMs),
+        buildFrameArgs(internalPath, timestampMs),
         maxOutputBytes,
       );
       data = stdout;
@@ -461,6 +506,86 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
       mimeType: 'image/png',
       timestampMs,
     };
+  }
+
+  /**
+   * IN-MEMORY inspection for the pre-storage upload screen. ffprobe/ffmpeg
+   * need a real file, so the buffer is written to an EPHEMERAL scratch
+   * file in the OS temp dir (0o700 dir / 0o600 file) — never under the
+   * durable storage root — probed there, and the whole scratch directory
+   * is removed in every path: on a probe failure before the session is
+   * returned, and by close() afterwards (retry once, then the existing
+   * infrastructure classification — the unscreened bytes are never
+   * silently left behind). Scratch write failures are environmental
+   * (ENOSPC, permissions), so they map to ExtractionInfrastructureError.
+   */
+  async inspectBuffer(data: Buffer): Promise<BufferInspectionSession> {
+    let scratchDir: string | undefined;
+    let scratchPath: string;
+    try {
+      scratchDir = await mkdtemp(join(tmpdir(), SCRATCH_DIR_PREFIX));
+      // mkdtemp already creates 0o700 on POSIX; tighten explicitly and
+      // best-effort (exotic mounts must not lose the write) like the
+      // storage adapter does.
+      await chmod(scratchDir, SCRATCH_DIR_MODE).catch(() => undefined);
+      scratchPath = join(scratchDir, SCRATCH_FILE_NAME);
+      await writeFile(scratchPath, data, {
+        mode: SCRATCH_FILE_MODE,
+        flag: 'wx',
+      });
+    } catch {
+      if (scratchDir !== undefined) {
+        // Never leave a partial scratch tree; a persistent removal
+        // failure keeps the (correct) infrastructure classification.
+        await this.removeScratchDir(scratchDir);
+      }
+      throw new ExtractionInfrastructureError();
+    }
+    let probe: VideoProbeResult;
+    try {
+      const stdout = await this.run(
+        FFPROBE_BINARY,
+        buildProbeArgs(scratchPath),
+        MAX_OUTPUT_BYTES,
+      );
+      probe = parseProbeOutput(stdout.toString('utf8'));
+    } catch (error) {
+      // The caller never received a session, so the cleanup is ours. A
+      // removal failure escalates as ExtractionInfrastructureError from
+      // removeScratchDir (fail closed); otherwise the probe's own
+      // classification propagates.
+      await this.removeScratchDir(scratchDir);
+      throw error;
+    }
+    const dir = scratchDir;
+    let closed = false;
+    return {
+      probe,
+      extractFrameAt: (timestampMs, options) =>
+        this.frameAtPathWithOptions(scratchPath, probe, timestampMs, options),
+      close: async () => {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        await this.removeScratchDir(dir);
+      },
+    };
+  }
+
+  /** Retry-once scratch removal; a persistent failure means unscreened
+   *  bytes may linger, so it surfaces as an infrastructure failure
+   *  (controlled, path-free) instead of being swallowed. */
+  private async removeScratchDir(scratchDir: string): Promise<void> {
+    try {
+      await rm(scratchDir, { recursive: true, force: true });
+    } catch {
+      try {
+        await rm(scratchDir, { recursive: true, force: true });
+      } catch {
+        throw new ExtractionInfrastructureError();
+      }
+    }
   }
 
   async extractCrop(

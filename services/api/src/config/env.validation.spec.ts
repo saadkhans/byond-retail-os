@@ -59,6 +59,91 @@ describe('validateEnv', () => {
     });
   });
 
+  describe('Phase 10 screening flags survive whitelist validation', () => {
+    // validateSync runs with whitelist:true — an UNDECLARED key is
+    // stripped before ConfigService construction. These flags select the
+    // real OCR recognizer and the (non-production) screening bypass, so
+    // silently losing them made every deployment's uploads 503.
+    it.each(['true', 'false', 'TRUE'])(
+      'preserves VIDEO_OCR_ENABLED=%s through validation',
+      (value) => {
+        const validated = validateEnv({
+          ...validConfig,
+          VIDEO_OCR_ENABLED: value,
+        });
+        expect(validated.VIDEO_OCR_ENABLED).toBe(value);
+      },
+    );
+
+    it('still preserves VIDEO_FFMPEG_ENABLED (regression guard)', () => {
+      expect(
+        validateEnv({ ...validConfig, VIDEO_FFMPEG_ENABLED: 'true' })
+          .VIDEO_FFMPEG_ENABLED,
+      ).toBe('true');
+    });
+
+    it.each(['yes', '1', 'enabled', 'on'])(
+      'rejects invalid VIDEO_OCR_ENABLED=%s at boot',
+      (value) => {
+        expect(() =>
+          validateEnv({ ...validConfig, VIDEO_OCR_ENABLED: value }),
+        ).toThrow(/VIDEO_OCR_ENABLED/);
+      },
+    );
+
+    it.each(['development', 'test'])(
+      'preserves VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS=true when NODE_ENV=%s',
+      (nodeEnv) => {
+        const validated = validateEnv({
+          ...validConfig,
+          NODE_ENV: nodeEnv,
+          VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'true',
+        });
+        expect(validated.VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS).toBe('true');
+      },
+    );
+
+    it.each(['yes', '1', 'never'])(
+      'rejects invalid VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS=%s at boot',
+      (value) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: value,
+          }),
+        ).toThrow(/VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS/);
+      },
+    );
+  });
+
+  describe('the screening bypass is banned in production (startup failure)', () => {
+    it.each(['true', 'TRUE'])(
+      'fails validation when NODE_ENV=production and the bypass is %s',
+      (value) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            NODE_ENV: 'production',
+            VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: value,
+          }),
+        ).toThrow(/strictly non-production/);
+      },
+    );
+
+    it('accepts production with the bypass false or unset', () => {
+      expect(() =>
+        validateEnv({
+          ...validConfig,
+          NODE_ENV: 'production',
+          VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'false',
+        }),
+      ).not.toThrow();
+      expect(() =>
+        validateEnv({ ...validConfig, NODE_ENV: 'production' }),
+      ).not.toThrow();
+    });
+  });
+
   describe('placeholder secrets are rejected in EVERY environment', () => {
     const placeholderSecrets = [
       'local-dev-only-placeholder-jwt-secret-change-me', // old .env.example value

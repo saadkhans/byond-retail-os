@@ -14,6 +14,7 @@ import { formatDate, Page, StatusBadge, useLoad } from '../components';
 
 const ASSET_STATUSES = [
   '',
+  'PENDING_MEDIA',
   'QUARANTINED',
   'UPLOADED',
   'VALIDATED',
@@ -554,7 +555,18 @@ export function VideoAssetDetailPage() {
                 />
                 <button
                   className="primary"
-                  disabled={busy}
+                  // Approval requires an inspection: enabled only once a
+                  // preview actually served frames in THIS session. The
+                  // server enforces the same rule (recorded real-frame
+                  // inspection evidence, fresh) with a controlled 409.
+                  disabled={busy || !preview || preview.frames.length === 0}
+                  title={
+                    !preview || preview.frames.length === 0
+                      ? 'Load the preview to enable approval — approval ' +
+                        'requires a recorded real-frame inspection.'
+                      : 'Release the inspected upload for processing ' +
+                        '(audited).'
+                  }
                   onClick={() => void screen('APPROVE')}
                 >
                   Approve screening
@@ -565,6 +577,13 @@ export function VideoAssetDetailPage() {
                 >
                   Reject screening (remove media)
                 </button>
+                {!preview || preview.frames.length === 0 ? (
+                  <span className="muted">
+                    Load the preview to enable approval — approval requires
+                    a recorded real-frame inspection. Reject stays available
+                    without one.
+                  </span>
+                ) : null}
               </div>
             </>
           ) : null}

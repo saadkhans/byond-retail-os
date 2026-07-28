@@ -31,17 +31,6 @@ const SAFE_KEY = /^[A-Za-z0-9][A-Za-z0-9/._-]*$/;
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 
-/**
- * Dedicated subtree for PRE-STORAGE screening staging, INSIDE the storage
- * root (same confinement, same 0700/0600 modes). The '.' in the segment
- * guarantees it can never collide with a real asset key's first segment:
- * asset keys start with a tenant id (dot-free by construction), and the
- * safe-key charset forbids a LEADING dot, so no server-generated asset key
- * can ever begin with this prefix. Staged bytes are never listed or served
- * and exist only for the duration of one upload's pre-storage screen.
- */
-const STAGING_PREFIX = 'staging.prestore';
-
 export class InvalidStorageKeyError extends Error {
   constructor() {
     // Deliberately generic: the offending key is never echoed (it could be
@@ -165,9 +154,12 @@ export class LocalVideoStorageAdapter extends VideoStoragePort {
       throw new InvalidStorageKeyError();
     }
     return this.guarded(async () => {
-      // Report whether anything existed: callers use this to record a
-      // media-removal completion exactly once (an idempotent replay over an
-      // already-clean prefix returns false and records nothing).
+      // Report whether anything existed — INFORMATIONAL only. The
+      // stat-then-rm pair is not atomic: two concurrent removals can both
+      // observe the directory and both return true, so this report must
+      // never gate exactly-once side effects. Media-removal COMPLETION
+      // evidence is recorded through the repository's `mediaRemovedAt`
+      // marker CAS instead.
       const existed = await stat(target).then(
         () => true,
         (error: NodeJS.ErrnoException) => {
@@ -182,27 +174,6 @@ export class LocalVideoStorageAdapter extends VideoStoragePort {
       }
       return existed;
     });
-  }
-
-  async putStaging(storageKey: string, data: Buffer): Promise<string> {
-    // Validate the RAW key first (same gate as every operation), then
-    // stage under the deterministic staging key. Deterministic mapping is
-    // the contract: the asset row that stores storageKey is the recovery
-    // record for the staged bytes too — deleteStaging (and the DELETE
-    // recovery flow) can re-derive this location from the row alone.
-    this.resolveWithinRoot(storageKey);
-    const stagingKey = `${STAGING_PREFIX}/${storageKey}`;
-    await this.put(stagingKey, data);
-    return stagingKey;
-  }
-
-  async deleteStaging(storageKey: string): Promise<void> {
-    this.resolveWithinRoot(storageKey);
-    // Remove the staged media's DIRECTORY (tenant/uuid), mirroring the
-    // asset-directory removal shape — idempotent via deletePrefix.
-    const slash = storageKey.lastIndexOf('/');
-    const dir = slash > 0 ? storageKey.slice(0, slash) : storageKey;
-    await this.deletePrefix(`${STAGING_PREFIX}/${dir}`);
   }
 
   /**

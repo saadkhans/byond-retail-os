@@ -1693,8 +1693,26 @@ model VideoAsset {
   // Safe, stable failure information (UPPER_SNAKE code + screened message).
   errorCode    String?
   errorMessage String?
+  // Server-side SCREENING INSPECTION EVIDENCE: stamped ONLY by the guarded
+  // screening-preview serve authorization (which requires a byte-reading
+  // extractor and at least one actually-served frame), and REQUIRED by the
+  // APPROVE screening decision — so an approval can never happen blind.
+  // Cleared on EVERY status transition (evidence is QUARANTINED-scoped and
+  // single-use; a fresh QUARANTINED publish starts with none).
+  screeningInspectedAt     DateTime?
+  screeningInspectedBy     String?
+  screeningInspectedFrames Int?
   uploadedById String?
   deletedAt    DateTime?
+  // EXACTLY-ONCE media-removal completion marker: stamped by a DB
+  // compare-and-set (updateMany WHERE mediaRemovedAt IS NULL) in the same
+  // transaction as the "media removal completed" audit entry, so the
+  // durable completion evidence is written exactly once no matter how the
+  // filesystem removal and its retries/replays interleave — the marker,
+  // never the storage adapter's "did anything exist" report, is the
+  // authority. Shared by the screening-rejection removal and the delete
+  // cleanup (the completion audit reason distinguishes them).
+  mediaRemovedAt DateTime?
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 

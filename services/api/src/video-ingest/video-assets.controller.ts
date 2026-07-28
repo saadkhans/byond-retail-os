@@ -191,7 +191,12 @@ export class VideoAssetsController {
       'QUARANTINED → REJECTED (REJECT: stored media removed, metadata row ' +
       'kept as evidence). The upload attestation is defense-in-depth only — ' +
       'this audited decision is the enforced control before ANY processing. ' +
-      'Decisions on non-QUARANTINED assets are controlled 409s.',
+      'Decisions on non-QUARANTINED assets are controlled 409s. APPROVE ' +
+      'additionally REQUIRES recorded inspection evidence: a screening ' +
+      'preview that actually served frames within the last 30 minutes ' +
+      '(server-stamped by the audited preview itself) — approving without ' +
+      'a fresh real-media inspection is a controlled 409. REJECT never ' +
+      'requires a preview.',
   })
   @ApiCreatedResponse({ description: 'Screening decision recorded' })
   @ApiNotFoundResponse({ description: 'Asset not found in this tenant' })

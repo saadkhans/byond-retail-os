@@ -41,6 +41,7 @@ import {
 } from './dto/screen-video-asset.dto';
 import { UploadVideoAssetDto } from './dto/upload-video-asset.dto';
 import {
+  BufferInspectionSession,
   ExtractionFailedError,
   ExtractionInfrastructureError,
   ExtractorUnavailableError,
@@ -113,6 +114,16 @@ export const SCREENING_PREVIEW_TOTAL_BYTES = 16 * 1024 * 1024;
  * issuing extractor calls that are guaranteed to overflow.
  */
 export const SCREENING_PREVIEW_MIN_FRAME_BYTES = 1024;
+
+/**
+ * Freshness window for screening inspection evidence: an APPROVE decision
+ * requires a real-media preview inspection recorded within this window.
+ * 30 minutes — the evidence must reflect a RECENT human look at the actual
+ * frames (one screening sitting), not a preview loaded hours or days ago
+ * whose content the approver no longer has in front of them. Stale
+ * evidence forces a fresh preview, never a blind approval.
+ */
+export const SCREENING_INSPECTION_MAX_AGE_MS = 30 * 60 * 1000;
 
 /**
  * Hard cap on PRE-STORAGE screening frames per upload: the same sampling
@@ -291,7 +302,10 @@ export class VideoAssetsService {
    * frame screen when the configured extractor/recognizer cannot perform
    * it (simulated adapters, dev/test hosts with no media tooling). Every
    * upload accepted under it records the bypass in its create audit entry.
-   * PRODUCTION MUST NEVER SET THIS FLAG.
+   * PRODUCTION MUST NEVER SET THIS FLAG — and that is ENFORCED twice:
+   * validateEnv fails startup when NODE_ENV=production sets it, and the
+   * constructor below forces this field false under production even if a
+   * config source somehow still carries the flag.
    */
   private readonly allowUnscreenedUploads: boolean;
 
@@ -309,7 +323,12 @@ export class VideoAssetsService {
     const parsed = Number(configured);
     this.maxUploadBytes =
       Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_UPLOAD_BYTES;
+    // Defense-in-depth on top of the boot-time validateEnv rule (which
+    // FAILS startup for production + true): the runtime read is forced
+    // false under NODE_ENV=production, so the screening bypass can never
+    // be live in a production process no matter what the config carries.
     this.allowUnscreenedUploads =
+      config.get<string>('NODE_ENV')?.toLowerCase() !== 'production' &&
       config
         .get<string>('VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS')
         ?.toLowerCase() === 'true';
@@ -512,21 +531,24 @@ export class VideoAssetsService {
     }
     const created = result;
     // PRE-STORAGE FRAME SCREEN — between the staging-row commit and the
-    // durable media write: the buffer is staged into the storage adapter's
-    // dedicated staging area (deterministic key derived from storageKey, so
-    // the PENDING_MEDIA row above remains the recovery record for the
-    // staged bytes too), up to PRESTORE_SCREENING_MAX_FRAMES real frames
-    // are extracted and OCR-screened with the same fused sensitive-text
-    // predicate as every other surface, and only a clean pass reaches
-    // storage.put below. A hit rejects the row (PRESTORE_SCREENING_REJECTED)
-    // with the media NEVER having reached durable storage; tooling trouble
-    // fails the row (UPLOAD_INCOMPLETE) exactly like a failed media write.
-    // Staging is cleaned in every path.
+    // durable media write, and ENTIRELY IN MEMORY: the unscreened buffer
+    // never touches the durable storage root (the extractor port's
+    // buffer-inspection session materializes at most an ephemeral
+    // OS-tempdir scratch file that the adapter removes in every path — a
+    // crash mid-screen leaves nothing under VIDEO_STORAGE_ROOT, only the
+    // PENDING_MEDIA row, which DELETE cleans). Up to
+    // PRESTORE_SCREENING_MAX_FRAMES real frames are extracted and
+    // OCR-screened with the same fused sensitive-text predicate as every
+    // other surface, and only a clean pass — with at least one frame
+    // actually screened — reaches storage.put below. A hit (or an upload
+    // where NO frame could be screened) rejects the row
+    // (PRESTORE_SCREENING_REJECTED) with the media NEVER having reached
+    // durable storage; tooling trouble fails the row (UPLOAD_INCOMPLETE)
+    // exactly like a failed media write.
     if (screeningAvailable) {
       await this.screenFramesBeforeStorage(
         tenantId,
         created.id,
-        storageKey,
         file.buffer,
         actor,
       );
@@ -636,9 +658,12 @@ export class VideoAssetsService {
    * original plus any extracted artifacts): one retry for transient errors,
    * then a controlled 503 with the caller's condition-specific message —
    * a removal failure is never silently swallowed. Propagates the storage
-   * port's "did anything exist" report so callers can record a
-   * media-removal COMPLETION exactly once (an idempotent replay over an
-   * already-clean directory returns false and records nothing).
+   * port's "did anything exist" report as INFORMATION ONLY: the exactly-
+   * once media-removal COMPLETION evidence is decided by the repository's
+   * `mediaRemovedAt` marker CAS, never by this boolean (which two
+   * concurrent removals can both observe as true, and which a replay
+   * observes as false even when the earlier completion audit never
+   * committed).
    */
   private async removeAssetMediaDir(
     storageKey: string,
@@ -661,49 +686,57 @@ export class VideoAssetsService {
    * credential) that is visible IN THE PIXELS of an upload — which no
    * filename or container-text check can see, and which the attestation
    * proves nothing about. Runs BETWEEN the PENDING_MEDIA row commit and the
-   * durable storage.put:
+   * durable storage.put, and consumes the IN-MEMORY buffer — the
+   * unscreened bytes never touch the durable storage root:
    *
-   * 1. The in-memory buffer is staged via the storage adapter's dedicated
-   *    staging area (deterministic key from storageKey — the PENDING_MEDIA
-   *    row is the recovery record for the staged bytes too; DELETE cleans
-   *    both trees).
-   * 2. The staged clip is probed and up to PRESTORE_SCREENING_MAX_FRAMES
-   *    evenly spaced REAL frames are extracted (requires a byte-reading
-   *    extractor — enforced by the caller's availability gate) and each
-   *    frame's recognized text (requires a pixel-reading recognizer) runs
-   *    through the SAME fused sensitive-text predicate as every persisted
-   *    surface (Luhn-wins PAN windows, credentials, fused labels).
-   * 3. A hit → staging cleaned, audited CAS PENDING_MEDIA → REJECTED with
-   *    the stable PRESTORE_SCREENING_REJECTED code, controlled 400. The
-   *    recognized text is CARD DATA and is never echoed, stored, or
-   *    audited — only the tripping frame's index is recorded. The media
-   *    never reaches durable storage.
-   * 4. Tooling trouble (extractor/recognizer infrastructure — or a frame
+   * 1. The buffer is opened through the extractor port's buffer-inspection
+   *    session (the optional binary adapter materializes an ephemeral
+   *    OS-tempdir scratch file that IT removes in every path; nothing is
+   *    ever written under VIDEO_STORAGE_ROOT before the screen passes).
+   * 2. Up to PRESTORE_SCREENING_MAX_FRAMES evenly spaced REAL frames are
+   *    extracted (requires a byte-reading extractor — enforced by the
+   *    caller's availability gate) and each frame's recognized text
+   *    (requires a pixel-reading recognizer) runs through the SAME fused
+   *    sensitive-text predicate as every persisted surface (Luhn-wins PAN
+   *    windows, credentials, fused labels).
+   * 3. A hit → audited CAS PENDING_MEDIA → REJECTED with the stable
+   *    PRESTORE_SCREENING_REJECTED code, controlled 400. The recognized
+   *    text is CARD DATA and is never echoed, stored, or audited — only
+   *    the tripping frame's index is recorded. The media never reaches
+   *    durable storage.
+   * 4. ZERO frames screened (the probe accepted the container but EVERY
+   *    sampled position was undecodable) → the upload was never actually
+   *    screened, so it FAILS CLOSED: the same audited rejection path as a
+   *    hit with a distinct reason, controlled 400, nothing durably stored.
+   * 5. Tooling trouble (extractor/recognizer infrastructure — or a frame
    *    the recognizer could not process: an unreadable frame is an
-   *    INCOMPLETE screen, never a pass, so it fails closed too) → staging
-   *    cleaned, CAS PENDING_MEDIA → FAILED (UPLOAD_INCOMPLETE), 503 — the
-   *    same recovery contract as a failed media write (fresh upload
-   *    retries; the row is the record).
-   * 5. Unreadable content (the staged bytes cannot be probed as a video) →
-   *    staging cleaned, CAS PENDING_MEDIA → REJECTED (PROBE_FAILED), 400.
+   *    INCOMPLETE screen, never a pass, so it fails closed too) → CAS
+   *    PENDING_MEDIA → FAILED (UPLOAD_INCOMPLETE), 503 — the same
+   *    recovery contract as a failed media write (fresh upload retries;
+   *    the row is the record).
+   * 6. Unreadable content (the bytes cannot be probed as a video) → CAS
+   *    PENDING_MEDIA → REJECTED (PROBE_FAILED), 400.
    *
-   * Staging is cleaned in EVERY path (finally): a cleanup failure follows
-   * the removal retry/escalate idiom — the escalation 503 leaves the
-   * PENDING_MEDIA row as the recovery record (DELETE re-derives and cleans
-   * the staging location).
+   * The inspection session is closed in EVERY path (finally). A close
+   * failure means the adapter could not remove its ephemeral scratch bytes
+   * — that fails closed too (it replaces a pending pass/hit verdict and
+   * maps through the infrastructure branch below to FAILED +
+   * UPLOAD_INCOMPLETE, 503) so unscreened bytes are never silently left
+   * behind while the upload "succeeds".
    */
   private async screenFramesBeforeStorage(
     tenantId: string,
     assetId: string,
-    storageKey: string,
     buffer: Buffer,
     actor: AuditActor | undefined,
   ): Promise<void> {
     let hitFrameIndex: number | null = null;
+    let screenedFrames = 0;
     let failure: unknown = null;
+    let session: BufferInspectionSession | null = null;
     try {
-      const stagingKey = await this.storage.putStaging(storageKey, buffer);
-      const probe = await this.extractor.probe(stagingKey);
+      session = await this.extractor.inspectBuffer(buffer);
+      const probe = session.probe;
       // Same sampling shape as the quarantine screening preview: one frame
       // per started second, capped; a very short clip yields one frame at 0.
       const count = Math.max(
@@ -717,20 +750,21 @@ export class VideoAssetsService {
         const timestampMs = Math.floor((probe.durationMs * index) / count);
         let image;
         try {
-          image = await this.extractor.extractFrameAt(
-            stagingKey,
-            probe,
-            timestampMs,
-          );
+          image = await session.extractFrameAt(timestampMs);
         } catch (error) {
           if (error instanceof FrameUnavailableError) {
             // Container durations routinely overshoot the last decodable
-            // frame — a missing sample position is not a failed screen.
+            // frame — a missing sample position is not a failed screen
+            // (but ZERO screenable positions is: see the fail-closed
+            // zero-frames branch below).
             continue;
           }
           throw error;
         }
         const text = await this.recognizer.recognize(image.data);
+        // Counted only AFTER recognition succeeded: a frame is "screened"
+        // when its pixels actually went through OCR + the fused predicate.
+        screenedFrames += 1;
         if (containsSensitiveFreeText(text)) {
           hitFrameIndex = index;
         }
@@ -738,12 +772,21 @@ export class VideoAssetsService {
     } catch (error) {
       failure = error;
     } finally {
-      // Staged bytes are cleaned in EVERY path — pass, hit, and failure —
-      // before any verdict is recorded. Retry/escalate: a persistent
-      // cleanup failure surfaces as 503 (replacing any pending verdict);
-      // the PENDING_MEDIA row remains the recovery record and DELETE
-      // re-derives and cleans the staging location.
-      await this.deleteStagingWithRetry(storageKey);
+      // The session is closed in EVERY path — pass, hit, and failure —
+      // before any verdict is recorded. The adapter owns the retry; a
+      // persistent scratch-cleanup failure surfaces here and REPLACES a
+      // pending pass/hit verdict (fail closed — an original failure is
+      // kept: it is the more specific classification and both fail
+      // closed).
+      if (session !== null) {
+        try {
+          await session.close();
+        } catch (error) {
+          if (failure === null) {
+            failure = error;
+          }
+        }
+      }
     }
     if (failure !== null) {
       throw await this.mapPrestoreScreeningError(
@@ -751,6 +794,41 @@ export class VideoAssetsService {
         assetId,
         actor,
         failure,
+      );
+    }
+    if (screenedFrames === 0) {
+      // FAIL CLOSED — no frame could be screened: the probe accepted the
+      // container but every sampled timestamp was undecodable, so zero
+      // frames went through OCR and the upload is UNSCREENED. Same audited
+      // rejection path as a screening hit, distinct wording/reason; the
+      // media never reached durable storage.
+      await this.repository.transitionStatus(
+        tenantId,
+        assetId,
+        [VideoAssetStatus.PENDING_MEDIA],
+        {
+          status: VideoAssetStatus.REJECTED,
+          errorCode: VIDEO_ERROR_CODES.PRESTORE_SCREENING_REJECTED,
+          errorMessage:
+            'Pre-storage frame screening refused this upload: no frame ' +
+            'could be screened; its media never reached durable storage',
+        },
+        (before, after) =>
+          this.auditEntry(tenantId, actor, {
+            action: AuditAction.UPDATE,
+            entityType: 'VideoAsset',
+            entityId: assetId,
+            before,
+            after,
+            reason:
+              'Pre-storage frame screening refused the upload: no sampled ' +
+              'frame could be decoded and screened (an unscreened upload ' +
+              'is never stored); the media never reached durable storage',
+          }),
+      );
+      throw new BadRequestException(
+        'Pre-storage frame screening refused the upload: no frame could ' +
+          'be screened; nothing was stored',
       );
     }
     if (hitFrameIndex !== null) {
@@ -794,29 +872,6 @@ export class VideoAssetsService {
   }
 
   /**
-   * Staging cleanup with the module's removal retry/escalate idiom: one
-   * retry for transient errors, then a controlled 503. deleteStaging is
-   * idempotent, and the staging key is DERIVED from the asset's storage
-   * key, so the PENDING_MEDIA row is the recovery record — deleting the
-   * asset re-runs this same removal.
-   */
-  private async deleteStagingWithRetry(storageKey: string): Promise<void> {
-    try {
-      await this.storage.deleteStaging(storageKey);
-    } catch {
-      try {
-        await this.storage.deleteStaging(storageKey);
-      } catch {
-        throw new ServiceUnavailableException(
-          'The pre-storage screening staging bytes could not be removed; ' +
-            'the asset row is the recovery record — delete the asset to ' +
-            'retry the cleanup',
-        );
-      }
-    }
-  }
-
-  /**
    * Failure mapping for the pre-storage frame screen. Infrastructure
    * trouble — extractor or recognizer — AND a frame the recognizer could
    * not process both fail CLOSED into the existing staged-upload failure
@@ -840,9 +895,7 @@ export class VideoAssetsService {
       error instanceof FrameTextRecognitionInfrastructureError ||
       // The tool ran and could not process the frame: an unreadable frame
       // is an INCOMPLETE screen, never a pass — fail closed as retryable.
-      error instanceof FrameTextRecognitionFailedError ||
-      // The staging write itself failed (environmental) — same contract.
-      error instanceof VideoStorageOperationError
+      error instanceof FrameTextRecognitionFailedError
     ) {
       await this.repository.transitionStatus(
         tenantId,
@@ -1196,17 +1249,23 @@ export class VideoAssetsService {
       internal.status === VideoAssetStatus.REJECTED &&
       internal.errorCode === VIDEO_ERROR_CODES.SCREENING_REJECTED
     ) {
-      const removed = await this.removeAssetMediaDir(
+      await this.removeAssetMediaDir(
         internal.storageKey,
         SCREENING_MEDIA_ORPHAN_MESSAGE,
       );
-      // Completion is recorded ONCE: only the replay that actually found
-      // and removed media writes the completion entry — a replay over an
-      // already-clean directory (the earlier attempt or a previous replay
-      // completed the removal) records nothing.
-      if (removed) {
-        await this.recordScreeningMediaRemovalCompleted(tenantId, id, actor);
-      }
+      // Completion is recorded EXACTLY ONCE by the DB marker CAS — never
+      // by deletePrefix's "did anything exist" report, which two
+      // concurrent removals can both observe as true, and which a replay
+      // observes as false even when the earlier attempt's completion
+      // audit never committed. Calling unconditionally after the bytes
+      // are confirmed gone lets a replay REPAIR a missing completion
+      // record; the marker guarantees no duplicate is ever written.
+      await this.recordMediaRemovalCompleted(
+        tenantId,
+        id,
+        actor,
+        'screening-rejection',
+      );
       return this.findById(tenantId, id);
     }
     // This gate covers PENDING_MEDIA too — an asset whose media write has
@@ -1222,13 +1281,33 @@ export class VideoAssetsService {
     const noteSuffix = dto.note ? `; note: ${dto.note}` : '';
 
     if (dto.decision === VideoScreeningDecision.APPROVE) {
+      // MANDATORY INSPECTION EVIDENCE — the human backstop must have SEEN
+      // the frames: APPROVE requires server-stamped evidence that a
+      // real-media screening preview actually served frames to an
+      // inspector, recently. The fast pre-check gives a clear 409 without
+      // taking the lock; the AUTHORITATIVE re-check runs as the CAS
+      // transaction's guard (same advisory lock as every decision), so the
+      // evidence the approval consumes cannot be invalidated between a
+      // pre-check and the transition. REJECT never requires evidence —
+      // rejecting blind is safe.
+      this.assertScreeningInspectionEvidence(internal);
       const approved = await this.repository.transitionStatus(
         tenantId,
         id,
         [VideoAssetStatus.QUARANTINED],
         { status: VideoAssetStatus.UPLOADED },
-        (before, after) =>
-          this.auditEntry(tenantId, actor, {
+        (before, after) => {
+          // The approval audit records the evidence it consumed: when the
+          // inspection happened, how many real frames were served, and to
+          // whom (an actor id is server-resolved but still passes the
+          // redaction screen before interpolation).
+          const inspectedAt =
+            before.screeningInspectedAt?.toISOString() ?? 'unknown';
+          const inspectedFrames = before.screeningInspectedFrames ?? 0;
+          const inspectedBy = before.screeningInspectedBy
+            ? safeAuditEntityId(before.screeningInspectedBy)
+            : 'system';
+          return this.auditEntry(tenantId, actor, {
             action: AuditAction.UPDATE,
             entityType: 'VideoAsset',
             entityId: id,
@@ -1236,8 +1315,12 @@ export class VideoAssetsService {
             after,
             reason:
               'Frame-content screening approved: quarantined upload ' +
-              `released for processing${noteSuffix}`,
-          }),
+              'released for processing (inspection evidence: ' +
+              `${inspectedFrames} preview frame(s) served at ` +
+              `${inspectedAt} to ${inspectedBy})${noteSuffix}`,
+          });
+        },
+        (before) => this.assertScreeningInspectionEvidence(before),
       );
       if (!approved) {
         // CAS lost — a concurrent decision (or delete) resolved first.
@@ -1294,37 +1377,88 @@ export class VideoAssetsService {
           'again',
       );
     }
-    const removed = await this.removeAssetMediaDir(
+    await this.removeAssetMediaDir(
       internal.storageKey,
       SCREENING_MEDIA_ORPHAN_MESSAGE,
     );
-    if (removed) {
-      await this.recordScreeningMediaRemovalCompleted(tenantId, id, actor);
-    }
+    // The DB marker CAS (not deletePrefix's report) decides whether the
+    // completion audit is written — exactly once under any interleaving;
+    // if this record fails after the bytes were removed, the REJECT
+    // replay above repairs the missing completion evidence.
+    await this.recordMediaRemovalCompleted(
+      tenantId,
+      id,
+      actor,
+      'screening-rejection',
+    );
     return rejected;
   }
 
   /**
-   * Durable evidence that a screening rejection's media removal actually
-   * COMPLETED — written only after the removal succeeded (initial attempt
-   * or replay), never at claim time. AuditAction.DELETE on the VideoAsset:
-   * the closest existing action to "the stored media bytes are gone" (the
-   * row itself is kept as evidence).
+   * The APPROVE evidence gate: server-stamped proof that a real-media
+   * screening preview served at least one frame to an inspector within
+   * SCREENING_INSPECTION_MAX_AGE_MS. The evidence is written ONLY by the
+   * guarded preview-serve authorization (which itself runs only after the
+   * readsRealBytes 503 gate and only for actually-served frames), so
+   * missing/zero-frame/stale evidence means no qualifying inspection
+   * happened — a controlled 409, never a blind release. Called twice per
+   * approval: a fast pre-check on the initial read, then authoritatively
+   * inside the decision's advisory-locked CAS transaction.
    */
-  private async recordScreeningMediaRemovalCompleted(
+  private assertScreeningInspectionEvidence(row: {
+    screeningInspectedAt: Date | null;
+    screeningInspectedFrames: number | null;
+  }): void {
+    const inspectedAt = row.screeningInspectedAt;
+    const inspectedFrames = row.screeningInspectedFrames ?? 0;
+    if (
+      !inspectedAt ||
+      inspectedFrames <= 0 ||
+      Date.now() - inspectedAt.getTime() > SCREENING_INSPECTION_MAX_AGE_MS
+    ) {
+      throw new ConflictException(
+        'Approving a quarantined upload requires a recorded real-media ' +
+          'preview inspection: load the screening preview (it must serve ' +
+          'at least one frame) within the last ' +
+          `${SCREENING_INSPECTION_MAX_AGE_MS / 60_000} minutes, inspect ` +
+          'the frames, then approve. Rejecting does not require a preview.',
+      );
+    }
+  }
+
+  /**
+   * Durable evidence that an asset's media removal actually COMPLETED —
+   * recorded only after the bytes are confirmed gone (removal succeeded or
+   * the directory was already absent), never at claim time. The write goes
+   * through the repository's `mediaRemovedAt` compare-and-set: the DB
+   * marker — not the storage adapter's "did anything exist" report — is
+   * the exactly-once authority, so concurrent removal replays can never
+   * duplicate the completion entry, and a replay over already-removed
+   * bytes REPAIRS a completion record whose audit write failed the first
+   * time. AuditAction.DELETE on the VideoAsset: the closest existing
+   * action to "the stored media bytes are gone" (the row itself is kept
+   * as evidence); the reason distinguishes the screening-rejection
+   * removal from the delete cleanup.
+   */
+  private async recordMediaRemovalCompleted(
     tenantId: string,
     id: string,
     actor: AuditActor | undefined,
+    context: 'screening-rejection' | 'deletion-cleanup',
   ): Promise<void> {
-    await this.auditLog.record(
+    await this.repository.recordMediaRemovalCompleted(tenantId, id, () =>
       this.auditEntry(tenantId, actor, {
         action: AuditAction.DELETE,
         entityType: 'VideoAsset',
         entityId: id,
         reason:
-          'Screening-rejection media removal completed: the stored media ' +
-          'directory was removed; the REJECTED metadata row is kept as ' +
-          'evidence',
+          context === 'screening-rejection'
+            ? 'Screening-rejection media removal completed: the stored ' +
+              'media directory was removed; the REJECTED metadata row is ' +
+              'kept as evidence'
+            : 'Video asset deletion cleanup completed: linked inference ' +
+              'jobs retired and the stored media directory removed; the ' +
+              'soft-deleted metadata row is kept for lineage',
       }),
     );
   }
@@ -1363,7 +1497,11 @@ export class VideoAssetsService {
    * advisory lock as every screening-decision CAS, re-reads the status,
    * and writes the READ audit — so a decision committing mid-extraction
    * makes the preview discard its frames and 409 instead of auditing and
-   * serving bytes under a stale status.
+   * serving bytes under a stale status. That same guarded transaction is
+   * the ONLY writer of the screening-inspection evidence the APPROVE
+   * decision requires (stamped only when frames were actually served) —
+   * which is why the readsRealBytes gate above matters twice: no preview,
+   * no evidence, no approval.
    */
   async screeningPreview(
     tenantId: string,
@@ -1480,6 +1618,15 @@ export class VideoAssetsService {
     const authorized = await this.repository.authorizeScreeningPreviewServe(
       tenantId,
       id,
+      // Inspection evidence for the APPROVE gate, stamped by the SAME
+      // guarded transaction that authorizes and audits the serve — and
+      // only when frames were ACTUALLY served: a preview whose every
+      // sample position was skipped proves nothing was inspected, so it
+      // must never enable an approval. This call is the only path that
+      // can mint evidence, and it is only reachable past the
+      // readsRealBytes 503 gate above — simulated extractors can never
+      // produce approval evidence.
+      { actorId: actor?.id ?? null, servedFrameCount: frames.length },
       () =>
         this.auditEntry(tenantId, actor, {
           action: AuditAction.READ,
@@ -1555,6 +1702,9 @@ export class VideoAssetsService {
     artifacts: VideoArtifactView[];
     replayed: boolean;
   }> {
+    // Route id validated before ANY read (incl. the replay lookup), matching
+    // every other endpoint's validate-first ordering.
+    assertPlainId('id', id);
     assertOpaqueKey('idempotencyKey', dto.idempotencyKey);
     const requestFingerprint = framesRequestFingerprint(dto);
     // Replay BEFORE extracting: a committed batch whose response was lost
@@ -1653,6 +1803,9 @@ export class VideoAssetsService {
     artifact: VideoArtifactView;
     replayed: boolean;
   }> {
+    // Route id validated before ANY read (incl. the replay lookup), matching
+    // every other endpoint's validate-first ordering.
+    assertPlainId('id', id);
     assertOpaqueKey('idempotencyKey', dto.idempotencyKey);
     const requestFingerprint = cropRequestFingerprint(dto);
     if (dto.idempotencyKey) {
@@ -1931,12 +2084,20 @@ export class VideoAssetsService {
    * the audited transition — a crash between the two leaves a soft-deleted
    * row with orphaned files, and because the endpoint is IDEMPOTENT over
    * already-deleted assets (it re-runs the file cleanup and succeeds), a
-   * retry completes the removal. Before the media is removed, inference
-   * jobs linked through the asset's crop artifacts are retired (QUEUED →
-   * CANCELLED; a claimed job is audited as an orphan condition) so deleted
-   * media never leaves claimable queue work behind. Metadata is KEPT
-   * (audit lineage; artifacts are append-only) — only the media bytes are
-   * removed. A deleted asset 404s on every ordinary read.
+   * retry completes the removal. The soft-delete's audit entry therefore
+   * records the media cleanup as PENDING — at that point the linked-job
+   * retirement and the storage removal have not run and can still fail, so
+   * durable evidence claiming the media "was removed" would lie. Only
+   * after the retirement AND the storage removal succeed is completion
+   * recorded, through the same `mediaRemovedAt` marker CAS as the
+   * screening-rejection removal (exactly-once; a failed cleanup leaves the
+   * honest pending state and the idempotent replay completes and records).
+   * Before the media is removed, inference jobs linked through the asset's
+   * crop artifacts are retired (QUEUED → CANCELLED; a claimed job is
+   * audited as an orphan condition) so deleted media never leaves
+   * claimable queue work behind. Metadata is KEPT (audit lineage;
+   * artifacts are append-only) — only the media bytes are removed. A
+   * deleted asset 404s on every ordinary read.
    */
   async delete(
     tenantId: string,
@@ -1963,7 +2124,14 @@ export class VideoAssetsService {
             entityType: 'VideoAsset',
             entityId: id,
             before,
-            reason: 'Video asset deleted (local media removed, metadata kept)',
+            // PENDING wording only: at soft-delete time the linked-job
+            // retirement and the storage cleanup have not run yet and can
+            // still fail — completion gets its own audit entry (marker
+            // CAS) once the cleanup actually succeeded.
+            reason:
+              'Video asset deletion requested: media cleanup pending, ' +
+              'metadata kept (cleanup completion is recorded in the ' +
+              'audit trail)',
           }),
       );
       if (!marked) {
@@ -1986,22 +2154,31 @@ export class VideoAssetsService {
       internal.storageKey.lastIndexOf('/'),
     );
     try {
+      // (Pre-storage screening keeps unscreened bytes IN MEMORY — an
+      // upload interrupted mid-screen leaves only the PENDING_MEDIA row
+      // and nothing under the storage root, so this prefix removal is the
+      // whole cleanup.)
       await this.storage.deletePrefix(assetDir);
-      // The staging key is DERIVED deterministically from the storage key,
-      // which makes this row the recovery record for pre-storage-screening
-      // staged bytes too: an upload interrupted mid-screen leaves a
-      // PENDING_MEDIA row plus staged bytes, and this idempotent removal
-      // (a no-op when nothing is staged) cleans them on the same recovery
-      // path as the media directory.
-      await this.storage.deleteStaging(internal.storageKey);
     } catch (error) {
       if (error instanceof VideoStorageOperationError) {
         // The soft-delete is already durable; the file cleanup is
-        // retryable via this same idempotent endpoint — 503, not 500.
+        // retryable via this same idempotent endpoint — 503, not 500. NO
+        // completion is recorded: the durable state honestly stays
+        // "cleanup pending" until a replay succeeds.
         throw new ServiceUnavailableException(error.message);
       }
       throw error;
     }
+    // Retirement AND storage removal succeeded — record cleanup completion
+    // through the exactly-once marker CAS (shared with the screening
+    // removal; an asset whose media a screening rejection already removed
+    // and recorded stays at ONE completion entry — 'already-recorded').
+    await this.recordMediaRemovalCompleted(
+      tenantId,
+      id,
+      actor,
+      'deletion-cleanup',
+    );
     return { deleted: true };
   }
 

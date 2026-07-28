@@ -1,3 +1,6 @@
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { LocalVideoStorageAdapter } from '../storage/local-video-storage.adapter';
 import {
   buildCropArgs,
@@ -10,7 +13,23 @@ import {
   MAX_PROBE_DURATION_MS,
   MAX_TOTAL_EXTRACTION_BYTES,
   parseProbeOutput,
+  SCRATCH_DIR_PREFIX,
 } from './ffmpeg-extractor.adapter';
+
+// The scratch-file logic never touches the real filesystem in tests: the
+// fs layer is mocked wholesale (the storage adapter import shares the
+// module but no test here performs storage I/O).
+jest.mock('node:fs/promises', () => ({
+  chmod: jest.fn(async () => undefined),
+  mkdir: jest.fn(async () => undefined),
+  mkdtemp: jest.fn(async (prefix: string) => `${prefix}abc123`),
+  readFile: jest.fn(async () => Buffer.alloc(0)),
+  rename: jest.fn(async () => undefined),
+  rm: jest.fn(async () => undefined),
+  stat: jest.fn(async () => ({})),
+  unlink: jest.fn(async () => undefined),
+  writeFile: jest.fn(async () => undefined),
+}));
 import {
   ExtractionFailedError,
   ExtractionInfrastructureError,
@@ -458,6 +477,116 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
       { intervalMs: 3000, maxFrames: 10, startMs: 0 },
     );
     expect(frames.map((f) => f.timestampMs)).toEqual([0, 3000]);
+  });
+
+  describe('inspectBuffer (pre-storage screening scratch file)', () => {
+    const probeJson = JSON.stringify({
+      streams: [
+        { width: 1280, height: 720, r_frame_rate: '30/1', duration: '10.0' },
+      ],
+    });
+    const scratchDir = join(tmpdir(), `${SCRATCH_DIR_PREFIX}abc123`);
+    const scratchPath = join(scratchDir, 'inspect.media');
+
+    beforeEach(() => {
+      (mkdtemp as jest.Mock)
+        .mockReset()
+        .mockImplementation(async (prefix: string) => `${prefix}abc123`);
+      (writeFile as jest.Mock).mockReset().mockResolvedValue(undefined);
+      (rm as jest.Mock).mockReset().mockResolvedValue(undefined);
+      (chmod as jest.Mock).mockReset().mockResolvedValue(undefined);
+    });
+
+    it('writes the buffer to an OS-tempdir scratch file (0600, wx), probes THERE, and close() removes the tree', async () => {
+      const calls: { binary: string; args: string[] }[] = [];
+      const extractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        (binary, args) => {
+          calls.push({ binary, args });
+          return Promise.resolve({
+            stdout:
+              binary === 'ffprobe'
+                ? Buffer.from(probeJson)
+                : Buffer.from('png'),
+          });
+        },
+      );
+      const data = Buffer.from('unscreened-bytes');
+      const session = await extractor.inspectBuffer(data);
+      // Scratch lives in the OS temp dir — NEVER under the storage root.
+      expect(mkdtemp).toHaveBeenCalledWith(join(tmpdir(), SCRATCH_DIR_PREFIX));
+      expect(writeFile).toHaveBeenCalledWith(scratchPath, data, {
+        mode: 0o600,
+        flag: 'wx',
+      });
+      expect(chmod).toHaveBeenCalledWith(scratchDir, 0o700);
+      expect(session.probe.durationMs).toBe(10_000);
+      // The probe ran against the scratch path, not any storage key.
+      expect(calls[0].args[calls[0].args.length - 1]).toBe(scratchPath);
+      // Frame extraction reads the SAME scratch path.
+      const frame = await session.extractFrameAt(1000);
+      expect(frame.timestampMs).toBe(1000);
+      expect(calls[1].args[calls[1].args.indexOf('-i') + 1]).toBe(scratchPath);
+      // close() removes the whole scratch tree — idempotently.
+      await session.close();
+      expect(rm).toHaveBeenCalledWith(scratchDir, {
+        recursive: true,
+        force: true,
+      });
+      await session.close();
+      expect(rm).toHaveBeenCalledTimes(1);
+    });
+
+    it('removes the scratch tree when the probe itself fails (no session to close)', async () => {
+      const exitFailure = Object.assign(new Error('exit 1'), { code: 1 });
+      const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+        Promise.reject(exitFailure),
+      );
+      await expect(
+        extractor.inspectBuffer(Buffer.from('x')),
+      ).rejects.toBeInstanceOf(ExtractionFailedError);
+      expect(rm).toHaveBeenCalledTimes(1);
+      expect(rm).toHaveBeenCalledWith(scratchDir, {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    it('maps a scratch-write failure to a controlled infrastructure error and never echoes the path', async () => {
+      (writeFile as jest.Mock).mockRejectedValueOnce(
+        Object.assign(new Error("ENOSPC: no space, write '/tmp/secret'"), {
+          code: 'ENOSPC',
+        }),
+      );
+      const runner = jest.fn(() =>
+        Promise.resolve({ stdout: Buffer.from(probeJson) }),
+      );
+      const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+      const error: Error = await extractor
+        .inspectBuffer(Buffer.from('x'))
+        .then(() => {
+          throw new Error('expected rejection');
+        })
+        .catch((caught: Error) => caught);
+      expect(error).toBeInstanceOf(ExtractionInfrastructureError);
+      expect(error.message).not.toContain('/tmp');
+      expect(error.message).not.toContain('ENOSPC');
+      // No probe ran, and the partial scratch tree was still removed.
+      expect(runner).not.toHaveBeenCalled();
+      expect(rm).toHaveBeenCalledTimes(1);
+    });
+
+    it('retries a failed scratch removal once, then surfaces the infrastructure classification', async () => {
+      (rm as jest.Mock).mockRejectedValue(new Error('EBUSY'));
+      const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+        Promise.resolve({ stdout: Buffer.from(probeJson) }),
+      );
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      await expect(session.close()).rejects.toBeInstanceOf(
+        ExtractionInfrastructureError,
+      );
+      expect(rm).toHaveBeenCalledTimes(2);
+    });
   });
 
   it('declares itself byte-reading (screening previews may serve from it)', () => {

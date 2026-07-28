@@ -605,6 +605,7 @@ export interface Order extends EvidenceRefs {
 // never exposes storage locations, and crops feed Phase 9 inference jobs
 // by opaque id.
 export type VideoAssetStatus =
+  | 'PENDING_MEDIA'
   | 'QUARANTINED'
   | 'UPLOADED'
   | 'VALIDATED'

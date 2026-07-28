@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
 import {
+  BufferInspectionSession,
   CropBox,
   ExtractedImage,
   ExtractFrameAtOptions,
@@ -57,6 +58,22 @@ export class SimulatedVideoFrameExtractor extends VideoFrameExtractorPort {
     // probe never touches storage.
     void storageKey;
     return Promise.resolve({ ...SIMULATED_PROBE });
+  }
+
+  inspectBuffer(data: Buffer): Promise<BufferInspectionSession> {
+    // Trivial by design: the simulated adapter never reads real bytes
+    // (readsRealBytes=false already makes the pre-storage screen refuse to
+    // treat its output as a real screen), so the session is the
+    // deterministic probe plus placeholder frames and a no-op close — no
+    // scratch file exists to clean up.
+    void data;
+    const probe = { ...SIMULATED_PROBE };
+    return Promise.resolve({
+      probe,
+      extractFrameAt: (timestampMs, options) =>
+        this.extractFrameAt('in-memory', probe, timestampMs, options),
+      close: () => Promise.resolve(),
+    });
   }
 
   extractFrames(

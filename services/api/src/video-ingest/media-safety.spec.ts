@@ -60,6 +60,13 @@ describe('media-safety', () => {
       // join to the PAN exactly like single-character separators.
       ['4111 - 1111 - 1111 - 1111.mp4'],
       ['4111 -- 1111 __ 1111 .. 1111.mp4'],
+      // NON-ASCII separators (pass filename hygiene — no control chars, no
+      // path chars): the separator class is "not an ASCII alphanumeric",
+      // so Unicode dashes/spaces chain digit groups like any '-'.
+      ['4111—1111—1111—1111.mp4'], // em dash
+      ['4111–1111–1111–1111.mp4'], // en dash
+      ['4111 1111 1111 1111.mp4'], // NBSP separators
+      ['4111—1111 1111•1111.mp4'], // mixed em dash/NBSP/bullet
       // NONCANONICAL groupings: separator placement never launders a PAN.
       ['41111111-11111111.mp4'],
       ['4-111111111111111.mp4'],
@@ -204,8 +211,9 @@ describe('media-safety', () => {
       // key=value / key: value credential fragments.
       ['operator note password=hunter2'],
       ['token: abc123 issued for retest'],
-      // Bare well-known secret tokens.
-      ['pasted sk_live_abcdefghijklmnop by mistake'],
+      // Bare well-known secret tokens. Concatenated so no token-shaped
+      // literal appears in source (Gitleaks blocks even fake keys).
+      ['pasted ' + 'sk_live_' + 'abcdefghijklmnop' + ' by mistake'],
       // Fused credential label + value in one token.
       ['card read cvv123 during test'],
       ['keypad pin1234 visible'],
@@ -216,6 +224,17 @@ describe('media-safety', () => {
       // 27-group P1 payload: the tail 16 single-digit groups join to the
       // Visa test PAN — the COMPLETE chain is windowed, no group cap.
       ['3-4-3-0-3-3-0-1-1-1-9-4-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1'],
+      // Separators OUTSIDE printable ASCII must not split a grouped PAN
+      // (Codex P1): whitespace controls, Unicode dashes/spaces, and
+      // mixtures all chain digit groups — the separator class is "not an
+      // ASCII alphanumeric", so nothing short of a letter breaks a chain.
+      ['card\n4111\n1111\n1111\n1111\nvisible'], // newlines
+      ['4111\t1111\r\n1111\t1111'], // tabs + CRLF
+      ['4111—1111—1111—1111'], // em dash (literal U+2014)
+      ['4111\u20141111\u20141111\u20141111'], // em dash (\u2014 escape)
+      [['4111', '1111', '1111', '1111'].join(String.fromCharCode(0xa0))], // NBSP
+      [['4111', '1111', '1111', '1111'].join(String.fromCharCode(0x3000))], // ideographic space
+      ['4111 • 1111 — 1111\n1111'], // mixed bullet / em dash / newline
     ])('rejects %p', (text) => {
       expect(containsSensitiveFreeText(text)).toBe(true);
     });
@@ -225,6 +244,14 @@ describe('media-safety', () => {
       ['rejected due to glare on aisle 4 between 10:00 and 10:15'],
       ['pinch-zoom artifact near panorama seam, keep clip'],
       ['clip recorded 2026-07-27, duration 00:00:10'],
+      // MULTI-LINE notes: newlines now chain digit groups, so these guard
+      // the main false-positive classes. The newline-joined datetime join
+      // (20260727113347) is Luhn-INVALID — verified by computation; the
+      // 'T' in ISO 8601 datetimes is a letter and breaks the chain anyway.
+      ['approved 2026-07-27\n11:33:47 retest cam3'],
+      ['start 2026-07-27T11:33:47\nend 2026-07-27T11:35:12'],
+      ['build 61.1.100\nversion 10.0.26200\nrev 4.2'],
+      ['v1.2.3\n4.5.6\n7.8.9'],
     ])('accepts %p', (text) => {
       expect(containsSensitiveFreeText(text)).toBe(false);
     });
@@ -387,6 +414,79 @@ describe('media-safety', () => {
           Buffer.alloc(2),
         ]);
         expect(bufferCarriesSensitiveText(payload)).toBe(expected);
+      }
+    });
+
+    it.each([
+      ['newlines', '4111\n1111\n1111\n1111'],
+      ['CRLF pairs', '4111\r\n1111\r\n1111\r\n1111'],
+      ['tabs', '4111\t1111\t1111\t1111'],
+      ['em dashes', '4111—1111—1111—1111'],
+      ['en dashes', '4111–1111–1111–1111'],
+      ['bullets', '4111 • 1111 • 1111 • 1111'],
+      ['NBSPs', ['4111', '1111', '1111', '1111'].join(String.fromCharCode(0xa0))],
+      [
+        'ideographic spaces',
+        ['4111', '1111', '1111', '1111'].join(String.fromCharCode(0x3000)),
+      ],
+      ['mixed em dash/newline/spaced dash', '4111—1111\n1111 - 1111'],
+    ])(
+      'finds a PAN behind %s separators in UTF-8 payload bytes (Codex P1)',
+      (_label, pan) => {
+        // Buffer.from(..., 'utf8') exercises the BYTE-level path: each
+        // non-ASCII separator becomes a MULTI-BYTE UTF-8 sequence (em dash
+        // U+2014 → E2 80 94, NBSP U+00A0 → C2 A0) whose bytes are all
+        // non-alphanumeric in the latin1 decode, so the full-view chain
+        // scan joins the digit groups across them; \n/\r/\t are outside
+        // printable ASCII, so only the full-view scan — never the
+        // printable-run extraction — can see these chains.
+        const payload = Buffer.concat([
+          noise,
+          Buffer.alloc(2),
+          Buffer.from(`meta ${pan} end`, 'utf8'),
+          Buffer.alloc(2),
+          noise,
+        ]);
+        expect(bufferCarriesSensitiveText(payload)).toBe(true);
+      },
+    );
+
+    it('finds PANs behind non-ASCII separators in UTF-16 metadata text', () => {
+      // In the UTF-16LE views the em dash decodes to the single U+2014
+      // code unit — non-alphanumeric, so the chain joins. (The latin1 view
+      // independently joins the digits across the NUL interleave.)
+      const pan = '4111—1111—1111—1111';
+      const lePayload = Buffer.concat([
+        noise,
+        Buffer.alloc(2),
+        Buffer.from(pan, 'utf16le'),
+        Buffer.alloc(2),
+        noise,
+      ]);
+      expect(bufferCarriesSensitiveText(lePayload)).toBe(true);
+      const be = Buffer.from(`  ${pan}  `, 'utf16le').swap16();
+      const bePayload = Buffer.concat([noise, Buffer.alloc(2), be, noise]);
+      expect(bufferCarriesSensitiveText(bePayload)).toBe(true);
+    });
+
+    it('accepts multi-line metadata: ISO datetimes and version/build strings', () => {
+      // Newlines now JOIN digit groups, so multi-line metadata is the main
+      // new false-positive class. These pass because their window joins
+      // are Luhn-INVALID (newline-joined 20260727113347 — verified by
+      // computation) or under 13 digits ('T' is a letter and breaks ISO
+      // 8601 datetime chains) — never via a shape exemption.
+      for (const value of [
+        'created 2026-07-27\n11:33:47',
+        'start 2026-07-27T11:33:47\nend 2026-07-27T11:35:12',
+        'build 61.1.100\nversion 10.0.26200\nrev 4.2',
+        'v1.2.3\n4.5.6\n7.8.9',
+      ]) {
+        const payload = Buffer.concat([
+          Buffer.alloc(2),
+          Buffer.from(value, 'utf8'),
+          Buffer.alloc(2),
+        ]);
+        expect(bufferCarriesSensitiveText(payload)).toBe(false);
       }
     });
 

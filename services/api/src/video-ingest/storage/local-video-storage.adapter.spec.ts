@@ -99,38 +99,6 @@ describe('LocalVideoStorageAdapter', () => {
     expect(caught?.message).not.toContain('missing.mp4');
   });
 
-  it('stages bytes under the dedicated staging prefix and cleans them idempotently', async () => {
-    const key = 'tenant-1/asset-1/original.mp4';
-    await adapter.put(key, Buffer.from('final-bytes'));
-    const stagingKey = await adapter.putStaging(key, Buffer.from('staged'));
-    // Deterministic mapping: the asset row (which stores the storage key)
-    // is the recovery record for the staged bytes too.
-    expect(stagingKey).toBe(`staging.prestore/${key}`);
-    // The staged object is a normal root-confined key: readable by the
-    // extraction adapters, resolved INSIDE the root.
-    expect((await adapter.read(stagingKey)).toString('utf8')).toBe('staged');
-    expect(
-      adapter.internalPathFor(stagingKey).startsWith(resolve(root) + sep),
-    ).toBe(true);
-    // Removal cleans the staged directory without touching the real asset…
-    await adapter.deleteStaging(key);
-    await expect(adapter.read(stagingKey)).rejects.toBeInstanceOf(
-      VideoStorageOperationError,
-    );
-    expect((await adapter.read(key)).toString('utf8')).toBe('final-bytes');
-    // …and is idempotent like deletePrefix (missing staging is a no-op).
-    await expect(adapter.deleteStaging(key)).resolves.toBeUndefined();
-  });
-
-  it('staging validates the RAW storage key with the same confinement gate', async () => {
-    await expect(
-      adapter.putStaging('../escape.mp4', Buffer.alloc(1)),
-    ).rejects.toBeInstanceOf(InvalidStorageKeyError);
-    await expect(adapter.deleteStaging('../escape.mp4')).rejects.toBeInstanceOf(
-      InvalidStorageKeyError,
-    );
-  });
-
   it('deletePrefix removes an asset directory but refuses the root itself', async () => {
     await adapter.put('tenant-1/asset-1/original.mp4', Buffer.alloc(4));
     await adapter.put('tenant-1/asset-1/artifacts/a.png', Buffer.alloc(4));

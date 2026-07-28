@@ -36,27 +36,11 @@ export abstract class VideoStoragePort {
    * idempotent, used by asset deletion and screening rejection to clean
    * the original plus all extracted artifacts. Returns whether anything
    * existed under the prefix (true = something was removed by THIS call,
-   * false = already gone): callers that record a "media removal completed"
-   * audit entry use it to avoid re-recording completion on an idempotent
-   * replay that found nothing to remove.
+   * false = already gone). INFORMATIONAL only: adapters cannot make the
+   * observe-then-remove pair atomic (two concurrent removals may both
+   * report true), so callers must never use this report to gate
+   * exactly-once side effects — media-removal completion evidence is
+   * recorded through the repository's DB marker CAS instead.
    */
   abstract deletePrefix(storageKeyPrefix: string): Promise<boolean>;
-
-  /**
-   * Stage bytes for PRE-STORAGE screening under a dedicated staging prefix
-   * inside the storage root, derived DETERMINISTICALLY from the final
-   * storage key — so the asset row that records the key (the PENDING_MEDIA
-   * staging row) is the recovery record for the STAGED bytes too: any
-   * later cleanup can re-derive the staging location from the row alone.
-   * Returns the staging key — a normal opaque key usable with read() and
-   * the extraction adapters. Staged objects are never listed, never
-   * served, and live only for the duration of the pre-storage screen.
-   */
-  abstract putStaging(storageKey: string, data: Buffer): Promise<string>;
-
-  /**
-   * Remove the staged bytes for a storage key — idempotent like
-   * deletePrefix (a missing staging entry is a no-op).
-   */
-  abstract deleteStaging(storageKey: string): Promise<void>;
 }
