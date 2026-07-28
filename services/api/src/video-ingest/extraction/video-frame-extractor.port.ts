@@ -91,9 +91,47 @@ export class FrameUnavailableError extends Error {
   }
 }
 
+/**
+ * Controlled failure: the decoded frame did not fit the CALLER-supplied
+ * byte cap (ExtractFrameAtOptions.maxBytes) — the cap the caller chose,
+ * not the adapter's own per-invocation ceiling. Distinct from
+ * ExtractionInfrastructureError (which the same low-level overflow maps to
+ * when the adapter's OWN ceiling fired) so a caller running a deliberately
+ * tight budget — the screening preview shrinking its per-response
+ * allowance — can treat the overflow as "this frame doesn't fit, skip it"
+ * instead of a retryable infrastructure failure.
+ */
+export class FrameExceedsBudgetError extends Error {
+  constructor() {
+    super('The decoded frame exceeds the caller-supplied byte budget');
+    this.name = 'FrameExceedsBudgetError';
+  }
+}
+
+export interface ExtractFrameAtOptions {
+  /**
+   * Optional decoded-byte cap for THIS invocation, always clamped by the
+   * adapter's own per-invocation ceiling. When the decoded frame cannot
+   * fit under a supplied cap the adapter throws FrameExceedsBudgetError
+   * (never a partial frame), letting budgeted callers skip the frame.
+   */
+  maxBytes?: number;
+}
+
 export abstract class VideoFrameExtractorPort {
   /** Opaque adapter key recorded nowhere yet — identifies the strategy. */
   abstract readonly kind: string;
+
+  /**
+   * TRUE only when probe/extract genuinely read the stored media bytes.
+   * The simulated adapter reports false: its probe and frames are
+   * deterministic placeholders that ignore the storage key entirely, so
+   * any surface whose PURPOSE is human inspection of the real bytes (the
+   * quarantine screening preview) must refuse to serve from an adapter
+   * that does not read them — a screener approving footage over
+   * placeholder images would be a blind attestation.
+   */
+  abstract readonly readsRealBytes: boolean;
 
   abstract probe(storageKey: string): Promise<VideoProbeResult>;
 
@@ -107,6 +145,7 @@ export abstract class VideoFrameExtractorPort {
     storageKey: string,
     probe: VideoProbeResult,
     timestampMs: number,
+    options?: ExtractFrameAtOptions,
   ): Promise<ExtractedImage>;
 
   abstract extractCrop(

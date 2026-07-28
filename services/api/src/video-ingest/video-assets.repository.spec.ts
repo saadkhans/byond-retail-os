@@ -389,10 +389,12 @@ describe('VideoAssetsRepository.createAsset hierarchy validation', () => {
     expect(result).toBe('unit-not-found');
   });
 
-  it('persists every new asset as QUARANTINED (forced at the persistence layer)', async () => {
-    // The upload attestation proves nothing about the bytes: the row must
-    // land non-processable until an audited screening decision releases it,
-    // and no caller-supplied field can override that.
+  it('persists every new asset as PENDING_MEDIA (forced at the persistence layer)', async () => {
+    // The row commits BEFORE the media write, so it must land in the
+    // NON-SCREENABLE staging state: a QUARANTINED row here would be
+    // screenable before its bytes existed (the Finding A race). No
+    // caller-supplied field can override the forced status; the service
+    // publishes PENDING_MEDIA → QUARANTINED only after put succeeds.
     const tx = makeTx();
     const { repository } = makeRepository(tx);
     await repository.createAsset(
@@ -403,7 +405,7 @@ describe('VideoAssetsRepository.createAsset hierarchy validation', () => {
     const [{ data }] = tx.videoAsset.create.mock.calls[0] as unknown as [
       { data: { status: VideoAssetStatus } },
     ];
-    expect(data.status).toBe(VideoAssetStatus.QUARANTINED);
+    expect(data.status).toBe(VideoAssetStatus.PENDING_MEDIA);
   });
 
   it('creates the row and audits when the hierarchy is consistent', async () => {
@@ -534,6 +536,134 @@ describe('deleted-parent scoping on artifact reads', () => {
       () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
     );
     expect(result).toBe('already-linked');
+  });
+});
+
+describe('decision/preview serialization on the asset advisory lock', () => {
+  // Finding B regression pins: every screening-decision CAS
+  // (transitionStatus) and the preview's final serve authorization take
+  // the SAME pg_advisory_xact_lock, so a preview can never be audited or
+  // served for an asset whose terminal decision committed first. The key
+  // assertions mirror the unit-lock tests: $queryRaw is a tagged template,
+  // so calls[n][1] is the interpolated advisory-lock key.
+  it('transitionStatus takes the asset advisory lock inside its transaction', async () => {
+    const tx = makeTx();
+    tx.videoAsset.findFirst.mockResolvedValue({
+      id: 'asset-1',
+      status: VideoAssetStatus.QUARANTINED,
+    });
+    tx.videoAsset.findFirstOrThrow.mockResolvedValue({
+      id: 'asset-1',
+      status: VideoAssetStatus.UPLOADED,
+    });
+    const { repository, auditLog } = makeRepository(tx);
+    const result = await repository.transitionStatus(
+      TENANT,
+      'asset-1',
+      [VideoAssetStatus.QUARANTINED],
+      { status: VideoAssetStatus.UPLOADED },
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
+    );
+    expect(result).toEqual({ id: 'asset-1', status: VideoAssetStatus.UPLOADED });
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(tx.$queryRaw.mock.calls[0][1]).toBe(`video-asset:${TENANT}:asset-1`);
+    // The lock precedes the CAS read (the whole point of serializing).
+    expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      tx.videoAsset.findFirst.mock.invocationCallOrder[0],
+    );
+    expect(auditLog.record).toHaveBeenCalledTimes(1);
+  });
+
+  it('authorizeScreeningPreviewServe takes the SAME lock, re-reads, and audits the QUARANTINED serve in one transaction', async () => {
+    const tx = makeTx();
+    tx.videoAsset.findFirst.mockResolvedValue({
+      status: VideoAssetStatus.QUARANTINED,
+    });
+    const { repository, auditLog } = makeRepository(tx);
+    const entry = {
+      tenantId: TENANT,
+      actorEmail: 'x',
+      action: 'READ',
+    } as never;
+    const result = await repository.authorizeScreeningPreviewServe(
+      TENANT,
+      'asset-1',
+      () => entry,
+    );
+    expect(result).toBe(VideoAssetStatus.QUARANTINED);
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(tx.$queryRaw.mock.calls[0][1]).toBe(`video-asset:${TENANT}:asset-1`);
+    expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      tx.videoAsset.findFirst.mock.invocationCallOrder[0],
+    );
+    // The READ audit is written INSIDE the guarded transaction (tx handle).
+    expect(auditLog.record).toHaveBeenCalledTimes(1);
+    expect(auditLog.record).toHaveBeenCalledWith(entry, tx);
+  });
+
+  it('authorizeScreeningPreviewServe reports a committed decision WITHOUT auditing', async () => {
+    // A decision serialized ahead of the guard: the re-read sees the
+    // terminal status — no READ audit may be written (nothing is served).
+    const tx = makeTx();
+    tx.videoAsset.findFirst.mockResolvedValue({
+      status: VideoAssetStatus.REJECTED,
+    });
+    const { repository, auditLog } = makeRepository(tx);
+    const result = await repository.authorizeScreeningPreviewServe(
+      TENANT,
+      'asset-1',
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'READ' }) as never,
+    );
+    expect(result).toBe(VideoAssetStatus.REJECTED);
+    expect(auditLog.record).not.toHaveBeenCalled();
+  });
+
+  it('authorizeScreeningPreviewServe returns null for a deleted/missing asset WITHOUT auditing', async () => {
+    const tx = makeTx();
+    tx.videoAsset.findFirst.mockResolvedValue(null);
+    const { repository, auditLog } = makeRepository(tx);
+    const result = await repository.authorizeScreeningPreviewServe(
+      TENANT,
+      'asset-1',
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'READ' }) as never,
+    );
+    expect(result).toBeNull();
+    expect(auditLog.record).not.toHaveBeenCalled();
+  });
+});
+
+describe('VideoAssetsRepository.listLinkedInferenceJobs', () => {
+  it('enumerates linked job ids with status, deduped, WITHOUT a non-deleted-parent filter', async () => {
+    // The delete flow runs AFTER the soft-delete committed (and on
+    // idempotent replays), so the query must see artifacts of the
+    // already-deleted parent — scoping it to non-deleted parents would
+    // hide exactly the jobs the delete needs to retire.
+    const { repository, prisma } = makeRepository(makeTx());
+    prisma.videoArtifact.findMany.mockResolvedValue([
+      { inferenceJobId: 'job-1', inferenceJob: { status: 'QUEUED' } },
+      { inferenceJobId: 'job-1', inferenceJob: { status: 'QUEUED' } },
+      { inferenceJobId: 'job-2', inferenceJob: { status: 'RUNNING' } },
+    ] as never);
+    const result = await repository.listLinkedInferenceJobs(TENANT, 'asset-1');
+    expect(result).toEqual([
+      { id: 'job-1', status: 'QUEUED' },
+      { id: 'job-2', status: 'RUNNING' },
+    ]);
+    const [{ where }] = prisma.videoArtifact.findMany.mock
+      .calls[0] as unknown as [
+      {
+        where: {
+          tenantId: string;
+          videoAssetId: string;
+          inferenceJobId: { not: null };
+          videoAsset?: unknown;
+        };
+      },
+    ];
+    expect(where.tenantId).toBe(TENANT);
+    expect(where.videoAssetId).toBe('asset-1');
+    expect(where.inferenceJobId).toEqual({ not: null });
+    expect(where.videoAsset).toBeUndefined();
   });
 });
 

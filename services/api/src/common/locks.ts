@@ -182,6 +182,28 @@ export function reconciliationAdvisoryLockKey(
 }
 
 /**
+ * Serializes a video asset's audited status transitions against the
+ * screening preview's final serve authorization within a tenant. A
+ * screening decision is a read-then-write CAS on the asset's status, and
+ * the preview serves quarantined frame BYTES that must never be
+ * audited/served for an asset whose terminal decision already committed —
+ * on POSIX, an extraction racing a rejection's media removal can even keep
+ * reading an unlinked-while-open file. Both
+ * `VideoAssetsRepository.transitionStatus()` (every decision CAS) and
+ * `VideoAssetsRepository.authorizeScreeningPreviewServe()` (the re-read +
+ * READ audit that gates the preview response) take
+ * `pg_advisory_xact_lock(hashtext(key))` first, so a preview
+ * authorization and a decision serialize: whichever commits second
+ * observes the other. Both call sites MUST derive the key identically.
+ */
+export function videoAssetAdvisoryLockKey(
+  tenantId: string,
+  assetId: string,
+): string {
+  return `video-asset:${tenantId}:${assetId}`;
+}
+
+/**
  * Serializes provider-event ingestion per (tenant, provider, providerEventId):
  * the ingest path decides from a read-then-write ("have I seen this event?"),
  * so two concurrent deliveries of the SAME provider event must not both insert

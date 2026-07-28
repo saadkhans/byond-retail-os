@@ -33,12 +33,15 @@ describe('video-ingest module vendor neutrality', () => {
     'nats',
   ];
 
-  // The adapter itself plus the module wiring that selects it behind the
-  // VIDEO_FFMPEG_ENABLED opt-in — the string may appear nowhere else.
-  const OPTIONAL_BINARY_FILES = [
-    'ffmpeg-extractor.adapter.ts',
-    'video-ingest.module.ts',
-  ];
+  // Each optional system-binary name is confined to its adapter file plus
+  // the module wiring that selects it behind its env opt-in
+  // (VIDEO_FFMPEG_ENABLED / VIDEO_OCR_ENABLED) — the strings may appear
+  // nowhere else.
+  const OPTIONAL_BINARY_CONFINEMENT: Record<string, string[]> = {
+    ffmpeg: ['ffmpeg-extractor.adapter.ts', 'video-ingest.module.ts'],
+    ffprobe: ['ffmpeg-extractor.adapter.ts', 'video-ingest.module.ts'],
+    tesseract: ['tesseract-recognizer.adapter.ts', 'video-ingest.module.ts'],
+  };
 
   const collectSources = (dir: string): string[] => {
     const files: string[] = [];
@@ -60,11 +63,23 @@ describe('video-ingest module vendor neutrality', () => {
       for (const vendor of FORBIDDEN) {
         expect(source).not.toContain(vendor);
       }
-      // The optional-system-binary name is confined to its adapter file
-      // and the module wiring.
-      if (!OPTIONAL_BINARY_FILES.includes(basename(file))) {
-        expect(source).not.toContain('ffmpeg');
-        expect(source).not.toContain('ffprobe');
+      // Each optional-system-binary name is confined to its adapter file
+      // and the module wiring. The OPERATOR-FACING opt-in flag names
+      // (VIDEO_FFMPEG_ENABLED, VIDEO_OCR_ENABLED) are different: they are
+      // documented public configuration surface (README, Swagger, the
+      // controlled 503s naming them), so referencing a FLAG is allowed
+      // anywhere — only the binary names themselves stay confined.
+      const neutralized = source
+        .split('video_ffmpeg_enabled')
+        .join('')
+        .split('video_ocr_enabled')
+        .join('');
+      for (const [binary, allowedFiles] of Object.entries(
+        OPTIONAL_BINARY_CONFINEMENT,
+      )) {
+        if (!allowedFiles.includes(basename(file))) {
+          expect(neutralized).not.toContain(binary);
+        }
       }
     },
   );
@@ -76,7 +91,13 @@ describe('video-ingest module vendor neutrality', () => {
     const dependencyNames = Object.keys(packageJson.dependencies ?? {}).map(
       (name) => name.toLowerCase(),
     );
-    for (const vendor of [...FORBIDDEN, 'ffmpeg', 'fluent-ffmpeg', 'opencv4nodejs']) {
+    for (const vendor of [
+      ...FORBIDDEN,
+      'ffmpeg',
+      'fluent-ffmpeg',
+      'opencv4nodejs',
+      'tesseract',
+    ]) {
       for (const name of dependencyNames) {
         expect(name).not.toContain(vendor);
       }

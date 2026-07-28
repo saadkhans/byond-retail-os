@@ -6,6 +6,9 @@ import { PlatformModulesModule } from '../platform-modules/platform-modules.modu
 import { FfmpegVideoFrameExtractor } from './extraction/ffmpeg-extractor.adapter';
 import { SimulatedVideoFrameExtractor } from './extraction/simulated-extractor.adapter';
 import { VideoFrameExtractorPort } from './extraction/video-frame-extractor.port';
+import { FrameTextRecognizerPort } from './recognition/frame-text-recognizer.port';
+import { SimulatedFrameTextRecognizer } from './recognition/simulated-recognizer.adapter';
+import { TesseractFrameTextRecognizer } from './recognition/tesseract-recognizer.adapter';
 import { LocalVideoStorageAdapter } from './storage/local-video-storage.adapter';
 import { VideoStoragePort } from './storage/video-storage.port';
 import { DEFAULT_MAX_UPLOAD_BYTES } from './video-assets.service';
@@ -66,6 +69,12 @@ import { VideoCropsController } from './video-crops.controller';
     // system-binary extractor needs the CONCRETE local adapter for its
     // path capability, so both tokens resolve to one instance.
     { provide: VideoStoragePort, useExisting: LocalVideoStorageAdapter },
+    // Extractor selection: the simulated adapter (default) declares
+    // readsRealBytes=false, so the quarantine screening preview refuses to
+    // serve from it (controlled 503) — placeholder frames must never stand
+    // in for the real footage a screener is approving. Production (and any
+    // deployment where uploads are actually screened) must therefore run
+    // with VIDEO_FFMPEG_ENABLED=true.
     {
       provide: VideoFrameExtractorPort,
       inject: [
@@ -80,6 +89,25 @@ import { VideoCropsController } from './video-crops.controller';
       ) =>
         config.get<string>('VIDEO_FFMPEG_ENABLED')?.toLowerCase() === 'true'
           ? new FfmpegVideoFrameExtractor(localStorage)
+          : simulated,
+    },
+    SimulatedFrameTextRecognizer,
+    // Frame-text recognizer selection, mirroring the extractor factory:
+    // the simulated adapter (default) declares readsRealPixels=false, so
+    // the PRE-STORAGE frame screen refuses to treat its empty result as a
+    // pass — uploads then fail closed (controlled 503) unless the operator
+    // explicitly set VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS for a
+    // non-production/simulated environment. Production must run with
+    // VIDEO_OCR_ENABLED=true (and VIDEO_FFMPEG_ENABLED=true).
+    {
+      provide: FrameTextRecognizerPort,
+      inject: [ConfigService, SimulatedFrameTextRecognizer],
+      useFactory: (
+        config: ConfigService,
+        simulated: SimulatedFrameTextRecognizer,
+      ) =>
+        config.get<string>('VIDEO_OCR_ENABLED')?.toLowerCase() === 'true'
+          ? new TesseractFrameTextRecognizer()
           : simulated,
     },
   ],

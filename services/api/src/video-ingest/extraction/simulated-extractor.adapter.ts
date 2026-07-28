@@ -3,6 +3,8 @@ import { Injectable } from '@nestjs/common';
 import {
   CropBox,
   ExtractedImage,
+  ExtractFrameAtOptions,
+  FrameExceedsBudgetError,
   FrameExtractionOptions,
   VideoFrameExtractorPort,
   VideoProbeResult,
@@ -45,6 +47,11 @@ const PLACEHOLDER_PNG = Buffer.from(
 export class SimulatedVideoFrameExtractor extends VideoFrameExtractorPort {
   readonly kind = SIMULATED_EXTRACTOR_KIND;
 
+  // Placeholder bytes, NOT the stored media: byte-inspecting surfaces (the
+  // quarantine screening preview) must refuse to serve from this adapter —
+  // a screener looking at placeholders would be attesting blind.
+  readonly readsRealBytes = false;
+
   probe(storageKey: string): Promise<VideoProbeResult> {
     // The key is unused except to keep the contract honest — a simulated
     // probe never touches storage.
@@ -76,11 +83,16 @@ export class SimulatedVideoFrameExtractor extends VideoFrameExtractorPort {
     storageKey: string,
     probe: VideoProbeResult,
     timestampMs: number,
+    options?: ExtractFrameAtOptions,
   ): Promise<ExtractedImage> {
     void storageKey;
-    return Promise.resolve(
-      this.placeholderImage(probe.width, probe.height, timestampMs),
-    );
+    const image = this.placeholderImage(probe.width, probe.height, timestampMs);
+    // Honor a caller budget trivially: the placeholder either fits or the
+    // contract's budget verdict applies — same behavior as a real adapter.
+    if (options?.maxBytes !== undefined && image.data.length > options.maxBytes) {
+      return Promise.reject(new FrameExceedsBudgetError());
+    }
+    return Promise.resolve(image);
   }
 
   extractCrop(

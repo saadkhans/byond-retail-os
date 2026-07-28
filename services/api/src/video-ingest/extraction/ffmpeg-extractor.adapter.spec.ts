@@ -5,6 +5,7 @@ import {
   buildProbeArgs,
   classifyCommandError,
   FfmpegVideoFrameExtractor,
+  MAX_OUTPUT_BYTES,
   MAX_PROBE_DIMENSION,
   MAX_PROBE_DURATION_MS,
   MAX_TOTAL_EXTRACTION_BYTES,
@@ -14,6 +15,7 @@ import {
   ExtractionFailedError,
   ExtractionInfrastructureError,
   ExtractorUnavailableError,
+  FrameExceedsBudgetError,
   FrameUnavailableError,
 } from './video-frame-extractor.port';
 
@@ -456,6 +458,104 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
       { intervalMs: 3000, maxFrames: 10, startMs: 0 },
     );
     expect(frames.map((f) => f.timestampMs)).toEqual([0, 3000]);
+  });
+
+  it('declares itself byte-reading (screening previews may serve from it)', () => {
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.resolve({ stdout: Buffer.from('png') }),
+    );
+    expect(extractor.readsRealBytes).toBe(true);
+  });
+
+  it('enforces a caller-supplied maxBytes as the exec maxBuffer, clamped by the ceiling', async () => {
+    const budgets: number[] = [];
+    const extractor = new FfmpegVideoFrameExtractor(
+      storageStub,
+      (_binary, _args, maxOutputBytes) => {
+        budgets.push(maxOutputBytes);
+        return Promise.resolve({ stdout: Buffer.from('png') });
+      },
+    );
+    const probe = { durationMs: 10_000, width: 100, height: 100, fps: 30 };
+    // A tightened caller budget IS the invocation's maxBuffer.
+    await extractor.extractFrameAt('a/original.mp4', probe, 0, {
+      maxBytes: 1000,
+    });
+    // A caller budget can never RAISE the adapter's own ceiling.
+    await extractor.extractFrameAt('a/original.mp4', probe, 0, {
+      maxBytes: MAX_OUTPUT_BYTES * 4,
+    });
+    // No caller budget → the ceiling, unchanged.
+    await extractor.extractFrameAt('a/original.mp4', probe, 0);
+    expect(budgets).toEqual([1000, MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES]);
+  });
+
+  it('maps a BUDGET-tripped maxBuffer overflow to FrameExceedsBudgetError, not infrastructure', async () => {
+    const overflow = () =>
+      Promise.reject(
+        Object.assign(new RangeError('stdout maxBuffer length exceeded'), {
+          code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+        }),
+      );
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, overflow);
+    const probe = { durationMs: 10_000, width: 100, height: 100, fps: 30 };
+    // The caller-supplied cap (below the ceiling) is what fired → a budget
+    // verdict the caller can treat as a skip.
+    await expect(
+      extractor.extractFrameAt('a/original.mp4', probe, 0, { maxBytes: 1000 }),
+    ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
+    // The adapter's OWN ceiling firing stays the existing infrastructure
+    // classification (a parent-side cap, not a caller budget).
+    await expect(
+      extractor.extractFrameAt('a/original.mp4', probe, 0),
+    ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+    await expect(
+      extractor.extractFrameAt('a/original.mp4', probe, 0, {
+        maxBytes: MAX_OUTPUT_BYTES,
+      }),
+    ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+  });
+
+  it('rejects a degenerate caller budget WITHOUT spawning anything', async () => {
+    const runner = jest.fn(() =>
+      Promise.resolve({ stdout: Buffer.from('png') }),
+    );
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+    const probe = { durationMs: 10_000, width: 100, height: 100, fps: 30 };
+    for (const maxBytes of [0, -1, 1.5, Number.NaN]) {
+      await expect(
+        extractor.extractFrameAt('a/original.mp4', probe, 0, { maxBytes }),
+      ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
+    }
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it('keeps a batch whose SHRINKING budget trips the exec cap a content failure', async () => {
+    // Once the aggregate pool drops below the per-frame ceiling the
+    // remainder becomes the exec cap; a real overflow there surfaces as
+    // FrameExceedsBudgetError inside the loop and must convert to the
+    // batch's ExtractionFailedError — never an infrastructure 503.
+    let call = 0;
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () => {
+      call += 1;
+      if (call <= 2) {
+        return Promise.resolve({
+          stdout: Buffer.alloc(48 * 1024 * 1024),
+        });
+      }
+      return Promise.reject(
+        Object.assign(new RangeError('stdout maxBuffer length exceeded'), {
+          code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+        }),
+      );
+    });
+    await expect(
+      extractor.extractFrames(
+        'a/original.mp4',
+        { durationMs: 20_000, width: 100, height: 100, fps: 30 },
+        { intervalMs: 1000, maxFrames: 10, startMs: 0 },
+      ),
+    ).rejects.toBeInstanceOf(ExtractionFailedError);
   });
 
   it('forwards the SHRINKING remaining budget once the pool drops below the per-frame cap', async () => {

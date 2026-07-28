@@ -1620,8 +1620,19 @@ model InferenceCandidate {
 // ---------------------------------------------------------------------------
 
 enum VideoAssetStatus {
-  // Every new upload lands QUARANTINED: bytes are held in local storage but
-  // the asset is NOT processable (validate/extract/crop all 409) until an
+  // DB-first staging state: the metadata row committed but the media write
+  // has not succeeded yet. NOT screenable and NOT processable — a screening
+  // decision, preview, validate, or extraction on a PENDING_MEDIA asset is
+  // a controlled 409, so a concurrent screener can never APPROVE an asset
+  // whose bytes may still fail to land. The upload publishes the asset
+  // (PENDING_MEDIA → QUARANTINED) only AFTER the media write succeeds; a
+  // failed write parks it PENDING_MEDIA → FAILED (UPLOAD_INCOMPLETE). A
+  // crash in the window leaves this row as the recovery record (DELETE
+  // cleans it).
+  PENDING_MEDIA
+  // Every upload whose media landed is published QUARANTINED: bytes are held
+  // in local storage but the asset is NOT processable (validate/extract/crop
+  // all 409) until an
   // audited frame-content screening decision APPROVEs it (→ UPLOADED) or
   // REJECTs it (media removed, → REJECTED). The upload attestation is
   // defense-in-depth only — quarantine is the enforced control.

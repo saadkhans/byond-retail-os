@@ -29,6 +29,16 @@ export const VIDEO_ERROR_CODES = {
    * REJECTED/FAILED assets).
    */
   UPLOAD_INCOMPLETE: 'UPLOAD_INCOMPLETE',
+  /**
+   * PRE-STORAGE frame screening (OCR text recognition over sampled frames
+   * of the STAGED upload) found credential- or payment-bearing content
+   * BEFORE any media reached durable storage: the PENDING_MEDIA staging
+   * row transitions directly to REJECTED with this code (error codes exist
+   * exactly on REJECTED/FAILED — error_only_terminal_check). The
+   * recognized text itself is NEVER stored, echoed, or audited — only the
+   * index of the frame that tripped the screen.
+   */
+  PRESTORE_SCREENING_REJECTED: 'PRESTORE_SCREENING_REJECTED',
 } as const;
 
 /**
@@ -139,11 +149,17 @@ export function isAllowedVideoUpload(
  * (calendar, epoch, coordinate, version) ever rescues a Luhn-valid window.
  */
 const CONTIGUOUS_DIGIT_RUN = /(?<!\d)\d{13,}(?!\d)/g;
-// Up to 26 separator-joined digit groups: covers a 19-digit PAN split into
-// single digits (19 groups) with margin for decoy groups around it. Each
-// separator is a MAXIMAL run of non-alphanumeric characters, so
-// "4111 - 1111" chains exactly like "4111-1111".
-const GROUPED_PAN = /(?<!\d)\d+(?:[^0-9A-Za-z]+\d+){1,25}(?!\d)/g;
+// The COMPLETE maximal separated digit chain, with NO group cap: a fixed
+// repetition bound (an earlier {1,25}) split longer chains into a first
+// match plus a remainder, so a PAN whose window crossed the cap boundary
+// (11 decoy single-digit groups + a 16-digit card split into single digits
+// = 27 groups) was never Luhn-tested. Each separator is a MAXIMAL run of
+// non-alphanumeric characters, so "4111 - 1111" chains exactly like
+// "4111-1111". The pattern is linear-time — the digit and separator
+// character classes are disjoint, so there is no backtracking ambiguity —
+// and the window scan below is O(groups x 7) because each window join is
+// abandoned past 19 digits.
+const GROUPED_PAN = /(?<!\d)\d+(?:[^0-9A-Za-z]+\d+)+(?!\d)/g;
 
 /** Pure Luhn verdict on an exact 13-19-digit window — no shape exemptions. */
 function isLuhnValidPanWindow(digits: string): boolean {
@@ -275,16 +291,19 @@ export function filenameCarriesSensitiveContent(filename: string): boolean {
   );
 }
 
-// Chunked scan parameters for the payload text screen below. The overlap
-// exceeds every single-character-separated PAN grouping (19 digits + 18
-// separators) and every KEY_VALUE credential fragment we screen for, so a
-// sensitive run cannot hide across a chunk boundary. (A PAN stretched past
-// 256 bytes with multi-character separator runs COULD straddle a boundary
-// undetected — an accepted bound: chunks are 1 MiB, so the straddle window
-// is ~0.025% of positions, and every non-straddling occurrence still
-// rejects.)
+// Chunked scan parameters for the payload text screen below. Separated
+// digit chains are now scanned WITHOUT a group cap, so the chunk overlap is
+// the effective length bound on a boundary-straddling chain: the overlap
+// must comfortably exceed every PAN grouping we expect to catch, including
+// multi-character separator runs. 2 KiB covers a 19-digit PAN whose 18
+// separators are each ~100 characters of padding (and, in the UTF-16 views,
+// ~1 KiB of UTF-16 text), far past any single-character-separated grouping
+// or KEY_VALUE credential fragment. (A sensitive run stretched past 2 KiB
+// COULD still straddle a boundary undetected — an accepted bound: chunks
+// are 1 MiB, so the straddle window is ~0.2% of positions, and every
+// non-straddling occurrence still rejects.)
 const PAYLOAD_SCAN_CHUNK_BYTES = 1024 * 1024;
-const PAYLOAD_SCAN_OVERLAP_BYTES = 256;
+const PAYLOAD_SCAN_OVERLAP_BYTES = 2048;
 // Printable ASCII runs of at least this length are treated as embedded
 // text; shorter runs are overwhelmingly codec noise. The floor is FIVE, not
 // eight: the shortest credential fragment the shared screen classifies is

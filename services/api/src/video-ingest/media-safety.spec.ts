@@ -70,6 +70,19 @@ describe('media-safety', () => {
       // Decoy digit groups around the card never launder it.
       ['4111-1111-1111-1111-9.mp4'],
       ['99-4111-1111-1111-1111.mp4'],
+      // LONG separated chains — beyond the 26 groups an earlier fixed
+      // repetition cap could match. The exact P1 payload: 27 single-digit
+      // groups whose final 16 digits join to 4111111111111111; the cap
+      // split it into a 26-group first match (no Luhn-valid window inside —
+      // verified by computation) plus an unscanned remainder, so it reached
+      // storage. The full maximal chain must be windowed.
+      ['3-4-3-0-3-3-0-1-1-1-9-4-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1.mp4'],
+      ['3_4_3_0_3_3_0_1_1_1_9_4_1_1_1_1_1_1_1_1_1_1_1_1_1_1_1.mp4'],
+      // 32 groups with the PAN at the TAIL: the 16 decoy digits were chosen
+      // by computation so the old 26-group first match (decoys + first 10
+      // card digits) contains NO Luhn-valid window — only the full-chain
+      // scan catches the trailing card.
+      ['1-3-4-6-2-2-6-8-7-2-6-1-4-3-4-3-4-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1.mp4'],
       // ... not even behind a separator CHANGE.
       ['4111-1111-1111-1111.5.mp4'],
       // CHANGING separators inside the chain: no consistent-separator
@@ -127,6 +140,10 @@ describe('media-safety', () => {
       ['panorama_shelf.mp4'],
       ['pancake_stand.mp4'],
       ['pinned_note.mp4'],
+      // 32-group separated chain (beyond the old 26-group cap) whose EVERY
+      // 13-19-digit window join is Luhn-INVALID (verified by computation):
+      // long chains are windowed in full, not blanket-rejected by length.
+      [`${'37'.repeat(16).split('').join('_')}.mp4`],
     ])('accepts %p', (name) => {
       expect(filenameCarriesSensitiveContent(name)).toBe(false);
     });
@@ -196,6 +213,9 @@ describe('media-safety', () => {
       ['card 4111 - 1111 - 1111 - 1111 visible in frame'],
       ['pan4111111111111111 seen on receipt'],
       ['ref 4000000000006 end'],
+      // 27-group P1 payload: the tail 16 single-digit groups join to the
+      // Visa test PAN — the COMPLETE chain is windowed, no group cap.
+      ['3-4-3-0-3-3-0-1-1-1-9-4-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1'],
     ])('rejects %p', (text) => {
       expect(containsSensitiveFreeText(text)).toBe(true);
     });
@@ -351,12 +371,49 @@ describe('media-safety', () => {
       expect(bufferCarriesSensitiveText(payload)).toBe(true);
     });
 
+    it('finds long separated chains (past the old 26-group cap) in metadata', () => {
+      // The P1 payload (27 single-digit groups, PAN in the tail 16) and the
+      // computed 32-group tail-PAN chain must reject; the 32-group chain
+      // whose every window join is Luhn-invalid must still accept.
+      const cases: Array<[string, boolean]> = [
+        ['3-4-3-0-3-3-0-1-1-1-9-4-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1', true],
+        ['1-3-4-6-2-2-6-8-7-2-6-1-4-3-4-3-4-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1', true],
+        ['37'.repeat(16).split('').join('-'), false],
+      ];
+      for (const [chain, expected] of cases) {
+        const payload = Buffer.concat([
+          Buffer.alloc(2),
+          Buffer.from(`ref ${chain} end`, 'ascii'),
+          Buffer.alloc(2),
+        ]);
+        expect(bufferCarriesSensitiveText(payload)).toBe(expected);
+      }
+    });
+
     it('finds sensitive text that straddles a scan-chunk boundary', () => {
       const chunk = 1024 * 1024;
       const pan = '4111 1111 1111 1111';
       const payload = Buffer.concat([
         Buffer.alloc(chunk - 10), // NULs — not printable
         Buffer.from(pan, 'ascii'),
+        Buffer.alloc(64),
+      ]);
+      expect(bufferCarriesSensitiveText(payload)).toBe(true);
+    });
+
+    it('finds a multi-char-separated PAN spanning >256 bytes across a chunk boundary', () => {
+      // Overlap regression: with the group cap removed, a PAN stretched
+      // with long separator runs is the boundary-straddling shape the 2 KiB
+      // overlap must cover. This 316-byte chain starts 30 bytes before the
+      // 1 MiB boundary and ends 286 bytes after it — beyond the old 256-byte
+      // overlap (neither truncated chunk view contained a full PAN window —
+      // verified by simulation), inside the 2 KiB one.
+      const chunk = 1024 * 1024;
+      const stretched = ['4111', '1111', '1111', '1111'].join('-'.repeat(100));
+      expect(stretched.length).toBe(316);
+      const payload = Buffer.concat([
+        Buffer.alloc(chunk - 30), // NULs — not printable
+        Buffer.from(stretched, 'ascii'),
         Buffer.alloc(64),
       ]);
       expect(bufferCarriesSensitiveText(payload)).toBe(true);

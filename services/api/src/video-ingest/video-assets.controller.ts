@@ -64,8 +64,15 @@ export class VideoAssetsController {
       '+ magic bytes), conservative size limit, filename traversal ' +
       'rejection, SHA-256 checksum. Bytes land in LOCAL/DEV storage behind ' +
       'a server-generated internal key — no public URLs, no client-supplied ' +
-      'paths, no media in the database. The asset lands QUARANTINED and is ' +
-      'not processable until an audited screening decision approves it.',
+      'paths, no media in the database. The asset is staged PENDING_MEDIA ' +
+      'and its frames are OCR-SCREENED BEFORE any byte reaches durable ' +
+      'storage (a frame carrying payment/credential text is a controlled ' +
+      '400 with code PRESTORE_SCREENING_REJECTED; when the screening ' +
+      'toolchain cannot run — VIDEO_FFMPEG_ENABLED / VIDEO_OCR_ENABLED — ' +
+      'the upload is refused 503 before any row or byte is accepted). ' +
+      'Only after the screen passes and the media write succeeds is the ' +
+      'asset published QUARANTINED — not processable until an audited ' +
+      'screening decision approves it.',
   })
   @ApiCreatedResponse({
     description: 'Asset created (QUARANTINED pending screening)',
@@ -148,7 +155,14 @@ export class VideoAssetsController {
       'and the video container / original bytes are never downloadable. ' +
       'Only while the asset is QUARANTINED (409 otherwise). POST, not GET: ' +
       'every served preview writes an audit entry (module idiom for ' +
-      'audited actions). Extractor unavailable or infrastructure trouble ' +
+      'audited actions). REQUIRES a byte-reading extractor ' +
+      '(VIDEO_FFMPEG_ENABLED=true): under the default simulated extractor ' +
+      'this route is a controlled 503 — placeholder frames would let a ' +
+      'screener approve footage without ever seeing it, so informed ' +
+      'screening (and any APPROVE) needs the real extractor; REJECT never ' +
+      'required a preview. Decoded preview bytes are capped per response ' +
+      '(16 MiB before base64), with over-budget frames skipped and ' +
+      'reported. Extractor unavailable or infrastructure trouble ' +
       'is a retryable 503; unreadable content is a controlled 400 with NO ' +
       'status transition — the screening decision stays open.',
   })

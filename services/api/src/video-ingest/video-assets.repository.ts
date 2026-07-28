@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import {
+  InferenceJobStatus,
   Prisma,
   VideoArtifactType,
   VideoAssetStatus,
@@ -12,6 +13,7 @@ import {
 import {
   deviceAdvisoryLockKey,
   unitAdvisoryLockKey,
+  videoAssetAdvisoryLockKey,
 } from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
 import { TenantScopedRepository } from '../prisma/tenant-scoped.repository';
@@ -287,11 +289,13 @@ export class VideoAssetsRepository extends TenantScopedRepository {
           locationId: effectiveLocationId ?? undefined,
           tenantId: scopedTenantId,
           // NON-NEGOTIABLE at the persistence layer (not caller-supplied):
-          // every new upload lands QUARANTINED. The operator attestation
-          // proves nothing about the bytes, so the asset stays
-          // non-processable until an audited screening decision releases
-          // (→ UPLOADED) or rejects (media removed, → REJECTED) it.
-          status: VideoAssetStatus.QUARANTINED,
+          // every new upload lands PENDING_MEDIA — staged, NOT screenable,
+          // NOT processable. The row commits BEFORE the media write, so a
+          // screenable status here would let a concurrent screener APPROVE
+          // an asset whose bytes then fail to land. The service publishes
+          // PENDING_MEDIA → QUARANTINED only after the media write
+          // succeeds; only then does the audited screening decision apply.
+          status: VideoAssetStatus.PENDING_MEDIA,
         },
         select: VIDEO_ASSET_SELECT,
       });
@@ -367,6 +371,11 @@ export class VideoAssetsRepository extends TenantScopedRepository {
    * Status transition as a guarded compare-and-set: the update matches the
    * EXPECTED current status, so two concurrent transitions cannot both win
    * (the loser sees count 0 and returns null for the caller to re-read).
+   * Every transition runs under the asset's advisory lock so it SERIALIZES
+   * with `authorizeScreeningPreviewServe()`: a screening decision and a
+   * preview-serve authorization can never interleave, which is what makes
+   * the preview's final status re-read authoritative (a preview is never
+   * audited/served for an asset whose terminal decision committed first).
    */
   transitionStatus(
     tenantId: string,
@@ -388,6 +397,10 @@ export class VideoAssetsRepository extends TenantScopedRepository {
   ): Promise<VideoAssetView | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${videoAssetAdvisoryLockKey(
+        scopedTenantId,
+        id,
+      )}))`;
       const before = await tx.videoAsset.findFirst({
         where: { id, tenantId: scopedTenantId, deletedAt: null },
         select: VIDEO_ASSET_SELECT,
@@ -414,6 +427,79 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       await this.auditLog.record(buildAuditEntry(before, after), tx);
       return after;
     });
+  }
+
+  /**
+   * FINAL authorization for serving a screening preview, taken AFTER the
+   * frames were extracted: one transaction that (1) takes the SAME advisory
+   * lock as every `transitionStatus()` decision CAS, (2) re-reads the
+   * asset's CURRENT status, and (3) writes the byte-exposing READ audit
+   * entry — audit and authorization commit together or not at all. Because
+   * decisions and this guard serialize on the lock, a preview can never be
+   * audited or served for an asset whose terminal screening decision
+   * committed first (the mid-extraction race, including POSIX
+   * unlink-while-open serving after a committed rejection). Returns the
+   * observed status — the caller serves ONLY on QUARANTINED (no audit is
+   * written otherwise) — or null when the asset is gone (deleted).
+   */
+  authorizeScreeningPreviewServe(
+    tenantId: string,
+    id: string,
+    buildAuditEntry: () => AuditEntry,
+  ): Promise<VideoAssetStatus | null> {
+    const scopedTenantId = this.requireTenantId(tenantId);
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${videoAssetAdvisoryLockKey(
+        scopedTenantId,
+        id,
+      )}))`;
+      const current = await tx.videoAsset.findFirst({
+        where: { id, tenantId: scopedTenantId, deletedAt: null },
+        select: { status: true },
+      });
+      if (!current) {
+        return null;
+      }
+      if (current.status !== VideoAssetStatus.QUARANTINED) {
+        // Not authorized — NO audit entry: nothing is served, so recording
+        // a READ would fabricate a byte exposure that never happened.
+        return current.status;
+      }
+      await this.auditLog.record(buildAuditEntry(), tx);
+      return current.status;
+    });
+  }
+
+  /**
+   * Inference jobs linked through THIS asset's crop artifacts (the one-shot
+   * `inferenceJobId` stamp), with their CURRENT status — the delete flow
+   * retires them before the media disappears. Deliberately NO
+   * non-deleted-parent scoping: the delete flow (and its idempotent replay)
+   * runs AFTER the soft-delete committed, so the artifacts' parent is
+   * already deleted by the time this query runs. Deduped: each linked job
+   * is reported once even if multiple artifacts ever referenced it.
+   */
+  async listLinkedInferenceJobs(
+    tenantId: string,
+    videoAssetId: string,
+  ): Promise<{ id: string; status: InferenceJobStatus }[]> {
+    const rows = await this.prisma.videoArtifact.findMany({
+      where: this.scope(tenantId, {
+        videoAssetId,
+        inferenceJobId: { not: null },
+      }),
+      select: {
+        inferenceJobId: true,
+        inferenceJob: { select: { status: true } },
+      },
+    });
+    const byId = new Map<string, InferenceJobStatus>();
+    for (const row of rows) {
+      if (row.inferenceJobId && row.inferenceJob) {
+        byId.set(row.inferenceJobId, row.inferenceJob.status);
+      }
+    }
+    return [...byId.entries()].map(([id, status]) => ({ id, status }));
   }
 
   /**

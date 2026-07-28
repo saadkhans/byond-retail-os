@@ -4,9 +4,11 @@ import { LocalVideoStorageAdapter } from '../storage/local-video-storage.adapter
 import {
   CropBox,
   ExtractedImage,
+  ExtractFrameAtOptions,
   ExtractionFailedError,
   ExtractionInfrastructureError,
   ExtractorUnavailableError,
+  FrameExceedsBudgetError,
   FrameExtractionOptions,
   FrameUnavailableError,
   VideoFrameExtractorPort,
@@ -23,7 +25,8 @@ const FFPROBE_BINARY = 'ffprobe';
 
 // Decoded PNG frames are bounded (a single 4K PNG is well under this); the
 // cap exists so a hostile container cannot balloon the parent process.
-const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+// Exported: it is the ceiling every caller-supplied maxBytes is clamped to.
+export const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 const COMMAND_TIMEOUT_MS = 30_000;
 
 // Request-wide decoded-byte budget for multi-frame extraction: the
@@ -220,6 +223,21 @@ interface CommandError {
 }
 
 /**
+ * The exec output overran the invocation's maxBuffer cap. Recognized
+ * separately from the general classification so a DELIBERATELY tightened
+ * cap (a caller-supplied budget below the adapter's own ceiling) can map
+ * to FrameExceedsBudgetError instead of an infrastructure failure.
+ */
+export function isMaxBufferOverflow(error: unknown): boolean {
+  const failure = (error ?? {}) as CommandError;
+  return (
+    failure.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' ||
+    (typeof failure.message === 'string' &&
+      failure.message.includes('maxBuffer'))
+  );
+}
+
+/**
  * Classify a child-process failure so INFRASTRUCTURE problems stay
  * retryable instead of permanently rejecting a valid asset:
  *
@@ -247,11 +265,7 @@ export function classifyCommandError(error: unknown): Error {
   if (failure.killed === true || typeof failure.signal === 'string') {
     return new ExtractionInfrastructureError();
   }
-  if (
-    failure.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' ||
-    (typeof failure.message === 'string' &&
-      failure.message.includes('maxBuffer'))
-  ) {
+  if (isMaxBufferOverflow(error)) {
     return new ExtractionInfrastructureError();
   }
   if (typeof failure.code === 'string') {
@@ -294,6 +308,10 @@ const defaultRunCommand: RunCommand = (binary, args, maxOutputBytes) =>
 @Injectable()
 export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
   readonly kind = FFMPEG_EXTRACTOR_KIND;
+
+  // Frames come from decoding the stored media — byte-inspecting surfaces
+  // (the quarantine screening preview) may serve from this adapter.
+  readonly readsRealBytes = true;
 
   constructor(
     // The CONCRETE local adapter, not the neutral port: only local storage
@@ -357,6 +375,12 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
           Math.min(MAX_OUTPUT_BYTES, remaining),
         );
       } catch (error) {
+        // The SHRINKING remainder tripped the exec cap: the batch cannot
+        // fit its aggregate budget — the same verdict as the injected-
+        // runner backstop below, never an infrastructure retry.
+        if (error instanceof FrameExceedsBudgetError) {
+          throw new ExtractionFailedError();
+        }
         // Real containers report durations slightly past the last decodable
         // frame — end-of-stream mid-sampling is a NORMAL end condition, not
         // a batch failure. Only an empty FIRST frame means the video is
@@ -380,7 +404,23 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
     storageKey: string,
     probe: VideoProbeResult,
     timestampMs: number,
+    options?: ExtractFrameAtOptions,
   ): Promise<ExtractedImage> {
+    const maxBytes = options?.maxBytes;
+    if (maxBytes !== undefined) {
+      // A degenerate caller budget (zero/negative/non-integer) can fit no
+      // frame at all — the budget verdict, decided before any exec.
+      if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
+        return Promise.reject(new FrameExceedsBudgetError());
+      }
+      return this.frameAt(
+        storageKey,
+        probe,
+        timestampMs,
+        // The caller cap never RAISES the adapter's own ceiling.
+        Math.min(MAX_OUTPUT_BYTES, maxBytes),
+      );
+    }
     return this.frameAt(storageKey, probe, timestampMs, MAX_OUTPUT_BYTES);
   }
 
@@ -390,11 +430,25 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
     timestampMs: number,
     maxOutputBytes: number,
   ): Promise<ExtractedImage> {
-    const data = await this.run(
-      FFMPEG_BINARY,
-      buildFrameArgs(this.storage.internalPathFor(storageKey), timestampMs),
-      maxOutputBytes,
-    );
+    let data: Buffer;
+    try {
+      const { stdout } = await this.runCommand(
+        FFMPEG_BINARY,
+        buildFrameArgs(this.storage.internalPathFor(storageKey), timestampMs),
+        maxOutputBytes,
+      );
+      data = stdout;
+    } catch (error) {
+      // BUDGET-tripped overflow: the cap that fired was a deliberately
+      // tightened one (below the adapter's own ceiling) — a verdict on the
+      // budget, not on the infrastructure, so budgeted callers can skip
+      // the frame. An overflow of the full ceiling keeps the existing
+      // infrastructure classification.
+      if (maxOutputBytes < MAX_OUTPUT_BYTES && isMaxBufferOverflow(error)) {
+        throw new FrameExceedsBudgetError();
+      }
+      throw classifyCommandError(error);
+    }
     if (data.length === 0) {
       // The command succeeded but decoded nothing — the position is past
       // the last decodable frame, not a broken video.

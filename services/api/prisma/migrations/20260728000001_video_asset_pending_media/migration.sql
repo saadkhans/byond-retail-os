@@ -1,0 +1,26 @@
+-- Phase 10 follow-up (Codex P1: keep staged rows unavailable until storage
+-- succeeds): non-screenable PENDING_MEDIA staging state.
+--
+-- DB-first staging commits the asset row BEFORE any byte reaches storage.
+-- When that row landed directly QUARANTINED it was already SCREENABLE in the
+-- window between the row commit and the media write: a concurrent screener
+-- could APPROVE an asset whose bytes then failed to land (and the
+-- QUARANTINED → FAILED compensation would lose its CAS to that approval),
+-- leaving an UPLOADED asset with no media. PENDING_MEDIA closes the window
+-- as a LIFECYCLE STATE: every new upload now lands PENDING_MEDIA (rejected
+-- by screening decisions, the screening preview, validate, and extraction
+-- with controlled 409s), and the upload publishes it PENDING_MEDIA →
+-- QUARANTINED only AFTER the media write succeeds. A failed media write
+-- parks it PENDING_MEDIA → FAILED (UPLOAD_INCOMPLETE); a crash in the
+-- window leaves the PENDING_MEDIA row as the recovery record (DELETE
+-- /video-assets/:id cleans it — REJECT never applies, the asset was never
+-- screenable).
+
+-- New lifecycle value. Postgres 12+ allows ADD VALUE inside a transaction
+-- as long as the NEW value is not used in the same transaction — nothing
+-- below references it. The DB column default stays 'UPLOADED'; the
+-- repository sets PENDING_MEDIA explicitly on every create, so no ALTER
+-- COLUMN (which would use the new value) is needed here. No status CHECK
+-- constraint changes: the error_only_terminal_check ties error columns to
+-- REJECTED/FAILED only, and PENDING_MEDIA rows carry no error.
+ALTER TYPE "VideoAssetStatus" ADD VALUE IF NOT EXISTS 'PENDING_MEDIA' BEFORE 'QUARANTINED';

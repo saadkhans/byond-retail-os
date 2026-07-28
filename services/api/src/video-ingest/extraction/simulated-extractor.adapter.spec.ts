@@ -2,6 +2,7 @@ import {
   SIMULATED_PROBE,
   SimulatedVideoFrameExtractor,
 } from './simulated-extractor.adapter';
+import { FrameExceedsBudgetError } from './video-frame-extractor.port';
 
 describe('SimulatedVideoFrameExtractor', () => {
   const extractor = new SimulatedVideoFrameExtractor();
@@ -9,6 +10,24 @@ describe('SimulatedVideoFrameExtractor', () => {
   it('probes deterministic metadata without touching storage', async () => {
     const probe = await extractor.probe('tenant/asset/original.mp4');
     expect(probe).toEqual(SIMULATED_PROBE);
+  });
+
+  it('declares that it does NOT read real bytes (screening previews must refuse it)', () => {
+    // The discriminator behind the informed-screening gate: placeholder
+    // frames must never stand in for the footage a screener approves.
+    expect(extractor.readsRealBytes).toBe(false);
+  });
+
+  it('honors a caller-supplied maxBytes on extractFrameAt', async () => {
+    const fits = await extractor.extractFrameAt('k', SIMULATED_PROBE, 0, {
+      maxBytes: 1024,
+    });
+    expect(fits.data.length).toBeLessThanOrEqual(1024);
+    // A budget the placeholder cannot fit is the SAME controlled budget
+    // verdict a real adapter produces — never a partial frame.
+    await expect(
+      extractor.extractFrameAt('k', SIMULATED_PROBE, 0, { maxBytes: 8 }),
+    ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
   });
 
   it('samples frames at the interval and honors the cap', async () => {
