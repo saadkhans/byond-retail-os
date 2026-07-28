@@ -133,14 +133,16 @@ class EnvironmentVariables {
   })
   VIDEO_OCR_ENABLED?: string;
 
-  // NON-PRODUCTION-ONLY escape hatch (deliberately alarming name):
+  // DEVELOPMENT/TEST-ONLY escape hatch (deliberately alarming name):
   // permits uploads WITHOUT the pre-storage frame screen when the
   // extractor/recognizer toolchain cannot perform it. Strict boolean like
   // the other Phase 10 flags — and declared for the same whitelist
-  // reason. The production ban is ENFORCED, not advisory:
-  // assertScreeningBypassAllowed below fails startup when
-  // NODE_ENV=production sets this true, and the video-ingest service
-  // additionally forces its runtime read to false under production.
+  // reason. The ban outside dev/test is ENFORCED, not advisory:
+  // assertScreeningBypassAllowed below fails startup unless NODE_ENV is
+  // EXPLICITLY development or test (an UNSET NODE_ENV fails too — a
+  // production deploy that simply omits NODE_ENV must never boot
+  // unscreened), and the video-ingest service additionally honors its
+  // runtime read only under an explicit development/test NODE_ENV.
   @IsOptional()
   @Matches(/^(true|false)$/i, {
     message: 'VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS must be true or false',
@@ -215,20 +217,30 @@ export function assertJwtSecretUsable(secret: string): void {
 /**
  * Cross-field startup rule (same post-validate idiom as
  * assertJwtSecretUsable): the pre-storage upload-screening bypass is
- * STRICTLY non-production. A production deployment that sets it fails AT
- * BOOT with an actionable message instead of silently accepting unscreened
- * media; the video-ingest service also forces its runtime read of the flag
- * to false under production as defense-in-depth.
+ * permitted ONLY when NODE_ENV is EXPLICITLY 'development' or 'test'.
+ * Every other NODE_ENV — 'production' AND unset alike — fails AT BOOT
+ * with an actionable message instead of silently accepting unscreened
+ * media: production deployments routinely omit NODE_ENV, and "unset means
+ * non-production" would let exactly those deployments boot with the
+ * bypass live. (NODE_ENV itself is enum-validated upstream, so the only
+ * values that can reach this check are development, test, production, or
+ * unset.) The video-ingest service mirrors the same rule at runtime as
+ * defense-in-depth.
  */
 export function assertScreeningBypassAllowed(
   nodeEnv: NodeEnv | undefined,
   bypass: string | undefined,
 ): void {
-  if (nodeEnv === NodeEnv.Production && bypass?.toLowerCase() === 'true') {
+  if (bypass?.toLowerCase() !== 'true') {
+    return;
+  }
+  if (nodeEnv !== NodeEnv.Development && nodeEnv !== NodeEnv.Test) {
     throw new Error(
-      'VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS must not be enabled when ' +
-        'NODE_ENV=production: the pre-storage upload screening bypass is ' +
-        'strictly non-production — unset it and configure ' +
+      'VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS is permitted only when ' +
+        "NODE_ENV is explicitly 'development' or 'test' (it is currently " +
+        `${nodeEnv ?? 'unset'}): the pre-storage upload screening bypass ` +
+        'is strictly non-production and an unset NODE_ENV must be treated ' +
+        'as production — unset the bypass and configure ' +
         'VIDEO_FFMPEG_ENABLED=true and VIDEO_OCR_ENABLED=true so every ' +
         'upload is frame-screened before storage',
     );

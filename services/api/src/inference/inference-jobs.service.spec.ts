@@ -98,7 +98,6 @@ describe('InferenceJobsService', () => {
     findByIdempotencyKey: jest.Mock;
     search: jest.Mock;
     linkVisionEvent: jest.Mock;
-    cancelQueuedJob: jest.Mock;
   };
   let queue: {
     enqueue: jest.Mock;
@@ -107,6 +106,7 @@ describe('InferenceJobsService', () => {
     complete: jest.Mock;
     fail: jest.Mock;
     reclaimExpired: jest.Mock;
+    cancelQueued: jest.Mock;
   };
   let visionEvents: { ingest: jest.Mock; findById: jest.Mock };
   let platformModules: { isEnabledForTenant: jest.Mock };
@@ -140,11 +140,6 @@ describe('InferenceJobsService', () => {
         ...succeededJob,
         visionEventId: 'event-1',
       }),
-      cancelQueuedJob: jest.fn().mockResolvedValue({
-        ...jobDetail,
-        status: InferenceJobStatus.CANCELLED,
-        completedAt: new Date('2026-07-26T10:03:00.000Z'),
-      }),
     };
     queue = {
       enqueue: jest
@@ -162,6 +157,11 @@ describe('InferenceJobsService', () => {
         status: InferenceJobStatus.FAILED,
       }),
       reclaimExpired: jest.fn().mockResolvedValue([]),
+      cancelQueued: jest.fn().mockResolvedValue({
+        ...jobDetail,
+        status: InferenceJobStatus.CANCELLED,
+        completedAt: new Date('2026-07-26T10:03:00.000Z'),
+      }),
     };
     visionEvents = {
       ingest: jest.fn().mockResolvedValue(visionEvent),
@@ -469,7 +469,7 @@ describe('InferenceJobsService', () => {
   });
 
   describe('cancelOrphanedJob', () => {
-    it('cancels a QUEUED job through the audited CAS with a CANCEL entry', async () => {
+    it('cancels a QUEUED job through the QUEUE PORT (audited CAS, CANCEL entry), never the repository', async () => {
       const result = await service.cancelOrphanedJob(
         'tenant-a',
         'job-1',
@@ -479,7 +479,7 @@ describe('InferenceJobsService', () => {
       expect(result).toEqual(
         expect.objectContaining({ status: InferenceJobStatus.CANCELLED }),
       );
-      const [tenantId, jobId, buildAudit] = repository.cancelQueuedJob.mock
+      const [tenantId, jobId, buildAudit] = queue.cancelQueued.mock
         .calls[0] as [
         string,
         string,
@@ -496,16 +496,22 @@ describe('InferenceJobsService', () => {
       expect(entry.reason).toBe(
         'Inference job cancelled: downstream linkage failed',
       );
+      // Cancellation is a queue-lifecycle mutation: it must reach the
+      // injected port (so a broker-backed queue drops the message too) and
+      // never bypass it into the Prisma repository.
+      for (const repositoryMethod of Object.values(repository)) {
+        expect(repositoryMethod).not.toHaveBeenCalled();
+      }
     });
 
     it("maps a claimed/finished job and a missing job to 'not-cancellable' WITHOUT throwing", async () => {
       // The compensation path runs while a different controlled error is
       // already being surfaced — it must never throw HTTP errors itself.
-      repository.cancelQueuedJob.mockResolvedValueOnce('not-queued');
+      queue.cancelQueued.mockResolvedValueOnce('not-queued');
       await expect(
         service.cancelOrphanedJob('tenant-a', 'job-1', 'orphan'),
       ).resolves.toBe('not-cancellable');
-      repository.cancelQueuedJob.mockResolvedValueOnce(null);
+      queue.cancelQueued.mockResolvedValueOnce(null);
       await expect(
         service.cancelOrphanedJob('tenant-a', 'job-1', 'orphan'),
       ).resolves.toBe('not-cancellable');

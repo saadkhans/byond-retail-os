@@ -1,5 +1,12 @@
 import { execFile } from 'node:child_process';
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdtemp,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Injectable } from '@nestjs/common';
@@ -38,6 +45,21 @@ export const SCRATCH_DIR_PREFIX = 'byond-video-inspect-';
 const SCRATCH_FILE_NAME = 'inspect.media';
 const SCRATCH_DIR_MODE = 0o700;
 const SCRATCH_FILE_MODE = 0o600;
+
+// Crash-recovery scavenger threshold. Normal paths always remove the
+// scratch dir, but a process crash / SIGKILL / host restart between the
+// write and close() would strand it forever — so every inspectBuffer call
+// first sweeps abandoned SCRATCH_DIR_PREFIX dirs. 15 minutes is FAR beyond
+// any bounded live inspection (a session runs a handful of 30 s-capped
+// execs over at most a few frames), so a concurrent live session's dir can
+// never be swept, while a crashed process's dir is reclaimed on the next
+// upload attempt.
+export const SCRATCH_ABANDONED_AFTER_MS = 15 * 60 * 1000;
+
+// Entries examined per sweep are capped so a pathological tmpdir (or a
+// hostile local process minting prefix-matching dirs) cannot add unbounded
+// latency to an upload; anything beyond the cap waits for the next sweep.
+export const SCRATCH_SWEEP_MAX_DIRS = 50;
 
 // Decoded PNG frames are bounded (a single 4K PNG is well under this); the
 // cap exists so a hostile container cannot balloon the parent process.
@@ -510,16 +532,28 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
 
   /**
    * IN-MEMORY inspection for the pre-storage upload screen. ffprobe/ffmpeg
-   * need a real file, so the buffer is written to an EPHEMERAL scratch
-   * file in the OS temp dir (0o700 dir / 0o600 file) — never under the
-   * durable storage root — probed there, and the whole scratch directory
-   * is removed in every path: on a probe failure before the session is
-   * returned, and by close() afterwards (retry once, then the existing
-   * infrastructure classification — the unscreened bytes are never
-   * silently left behind). Scratch write failures are environmental
-   * (ENOSPC, permissions), so they map to ExtractionInfrastructureError.
+   * need a real, SEEKABLE file — stdin feeding is deliberately not used
+   * because probing non-faststart MP4 containers (moov atom at the end)
+   * requires seeking, which a pipe cannot provide — so the buffer is
+   * written to an EPHEMERAL scratch file in the OS temp dir (0o700 dir /
+   * 0o600 file) — never under the durable storage root — probed there, and
+   * the whole scratch directory is removed in every path: on a probe
+   * failure before the session is returned, and by close() afterwards
+   * (retry once, then the existing infrastructure classification — the
+   * unscreened bytes are never silently left behind). Scratch write
+   * failures are environmental (ENOSPC, permissions), so they map to
+   * ExtractionInfrastructureError.
+   *
+   * Crash recovery: a crash between the write and close() would strand the
+   * scratch dir, so each call FIRST runs an awaited best-effort sweep of
+   * abandoned scratch dirs (see sweepAbandonedScratchDirs) — before this
+   * session's own dir even exists, so the sweep can never touch it.
    */
   async inspectBuffer(data: Buffer): Promise<BufferInspectionSession> {
+    // Awaited (not fire-and-forget) so "cleanup before accepting uploads"
+    // is literal; runs BEFORE mkdtemp so the live session's own dir is
+    // never a sweep candidate. Sweep failures never fail the inspection.
+    await this.sweepAbandonedScratchDirs();
     let scratchDir: string | undefined;
     let scratchPath: string;
     try {
@@ -571,6 +605,46 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
         await this.removeScratchDir(dir);
       },
     };
+  }
+
+  /**
+   * LAZY crash-recovery scavenger for scratch dirs stranded by a process
+   * crash / SIGKILL / host restart mid-inspection. One readdir of the OS
+   * temp dir (cheap when there is nothing to do); only entries carrying
+   * the shared SCRATCH_DIR_PREFIX are considered, capped at
+   * SCRATCH_SWEEP_MAX_DIRS per sweep; a dir is removed only when its mtime
+   * is older than SCRATCH_ABANDONED_AFTER_MS, so a live concurrent
+   * session's dir is never a candidate. Everything is best-effort: a
+   * per-dir stat/removal failure is swallowed (it must not block the
+   * upload or the sweep of the remaining dirs), and the whole sweep is
+   * wrapped so even a readdir failure never fails the inspection. Removal
+   * relies on the same rm recursive+force semantics close() uses (safe on
+   * Windows). Nothing here ever surfaces a tmp path in an error.
+   */
+  private async sweepAbandonedScratchDirs(): Promise<void> {
+    try {
+      const tempRoot = tmpdir();
+      const entries = await readdir(tempRoot);
+      const candidates = entries
+        .filter((name) => name.startsWith(SCRATCH_DIR_PREFIX))
+        .slice(0, SCRATCH_SWEEP_MAX_DIRS);
+      const cutoff = Date.now() - SCRATCH_ABANDONED_AFTER_MS;
+      for (const name of candidates) {
+        const abandonedDir = join(tempRoot, name);
+        try {
+          const info = await stat(abandonedDir);
+          if (info.mtimeMs <= cutoff) {
+            await rm(abandonedDir, { recursive: true, force: true });
+          }
+        } catch {
+          // Best-effort per dir: one unreadable/unremovable entry must not
+          // block this upload or the sweep of the other dirs.
+        }
+      }
+    } catch {
+      // The sweep is opportunistic hygiene — a readdir failure (exotic
+      // tmpdir permissions) must never fail the live inspection.
+    }
   }
 
   /** Retry-once scratch removal; a persistent failure means unscreened

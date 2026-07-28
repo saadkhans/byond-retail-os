@@ -34,6 +34,13 @@ export interface FailJobInput {
 }
 
 /**
+ * 'not-queued': the job had already left QUEUED (claimed or finished) —
+ * before or during the cancellation compare-and-set — so nothing was
+ * cancelled and nothing was written.
+ */
+export type CancelQueuedRejection = 'not-queued';
+
+/**
  * 'lease-superseded': the caller's view of the job predates a lease
  * reclaim + re-claim — another attempt now owns the job, so a late result
  * from the previous attempt must not commit under the new attempt's lease.
@@ -63,12 +70,15 @@ export const INFERENCE_JOB_MAX_ATTEMPTS = 3;
 export const LEASE_EXPIRED_ERROR_CODE = 'LEASE_EXPIRED';
 
 /**
- * The queue abstraction: enqueue, claim, and drive the job lifecycle.
- * Phase 9 ships exactly one implementation — the database-backed
- * PrismaInferenceQueue (deterministic ordering: priority DESC, requestedAt
- * ASC, id ASC; tenant-safe compare-and-set transitions). Message-broker
- * adapters can implement this same port in later phases without touching
- * core code; no broker dependency exists today.
+ * The queue abstraction: enqueue, claim, drive the job lifecycle, and
+ * cancel queued work (cancelQueued) — EVERY queue-lifecycle mutation goes
+ * through this port, cancellation included, so an implementation always
+ * learns when queued work is withdrawn. Phase 9 ships exactly one
+ * implementation — the database-backed PrismaInferenceQueue (deterministic
+ * ordering: priority DESC, requestedAt ASC, id ASC; tenant-safe
+ * compare-and-set transitions). Message-broker adapters can implement this
+ * same port in later phases without touching core code; no broker
+ * dependency exists today.
  *
  * The generic parameter object shapes are defined by the repository module
  * (Prisma payload types); the port stays engine-neutral by treating the job
@@ -142,4 +152,20 @@ export abstract class InferenceQueuePort<TJobDetail = unknown> {
     input: FailJobInput,
     buildAuditEntry: (before: TJobDetail, after: TJobDetail) => AuditEntry,
   ): Promise<TJobDetail | TransitionRejection | null>;
+
+  /**
+   * QUEUED → CANCELLED compare-and-set for the orphaned-job compensation
+   * path (see InferenceJobsService.cancelOrphanedJob): work whose source
+   * media is gone must leave the queue, so an implementation that holds
+   * queued work outside the database (a message broker) drops or
+   * tombstones the message here — the orphan is never delivered to a
+   * worker. Only a QUEUED job cancels; a job that was claimed or finished
+   * (before or during the CAS) returns 'not-queued' without writing, and
+   * a job missing in this tenant returns null.
+   */
+  abstract cancelQueued(
+    tenantId: string,
+    jobId: string,
+    buildAuditEntry: (before: TJobDetail, after: TJobDetail) => AuditEntry,
+  ): Promise<TJobDetail | CancelQueuedRejection | null>;
 }

@@ -145,6 +145,9 @@ describe('PrismaInferenceQueue', () => {
       expect(() =>
         queue.fail('', 'job-1', 0, { errorCode: 'X_Y' }, transitionAudit),
       ).toThrow(TenantIdRequiredError);
+      expect(() =>
+        queue.cancelQueued('', 'job-1', transitionAudit),
+      ).toThrow(TenantIdRequiredError);
     });
 
     it('scopes every enqueue reference check to the tenant', async () => {
@@ -771,6 +774,68 @@ describe('PrismaInferenceQueue', () => {
         ),
       ).resolves.toBe('lease-superseded');
       expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('cancelQueued', () => {
+    it('cancels with a tenant-scoped QUEUED-only compare-and-set and audits it', async () => {
+      tx.inferenceJob.findFirst.mockResolvedValue(queuedJob);
+      tx.inferenceJob.findFirstOrThrow.mockResolvedValue({
+        ...queuedJob,
+        status: InferenceJobStatus.CANCELLED,
+      });
+      const result = await queue.cancelQueued(
+        'tenant-a',
+        'job-1',
+        transitionAudit,
+      );
+      expect(tx.inferenceJob.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'job-1',
+          tenantId: 'tenant-a',
+          status: InferenceJobStatus.QUEUED,
+        },
+        // CANCELLED is terminal: completedAt is stamped with the flip (DB
+        // CHECK) and errorCode stays untouched (errors exist only on
+        // FAILED).
+        data: expect.objectContaining({
+          status: InferenceJobStatus.CANCELLED,
+          completedAt: expect.any(Date),
+        }),
+      });
+      expect(result).toEqual(
+        expect.objectContaining({ status: InferenceJobStatus.CANCELLED }),
+      );
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ entityType: 'InferenceJob' }),
+        tx,
+      );
+    });
+
+    it('returns null when the job is missing in this tenant', async () => {
+      tx.inferenceJob.findFirst.mockResolvedValue(null);
+      await expect(
+        queue.cancelQueued('tenant-a', 'missing', transitionAudit),
+      ).resolves.toBeNull();
+      expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("returns 'not-queued' for a claimed or finished job without writing", async () => {
+      tx.inferenceJob.findFirst.mockResolvedValue(runningJob);
+      await expect(
+        queue.cancelQueued('tenant-a', 'job-1', transitionAudit),
+      ).resolves.toBe('not-queued');
+      expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
+    });
+
+    it("loses the CAS to a concurrent claim as 'not-queued' without auditing", async () => {
+      tx.inferenceJob.findFirst.mockResolvedValue(queuedJob);
+      tx.inferenceJob.updateMany.mockResolvedValue({ count: 0 });
+      await expect(
+        queue.cancelQueued('tenant-a', 'job-1', transitionAudit),
+      ).resolves.toBe('not-queued');
       expect(auditLog.record).not.toHaveBeenCalled();
     });
   });

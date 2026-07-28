@@ -144,7 +144,20 @@ export function isAllowedVideoUpload(
  *     whether the separators stay consistent or change mid-chain — has
  *     EVERY window of consecutive groups whose joined digits are PAN-length
  *     Luhn-tested, so decoy digit groups before/after a card
- *     (4111-1111-1111-1111-9) never launder it either.
+ *     (4111-1111-1111-1111-9) never launder it either;
+ *   - every OVERFLOW chain — one whose full digit join exceeds 19 digits,
+ *     i.e. where some aligned join of consecutive groups overruns the PAN
+ *     length bound — is ADDITIONALLY char-level windowed over its full
+ *     concatenated digits (every 13-19-digit substring Luhn-tested), because
+ *     the group-aligned scan abandons overrunning joins and is therefore
+ *     blind to PAN windows that START mid-group and cross a group boundary
+ *     ("000000014111111111-111111": 18-digit group carrying 8 zeros + the
+ *     first 10 card digits, then the remaining 6 — the aligned join is 24
+ *     digits, but offset 8 starts a Luhn-valid 16-digit card). Chains whose
+ *     full join is <=19 digits keep aligned-only windowing — no aligned join
+ *     ever overruns there, so the scan has no blind spot — which is what
+ *     lets Luhn-invalid ISO datetimes (14-digit join) and camera stamps
+ *     (14/17) keep their adjudicated accepts.
  * Separator placement never launders raw card data, and no digit shape
  * (calendar, epoch, coordinate, version) ever rescues a Luhn-valid window.
  */
@@ -189,6 +202,17 @@ export function carriesLikelyPan(text: string): boolean {
     if (groupWindowsCarryPan(groups)) {
       return true;
     }
+    // OVERFLOW chains: when the chain's full digit join exceeds 19, some
+    // aligned join hit groupWindowsCarryPan's >19 abandon, so windows that
+    // START mid-group and cross into later groups were never tested
+    // ("000000014111111111-111111"). Char-level windowing over the
+    // concatenated chain digits closes exactly that blind spot; <=19-join
+    // chains skip it and keep the aligned-only adjudicated behavior.
+    // Still linear-ish: O(chain digits x 7 window lengths).
+    const joined = groups.join('');
+    if (joined.length > 19 && digitWindowsCarryPan(joined)) {
+      return true;
+    }
   }
   return false;
 }
@@ -217,6 +241,11 @@ function digitWindowsCarryPan(run: string): boolean {
  * into many small groups, must not hide behind the full join being
  * over-length or Luhn-invalid. The Luhn verdict is final per window — no
  * timestamp/GPS shape rescues a Luhn-valid join (see policy above).
+ *
+ * GROUP-ALIGNED ONLY: a join that overruns 19 digits is abandoned, so this
+ * scan never sees windows starting MID-group. carriesLikelyPan compensates
+ * by char-level windowing the full concatenated digits of any chain whose
+ * join exceeds 19 (the only case where the abandon can hide a window).
  */
 function groupWindowsCarryPan(groups: readonly string[]): boolean {
   for (let start = 0; start < groups.length; start += 1) {
@@ -244,15 +273,47 @@ function groupWindowsCarryPan(groups: readonly string[]): boolean {
 // are covered by the cvv/cvc prefixes).
 const FUSED_CREDENTIAL_LABEL = /(?<![A-Za-z0-9])(?:cvv|cvc|cvn|csc|pin|pan|iban)\d/i;
 
+// Numeric credential labels SEPARATED from their digits by whitespace — the
+// shape OCR emits when a label and its value sit apart on a card or keypad
+// ("CVV 123", "PIN 1234", and "cvv\n123" across an OCR line break: \s
+// covers space/tab/CR/LF and nothing is anchored, so multi-line OCR text
+// matches wherever the pair occurs). The label list mirrors the fused-label
+// card words above minus iban (IBAN values start with letters, never bare
+// digits). The left word boundary keeps "coupon 123" / "napkin 42" clean
+// (the label letters sit inside a word), and the mandatory whitespace keeps
+// "pinch 4" clean ('pin' is followed by a letter, not \s). 'pan' is
+// included deliberately: "pan 45" (a camera pan angle) rejecting is
+// accepted reject-on-write overbreadth, the same policy that rejects
+// Luhn-valid timestamps.
+const SPACED_NUMERIC_CREDENTIAL_LABEL =
+  /(?<![A-Za-z0-9])(?:cvv|cvc|cvn|csc|pin|pan)\s+\d/i;
+
+// Secret-word labels followed by a whitespace-separated value TOKEN
+// ("password hunter2", "pwd\nhunter2" across an OCR line break). The shared
+// '='/':' screens (KEY_VALUE_CREDENTIAL / KEY_COLON_CREDENTIAL) accept ANY
+// single value character after the separator; whitespace is a far weaker
+// binding signal, so the value token here must LOOK like a value — contain
+// a digit OR run 6+ characters. That bound keeps short prose clean
+// ("password ok", "password reset") while "password redacted" REJECTS
+// (pinned): the same words with '=' or ':' already reject via
+// containsCredentialValue, and mirroring that verdict beats trying to
+// whitelist prose.
+const SPACED_SECRET_LABEL =
+  /(?<![A-Za-z0-9])(?:password|passwd|pwd)\s+(?:\S*\d\S*|\S{6,})/i;
+
 /**
  * Free-text sensitive-content screen — the single predicate for screening
- * ANY operator-supplied free text (audit/screening notes, metadata text
- * runs, filenames) before it is persisted:
+ * ANY operator-supplied free text (OCR frame text, audit/screening notes,
+ * metadata text runs, filenames, idempotency keys) before it is persisted
+ * or acted on:
  *   - `key=value` / `key: value` credential fragments and credential-bearing
  *     URLs (containsCredentialValue);
  *   - bare well-known secret tokens (sk_live_..., JWTs, AKIA..., ghp_...);
  *   - credential labels FUSED with their value in one token (cvv123,
  *     pin1234, pan4111111111111111);
+ *   - credential labels SEPARATED from their value by OCR whitespace —
+ *     numeric card labels before digits ("CVV 123", "pin\n1234") and
+ *     secret-word labels before a value-shaped token ("password hunter2");
  *   - grouping-aware PAN windows under the Luhn-verdict-wins policy above.
  * Returns true when the text must be REJECTED (reject-on-write policy).
  */
@@ -261,6 +322,8 @@ export function containsSensitiveFreeText(text: string): boolean {
     containsCredentialValue(text) ||
     containsKnownSecretToken(text) ||
     FUSED_CREDENTIAL_LABEL.test(text) ||
+    SPACED_NUMERIC_CREDENTIAL_LABEL.test(text) ||
+    SPACED_SECRET_LABEL.test(text) ||
     carriesLikelyPan(text)
   );
 }

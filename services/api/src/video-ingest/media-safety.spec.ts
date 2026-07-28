@@ -90,6 +90,17 @@ describe('media-safety', () => {
       // card digits) contains NO Luhn-valid window — only the full-chain
       // scan catches the trailing card.
       ['1-3-4-6-2-2-6-8-7-2-6-1-4-3-4-3-4-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1.mp4'],
+      // OVERSIZED separated groups (Codex P1 "window across oversized
+      // separated digit groups"): first group = 8 zeros + the first 10 PAN
+      // digits (18 digits), second group = the remaining 6. The aligned
+      // join is 24 digits — the aligned scan abandons it — and NO window
+      // inside the 18-digit contiguous group is Luhn-valid (verified by
+      // computation), so only char-level windowing of the full 24-digit
+      // join sees the Luhn-valid 16-digit card starting at offset 8.
+      ['000000014111111111-111111.mp4'],
+      // Same PAN, split at a different offset (16-digit group carrying 8
+      // zeros + 8 card digits, then the remaining 8).
+      ['0000000141111111-11111111.mp4'],
       // ... not even behind a separator CHANGE.
       ['4111-1111-1111-1111.5.mp4'],
       // CHANGING separators inside the chain: no consistent-separator
@@ -147,9 +158,12 @@ describe('media-safety', () => {
       ['panorama_shelf.mp4'],
       ['pancake_stand.mp4'],
       ['pinned_note.mp4'],
-      // 32-group separated chain (beyond the old 26-group cap) whose EVERY
-      // 13-19-digit window join is Luhn-INVALID (verified by computation):
-      // long chains are windowed in full, not blanket-rejected by length.
+      // 32-group separated chain whose 32-digit join OVERFLOWS 19, so it
+      // now gets FULL CHAR-LEVEL windowing on top of the aligned scan —
+      // and stays an accept: EVERY 13-19-digit substring of '37'x16 is
+      // Luhn-INVALID (recomputed for the char-level rule: 0 of the 119
+      // windows pass Luhn). Overflow chains are windowed, never
+      // blanket-rejected by length.
       [`${'37'.repeat(16).split('').join('_')}.mp4`],
     ])('accepts %p', (name) => {
       expect(filenameCarriesSensitiveContent(name)).toBe(false);
@@ -224,6 +238,30 @@ describe('media-safety', () => {
       // 27-group P1 payload: the tail 16 single-digit groups join to the
       // Visa test PAN — the COMPLETE chain is windowed, no group cap.
       ['3-4-3-0-3-3-0-1-1-1-9-4-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1'],
+      // OVERSIZED separated groups (Codex P1): the 24-digit aligned join
+      // overruns 19, so only char-level windowing over the full join sees
+      // the Luhn-valid card crossing the group boundary at offset 8.
+      ['000000014111111111-111111'],
+      ['ref 0000000141111111-11111111 end'], // same PAN, different split
+      // OCR whitespace between a credential label and its value (Codex P1
+      // "scan credential labels separated by OCR whitespace"): fused needs
+      // label+digit contiguous and key=value needs '='/':' — these carry
+      // neither, only \s (including OCR line breaks and doubled spaces).
+      ['CVV 123'],
+      ['cvv\n123'], // OCR line break between label and digits
+      ['PIN  1234'], // double space
+      ['pin\t9876'], // tab
+      ['csc 998 read from keypad'],
+      ['camera pan 45 during sweep'], // pan-angle FP — accepted overbreadth
+      ['password hunter2'],
+      ['PASSWORD HUNTER2'],
+      ['passwd hunter2'],
+      ['pwd\nhunter2'], // OCR line break between label and value
+      // PINNED: a 6+ char token after 'password' rejects even when it is
+      // prose — 'password=redacted'/'password: redacted' already reject
+      // via the shared key=value screen, and the whitespace form mirrors
+      // that verdict (reject-on-write overbreadth).
+      ['password redacted'],
       // Separators OUTSIDE printable ASCII must not split a grouped PAN
       // (Codex P1): whitespace controls, Unicode dashes/spaces, and
       // mixtures all chain digit groups — the separator class is "not an
@@ -244,6 +282,17 @@ describe('media-safety', () => {
       ['rejected due to glare on aisle 4 between 10:00 and 10:15'],
       ['pinch-zoom artifact near panorama seam, keep clip'],
       ['clip recorded 2026-07-27, duration 00:00:10'],
+      // 'pin' INSIDE words never exposes a whitespace-separated label —
+      // the label needs a non-alphanumeric left boundary AND \s before the
+      // digits ('pinned' puts a letter on both sides).
+      ['pinned annotation at aisle 4'],
+      ['pinch 4 fingers to zoom before retest'],
+      // Secret-word labels WITHOUT a value-shaped token after them: the
+      // next token has no digit and is under 6 chars, so discussion-only
+      // mentions stay clean ('password redacted' is pinned as a REJECT
+      // above — 6+ chars mirrors the '='/':' screens' verdict).
+      ['password ok'],
+      ['password reset requested by ops'],
       // MULTI-LINE notes: newlines now chain digit groups, so these guard
       // the main false-positive classes. The newline-joined datetime join
       // (20260727113347) is Luhn-INVALID — verified by computation; the
@@ -400,8 +449,10 @@ describe('media-safety', () => {
 
     it('finds long separated chains (past the old 26-group cap) in metadata', () => {
       // The P1 payload (27 single-digit groups, PAN in the tail 16) and the
-      // computed 32-group tail-PAN chain must reject; the 32-group chain
-      // whose every window join is Luhn-invalid must still accept.
+      // computed 32-group tail-PAN chain must reject; the 32-group '37'
+      // chain must still accept — its 32-digit join overflows 19 and is
+      // now char-level windowed in full, and EVERY 13-19-digit substring
+      // of '37'x16 is Luhn-invalid (recomputed: 0 of 119 windows pass).
       const cases: Array<[string, boolean]> = [
         ['3-4-3-0-3-3-0-1-1-1-9-4-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1', true],
         ['1-3-4-6-2-2-6-8-7-2-6-1-4-3-4-3-4-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1', true],
@@ -414,6 +465,44 @@ describe('media-safety', () => {
           Buffer.alloc(2),
         ]);
         expect(bufferCarriesSensitiveText(payload)).toBe(expected);
+      }
+    });
+
+    it('finds a PAN crossing an OVERSIZED group boundary in metadata bytes (Codex P1)', () => {
+      // Payload-bytes form of the oversized-group finding: the 24-digit
+      // aligned join overruns 19, so only the char-level windowing of the
+      // full join sees the Luhn-valid card crossing the group boundary.
+      for (const chain of [
+        '000000014111111111-111111',
+        '0000000141111111-11111111', // same PAN, split at a different offset
+      ]) {
+        const payload = Buffer.concat([
+          noise,
+          Buffer.alloc(2),
+          Buffer.from(`ref ${chain} end`, 'ascii'),
+          Buffer.alloc(2),
+          noise,
+        ]);
+        expect(bufferCarriesSensitiveText(payload)).toBe(true);
+      }
+    });
+
+    it('finds OCR-style whitespace-separated credential labels in metadata text', () => {
+      // Subtitle/comment atoms can carry the same label-space-value shapes
+      // OCR produces; spaces are printable, so the run reaches the shared
+      // containsSensitiveFreeText screen intact. (A label split from its
+      // value by a REAL line break in raw bytes lands in two separate
+      // printable runs — that shape is covered at the free-text/OCR level,
+      // where the whole multi-line string is screened as one text.)
+      for (const fragment of ['CVV 123', 'PIN  1234', 'password hunter2']) {
+        const payload = Buffer.concat([
+          noise,
+          Buffer.alloc(2),
+          Buffer.from(`note ${fragment} end`, 'ascii'),
+          Buffer.alloc(2),
+          noise,
+        ]);
+        expect(bufferCarriesSensitiveText(payload)).toBe(true);
       }
     });
 
@@ -529,19 +618,21 @@ describe('media-safety', () => {
       expect(bufferCarriesSensitiveText(payload)).toBe(false);
     });
 
-    it('accepts ISO 6709 GPS location atoms whose digit joins are Luhn-invalid', () => {
+    it('accepts ISO 6709 GPS location atoms whose digit windows are all Luhn-invalid', () => {
       // Under the Luhn-wins policy GPS shape is NOT an exemption: coordinate
-      // digit groups are windowed and Luhn-tested like any other chain.
-      // Most real coordinates pass because every 13-19-digit window of
-      // their joins fails Luhn — verified by direct computation for each
-      // value below (including the "ISO6709" digits in the atom key, which
-      // join into the chain).
+      // digit groups are windowed and Luhn-tested like any other chain
+      // (including the "ISO6709" digits in the atom key, which join into
+      // the chain). Chains whose full join is <=19 digits keep ALIGNED
+      // windowing (the first value: 17-digit join); chains whose join
+      // overflows 19 are now CHAR-LEVEL windowed in full, so a >19-join
+      // coordinate accepts only when EVERY 13-19-digit substring of its
+      // join fails Luhn — verified by direct computation for both 23-digit
+      // joins below (0 Luhn-valid windows out of 56 each). Long precision
+      // alone never blanket-rejects a location atom.
       for (const iso6709 of [
-        '+48.8577+002.2950/',
-        '-33.8688+151.2093+058.000/',
-        '+35.6581+139.7017+040.000/',
-        '-22.9519-043.2105+710.000/',
-        '+51.5007-000.1246+035.000/',
+        '+48.8577+002.2950/', // 17-digit join — aligned-only, unchanged
+        '+14.1822-085.5868+334.473/', // 23-digit join, all windows Luhn-invalid
+        '-33.6530-165.5941+134.775/', // 23-digit join, all windows Luhn-invalid
       ]) {
         const payload = Buffer.concat([
           Buffer.alloc(4),
@@ -563,6 +654,18 @@ describe('media-safety', () => {
         '+41.111111+111.11111/', // joins to the 16-digit Visa test PAN
         '-26.2050-67.9749+14.431/', // real-shaped; 17-digit join is Luhn-valid
         '+37.3349-122.0090+021.000/', // real-shaped; 19/13-digit joins Luhn-valid
+        // FLIPPED accept → reject by the overflow char-level rule: these
+        // real-shaped coordinates have 23-digit joins whose ALIGNED windows
+        // are all Luhn-invalid (they accepted before), but char-level
+        // windowing exposes Luhn-valid mid-group substrings (computed:
+        // e.g. 8688151209305 at offset 6 of the first; 5190432105710 at
+        // offset 7 of the third). Accepted overbreadth — the same window
+        // rule that catches 000000014111111111-111111 applies to every
+        // overflow chain, coordinate-shaped or not.
+        '-33.8688+151.2093+058.000/',
+        '+35.6581+139.7017+040.000/',
+        '-22.9519-043.2105+710.000/',
+        '+51.5007-000.1246+035.000/',
       ]) {
         const payload = Buffer.concat([
           Buffer.alloc(4),

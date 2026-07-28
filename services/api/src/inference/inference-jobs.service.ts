@@ -363,7 +363,10 @@ export class InferenceJobsService {
    * instead — this path never throws HTTP errors, because it runs while a
    * different controlled error is already being surfaced. `reason` is
    * composed by the internal caller (never end-user input) and lands in
-   * the audit trail verbatim.
+   * the audit trail verbatim. The cancellation goes through the QUEUE
+   * PORT (never the repository directly): withdrawing queued work is a
+   * queue-lifecycle mutation, and a broker-backed port implementation
+   * must learn about it to drop the message.
    */
   async cancelOrphanedJob(
     tenantId: string,
@@ -371,7 +374,7 @@ export class InferenceJobsService {
     reason: string,
     actor?: AuditActor,
   ): Promise<InferenceJobDetail | 'not-cancellable'> {
-    const result = await this.jobsRepository.cancelQueuedJob(
+    const result = await this.queue.cancelQueued(
       tenantId,
       jobId,
       (before, after) =>

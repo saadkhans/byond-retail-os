@@ -116,7 +116,7 @@ describe('validateEnv', () => {
     );
   });
 
-  describe('the screening bypass is banned in production (startup failure)', () => {
+  describe('the screening bypass requires an EXPLICIT development/test NODE_ENV (startup failure otherwise)', () => {
     it.each(['true', 'TRUE'])(
       'fails validation when NODE_ENV=production and the bypass is %s',
       (value) => {
@@ -129,6 +129,61 @@ describe('validateEnv', () => {
         ).toThrow(/strictly non-production/);
       },
     );
+
+    it('fails validation when NODE_ENV is UNSET and the bypass is true', () => {
+      // A production deploy that simply omits NODE_ENV must never boot
+      // with the bypass live — unset is treated as production, not as
+      // "non-production by default".
+      const { NODE_ENV: _omit, ...withoutNodeEnv } = validConfig;
+      expect(() =>
+        validateEnv({
+          ...withoutNodeEnv,
+          VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'true',
+        }),
+      ).toThrow(/explicitly 'development' or 'test'/);
+      expect(() =>
+        validateEnv({
+          ...withoutNodeEnv,
+          VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'true',
+        }),
+      ).toThrow(/unset/);
+    });
+
+    it('fails validation for a non-enum NODE_ENV (e.g. staging) with the bypass true', () => {
+      // 'staging' is rejected by the NODE_ENV enum validation itself — the
+      // bypass can never ride an unrecognized environment name past boot.
+      expect(() =>
+        validateEnv({
+          ...validConfig,
+          NODE_ENV: 'staging',
+          VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'true',
+        }),
+      ).toThrow(/NODE_ENV/);
+    });
+
+    it.each(['development', 'test'])(
+      'allows the bypass when NODE_ENV is explicitly %s',
+      (nodeEnv) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            NODE_ENV: nodeEnv,
+            VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'true',
+          }),
+        ).not.toThrow();
+      },
+    );
+
+    it('accepts an unset NODE_ENV with the bypass false or unset', () => {
+      const { NODE_ENV: _omit, ...withoutNodeEnv } = validConfig;
+      expect(() =>
+        validateEnv({
+          ...withoutNodeEnv,
+          VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: 'false',
+        }),
+      ).not.toThrow();
+      expect(() => validateEnv({ ...withoutNodeEnv })).not.toThrow();
+    });
 
     it('accepts production with the bypass false or unset', () => {
       expect(() =>

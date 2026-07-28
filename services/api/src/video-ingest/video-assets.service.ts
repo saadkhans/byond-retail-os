@@ -280,6 +280,32 @@ function framesRequestFingerprint(dto: ExtractFramesDto): string {
       });
 }
 
+/**
+ * Sample positions shared by the pre-storage screen and the screening
+ * preview: one frame per STARTED second — Math.ceil, because a 1.9 s clip
+ * has TWO started seconds and Math.floor would leave its entire second
+ * second unscreened — capped at maxFrames. While the cap is not hit,
+ * sample i lands at the START of second i: exactly one sample inside every
+ * started second, and the last one strictly below durationMs (for every
+ * durationMs > 0, (ceil(durationMs/1000) - 1) * 1000 < durationMs — the
+ * exclusive endpoint holds because no frame exists AT durationMs). When
+ * the cap bites, the capped count is instead spread evenly across the
+ * duration with the same exclusive endpoint. A very short (or zero-probed)
+ * clip yields a single sample at 0.
+ */
+function screeningSampleTimestampsMs(
+  durationMs: number,
+  maxFrames: number,
+): number[] {
+  const startedSeconds = Math.ceil(durationMs / 1000);
+  const count = Math.max(1, Math.min(maxFrames, startedSeconds));
+  return Array.from({ length: count }, (_, index) =>
+    count === startedSeconds
+      ? index * 1000
+      : Math.floor((durationMs * index) / count),
+  );
+}
+
 function cropRequestFingerprint(dto: CreateVideoCropDto): string {
   return JSON.stringify({
     op: 'CROP',
@@ -302,9 +328,12 @@ export class VideoAssetsService {
    * frame screen when the configured extractor/recognizer cannot perform
    * it (simulated adapters, dev/test hosts with no media tooling). Every
    * upload accepted under it records the bypass in its create audit entry.
-   * PRODUCTION MUST NEVER SET THIS FLAG — and that is ENFORCED twice:
-   * validateEnv fails startup when NODE_ENV=production sets it, and the
-   * constructor below forces this field false under production even if a
+   * ONLY AN EXPLICIT development/test NODE_ENV MAY CARRY THIS FLAG — and
+   * that is ENFORCED twice: validateEnv fails startup unless NODE_ENV is
+   * exactly 'development' or 'test' when the flag is true, and the
+   * constructor below honors the flag only under those same two values —
+   * production, an unrecognized value, and an UNSET NODE_ENV (production
+   * deploys routinely omit it) all force this field false even if a
    * config source somehow still carries the flag.
    */
   private readonly allowUnscreenedUploads: boolean;
@@ -324,11 +353,14 @@ export class VideoAssetsService {
     this.maxUploadBytes =
       Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_UPLOAD_BYTES;
     // Defense-in-depth on top of the boot-time validateEnv rule (which
-    // FAILS startup for production + true): the runtime read is forced
-    // false under NODE_ENV=production, so the screening bypass can never
-    // be live in a production process no matter what the config carries.
+    // FAILS startup unless NODE_ENV is explicitly development/test when
+    // the flag is true): the bypass is honored ONLY when NODE_ENV is
+    // exactly 'development' or 'test'. Production, staging-style values,
+    // and an UNSET NODE_ENV all read as bypass-off — a deployment that
+    // omits NODE_ENV must fail closed, never boot unscreened.
+    const nodeEnv = config.get<string>('NODE_ENV');
     this.allowUnscreenedUploads =
-      config.get<string>('NODE_ENV')?.toLowerCase() !== 'production' &&
+      (nodeEnv === 'development' || nodeEnv === 'test') &&
       config
         .get<string>('VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS')
         ?.toLowerCase() === 'true';
@@ -738,16 +770,19 @@ export class VideoAssetsService {
       session = await this.extractor.inspectBuffer(buffer);
       const probe = session.probe;
       // Same sampling shape as the quarantine screening preview: one frame
-      // per started second, capped; a very short clip yields one frame at 0.
-      const count = Math.max(
-        1,
-        Math.min(
-          PRESTORE_SCREENING_MAX_FRAMES,
-          Math.floor(probe.durationMs / 1000),
-        ),
+      // per STARTED second (ceil — a 1.9 s clip yields TWO samples, so its
+      // final started second is screened too), capped; a very short clip
+      // yields one frame at 0. Every timestamp is strictly < durationMs.
+      const timestamps = screeningSampleTimestampsMs(
+        probe.durationMs,
+        PRESTORE_SCREENING_MAX_FRAMES,
       );
-      for (let index = 0; index < count && hitFrameIndex === null; index += 1) {
-        const timestampMs = Math.floor((probe.durationMs * index) / count);
+      for (
+        let index = 0;
+        index < timestamps.length && hitFrameIndex === null;
+        index += 1
+      ) {
+        const timestampMs = timestamps[index];
         let image;
         try {
           image = await session.extractFrameAt(timestampMs);
@@ -1543,13 +1578,15 @@ export class VideoAssetsService {
     } catch (error) {
       throw this.mapPreviewError(error);
     }
-    // Evenly spaced sample positions strictly inside the duration
-    // (exclusive endpoint — no frame exists AT durationMs): one frame per
-    // started second, capped. A very short clip yields a single frame at 0.
-    const count = Math.max(
-      1,
-      Math.min(SCREENING_PREVIEW_MAX_FRAMES, Math.floor(probe.durationMs / 1000)),
+    // Sample positions strictly inside the duration (exclusive endpoint —
+    // no frame exists AT durationMs): one frame per STARTED second (ceil,
+    // matching the pre-storage screen — a 1.9 s clip previews TWO frames),
+    // capped. A very short clip yields a single frame at 0.
+    const timestamps = screeningSampleTimestampsMs(
+      probe.durationMs,
+      SCREENING_PREVIEW_MAX_FRAMES,
     );
+    const count = timestamps.length;
     const frames: ScreeningPreviewFrame[] = [];
     let retainedBytes = 0;
     let skippedOverBudget = 0;
@@ -1564,7 +1601,7 @@ export class VideoAssetsService {
         skippedOverBudget += count - index;
         break;
       }
-      const timestampMs = Math.floor((probe.durationMs * index) / count);
+      const timestampMs = timestamps[index];
       let image;
       try {
         image = await this.extractor.extractFrameAt(
@@ -2026,8 +2063,14 @@ export class VideoAssetsService {
       );
     }
 
+    // The parent asset id rides along explicitly: the repository takes the
+    // asset advisory lock BEFORE its guarded read, so it cannot learn the
+    // parent by reading first — and the lock is what serializes this link
+    // with DELETE /video-assets/:id (no QUEUED job can slip past the
+    // delete flow's linked-job enumeration).
     const linked = await this.repository.linkArtifactToInferenceJob(
       tenantId,
+      artifact.videoAssetId,
       artifactId,
       job.id,
       (before, after) =>
@@ -2092,6 +2135,16 @@ export class VideoAssetsService {
    * recorded, through the same `mediaRemovedAt` marker CAS as the
    * screening-rejection removal (exactly-once; a failed cleanup leaves the
    * honest pending state and the idempotent replay completes and records).
+   * EXCEPTION — media already removed AND recorded by an earlier screening
+   * rejection: the marker is read INSIDE softDelete's locked transaction
+   * (race-free — REJECT transitions hold the same asset lock, and after
+   * the soft-delete screening can no longer run), and when it is already
+   * claimed the delete audit states honestly that this is a METADATA-ONLY
+   * deletion (the screening rejection's completion entry already exists in
+   * the audit trail) instead of promising a cleanup completion whose
+   * marker CAS would always lose and never write — the service then skips
+   * the completion recording for that case (deletePrefix still runs
+   * idempotently for stragglers).
    * Before the media is removed, inference jobs linked through the asset's
    * crop artifacts are retired (QUEUED → CANCELLED; a claimed job is
    * audited as an orphan condition) so deleted media never leaves
@@ -2114,30 +2167,48 @@ export class VideoAssetsService {
         `Video asset "${safeAuditEntityId(id)}" not found`,
       );
     }
+    // Whether the media-removal completion is ALREADY recorded (a
+    // screening rejection removed the bytes and claimed the marker before
+    // this delete, or an earlier delete fully completed): initialized from
+    // the pre-delete read for the idempotent-replay path, then replaced by
+    // the AUTHORITATIVE marker read from inside softDelete's locked
+    // transaction for a fresh delete.
+    let removalAlreadyRecorded = Boolean(internal.mediaRemovedAt);
     if (!internal.deletedAt) {
       const marked = await this.repository.softDelete(
         tenantId,
         id,
-        (before) =>
+        (before, mediaAlreadyRemoved) =>
           this.auditEntry(tenantId, actor, {
             action: AuditAction.DELETE,
             entityType: 'VideoAsset',
             entityId: id,
             before,
-            // PENDING wording only: at soft-delete time the linked-job
+            // HONEST wording either way: when the media is still present
+            // the cleanup is PENDING — at soft-delete time the linked-job
             // retirement and the storage cleanup have not run yet and can
-            // still fail — completion gets its own audit entry (marker
-            // CAS) once the cleanup actually succeeded.
-            reason:
-              'Video asset deletion requested: media cleanup pending, ' +
-              'metadata kept (cleanup completion is recorded in the ' +
-              'audit trail)',
+            // still fail, so completion gets its own audit entry (marker
+            // CAS) once the cleanup actually succeeded. When an earlier
+            // screening rejection already removed the media AND recorded
+            // completion, promising another completion would lie forever
+            // (its marker CAS always loses) — the entry states the
+            // metadata-only reality instead.
+            reason: mediaAlreadyRemoved
+              ? 'Video asset deletion requested: the media was already ' +
+                'removed by an earlier screening rejection and its removal ' +
+                'completion is recorded in the audit trail — metadata-only ' +
+                'deletion, nothing left to remove'
+              : 'Video asset deletion requested: media cleanup pending, ' +
+                'metadata kept (cleanup completion is recorded in the ' +
+                'audit trail)',
           }),
       );
-      if (!marked) {
-        // Lost a race with another delete — the row is durably deleted;
-        // fall through to the idempotent file cleanup.
+      if (marked) {
+        removalAlreadyRecorded = marked.mediaAlreadyRemoved;
       }
+      // !marked: lost a race with another delete — the row is durably
+      // deleted; fall through to the idempotent file cleanup with the
+      // pre-read marker deciding the completion recording.
     }
     // BEFORE the media disappears: retire inference jobs already linked
     // through this asset's crop artifacts. A QUEUED job whose crop input
@@ -2171,14 +2242,20 @@ export class VideoAssetsService {
     }
     // Retirement AND storage removal succeeded — record cleanup completion
     // through the exactly-once marker CAS (shared with the screening
-    // removal; an asset whose media a screening rejection already removed
-    // and recorded stays at ONE completion entry — 'already-recorded').
-    await this.recordMediaRemovalCompleted(
-      tenantId,
-      id,
-      actor,
-      'deletion-cleanup',
-    );
+    // removal), but ONLY when the delete audit actually promised one: when
+    // an earlier screening rejection (or a fully completed earlier delete)
+    // already recorded the removal, the delete was audited as
+    // metadata-only, no completion is owed, and the CAS attempt is skipped
+    // — consistent with the wording, and any concurrent claim still stays
+    // at ONE completion entry ('already-recorded' writes nothing).
+    if (!removalAlreadyRecorded) {
+      await this.recordMediaRemovalCompleted(
+        tenantId,
+        id,
+        actor,
+        'deletion-cleanup',
+      );
+    }
     return { deleted: true };
   }
 

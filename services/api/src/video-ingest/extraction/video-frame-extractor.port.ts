@@ -128,7 +128,9 @@ export interface ExtractFrameAtOptions {
  * (a system-binary adapter) materializes an EPHEMERAL scratch file outside
  * durable storage and removes it on close(); a close failure surfaces as
  * the adapter's infrastructure classification so callers fail closed
- * rather than leaving unscreened bytes behind.
+ * rather than leaving unscreened bytes behind. A crash that skips close()
+ * entirely (SIGKILL, host restart) is recovered lazily: such an adapter
+ * sweeps its own abandoned scratch dirs before opening the next session.
  */
 export interface BufferInspectionSession {
   /** Probe of the in-memory bytes (already validated/bounded). */

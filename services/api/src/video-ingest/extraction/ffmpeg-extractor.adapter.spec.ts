@@ -1,4 +1,11 @@
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdtemp,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LocalVideoStorageAdapter } from '../storage/local-video-storage.adapter';
@@ -13,16 +20,21 @@ import {
   MAX_PROBE_DURATION_MS,
   MAX_TOTAL_EXTRACTION_BYTES,
   parseProbeOutput,
+  SCRATCH_ABANDONED_AFTER_MS,
   SCRATCH_DIR_PREFIX,
+  SCRATCH_SWEEP_MAX_DIRS,
 } from './ffmpeg-extractor.adapter';
 
 // The scratch-file logic never touches the real filesystem in tests: the
 // fs layer is mocked wholesale (the storage adapter import shares the
-// module but no test here performs storage I/O).
+// module but no test here performs storage I/O). readdir defaults to an
+// EMPTY tmpdir so the crash-recovery sweep is a no-op unless a test
+// configures it.
 jest.mock('node:fs/promises', () => ({
   chmod: jest.fn(async () => undefined),
   mkdir: jest.fn(async () => undefined),
   mkdtemp: jest.fn(async (prefix: string) => `${prefix}abc123`),
+  readdir: jest.fn(async () => []),
   readFile: jest.fn(async () => Buffer.alloc(0)),
   rename: jest.fn(async () => undefined),
   rm: jest.fn(async () => undefined),
@@ -495,6 +507,9 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
       (writeFile as jest.Mock).mockReset().mockResolvedValue(undefined);
       (rm as jest.Mock).mockReset().mockResolvedValue(undefined);
       (chmod as jest.Mock).mockReset().mockResolvedValue(undefined);
+      // Empty tmpdir → the crash-recovery sweep is a no-op in these tests.
+      (readdir as jest.Mock).mockReset().mockResolvedValue([]);
+      (stat as jest.Mock).mockReset().mockResolvedValue({});
     });
 
     it('writes the buffer to an OS-tempdir scratch file (0600, wx), probes THERE, and close() removes the tree', async () => {
@@ -586,6 +601,173 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
         ExtractionInfrastructureError,
       );
       expect(rm).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('crash-recovery scavenger for abandoned scratch dirs', () => {
+    // A crash / SIGKILL / host restart between the scratch write and
+    // close() strands the dir forever; the adapter reclaims such dirs
+    // lazily — an awaited sweep before each new session's dir is created.
+    const probeJson = JSON.stringify({
+      streams: [
+        { width: 1280, height: 720, r_frame_rate: '30/1', duration: '10.0' },
+      ],
+    });
+    const staleName = `${SCRATCH_DIR_PREFIX}stale111`;
+    const staleName2 = `${SCRATCH_DIR_PREFIX}stale222`;
+    const freshName = `${SCRATCH_DIR_PREFIX}fresh333`;
+    const stalePath = join(tmpdir(), staleName);
+    const stalePath2 = join(tmpdir(), staleName2);
+    const freshPath = join(tmpdir(), freshName);
+    const staleStats = () => ({
+      mtimeMs: Date.now() - SCRATCH_ABANDONED_AFTER_MS - 60_000,
+    });
+    const freshStats = () => ({ mtimeMs: Date.now() });
+    const workingRunner = () =>
+      Promise.resolve({ stdout: Buffer.from(probeJson) });
+
+    beforeEach(() => {
+      (mkdtemp as jest.Mock)
+        .mockReset()
+        .mockImplementation(async (prefix: string) => `${prefix}abc123`);
+      (writeFile as jest.Mock).mockReset().mockResolvedValue(undefined);
+      (rm as jest.Mock).mockReset().mockResolvedValue(undefined);
+      (chmod as jest.Mock).mockReset().mockResolvedValue(undefined);
+      (readdir as jest.Mock).mockReset().mockResolvedValue([]);
+      (stat as jest.Mock).mockReset().mockResolvedValue({});
+    });
+
+    it('removes an ABANDONED (stale-mtime) scratch dir before creating the new session dir', async () => {
+      (readdir as jest.Mock).mockResolvedValue([staleName]);
+      (stat as jest.Mock).mockResolvedValue(staleStats());
+      const extractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        workingRunner,
+      );
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      expect(readdir).toHaveBeenCalledWith(tmpdir());
+      expect(stat).toHaveBeenCalledWith(stalePath);
+      expect(rm).toHaveBeenCalledWith(stalePath, {
+        recursive: true,
+        force: true,
+      });
+      // The sweep ran BEFORE the live session's own dir existed, so the
+      // live dir can never be a sweep candidate.
+      expect((rm as jest.Mock).mock.invocationCallOrder[0]).toBeLessThan(
+        (mkdtemp as jest.Mock).mock.invocationCallOrder[0],
+      );
+      await session.close();
+    });
+
+    it('never removes a FRESH (recent-mtime) scratch dir — a live concurrent session', async () => {
+      (readdir as jest.Mock).mockResolvedValue([freshName]);
+      (stat as jest.Mock).mockResolvedValue(freshStats());
+      const extractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        workingRunner,
+      );
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      expect(stat).toHaveBeenCalledWith(freshPath);
+      expect(rm).not.toHaveBeenCalled();
+      // The only removal ever issued is the session's own close().
+      await session.close();
+      expect(rm).toHaveBeenCalledTimes(1);
+      expect(rm).not.toHaveBeenCalledWith(freshPath, expect.anything());
+    });
+
+    it('leaves non-matching tmpdir entries untouched (never stats or removes them)', async () => {
+      (readdir as jest.Mock).mockResolvedValue([
+        'systemd-private-xyz',
+        'byond-video-crops', // near miss: not the scratch prefix
+        staleName,
+      ]);
+      (stat as jest.Mock).mockResolvedValue(staleStats());
+      const extractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        workingRunner,
+      );
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      expect(stat).toHaveBeenCalledTimes(1);
+      expect(stat).toHaveBeenCalledWith(stalePath);
+      expect(rm).toHaveBeenCalledTimes(1);
+      expect(rm).toHaveBeenCalledWith(stalePath, {
+        recursive: true,
+        force: true,
+      });
+      await session.close();
+    });
+
+    it('swallows a per-dir removal failure — the upload proceeds and OTHER stale dirs still go', async () => {
+      (readdir as jest.Mock).mockResolvedValue([staleName, staleName2]);
+      (stat as jest.Mock).mockResolvedValue(staleStats());
+      (rm as jest.Mock).mockImplementation(async (path: string) => {
+        if (path === stalePath) {
+          throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' });
+        }
+      });
+      const extractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        workingRunner,
+      );
+      // The inspection itself succeeds despite the failed removal.
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      expect(session.probe.durationMs).toBe(10_000);
+      expect(rm).toHaveBeenCalledWith(stalePath, {
+        recursive: true,
+        force: true,
+      });
+      expect(rm).toHaveBeenCalledWith(stalePath2, {
+        recursive: true,
+        force: true,
+      });
+      await session.close();
+    });
+
+    it('tolerates a readdir failure — the sweep never fails the inspection', async () => {
+      (readdir as jest.Mock).mockRejectedValue(
+        Object.assign(new Error('EACCES'), { code: 'EACCES' }),
+      );
+      const extractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        workingRunner,
+      );
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      expect(session.probe.durationMs).toBe(10_000);
+      await session.close();
+    });
+
+    it('runs the sweep before EVERY inspectBuffer call', async () => {
+      const extractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        workingRunner,
+      );
+      const first = await extractor.inspectBuffer(Buffer.from('x'));
+      await first.close();
+      const second = await extractor.inspectBuffer(Buffer.from('y'));
+      await second.close();
+      expect(readdir).toHaveBeenCalledTimes(2);
+      // Each sweep preceded its own session's mkdtemp.
+      const readdirOrders = (readdir as jest.Mock).mock.invocationCallOrder;
+      const mkdtempOrders = (mkdtemp as jest.Mock).mock.invocationCallOrder;
+      expect(readdirOrders[0]).toBeLessThan(mkdtempOrders[0]);
+      expect(readdirOrders[1]).toBeLessThan(mkdtempOrders[1]);
+    });
+
+    it('caps the entries examined per sweep to bound upload latency', async () => {
+      const names = Array.from(
+        { length: SCRATCH_SWEEP_MAX_DIRS + 10 },
+        (_, i) => `${SCRATCH_DIR_PREFIX}old${i}`,
+      );
+      (readdir as jest.Mock).mockResolvedValue(names);
+      (stat as jest.Mock).mockResolvedValue(staleStats());
+      const extractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        workingRunner,
+      );
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      expect(stat).toHaveBeenCalledTimes(SCRATCH_SWEEP_MAX_DIRS);
+      expect(rm).toHaveBeenCalledTimes(SCRATCH_SWEEP_MAX_DIRS);
+      await session.close();
     });
   });
 

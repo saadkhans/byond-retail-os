@@ -461,14 +461,53 @@ describe('deleted-parent scoping on artifact reads', () => {
     const { repository } = makeRepository(tx);
     const result = await repository.linkArtifactToInferenceJob(
       TENANT,
+      'asset-1',
       'artifact-1',
       'job-1',
       () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
     );
     expect(result).toBeNull();
     const [{ where }] = tx.videoArtifact.findFirst.mock
-      .calls[0] as unknown as [{ where: { videoAsset: { deletedAt: null } } }];
+      .calls[0] as unknown as [
+      { where: { videoAssetId: string; videoAsset: { deletedAt: null } } },
+    ];
     expect(where.videoAsset).toEqual({ deletedAt: null });
+    // The read is pinned to the caller's parent asset (the lock key).
+    expect(where.videoAssetId).toBe('asset-1');
+  });
+
+  it('linkArtifactToInferenceJob takes the PARENT asset advisory lock BEFORE its guarded read (serializes with deletion)', async () => {
+    // Codex P1: without the lock, the non-deleted-parent predicate could
+    // pass, a DELETE (which holds the lock and enumerates linked jobs to
+    // retire) could commit in between, and the link would commit AFTER the
+    // enumeration ran — leaving a QUEUED job the delete flow never
+    // cancels. Same key/idiom as softDelete/transitionStatus/
+    // authorizeScreeningPreviewServe.
+    const tx = makeTx();
+    tx.videoArtifact.findFirst.mockResolvedValueOnce({
+      id: 'artifact-1',
+      inferenceJobId: null,
+    });
+    tx.videoArtifact.findFirstOrThrow.mockResolvedValueOnce({
+      id: 'artifact-1',
+      inferenceJobId: 'job-1',
+    });
+    const { repository } = makeRepository(tx);
+    await repository.linkArtifactToInferenceJob(
+      TENANT,
+      'asset-1',
+      'artifact-1',
+      'job-1',
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
+    );
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    // $queryRaw is a tagged template: calls[0][1] is the interpolated
+    // advisory-lock key — the SAME per-asset key deletion locks.
+    expect(tx.$queryRaw.mock.calls[0][1]).toBe(`video-asset:${TENANT}:asset-1`);
+    // The lock precedes the guarded read (and therefore the write).
+    expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      tx.videoArtifact.findFirst.mock.invocationCallOrder[0],
+    );
   });
 
   it('linkArtifactToInferenceJob requires a non-deleted parent IN THE WRITE itself', async () => {
@@ -487,6 +526,7 @@ describe('deleted-parent scoping on artifact reads', () => {
     const { repository } = makeRepository(tx);
     const result = await repository.linkArtifactToInferenceJob(
       TENANT,
+      'asset-1',
       'artifact-1',
       'job-1',
       () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
@@ -496,6 +536,7 @@ describe('deleted-parent scoping on artifact reads', () => {
       .calls[0] as unknown as [
       {
         where: {
+          videoAssetId: string;
           inferenceJobId: null;
           videoAsset: { deletedAt: null };
         };
@@ -503,6 +544,7 @@ describe('deleted-parent scoping on artifact reads', () => {
     ];
     expect(where.inferenceJobId).toBeNull();
     expect(where.videoAsset).toEqual({ deletedAt: null });
+    expect(where.videoAssetId).toBe('asset-1');
   });
 
   it('linkArtifactToInferenceJob returns null when the parent was deleted mid-flight', async () => {
@@ -514,6 +556,7 @@ describe('deleted-parent scoping on artifact reads', () => {
     const { repository, auditLog } = makeRepository(tx);
     const result = await repository.linkArtifactToInferenceJob(
       TENANT,
+      'asset-1',
       'artifact-1',
       'job-1',
       () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
@@ -531,6 +574,7 @@ describe('deleted-parent scoping on artifact reads', () => {
     const { repository } = makeRepository(tx);
     const result = await repository.linkArtifactToInferenceJob(
       TENANT,
+      'asset-1',
       'artifact-1',
       'job-1',
       () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
@@ -775,6 +819,56 @@ describe('decision/preview serialization on the asset advisory lock', () => {
     // The lock precedes the not-yet-deleted read (and thus the CAS).
     expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
       tx.videoAsset.findFirst.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('softDelete reads the mediaRemovedAt marker INSIDE its locked transaction and reports "media present" honestly', async () => {
+    // Codex P2 support: the marker read rides the SAME locked read as the
+    // CAS (screening REJECT transitions serialize on the same lock), so
+    // the delete audit and the caller's completion decision can never
+    // disagree with a concurrent screening removal.
+    const tx = makeTx();
+    tx.videoAsset.findFirst.mockResolvedValue({
+      id: 'asset-1',
+      status: VideoAssetStatus.QUARANTINED,
+      mediaRemovedAt: null,
+    });
+    const { repository } = makeRepository(tx);
+    const builder = jest.fn(
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'DELETE' }) as never,
+    );
+    const result = await repository.softDelete(TENANT, 'asset-1', builder);
+    expect(result).toMatchObject({ mediaAlreadyRemoved: false });
+    expect(builder).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'asset-1' }),
+      false,
+    );
+    // The marker is read alongside the safe select in ONE query.
+    const [{ select }] = tx.videoAsset.findFirst.mock.calls[0] as unknown as [
+      { select: { mediaRemovedAt: boolean } },
+    ];
+    expect(select.mediaRemovedAt).toBe(true);
+  });
+
+  it('softDelete reports an ALREADY-claimed removal marker (screening rejection removed the media first) and strips it from the audit snapshot', async () => {
+    const removedAt = new Date('2026-07-01T00:00:00Z');
+    const tx = makeTx();
+    tx.videoAsset.findFirst.mockResolvedValue({
+      id: 'asset-1',
+      status: VideoAssetStatus.REJECTED,
+      mediaRemovedAt: removedAt,
+    });
+    const { repository } = makeRepository(tx);
+    const builder = jest.fn(
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'DELETE' }) as never,
+    );
+    const result = await repository.softDelete(TENANT, 'asset-1', builder);
+    expect(result).toMatchObject({ mediaAlreadyRemoved: true });
+    // The builder learns the fact as a boolean; the before snapshot keeps
+    // the exact VIDEO_ASSET_SELECT shape (no marker column smuggled in).
+    expect(builder).toHaveBeenCalledWith(
+      expect.not.objectContaining({ mediaRemovedAt: removedAt }),
+      true,
     );
   });
 });

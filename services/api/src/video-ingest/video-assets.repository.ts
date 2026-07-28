@@ -565,25 +565,43 @@ export class VideoAssetsRepository extends TenantScopedRepository {
    * would still write its READ audit and serve frames for an asset that
    * is already deleted — the lock makes the preview guard cover deletion
    * exactly as it covers screening decisions.
+   *
+   * The `mediaRemovedAt` marker is read INSIDE the same locked transaction
+   * — race-free: the screening REJECT transition (whose removal flow
+   * claims the marker) serializes on the same lock, and after the
+   * soft-delete commits screening can no longer run — and is BOTH handed
+   * to the audit-entry builder and returned, so the delete audit can state
+   * honestly whether any media cleanup is still outstanding: a marker
+   * already claimed by the screening-rejection removal means this delete
+   * is metadata-only and must neither promise nor later record a second
+   * completion.
    */
   softDelete(
     tenantId: string,
     id: string,
-    buildAuditEntry: (before: VideoAssetView) => AuditEntry,
-  ): Promise<VideoAssetView | null> {
+    buildAuditEntry: (
+      before: VideoAssetView,
+      mediaAlreadyRemoved: boolean,
+    ) => AuditEntry,
+  ): Promise<{ asset: VideoAssetView; mediaAlreadyRemoved: boolean } | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${videoAssetAdvisoryLockKey(
         scopedTenantId,
         id,
       )}))`;
-      const before = await tx.videoAsset.findFirst({
+      const row = await tx.videoAsset.findFirst({
         where: { id, tenantId: scopedTenantId, deletedAt: null },
-        select: VIDEO_ASSET_SELECT,
+        // The safe select PLUS the removal marker — read under the lock;
+        // the marker is peeled off below so audit snapshots and the
+        // returned view keep the exact VIDEO_ASSET_SELECT shape.
+        select: { ...VIDEO_ASSET_SELECT, mediaRemovedAt: true },
       });
-      if (!before) {
+      if (!row) {
         return null;
       }
+      const { mediaRemovedAt, ...before } = row;
+      const mediaAlreadyRemoved = mediaRemovedAt != null;
       const updated = await tx.videoAsset.updateMany({
         where: { id, tenantId: scopedTenantId, deletedAt: null },
         data: {
@@ -599,8 +617,8 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       if (updated.count === 0) {
         return null;
       }
-      await this.auditLog.record(buildAuditEntry(before), tx);
-      return before;
+      await this.auditLog.record(buildAuditEntry(before, mediaAlreadyRemoved), tx);
+      return { asset: before, mediaAlreadyRemoved };
     });
   }
 
@@ -865,15 +883,30 @@ export class VideoAssetsRepository extends TenantScopedRepository {
   }
 
   /**
-   * One-shot crop → inference-job link. Conditional write (inferenceJobId
-   * IS NULL and the parent asset NOT soft-deleted): the append-only trigger
-   * allows exactly this mutation, two concurrent creations cannot both
-   * stamp — the loser reads the winner's link back and replays it — and a
-   * parent DELETE racing the link zeroes the count instead of linking a job
-   * to a deleted asset's crop.
+   * One-shot crop → inference-job link. Runs under the PARENT ASSET's
+   * advisory lock (taken FIRST, before any read — the same key/idiom as
+   * softDelete/transitionStatus/authorizeScreeningPreviewServe), so the
+   * link SERIALIZES with asset deletion: without the lock, the
+   * non-deleted-parent predicate could pass, the delete (which holds the
+   * lock and ENUMERATES linked jobs to retire) could commit in between,
+   * and this link would commit AFTER the enumeration ran — leaving a
+   * QUEUED job the delete flow never cancels. With the lock, either the
+   * link commits first (and the delete's enumeration sees and retires the
+   * job) or the delete commits first (and the conditional write below
+   * zeroes out). The caller therefore passes the parent `videoAssetId`
+   * explicitly — the lock must precede the guarded read, so the id cannot
+   * be learned by reading first; the where clauses also pin the artifact
+   * to that parent, so a mismatched pair reads as not-found instead of
+   * locking one asset while linking another's crop. Conditional write
+   * (inferenceJobId IS NULL and the parent asset NOT soft-deleted): the
+   * append-only trigger allows exactly this mutation, two concurrent
+   * creations cannot both stamp — the loser reads the winner's link back
+   * and replays it — and a parent DELETE racing the link zeroes the count
+   * instead of linking a job to a deleted asset's crop.
    */
   linkArtifactToInferenceJob(
     tenantId: string,
+    videoAssetId: string,
     artifactId: string,
     inferenceJobId: string,
     buildAuditEntry: (
@@ -883,12 +916,19 @@ export class VideoAssetsRepository extends TenantScopedRepository {
   ): Promise<VideoArtifactView | LinkArtifactRejection | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
+      // The asset lock comes FIRST — before the guarded read — so the
+      // deletion race above cannot slip between a read and the write.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${videoAssetAdvisoryLockKey(
+        scopedTenantId,
+        videoAssetId,
+      )}))`;
       const before = await tx.videoArtifact.findFirst({
         // Deleted-parent scoping here too: a deleted asset's crop can
         // neither link nor replay a job.
         where: {
           id: artifactId,
           tenantId: scopedTenantId,
+          videoAssetId,
           videoAsset: { deletedAt: null },
         },
         select: VIDEO_ARTIFACT_SELECT,
@@ -901,12 +941,13 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       }
       const linked = await tx.videoArtifact.updateMany({
         // The non-deleted-parent condition is part of the CONDITIONAL WRITE
-        // itself, not just the read above: a DELETE /video-assets/:id can
-        // commit between the two, and a job must never link to a crop whose
+        // itself, not just the read above: even under the advisory lock the
+        // atomic predicate stays — a job must never link to a crop whose
         // parent (and media) is already gone.
         where: {
           id: artifactId,
           tenantId: scopedTenantId,
+          videoAssetId,
           inferenceJobId: null,
           videoAsset: { deletedAt: null },
         },
@@ -914,13 +955,15 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       });
       if (linked.count === 0) {
         // Count 0 now has two causes: a concurrent link stamped first, or
-        // the parent was deleted after the read above. Re-read through the
-        // deleted-parent scope to report the honest one — null (gone, 404
-        // downstream) vs already-linked (caller replays the winner's link).
+        // the parent was deleted before the lock was acquired. Re-read
+        // through the deleted-parent scope to report the honest one — null
+        // (gone, 404 downstream) vs already-linked (caller replays the
+        // winner's link).
         const stillVisible = await tx.videoArtifact.findFirst({
           where: {
             id: artifactId,
             tenantId: scopedTenantId,
+            videoAssetId,
             videoAsset: { deletedAt: null },
           },
           select: { id: true },
