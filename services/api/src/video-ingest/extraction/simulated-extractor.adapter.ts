@@ -5,6 +5,7 @@ import {
   CropBox,
   ExtractedImage,
   ExtractFrameAtOptions,
+  FrameCountExceededError,
   FrameExceedsBudgetError,
   FrameExtractionOptions,
   VideoFrameExtractorPort,
@@ -64,12 +65,17 @@ export class SimulatedVideoFrameExtractor extends VideoFrameExtractorPort {
     // Trivial by design: the simulated adapter never reads real bytes
     // (readsRealBytes=false already makes the pre-storage screen refuse to
     // treat its output as a real screen), so the session is the
-    // deterministic probe plus one placeholder PNG per started second and
-    // a no-op close — fully in-memory, nothing ever touches disk.
+    // deterministic probe plus the EXHAUSTIVE placeholder stream — one
+    // placeholder PNG per SOURCE frame (fps × duration, mirroring the real
+    // adapter's every-frame contract) — and a no-op close: fully
+    // in-memory, nothing ever touches disk.
     void data;
     return Promise.resolve({
       probe: () => Promise.resolve({ ...SIMULATED_PROBE }),
-      extractFramesPerSecond: (options: { maxBytesPerFrame: number }) => {
+      extractAllFrames: (options: {
+        maxFrames: number;
+        maxBytesPerFrame: number;
+      }) => {
         // Same budget contract as the real adapter: a degenerate cap fits
         // no frame, and any frame over the cap is the budget verdict.
         if (
@@ -78,14 +84,23 @@ export class SimulatedVideoFrameExtractor extends VideoFrameExtractorPort {
         ) {
           return Promise.reject(new FrameExceedsBudgetError());
         }
-        const frames = Array.from(
-          { length: Math.ceil(SIMULATED_PROBE.durationMs / 1000) },
-          (_, second) =>
-            this.placeholderImage(
-              SIMULATED_PROBE.width,
-              SIMULATED_PROBE.height,
-              second * 1000,
-            ).data,
+        // Same frame-count contract too: a degenerate cap fits no frames,
+        // and a stream past the cap is the controlled count verdict.
+        if (!Number.isInteger(options.maxFrames) || options.maxFrames <= 0) {
+          return Promise.reject(new FrameCountExceededError());
+        }
+        const totalFrames = Math.ceil(
+          (SIMULATED_PROBE.fps * SIMULATED_PROBE.durationMs) / 1000,
+        );
+        if (totalFrames > options.maxFrames) {
+          return Promise.reject(new FrameCountExceededError());
+        }
+        const frames = Array.from({ length: totalFrames }, (_, index) =>
+          this.placeholderImage(
+            SIMULATED_PROBE.width,
+            SIMULATED_PROBE.height,
+            Math.round((index * 1000) / SIMULATED_PROBE.fps),
+          ).data,
         );
         if (frames.some((frame) => frame.length > options.maxBytesPerFrame)) {
           return Promise.reject(new FrameExceedsBudgetError());

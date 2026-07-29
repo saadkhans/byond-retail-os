@@ -228,6 +228,55 @@ describe('validateEnv', () => {
     );
   });
 
+  describe('VIDEO_MAX_SCREENING_FRAMES bounds (Phase 10 exhaustive pre-storage screen)', () => {
+    it('accepts the default and both boundary values', () => {
+      for (const value of ['900', '30', '3600']) {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            VIDEO_MAX_SCREENING_FRAMES: value,
+          }),
+        ).not.toThrow();
+      }
+    });
+
+    it.each(['29', '0', '-900'])(
+      'rejects under-floor value %s at boot',
+      (value) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            VIDEO_MAX_SCREENING_FRAMES: value,
+          }),
+        ).toThrow(/VIDEO_MAX_SCREENING_FRAMES/);
+      },
+    );
+
+    it.each(['3601', '100000'])(
+      'rejects over-cap value %s at boot (bounds the synchronous per-upload OCR work)',
+      (value) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            VIDEO_MAX_SCREENING_FRAMES: value,
+          }),
+        ).toThrow(/VIDEO_MAX_SCREENING_FRAMES/);
+      },
+    );
+
+    it.each(['abc', '450.5', ''])(
+      'rejects non-integer value %j at boot',
+      (value) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            VIDEO_MAX_SCREENING_FRAMES: value,
+          }),
+        ).toThrow(/VIDEO_MAX_SCREENING_FRAMES/);
+      },
+    );
+  });
+
   describe('placeholder secrets are rejected in EVERY environment', () => {
     const placeholderSecrets = [
       'local-dev-only-placeholder-jwt-secret-change-me', // old .env.example value

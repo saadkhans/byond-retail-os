@@ -630,8 +630,14 @@ describe('media-safety', () => {
     it('finds sensitive text that straddles a scan-chunk boundary', () => {
       const chunk = 1024 * 1024;
       const pan = '4111 1111 1111 1111';
+      // A letter ~1.2 KiB before the boundary stops the backward chain
+      // scan there (letter-free NUL padding past the 64 KiB cap would now
+      // fail closed via the overflow rule instead — pinned separately);
+      // the 2 KiB floor then carries the straddling PAN whole.
+      const pad = Buffer.alloc(chunk - 10); // NULs — not printable
+      pad[pad.length - 1190] = 0x78; // 'x'
       const payload = Buffer.concat([
-        Buffer.alloc(chunk - 10), // NULs — not printable
+        pad,
         Buffer.from(pan, 'ascii'),
         Buffer.alloc(64),
       ]);
@@ -648,8 +654,13 @@ describe('media-safety', () => {
       const chunk = 1024 * 1024;
       const stretched = ['4111', '1111', '1111', '1111'].join('-'.repeat(100));
       expect(stretched.length).toBe(316);
+      // Letter ~2.4 KiB pre-boundary: the chain scan stops there and the
+      // carry (above the 2 KiB floor) covers the whole stretched chain —
+      // keeps this pinned to the CARRY path, not the overflow rule.
+      const pad = Buffer.alloc(chunk - 30); // NULs — not printable
+      pad[pad.length - 2370] = 0x78; // 'x'
       const payload = Buffer.concat([
-        Buffer.alloc(chunk - 30), // NULs — not printable
+        pad,
         Buffer.from(stretched, 'ascii'),
         Buffer.alloc(64),
       ]);
@@ -664,14 +675,19 @@ describe('media-safety', () => {
       // (chunk 1 ended at boundary+2048, before g3 at boundary+2208;
       // chunk 2 began at the boundary, after g1 — verified by position
       // arithmetic). The content-aware carry walks back through the
-      // letter-free separator run, g1, and the NUL padding (cap 64 KiB)
-      // and prepends it, so the second chunk decodes the chain whole.
+      // letter-free separator run, g1, and the NUL padding up to the 'X'
+      // 30 000 bytes pre-boundary (well under the 64 KiB cap — a letter
+      // there keeps this on the CARRY path; a letter-free run past the
+      // cap now fails closed, pinned separately) and prepends it, so the
+      // second chunk decodes the chain whole.
       const chunk = 1024 * 1024;
       const sep = '-'.repeat(1500);
       const chain = ['4111', '1111', '1111', '1111'].join(sep);
       expect(chain.length).toBe(4516);
+      const pad = Buffer.alloc(chunk - 800); // NULs — not printable, not letters
+      pad[pad.length - 29200] = 0x58; // 'X' — 30 000 bytes pre-boundary
       const payload = Buffer.concat([
-        Buffer.alloc(chunk - 800), // NULs — not printable, not letters
+        pad,
         Buffer.from(chain, 'ascii'),
         Buffer.alloc(64),
       ]);
@@ -681,12 +697,17 @@ describe('media-safety', () => {
     it('accepts the same straddling chain shape when the digit join is Luhn-invalid', () => {
       // Identical geometry, last group 1112: the 16-digit join fails Luhn,
       // so being seen whole via the carry must NOT flip it to reject — the
-      // carry only widens visibility, never the verdict rules.
+      // carry only widens visibility, never the verdict rules. The 'X'
+      // 30 000 bytes pre-boundary bounds the letter-free run under the
+      // 64 KiB cap: without it the all-NUL prefix would fail closed via
+      // the overflow rule regardless of the chain (pinned separately).
       const chunk = 1024 * 1024;
       const sep = '-'.repeat(1500);
       const chain = ['4111', '1111', '1111', '1112'].join(sep);
+      const pad = Buffer.alloc(chunk - 800);
+      pad[pad.length - 29200] = 0x58; // 'X' — 30 000 bytes pre-boundary
       const payload = Buffer.concat([
-        Buffer.alloc(chunk - 800),
+        pad,
         Buffer.from(chain, 'ascii'),
         Buffer.alloc(64),
       ]);
@@ -712,6 +733,131 @@ describe('media-safety', () => {
         Buffer.alloc(chunk - 800),
         bytes,
         Buffer.alloc(64),
+      ]);
+      expect(bufferCarriesSensitiveText(payload)).toBe(false);
+    });
+
+    it('fails closed when a PAN chain straddling a boundary exceeds the 64 KiB carry cap (overflow → reject)', () => {
+      // Codex P1 "carry still loses context": the leading 8 PAN digits,
+      // then a 65 586-byte dash run crossing the 1 MiB boundary, then the
+      // remaining 8 digits. The backward chain scan hits the 64 KiB cap
+      // with the run still open, so the carry is necessarily TRUNCATED —
+      // the truncated view holds only dashes plus the trailing 8 digits
+      // (an accept), i.e. the leading digits are silently dropped.
+      // Truncated detector state cannot prove safety: fail closed and
+      // reject. (Letter filler on the left keeps the overflow rule — not
+      // the carried chain — as the only thing rejecting here.)
+      const chunk = 1024 * 1024;
+      const dashesBefore = 64 * 1024 + 50; // > carry cap, all pre-boundary
+      const head = '41111111'; // leading 8 digits of 4111111111111111
+      const payload = Buffer.concat([
+        Buffer.alloc(chunk - dashesBefore - head.length, 0x78), // 'x' filler
+        Buffer.from(head, 'ascii'),
+        Buffer.from('-'.repeat(dashesBefore + 20), 'ascii'),
+        Buffer.from('11111111end', 'ascii'), // remaining 8 digits
+      ]);
+      expect(bufferCarriesSensitiveText(payload)).toBe(true);
+    });
+
+    it('fails closed on a letter-free NUL run past the cap even when the straddling chain is Luhn-invalid (pinned overbreadth)', () => {
+      // The Luhn-INVALID chain from the accept test above WITHOUT the
+      // pre-boundary letter: the backward scan finds no letter within the
+      // 64 KiB cap (the ~1 MiB prefix is all NUL), so the boundary fails
+      // closed and the payload rejects even though the chain itself is
+      // benign. PINNED as accepted fail-closed overbreadth: >64 KiB of
+      // unbroken letter-free bytes straddling a 1 MiB boundary (e.g. a
+      // huge NUL padding region) is pathological for controlled test-clip
+      // metadata, and truncated carry state can no longer prove safety.
+      const chunk = 1024 * 1024;
+      const sep = '-'.repeat(1500);
+      const chain = ['4111', '1111', '1111', '1112'].join(sep);
+      const payload = Buffer.concat([
+        Buffer.alloc(chunk - 800), // all-NUL — letter-free past the cap
+        Buffer.from(chain, 'ascii'),
+        Buffer.alloc(64),
+      ]);
+      expect(bufferCarriesSensitiveText(payload)).toBe(true);
+    });
+
+    it('a >64 KiB chain-relevant run fully INSIDE one chunk keeps the windowed scan (no overflow trigger)', () => {
+      // The overflow rule is strictly a per-BOUNDARY decision: a 66 KiB
+      // digits+separators run that starts and ends inside chunk 0, with
+      // letters on both sides and letters right before the 1 MiB boundary,
+      // is scanned by the ordinary windowed detectors — its digit join is
+      // '1234' (< 13 digits), so the payload ACCEPTS. Length alone never
+      // rejects a run that does not straddle a boundary.
+      const chunk = 1024 * 1024;
+      const run = `12${'-'.repeat(66 * 1024)}34`;
+      const payload = Buffer.concat([
+        Buffer.alloc(1000, 0x78), // 'x'
+        Buffer.from(run, 'ascii'),
+        Buffer.alloc(chunk, 0x78), // letters through the 1 MiB boundary
+      ]);
+      expect(bufferCarriesSensitiveText(payload)).toBe(false);
+    });
+
+    it('ordinary multi-chunk payloads with letters near each boundary never trip the overflow rule', () => {
+      // 3 MiB of benign text-like bytes: letters recur every few bytes, so
+      // every backward boundary scan terminates almost immediately — no
+      // overflow, no reject. (Compressed-video bytes hit letters every ~5
+      // bytes on average, so real payloads sit in this regime.)
+      const filler = Buffer.from('abc123xyz '.repeat(320000), 'ascii');
+      expect(filler.length).toBeGreaterThan(3 * 1024 * 1024);
+      expect(bufferCarriesSensitiveText(filler)).toBe(false);
+    });
+
+    it('carries a credential label across the boundary through a multi-KiB whitespace run (label capture)', () => {
+      // Codex P1 (b): 'password' ends 3 000 bytes before the 1 MiB
+      // boundary; 'hunter2' starts 72 bytes after it. The old fixed 2 KiB
+      // overlap lost the pair (the whitespace alone exceeds it) and the
+      // plain chain carry stopped at the label's LETTERS — the letter-or-
+      // NUL label capture now walks the 8 label letters too, so the second
+      // chunk decodes 'password' + whitespace + 'hunter2' whole and
+      // SPACED_SECRET_LABEL rejects.
+      const chunk = 1024 * 1024;
+      const label = ' password'; // leading space keeps the word boundary real
+      const payload = Buffer.concat([
+        Buffer.alloc(chunk - 3000 - label.length, 0x78), // 'x' filler
+        Buffer.from(label, 'ascii'),
+        Buffer.from(' '.repeat(3072), 'ascii'),
+        Buffer.from('hunter2 end', 'ascii'),
+      ]);
+      expect(bufferCarriesSensitiveText(payload)).toBe(true);
+    });
+
+    it('carries a UTF-16 credential label across the boundary (NUL-interleaved label capture)', () => {
+      // UTF-16LE 'password' is p\0a\0s\0s\0w\0o\0r\0d — the backward chain
+      // scan stops at the LOW byte of 'd', and the letter-or-NUL extension
+      // (cap 32) walks the interleaved letters plus the preceding space's
+      // 0x00 high byte, carrying the whole label. The odd-length carry
+      // flips UTF-16 parity, which is safe: both UTF-16LE byte offsets are
+      // decoded, so one view reads label + whitespace + value whole.
+      const chunk = 1024 * 1024;
+      const label = Buffer.from(' password', 'utf16le'); // 18 bytes
+      const wsBefore = Buffer.from(' '.repeat(1200), 'utf16le'); // 2 400 B
+      const payload = Buffer.concat([
+        Buffer.alloc(chunk - wsBefore.length - label.length, 0x78), // 'x'
+        label,
+        wsBefore,
+        Buffer.from(' '.repeat(300), 'utf16le'),
+        Buffer.from('hunter2 end', 'utf16le'),
+      ]);
+      expect(bufferCarriesSensitiveText(payload)).toBe(true);
+    });
+
+    it('benign label + long whitespace straddling the boundary stays accepted (label capture widens visibility only)', () => {
+      // Same geometry with 'duration': the label capture is label-AGNOSTIC
+      // (it carries whatever letters precede the whitespace), but no
+      // spaced-label detector matches 'duration' and '600' is far below
+      // PAN length, so the payload ACCEPTS. Pinned: the carry mechanism
+      // only widens visibility — verdicts still come from the detectors.
+      const chunk = 1024 * 1024;
+      const label = ' duration';
+      const payload = Buffer.concat([
+        Buffer.alloc(chunk - 3000 - label.length, 0x78), // 'x' filler
+        Buffer.from(label, 'ascii'),
+        Buffer.from(' '.repeat(3072), 'ascii'),
+        Buffer.from('600 end', 'ascii'),
       ]);
       expect(bufferCarriesSensitiveText(payload)).toBe(false);
     });

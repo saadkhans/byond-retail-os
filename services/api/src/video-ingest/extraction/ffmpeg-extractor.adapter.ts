@@ -9,6 +9,7 @@ import {
   ExtractionFailedError,
   ExtractionInfrastructureError,
   ExtractorUnavailableError,
+  FrameCountExceededError,
   FrameExceedsBudgetError,
   FrameExtractionOptions,
   FrameUnavailableError,
@@ -147,19 +148,20 @@ export function buildCropArgs(
 }
 
 /**
- * Single-pass 1-frame-per-second decode of STDIN bytes to a concatenated
- * PNG stream on stdout — the in-memory inspection's only frame path. No
- * file path ever appears in the vector.
+ * Single-pass EXHAUSTIVE decode of STDIN bytes to a concatenated PNG
+ * stream on stdout — the in-memory inspection's only frame path. There is
+ * deliberately NO fps filter: an `fps=1` sample would drop every frame
+ * between one-second ticks, letting content visible only between samples
+ * reach storage unscreened — the screen must see EVERY decoded source
+ * frame. No file path ever appears in the vector.
  */
-export function buildFramesPerSecondArgs(): string[] {
+export function buildAllFramesArgs(): string[] {
   return [
     '-hide_banner',
     '-loglevel',
     'error',
     '-i',
     PIPE_INPUT,
-    '-vf',
-    'fps=1',
     '-f',
     'image2pipe',
     '-vcodec',
@@ -584,8 +586,9 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
   /**
    * IN-MEMORY inspection for the pre-storage upload screen. The unscreened
    * bytes NEVER touch any disk: ffprobe reads them from STDIN (pipe:0) and
-   * the single-pass fps=1 frame decode feeds the same buffer to ffmpeg's
-   * stdin, collecting PNG frames from stdout. A container whose probing
+   * the single-pass EXHAUSTIVE frame decode (every source frame — no fps
+   * filter) feeds the same buffer to ffmpeg's stdin, collecting PNG frames
+   * from stdout. A container whose probing
    * requires seeking (non-faststart MP4, moov atom at the end) cannot be
    * read from a pipe — the tool exits nonzero and the inspection FAILS
    * CLOSED with a controlled unstreamable-container content error (the
@@ -615,7 +618,10 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
 
     return Promise.resolve({
       probe,
-      extractFramesPerSecond: async (options: { maxBytesPerFrame: number }) => {
+      extractAllFrames: async (options: {
+        maxFrames: number;
+        maxBytesPerFrame: number;
+      }) => {
         // A degenerate per-frame budget (zero/negative/non-integer) can fit
         // no frame at all — the budget verdict, decided before any exec.
         if (
@@ -624,26 +630,33 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
         ) {
           throw new FrameExceedsBudgetError();
         }
-        // The caller cap never RAISES the adapter's own per-frame ceiling.
-        const perFrameCap = Math.min(MAX_OUTPUT_BYTES, options.maxBytesPerFrame);
-        const probed = await probe();
+        // A degenerate frame cap can fit no frame COUNT at all — the frame
+        // budget verdict, also decided before any exec.
+        if (!Number.isInteger(options.maxFrames) || options.maxFrames <= 0) {
+          throw new FrameCountExceededError();
+        }
         if (bytes === null) {
           throw new ExtractionFailedError();
         }
-        // One frame per STARTED second from t=0 → ceil(duration/1s) frames
-        // at most; the exec's maxBuffer is sized from that expectation and
-        // clamped by the aggregate multi-frame ceiling, so a hostile
-        // container can balloon neither one frame nor the whole pass.
-        const expectedFrames = Math.ceil(probed.durationMs / 1000);
+        // The caller cap never RAISES the adapter's own per-frame ceiling.
+        const perFrameCap = Math.min(MAX_OUTPUT_BYTES, options.maxBytesPerFrame);
+        // EXHAUSTIVE decode: every source frame, no fps filter. The exec's
+        // maxBuffer is sized so an in-cap stream fits — (maxFrames+1) ×
+        // per-frame budget, clamped by the aggregate multi-frame ceiling —
+        // and a runaway stream (a hostile container decoding far past the
+        // cap) trips the buffer classification below and STOPS the child
+        // instead of buffering unbounded output. A stream that fits the
+        // buffer but still splits into more than maxFrames frames is the
+        // controlled FrameCountExceededError after the split.
         const aggregateCap = Math.min(
-          expectedFrames * perFrameCap,
+          (options.maxFrames + 1) * perFrameCap,
           MAX_TOTAL_EXTRACTION_BYTES,
         );
         let stdout: Buffer;
         try {
           ({ stdout } = await this.runCommand(
             FFMPEG_BINARY,
-            buildFramesPerSecondArgs(),
+            buildAllFramesArgs(),
             aggregateCap,
             bytes,
           ));
@@ -671,8 +684,13 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
             throw new FrameExceedsBudgetError();
           }
         }
-        // FEWER than expectedFrames is returned AS-IS: completeness is the
-        // service's verdict, never grounds for an adapter throw.
+        if (frames.length > options.maxFrames) {
+          // More frames than the caller can screen — fail closed with the
+          // controlled frame-count verdict (no counts echoed).
+          throw new FrameCountExceededError();
+        }
+        // FEW frames are returned AS-IS: sufficiency is the service's
+        // verdict, never grounds for an adapter throw.
         return frames;
       },
       close: () => {

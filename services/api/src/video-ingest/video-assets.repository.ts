@@ -91,6 +91,41 @@ export type VideoArtifactView = Prisma.VideoArtifactGetPayload<{
 export type LinkArtifactRejection = 'already-linked';
 
 /**
+ * Advisory-lock key for ONE extraction/crop OPERATION — the (tenant, asset,
+ * operation-hash) triple whose hash also derives the DETERMINISTIC artifact
+ * staging keys. Two attempts that stage to the same keys are, by
+ * construction, the same operation, so this key is exactly the granularity
+ * that must serialize: staging puts → batch publication → staged-file
+ * cleanup. Without it, a FAILING attempt can run its committed-owner lookup
+ * while the WINNING attempt's artifact transaction is still uncommitted,
+ * observe no owner, delete the SHARED deterministic key, and leave the
+ * winner's append-only artifact rows pointing at a file that no longer
+ * exists.
+ *
+ * Lives here rather than in `common/locks` on purpose: it is derived from
+ * an operation hash that only this module computes (the staging-key hash),
+ * and both derivations must stay in one place or the lock stops covering
+ * the keys it exists to protect.
+ */
+export function videoExtractionOperationLockKey(
+  tenantId: string,
+  videoAssetId: string,
+  operationHash: string,
+): string {
+  return `video-extraction-op:${tenantId}:${videoAssetId}:${operationHash}`;
+}
+
+/**
+ * How long the operation lock may be WAITED for and HELD. The guarded
+ * section writes already-decoded, in-memory artifact buffers (bounded by
+ * MAX_TOTAL_ARTIFACT_BYTES) to local storage and runs one batch
+ * transaction — the expensive extractor-port work happens BEFORE it — so
+ * these ceilings are pathological-case guards, not expected waits.
+ */
+export const EXTRACTION_OPERATION_LOCK_MAX_WAIT_MS = 10_000;
+export const EXTRACTION_OPERATION_LOCK_TIMEOUT_MS = 60_000;
+
+/**
  * Upload reference-consistency rejections — the SAME vocabulary (and the
  * same rules) as PrismaInferenceQueue.enqueue(): an asset whose context the
  * queue would later reject must fail AT UPLOAD, not when its crops try to
@@ -765,6 +800,60 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       // ONLY when the incoming request's canonical fingerprint matches.
       requestFingerprint: request.requestFingerprint ?? null,
     };
+  }
+
+  /**
+   * Runs `run()` while holding the OPERATION advisory lock (see
+   * `videoExtractionOperationLockKey`), so one extraction/crop operation's
+   * staging puts, batch publication, and staged-file cleanup can never
+   * interleave with an identical concurrent attempt's. Serialized this way,
+   * a losing attempt always reaches its cleanup AFTER the winner's batch
+   * committed — it finds the winner through the in-transaction replay path
+   * and its committed-owner check keeps the shared deterministic keys
+   * instead of deleting the winner's files.
+   *
+   * LOCK STRATEGY — `pg_advisory_xact_lock` inside an interactive
+   * transaction whose ONLY job is to hold the lock while the callback runs,
+   * NOT the session-level `pg_advisory_lock`/`pg_advisory_unlock` pair. The
+   * session pair is unusable here: Prisma pins a connection only for the
+   * duration of an interactive transaction, so a later `pg_advisory_unlock`
+   * can be issued on a DIFFERENT pooled connection, silently fail, and leak
+   * the lock for the lifetime of the connection that took it — an
+   * unrecoverable module-wide stall. A transaction-scoped lock is released
+   * by the transaction's end, guaranteed on commit, rollback, timeout, and
+   * process death alike. The cost is that this ONE transaction is open
+   * across the section's file I/O; that is acceptable because the I/O is
+   * bounded local writes of buffers already held in memory (the extractor
+   * runs before the section), the hold is capped by an explicit timeout,
+   * and no OTHER lock is taken by this transaction (the callback's own
+   * transactions take the per-asset lock; a single-holder lock can never
+   * be part of a cycle).
+   *
+   * The callback's errors propagate UNCHANGED (Prisma rethrows them and
+   * rolls the lock transaction back) — the caller's cleanup/compensation
+   * semantics are untouched.
+   */
+  runUnderExtractionOperationLock<T>(
+    tenantId: string,
+    videoAssetId: string,
+    operationHash: string,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const scopedTenantId = this.requireTenantId(tenantId);
+    return this.prisma.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${videoExtractionOperationLockKey(
+          scopedTenantId,
+          videoAssetId,
+          operationHash,
+        )}))`;
+        return run();
+      },
+      {
+        maxWait: EXTRACTION_OPERATION_LOCK_MAX_WAIT_MS,
+        timeout: EXTRACTION_OPERATION_LOCK_TIMEOUT_MS,
+      },
+    );
   }
 
   /**

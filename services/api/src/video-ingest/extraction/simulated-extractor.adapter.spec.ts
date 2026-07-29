@@ -2,7 +2,10 @@ import {
   SIMULATED_PROBE,
   SimulatedVideoFrameExtractor,
 } from './simulated-extractor.adapter';
-import { FrameExceedsBudgetError } from './video-frame-extractor.port';
+import {
+  FrameCountExceededError,
+  FrameExceedsBudgetError,
+} from './video-frame-extractor.port';
 
 describe('SimulatedVideoFrameExtractor', () => {
   const extractor = new SimulatedVideoFrameExtractor();
@@ -18,24 +21,27 @@ describe('SimulatedVideoFrameExtractor', () => {
     expect(extractor.readsRealBytes).toBe(false);
   });
 
-  it('provides a trivial in-memory inspection session (deterministic probe, per-second placeholder frames, no-op close)', async () => {
+  it('provides a trivial in-memory inspection session (deterministic probe, EXHAUSTIVE placeholder frames, no-op close)', async () => {
     // The pre-storage screen refuses to TRUST this adapter anyway
     // (readsRealBytes=false), but the contract must still hold so the
-    // module wires without special cases.
+    // module wires without special cases: the exhaustive-decode contract
+    // yields one placeholder per SOURCE frame — fps × duration — never a
+    // per-second sample.
     const session = await extractor.inspectBuffer(Buffer.from('ignored'));
     await expect(session.probe()).resolves.toEqual(SIMULATED_PROBE);
-    const frames = await session.extractFramesPerSecond({
+    const frames = await session.extractAllFrames({
+      maxFrames: 900,
       maxBytesPerFrame: 1024,
     });
-    // One placeholder per started second of the 10 s simulated clip, each
+    // 30 fps × 10 s simulated clip → 300 placeholder source frames, each
     // a PNG-signature-led buffer.
-    expect(frames).toHaveLength(10);
+    expect(frames).toHaveLength(300);
     for (const frame of frames) {
       expect(frame.subarray(0, 8)).toEqual(
         Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
       );
     }
-    // Distinct seconds → distinct payloads (checksums differ downstream).
+    // Distinct frames → distinct payloads (checksums differ downstream).
     expect(frames[0].equals(frames[1])).toBe(false);
     await expect(session.close()).resolves.toBeUndefined();
     // Idempotent close.
@@ -46,13 +52,29 @@ describe('SimulatedVideoFrameExtractor', () => {
     const session = await extractor.inspectBuffer(Buffer.from('ignored'));
     // A budget the placeholder cannot fit → the controlled budget verdict.
     await expect(
-      session.extractFramesPerSecond({ maxBytesPerFrame: 8 }),
+      session.extractAllFrames({ maxFrames: 900, maxBytesPerFrame: 8 }),
     ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
     // Degenerate budgets are budget verdicts too, decided up front.
     for (const maxBytesPerFrame of [0, -1, 1.5, Number.NaN]) {
       await expect(
-        session.extractFramesPerSecond({ maxBytesPerFrame }),
+        session.extractAllFrames({ maxFrames: 900, maxBytesPerFrame }),
       ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
+    }
+    await session.close();
+  });
+
+  it('applies the frame-count contract inside the inspection session', async () => {
+    const session = await extractor.inspectBuffer(Buffer.from('ignored'));
+    // The 300-frame simulated stream past a smaller cap → the controlled
+    // count verdict, mirroring the real adapter.
+    await expect(
+      session.extractAllFrames({ maxFrames: 299, maxBytesPerFrame: 1024 }),
+    ).rejects.toBeInstanceOf(FrameCountExceededError);
+    // Degenerate caps are count verdicts too, decided up front.
+    for (const maxFrames of [0, -1, 1.5, Number.NaN]) {
+      await expect(
+        session.extractAllFrames({ maxFrames, maxBytesPerFrame: 1024 }),
+      ).rejects.toBeInstanceOf(FrameCountExceededError);
     }
     await session.close();
   });

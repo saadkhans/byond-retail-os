@@ -160,6 +160,16 @@ export function isAllowedVideoUpload(
  *     (14/17) keep their adjudicated accepts.
  * Separator placement never launders raw card data, and no digit shape
  * (calendar, epoch, coordinate, version) ever rescues a Luhn-valid window.
+ *
+ * BOUNDED WORK, FAIL CLOSED: char-level windowing costs O(digits x 7) Luhn
+ * checks, so a pathological chain (1 MiB of "1-" joins to 500k digits)
+ * would burn seconds per view. Any single run/chain carrying more than
+ * MAX_WINDOW_SCAN_DIGITS digits is therefore REJECTED outright instead of
+ * scanned: an unbroken digit-and-separator stretch that long is not
+ * plausible video metadata (real binary payloads break every few bytes on
+ * an ASCII letter), and a truncated scan could not prove the absence of a
+ * card anyway. Same policy as the chunk-boundary carry overflow below —
+ * bounded state, overflow rejects, never unbounded work.
  */
 const CONTIGUOUS_DIGIT_RUN = /(?<!\d)\d{13,}(?!\d)/g;
 // The COMPLETE maximal separated digit chain, with NO group cap: a fixed
@@ -179,6 +189,14 @@ const CONTIGUOUS_DIGIT_RUN = /(?<!\d)\d{13,}(?!\d)/g;
 // window join is abandoned past 19 digits.
 const GROUPED_PAN = /(?<!\d)\d+(?:[^0-9A-Za-z]+\d+)+(?!\d)/g;
 
+/**
+ * Work bound for the char-level window scans (see the policy note above).
+ * 4096 digits covers any realistic metadata atom by orders of magnitude
+ * (the longest legitimate shapes here are timestamps, GPS chains, and
+ * version strings — tens of digits); anything longer rejects unscanned.
+ */
+const MAX_WINDOW_SCAN_DIGITS = 4096;
+
 /** Pure Luhn verdict on an exact 13-19-digit window — no shape exemptions. */
 function isLuhnValidPanWindow(digits: string): boolean {
   return (
@@ -190,6 +208,10 @@ function isLuhnValidPanWindow(digits: string): boolean {
 
 export function carriesLikelyPan(text: string): boolean {
   for (const match of text.matchAll(CONTIGUOUS_DIGIT_RUN)) {
+    // Fail closed rather than scan an implausibly long run (see policy).
+    if (match[0].length > MAX_WINDOW_SCAN_DIGITS) {
+      return true;
+    }
     if (digitWindowsCarryPan(match[0])) {
       return true;
     }
@@ -199,6 +221,12 @@ export function carriesLikelyPan(text: string): boolean {
     // changes — "4111-1111 1111-1111" joins to a PAN even though no
     // consistent-separator sub-run reaches 13 digits.
     const groups = match[0].split(/\D+/).filter((group) => group.length > 0);
+    // Fail closed rather than scan an implausibly long chain (see policy).
+    // Checked BEFORE either window pass: both are per-digit, so the bound
+    // is what keeps a 500k-digit chain from burning seconds per view.
+    if (totalDigits(groups) > MAX_WINDOW_SCAN_DIGITS) {
+      return true;
+    }
     if (groupWindowsCarryPan(groups)) {
       return true;
     }
@@ -217,11 +245,21 @@ export function carriesLikelyPan(text: string): boolean {
   return false;
 }
 
+/** Total digits carried by a separated chain's groups. */
+function totalDigits(groups: readonly string[]): number {
+  let total = 0;
+  for (const group of groups) {
+    total += group.length;
+  }
+  return total;
+}
+
 /**
  * Luhn-tests EVERY 13-19-digit window inside a contiguous digit run of any
  * length: a PAN embedded in an overlong run (04111111111111111000) or a
  * 13-digit card inside a 14-digit run must not hide behind the full run's
- * length or Luhn verdict.
+ * length or Luhn verdict. Callers bound the input by
+ * MAX_WINDOW_SCAN_DIGITS, so the O(digits x 7) cost stays bounded.
  */
 function digitWindowsCarryPan(run: string): boolean {
   for (let start = 0; start < run.length; start += 1) {
@@ -298,8 +336,26 @@ const SPACED_NUMERIC_CREDENTIAL_LABEL =
 // (pinned): the same words with '=' or ':' already reject via
 // containsCredentialValue, and mirroring that verdict beats trying to
 // whitelist prose.
+//
+// The value TOKEN is captured with a BOUNDED quantifier and judged in code
+// rather than by an in-regex alternation. An unbounded `\S*\d\S*` after
+// `\s+` backtracks catastrophically on a megabyte-scale binary view — the
+// engine retries every give-back of the whitespace run against every
+// prefix of a long non-whitespace blob — which hung the payload scan.
+// `\S{1,64}` is linear, and a token longer than 64 characters already
+// satisfies the 6+ length rule, so nothing is lost.
 const SPACED_SECRET_LABEL =
-  /(?<![A-Za-z0-9])(?:password|passwd|pwd)\s+(?:\S*\d\S*|\S{6,})/i;
+  /(?<![A-Za-z0-9])(?:password|passwd|pwd)\s+(\S{1,64})/i;
+
+/** A whitespace-separated secret-label value: has a digit, or runs 6+. */
+function carriesSpacedSecretLabel(text: string): boolean {
+  const match = SPACED_SECRET_LABEL.exec(text);
+  if (match === null) {
+    return false;
+  }
+  const value = match[1];
+  return value.length >= 6 || /\d/.test(value);
+}
 
 /**
  * Free-text sensitive-content screen — the single predicate for screening
@@ -323,7 +379,7 @@ export function containsSensitiveFreeText(text: string): boolean {
     containsKnownSecretToken(text) ||
     FUSED_CREDENTIAL_LABEL.test(text) ||
     SPACED_NUMERIC_CREDENTIAL_LABEL.test(text) ||
-    SPACED_SECRET_LABEL.test(text) ||
+    carriesSpacedSecretLabel(text) ||
     carriesLikelyPan(text)
   );
 }
@@ -363,29 +419,54 @@ export function filenameCarriesSensitiveContent(filename: string): boolean {
 // 1 MiB. At each chunk boundary a CONTENT-AWARE CARRY is prepended to the
 // NEXT chunk (replacing the earlier fixed 2 KiB overlap appended to the
 // previous one): the carry is the longest suffix of the bytes before the
-// boundary that could still be part of a separated digit chain. The
-// backward scan carries every byte that is NOT an ASCII letter — digits,
-// punctuation, whitespace, control bytes, the 0x00 interleave of UTF-16
-// ASCII text, and every byte of a multi-byte UTF-8 separator (all >= 0x80)
-// — because GROUPED_PAN's separator class is "not an ASCII alphanumeric":
-// in every decode view only an ASCII letter breaks a digit chain, so a
-// suffix containing no letter byte is exactly the region a straddling
-// chain could extend through. The carry is capped at 64 KiB (memory and
-// rescan bound) and FLOORED at the old 2 KiB overlap: the floor covers
-// printable-run credential fragments such as "password hunter2" — whose
-// LETTERS stop the content-aware scan but whose whole run fits far inside
-// 2 KiB — and UTF-16 straddles generally. UTF-16 parity: prepending an
-// ODD-length carry flips the UTF-16 byte alignment of the concatenated
-// text relative to the raw chunk, which is safe because BOTH UTF-16LE byte
-// offsets are always decoded and scanned — a straddling UTF-16 string
-// lands on the correct alignment in one of the two views whatever the
-// carry length. The carried region is rescanned once per boundary (<=
-// 64 KiB per 1 MiB chunk — bounded, ~6% extra in the worst case, ~0.2%
-// typical).
-// RESIDUALS: (1) only a SINGLE digit chain stretched across MORE than
-// 64 KiB of separators straddling a boundary can now evade the carry — a
-// 16-digit PAN spread over >64 KiB of padding is beyond any realistic
-// container metadata (the earlier fixed-overlap residual was 2 KiB);
+// boundary that could still be part of a separated digit chain, plus a
+// bounded LABEL CAPTURE. The backward chain scan carries every byte that
+// is NOT an ASCII letter — digits, punctuation, whitespace, control bytes,
+// the 0x00 interleave of UTF-16 ASCII text, and every byte of a multi-byte
+// UTF-8 separator (all >= 0x80) — because GROUPED_PAN's separator class is
+// "not an ASCII alphanumeric": in every decode view only an ASCII letter
+// breaks a digit chain, so a suffix containing no letter byte is exactly
+// the region a straddling chain could extend through.
+// LABEL CAPTURE: when the chain scan stops at an ASCII letter, the carry
+// is EXTENDED backward through the contiguous run of bytes that are an
+// ASCII letter OR 0x00, capped at LABEL_CARRY_MAX_BYTES (32). This pulls a
+// credential label sitting immediately before a long whitespace run into
+// the carry ("password" + 3 KiB of spaces + boundary + "hunter2"), so the
+// SPACED_* label detectors see label and value together in the next
+// chunk's decode. Including 0x00 covers the UTF-16 interleaved label form
+// (p\0a\0s\0s\0w\0o\0r\0d), where label letters alternate with NUL high
+// bytes; 32 bytes covers the longest label ('password' = 8 letters = 16
+// interleaved bytes) with headroom. Cap truncation mid-word can only
+// CREATE a word boundary at the carry start (over-detection — the safe
+// direction); it can never hide a label the full text would have matched,
+// because a label preceded by more letters fails the detectors' left
+// word-boundary lookbehind in the full text too.
+// FAIL CLOSED ON OVERFLOW: the chain carry is capped at 64 KiB (memory
+// and rescan bound). If the backward scan hits the cap while the byte
+// beyond it is STILL chain-relevant (no letter terminated the run), the
+// carry is necessarily TRUNCATED — bounded state can no longer prove the
+// absence of a digit chain straddling the boundary (the dropped bytes may
+// hold the chain's leading digits) — so bufferCarriesSensitiveText
+// REJECTS outright. A >64 KiB unbroken letter-free run straddling a 1 MiB
+// boundary is pathological for controlled test-clip metadata
+// (compressed-video bytes hit an ASCII letter every ~5 bytes on average),
+// and the module's reject-on-write policy prefers a false reject over
+// silently truncated detector state. The decision is per-boundary and
+// O(1) once the scan stops; no unbounded buffering ever occurs.
+// The carry is FLOORED at the old 2 KiB overlap: the floor covers UTF-16
+// straddles generally and short mixed fragments whose letters stop the
+// content-aware scan early. UTF-16 parity: prepending an ODD-length carry
+// flips the UTF-16 byte alignment of the concatenated text relative to
+// the raw chunk, which is safe because BOTH UTF-16LE byte offsets are
+// always decoded and scanned — a straddling UTF-16 string lands on the
+// correct alignment in one of the two views whatever the carry length.
+// The carried region is rescanned once per boundary (<= 64 KiB per 1 MiB
+// chunk — bounded, ~6% extra in the worst case, ~0.2% typical).
+// RESIDUALS: (1) a LEGITIMATE letter-free byte run longer than 64 KiB
+// straddling a chunk boundary — e.g. a large all-NUL free/padding region —
+// now FALSE-REJECTS via the overflow rule (pinned in the spec): accepted
+// fail-closed overbreadth, replacing the earlier silent-evasion residual
+// where a chain stretched past the cap was truncated and MISSED;
 // (2) exotic UTF-16 separators whose code-unit bytes coincide with ASCII
 // letters (e.g. U+2041 = 0x41 0x20 LE) stop the backward scan early — the
 // 2 KiB floor still covers those within its bound, and non-straddling
@@ -393,6 +474,7 @@ export function filenameCarriesSensitiveContent(filename: string): boolean {
 const PAYLOAD_SCAN_CHUNK_BYTES = 1024 * 1024;
 const PAYLOAD_SCAN_OVERLAP_BYTES = 2048;
 const PAYLOAD_SCAN_CARRY_MAX_BYTES = 64 * 1024;
+const LABEL_CARRY_MAX_BYTES = 32;
 // Printable ASCII runs of at least this length are treated as embedded
 // text; shorter runs are overwhelmingly codec noise. The floor is FIVE, not
 // eight: the shortest credential fragment the shared screen classifies is
@@ -407,22 +489,75 @@ function isAsciiLetterByte(byte: number): boolean {
 }
 
 /**
- * Content-aware boundary carry (see the parameter doc above): the number of
- * bytes immediately BEFORE `boundary` to prepend to the next chunk. Scans
- * backward while bytes are chain-relevant (not an ASCII letter), capped at
- * PAYLOAD_SCAN_CARRY_MAX_BYTES, floored at PAYLOAD_SCAN_OVERLAP_BYTES, and
- * never past the start of the buffer.
+ * Label-capture extension class (see the parameter doc above): ASCII
+ * letters carry a credential label whose letters stopped the chain scan;
+ * 0x00 additionally carries the NUL interleave of a UTF-16 label.
  */
-function boundaryCarryBytes(buffer: Buffer, boundary: number): number {
-  let carried = 0;
+function isLabelCarryByte(byte: number): boolean {
+  return byte === 0x00 || isAsciiLetterByte(byte);
+}
+
+interface BoundaryCarry {
+  /** Bytes immediately BEFORE `boundary` to prepend to the next chunk. */
+  readonly carried: number;
+  /**
+   * The backward chain scan hit the 64 KiB cap with the chain-relevant run
+   * still open — the carry is truncated and the caller must FAIL CLOSED.
+   */
+  readonly truncated: boolean;
+}
+
+/**
+ * Content-aware boundary carry (see the parameter doc above). The carry is
+ * computed on RAW BYTES, before any decoding, so one decision serves the
+ * latin1 view and both UTF-16LE byte offsets alike: the chain-relevant
+ * class (every non-letter byte) is a superset of digit/separator bytes in
+ * every view, and the truncation verdict is view-independent.
+ *
+ * Three phases:
+ *   1. backward chain scan while bytes are chain-relevant (not an ASCII
+ *      letter), capped at PAYLOAD_SCAN_CARRY_MAX_BYTES;
+ *   2. TRUNCATION check — cap hit with the run still open means bounded
+ *      state cannot prove safety: report `truncated` so the caller rejects
+ *      (fail closed) instead of scanning with silently dropped context;
+ *   3. LABEL CAPTURE — the scan stopped at a letter, so additionally carry
+ *      the contiguous letter-or-NUL run before it (cap 32 bytes): a
+ *      credential label directly preceding the carried whitespace travels
+ *      with it, in both plain-ASCII and NUL-interleaved UTF-16 forms.
+ * The result is floored at the old 2 KiB overlap and never reaches past
+ * the start of the buffer.
+ */
+function boundaryCarry(buffer: Buffer, boundary: number): BoundaryCarry {
+  let chain = 0;
   while (
-    carried < PAYLOAD_SCAN_CARRY_MAX_BYTES &&
-    carried < boundary &&
-    !isAsciiLetterByte(buffer[boundary - 1 - carried])
+    chain < PAYLOAD_SCAN_CARRY_MAX_BYTES &&
+    chain < boundary &&
+    !isAsciiLetterByte(buffer[boundary - 1 - chain])
   ) {
-    carried += 1;
+    chain += 1;
   }
-  return Math.min(boundary, Math.max(carried, PAYLOAD_SCAN_OVERLAP_BYTES));
+  if (
+    chain === PAYLOAD_SCAN_CARRY_MAX_BYTES &&
+    chain < boundary &&
+    !isAsciiLetterByte(buffer[boundary - 1 - chain])
+  ) {
+    return { carried: chain, truncated: true };
+  }
+  let label = 0;
+  while (
+    label < LABEL_CARRY_MAX_BYTES &&
+    chain + label < boundary &&
+    isLabelCarryByte(buffer[boundary - 1 - chain - label])
+  ) {
+    label += 1;
+  }
+  return {
+    carried: Math.min(
+      boundary,
+      Math.max(chain + label, PAYLOAD_SCAN_OVERLAP_BYTES),
+    ),
+    truncated: false,
+  };
 }
 
 /**
@@ -472,9 +607,16 @@ function boundaryCarryBytes(buffer: Buffer, boundary: number): number {
  *
  * CHUNK BOUNDARIES use the content-aware carry documented at the scan
  * parameters above: each chunk after the first is prepended with the
- * longest letter-free suffix of the preceding bytes (floor 2 KiB, cap
- * 64 KiB), so a separated PAN chain of ANY length up to 64 KiB straddling
- * a 1 MiB boundary is decoded and scanned whole in the following chunk.
+ * longest letter-free suffix of the preceding bytes plus a bounded label
+ * capture (floor 2 KiB, chain cap 64 KiB, label cap 32 bytes), so a
+ * separated PAN chain of any length up to 64 KiB straddling a 1 MiB
+ * boundary — and a credential label separated from its value by up to
+ * 64 KiB of whitespace — is decoded and scanned whole in the following
+ * chunk. When the letter-free run before a boundary EXCEEDS the 64 KiB
+ * cap, the carry cannot contain the whole potential chain and this
+ * function FAILS CLOSED (returns true) instead of scanning with truncated
+ * state — bounded streaming state, overflow → reject, never unbounded
+ * buffering.
  *
  * SCOPE (documented limitation): this screens TEXT-ENCODED bytes. Sensitive
  * content that is only VISIBLE IN THE VIDEO FRAMES (a card filmed on
@@ -491,10 +633,20 @@ export function bufferCarriesSensitiveText(buffer: Buffer): boolean {
   ) {
     const end = Math.min(buffer.length, offset + PAYLOAD_SCAN_CHUNK_BYTES);
     // Content-aware carry: prepend the longest letter-free suffix of the
-    // bytes before this chunk (floor 2 KiB, cap 64 KiB) so a separated
-    // digit chain straddling the boundary is seen whole. subarray is a
-    // view — the carry costs no copy, only a bounded rescan.
-    const carry = offset === 0 ? 0 : boundaryCarryBytes(buffer, offset);
+    // bytes before this chunk plus the bounded label capture (floor 2 KiB,
+    // chain cap 64 KiB) so a separated digit chain — or a spaced
+    // credential label — straddling the boundary is seen whole. subarray
+    // is a view: the carry costs no copy, only a bounded rescan.
+    const boundary = offset === 0 ? null : boundaryCarry(buffer, offset);
+    if (boundary !== null && boundary.truncated) {
+      // FAIL CLOSED (see the carry doc): the letter-free run before this
+      // boundary exceeds the 64 KiB carry cap, so the truncated carry can
+      // no longer prove no digit chain straddles the boundary — the
+      // dropped bytes may hold the chain's leading digits. Reject rather
+      // than scan with silently lost detector state.
+      return true;
+    }
+    const carry = boundary === null ? 0 : boundary.carried;
     const chunk = buffer.subarray(offset - carry, end);
     const views = [
       chunk.toString('latin1'),
@@ -522,7 +674,7 @@ export function bufferCarriesSensitiveText(buffer: Buffer): boolean {
       // Linear: both regexes are single-pass with disjoint char classes.
       if (
         SPACED_NUMERIC_CREDENTIAL_LABEL.test(text) ||
-        SPACED_SECRET_LABEL.test(text)
+        carriesSpacedSecretLabel(text)
       ) {
         return true;
       }

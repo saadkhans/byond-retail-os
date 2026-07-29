@@ -41,8 +41,20 @@ export type DeviceRow = Prisma.DeviceGetPayload<{
  *   never change again.
  * - 'inactive-blocked': the device is DISABLED or RETIRED, so heartbeats
  *   and registration-token issuance are refused.
+ * - { rejection: 'has-video-assets', assetCount }: a unit move is blocked
+ *   while live (non-deleted) Phase 10 video assets reference the device —
+ *   assets denormalize the store/unit/device hierarchy they were captured
+ *   under, and reparenting would strand their crops (the inference queue
+ *   rejects the stale tuple with device-unit-mismatch). The count rides
+ *   along so the HTTP mapping can name it.
  */
-export type DeviceUpdateRejection = 'retired-blocked';
+export interface DeviceReparentRejection {
+  rejection: 'has-video-assets';
+  assetCount: number;
+}
+export type DeviceUpdateRejection =
+  | 'retired-blocked'
+  | DeviceReparentRejection;
 export type DeviceLivenessRejection = 'inactive-blocked';
 
 export interface DeviceSearchFilters {
@@ -187,6 +199,33 @@ export class DevicesRepository extends TenantScopedRepository {
         data.status !== DeviceStatus.RETIRED
       ) {
         return 'retired-blocked' as const;
+      }
+      // Phase 10 video assets denormalize the store/unit/device hierarchy
+      // they were captured under (their bindings are historical evidence);
+      // moving the device to another unit would leave every referencing
+      // asset with a stale device→unit tuple, and the inference queue
+      // would then reject its crops with device-unit-mismatch —
+      // permanently stranding them. A unit move is therefore BLOCKED while
+      // live assets reference the device; soft-deleted assets (deletedAt
+      // set) do not block. Race-free under the device advisory lock above
+      // ALONE: VideoAssetsRepository.createAsset() takes this same device
+      // lock (after the unit lock — canonical unit → device order) for
+      // every device-bound upload and holds it through its insert, so a
+      // concurrent upload cannot land between this count and the update
+      // below; no unit lock is needed here (assets reference the deviceId
+      // directly), and this path takes no further locks, so it cannot
+      // deadlock with the unit → device order.
+      if (data.unitId !== undefined && data.unitId !== before.unitId) {
+        const assetCount = await tx.videoAsset.count({
+          where: {
+            deviceId: before.id,
+            tenantId: scopedTenantId,
+            deletedAt: null,
+          },
+        });
+        if (assetCount > 0) {
+          return { rejection: 'has-video-assets', assetCount } as const;
+        }
       }
       const after = await tx.device.update({
         where: { id: before.id },

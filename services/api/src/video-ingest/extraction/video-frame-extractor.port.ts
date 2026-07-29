@@ -113,6 +113,21 @@ export class FrameExceedsBudgetError extends Error {
   }
 }
 
+/**
+ * Controlled failure: the exhaustive decode produced MORE frames than the
+ * caller's maxFrames cap allows. The message is fixed and echoes no counts
+ * or caps — the caller (the pre-storage screen) owns the audited verdict.
+ * Distinct from FrameExceedsBudgetError (a per-frame BYTE verdict) so the
+ * service can record "too many frames to screen" as its own fail-closed
+ * rejection reason.
+ */
+export class FrameCountExceededError extends Error {
+  constructor() {
+    super('The decoded frame count exceeds the caller-supplied frame cap');
+    this.name = 'FrameCountExceededError';
+  }
+}
+
 export interface ExtractFrameAtOptions {
   /**
    * Optional decoded-byte cap for THIS invocation, always clamped by the
@@ -146,17 +161,24 @@ export interface BufferInspectionSession {
   probe(): Promise<VideoProbeResult>;
 
   /**
-   * Decode ONE frame per started second from t=0 (fps=1) in a single pass
-   * over the in-memory bytes, returning the encoded frames in order.
-   * Enforces options.maxBytesPerFrame per frame (violation →
-   * FrameExceedsBudgetError) and an aggregate output cap derived from the
-   * probed duration. A successful decode yielding FEWER frames than
-   * ceil(durationMs/1000) returns what it yielded — completeness is the
-   * SERVICE's verdict; only zero frames from a successful decode is
-   * FrameUnavailableError. Infrastructure failures classify exactly as on
-   * the storage-key paths.
+   * EXHAUSTIVE decode: emit EVERY decoded source frame (no fps filter, no
+   * sampling of any kind) in a single pass over the in-memory bytes,
+   * returning the encoded frames in decode order. Sampling would let
+   * content visible only BETWEEN samples reach storage unscreened — the
+   * exhaustive stream is the screening contract. Enforces
+   * options.maxBytesPerFrame per frame (violation →
+   * FrameExceedsBudgetError) and options.maxFrames on the total (violation
+   * → FrameCountExceededError; the adapter prefers stopping early by
+   * capping its output buffer near (maxFrames+1)×frame budget so a runaway
+   * stream trips the budget classification instead of buffering unbounded
+   * output). A successful decode yielding FEW frames returns what it
+   * yielded — SUFFICIENCY is the SERVICE's verdict (it holds the probe and
+   * the configured screening budget); only zero frames from a successful
+   * decode is FrameUnavailableError. Infrastructure failures classify
+   * exactly as on the storage-key paths.
    */
-  extractFramesPerSecond(options: {
+  extractAllFrames(options: {
+    maxFrames: number;
     maxBytesPerFrame: number;
   }): Promise<Buffer[]>;
 

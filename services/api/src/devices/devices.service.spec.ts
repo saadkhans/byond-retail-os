@@ -270,6 +270,18 @@ describe('DevicesService', () => {
     ).rejects.toBeInstanceOf(ConflictException);
   });
 
+  it('maps the has-video-assets reparent rejection to a conflict naming the count', async () => {
+    repository.update.mockResolvedValue({
+      rejection: 'has-video-assets',
+      assetCount: 2,
+    });
+    const attempt = service.update('tenant-a', 'device-1', {
+      unitId: 'unit-2',
+    });
+    await expect(attempt).rejects.toBeInstanceOf(ConflictException);
+    await expect(attempt).rejects.toThrow(/2 live video asset/);
+  });
+
   it('maps a concurrent delete during update (P2025) to a 404', async () => {
     repository.update.mockRejectedValue({ code: 'P2025' });
     await expect(

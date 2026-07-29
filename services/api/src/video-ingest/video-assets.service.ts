@@ -25,6 +25,7 @@ import {
   SYSTEM_ACTOR_EMAIL,
 } from '../common/audit/audit-log.service';
 import { containsSensitiveValue } from '../common/sensitive-keys';
+import { DEFAULT_PRIORITY } from '../inference/dto/create-inference-job.dto';
 import { InferenceJobsService } from '../inference/inference-jobs.service';
 import { InferenceJobDetail } from '../inference/inference-jobs.repository';
 import { PlatformModulesService } from '../platform-modules/platform-modules.service';
@@ -46,6 +47,7 @@ import {
   ExtractionFailedError,
   ExtractionInfrastructureError,
   ExtractorUnavailableError,
+  FrameCountExceededError,
   FrameExceedsBudgetError,
   FrameUnavailableError,
   VideoFrameExtractorPort,
@@ -129,12 +131,26 @@ export const SCREENING_INSPECTION_MAX_AGE_MS = 30 * 60 * 1000;
 /**
  * Default ceiling on the probed duration eligible for the mandatory
  * PRE-STORAGE frame screen (VIDEO_MAX_SCREENING_DURATION_MS, boot-validated
- * to 1000..300000 ms): the screen inspects EVERY started second of the
- * clip at 1 fps — no sparse sampling — so this cap is what bounds the
- * synchronous upload request. A longer clip is a controlled, audited 400
- * BEFORE any byte reaches durable storage.
+ * to 1000..300000 ms): the screen decodes and inspects EVERY source frame
+ * of the clip — no sampling — so this cap (together with the frame budget
+ * below) is what bounds the synchronous upload request. A longer clip is a
+ * controlled, audited 400 BEFORE any byte reaches durable storage.
  */
 export const DEFAULT_MAX_SCREENING_DURATION_MS = 30_000;
+
+/**
+ * Default ceiling on the DECODED FRAME COUNT eligible for the mandatory
+ * PRE-STORAGE frame screen (VIDEO_MAX_SCREENING_FRAMES, boot-validated to
+ * 30..3600): the screen decodes EVERY source frame — an fps=1 sample would
+ * let content visible only between one-second ticks reach storage
+ * unscreened — so the frame count, not the duration alone, is what bounds
+ * the synchronous OCR work. 900 = 30 fps × the 30 s default duration
+ * ceiling. A clip whose ESTIMATED frame count (ceil(fps × duration))
+ * exceeds it is an audited 400 BEFORE any decode, and an exhaustive decode
+ * that still yields more frames (VFR clips can exceed the estimate) is the
+ * same audited rejection.
+ */
+export const DEFAULT_MAX_SCREENING_FRAMES = 900;
 
 /**
  * Per-frame decoded-byte cap handed to the pre-storage screening pass —
@@ -329,7 +345,8 @@ function framesRequestFingerprint(dto: ExtractFramesDto): string {
 
 /**
  * Sample positions for the SCREENING PREVIEW (the pre-storage upload
- * screen no longer samples — it consumes the complete 1 fps frame stream):
+ * screen no longer samples — it consumes the complete decoded frame
+ * stream, every source frame):
  * one frame per STARTED second — Math.ceil, because a 1.9 s clip
  * has TWO started seconds and Math.floor would leave its entire second
  * second unpreviewable — capped at maxFrames. While the cap is not hit,
@@ -380,6 +397,14 @@ export class VideoAssetsService {
    */
   private readonly maxScreeningDurationMs: number;
 
+  /**
+   * Ceiling on the decoded frame count eligible for the pre-storage frame
+   * screen (VIDEO_MAX_SCREENING_FRAMES, boot-validated to 30..3600): the
+   * screen decodes EVERY source frame, so this — not the duration alone —
+   * bounds the synchronous per-upload OCR work.
+   */
+  private readonly maxScreeningFrames: number;
+
   constructor(
     private readonly repository: VideoAssetsRepository,
     private readonly storage: VideoStoragePort,
@@ -407,6 +432,18 @@ export class VideoAssetsService {
       configuredScreeningMs <= 300_000
         ? configuredScreeningMs
         : DEFAULT_MAX_SCREENING_DURATION_MS;
+    // Same local re-check idiom for the screening frame budget (boot
+    // validation enforces 30..3600): a value that somehow skipped
+    // validateEnv can never zero out or balloon the exhaustive screen.
+    const configuredScreeningFrames = Number(
+      config.get<string>('VIDEO_MAX_SCREENING_FRAMES'),
+    );
+    this.maxScreeningFrames =
+      Number.isInteger(configuredScreeningFrames) &&
+      configuredScreeningFrames >= 30 &&
+      configuredScreeningFrames <= 3600
+        ? configuredScreeningFrames
+        : DEFAULT_MAX_SCREENING_FRAMES;
   }
 
   private auditEntry(
@@ -602,12 +639,13 @@ export class VideoAssetsService {
     // never touches the durable storage root (the extractor port's
     // buffer-inspection session is in-memory only — a crash mid-screen
     // leaves nothing under VIDEO_STORAGE_ROOT, only the PENDING_MEDIA
-    // row, which DELETE cleans). The COMPLETE 1 fps frame stream — one
-    // real frame for EVERY started second, after the duration cap gate —
-    // is OCR-screened with the same fused sensitive-text predicate as
-    // every other surface, and only a clean, COMPLETE pass reaches
-    // storage.put below. A hit, an over-cap duration, incomplete frame
-    // coverage, or a frame over the screening byte budget rejects the row
+    // row, which DELETE cleans). The COMPLETE decoded frame stream —
+    // EVERY source frame, no sampling, after the duration and frame-budget
+    // gates — is OCR-screened with the same fused sensitive-text predicate
+    // as every other surface, and only a clean, COMPLETE pass reaches
+    // storage.put below. A hit, an over-cap duration, an over-budget frame
+    // count, incomplete frame coverage, or a frame over the screening byte
+    // budget rejects the row
     // (PRESTORE_SCREENING_REJECTED) with the media NEVER having reached
     // durable storage; tooling trouble fails the row (UPLOAD_INCOMPLETE)
     // exactly like a failed media write. UNCONDITIONAL — the availability
@@ -793,29 +831,43 @@ export class VideoAssetsService {
    *    screened inside the synchronous request, so it is REJECTED (audited
    *    CAS PENDING_MEDIA → REJECTED, PRESTORE_SCREENING_REJECTED,
    *    controlled 400) BEFORE any frame extraction or storage write —
-   *    fail closed, never a partial screen.
-   * 3. The COMPLETE 1 fps frame stream is decoded in ONE pass
-   *    (session.extractFramesPerSecond — frame i is second i of the clip,
-   *    timestamp i*1000 ms) under a per-frame byte budget, and EVERY
-   *    returned frame's recognized text (requires a pixel-reading
-   *    recognizer — enforced by the caller's availability gate) runs
-   *    through the SAME fused sensitive-text predicate as every persisted
-   *    surface (Luhn-wins PAN windows, credentials, fused labels).
+   *    fail closed, never a partial screen. The ESTIMATED frame count
+   *    (ceil(fps × duration), from the same probe) is gated by the
+   *    configured frame budget (VIDEO_MAX_SCREENING_FRAMES) the same way:
+   *    the screen decodes EVERY source frame, so a clip estimated past the
+   *    budget is rejected BEFORE any decode with the same audited path.
+   * 3. EVERY source frame is decoded in ONE exhaustive pass
+   *    (session.extractAllFrames — no fps filter, no sampling: an fps=1
+   *    sample would let content visible only between one-second ticks
+   *    reach storage unscreened) under a per-frame byte budget and the
+   *    configured frame budget, and every UNIQUE returned frame's
+   *    recognized text (requires a pixel-reading recognizer — enforced by
+   *    the caller's availability gate) runs through the SAME fused
+   *    sensitive-text predicate as every persisted surface (Luhn-wins PAN
+   *    windows, credentials, fused labels). Byte-identical frames are
+   *    sha256-deduped before OCR — identical bytes decode to identical
+   *    pixels and thus an identical verdict, so a static scene collapses
+   *    to a handful of recognitions — with a hit still attributed to the
+   *    FIRST frame index carrying those bytes.
    * 4. A hit → audited CAS PENDING_MEDIA → REJECTED with the stable
    *    PRESTORE_SCREENING_REJECTED code, controlled 400. The recognized
    *    text is CARD DATA and is never echoed, stored, or audited — only
-   *    the tripping frame's index (= second) is recorded. The media never
-   *    reaches durable storage.
+   *    the tripping frame's index in the decoded stream is recorded. The
+   *    media never reaches durable storage.
    * 5. INCOMPLETE COVERAGE — fewer decoded frames than started seconds
-   *    (ceil(durationMs/1000)), ZERO frames included: every started
-   *    second must have been screened, so partial coverage FAILS CLOSED —
-   *    the same audited rejection path as a hit with a distinct
-   *    "incomplete frame coverage" reason, controlled 400, nothing
-   *    durably stored.
+   *    (ceil(durationMs/1000) — a sanity floor: a full decode of any real
+   *    clip yields at least one frame per second), ZERO frames included:
+   *    fewer means the stream was NOT exhaustively screened, so partial
+   *    coverage FAILS CLOSED — the same audited rejection path as a hit
+   *    with a distinct "incomplete frame coverage" reason, controlled
+   *    400, nothing durably stored.
    * 6. A frame over the per-frame screening byte budget
    *    (FrameExceedsBudgetError) → a frame that cannot be inspected
    *    cannot be stored: same audited rejection path, distinct reason,
-   *    controlled 400.
+   *    controlled 400. A decode past the frame budget
+   *    (FrameCountExceededError — VFR clips can exceed the estimate the
+   *    pre-gate passed) → the same audited frame-budget rejection as the
+   *    pre-gate, controlled 400.
    * 7. Tooling trouble (extractor/recognizer infrastructure — or a frame
    *    the recognizer could not process: an unreadable frame is an
    *    INCOMPLETE screen, never a pass, so it fails closed too) → CAS
@@ -841,6 +893,7 @@ export class VideoAssetsService {
   ): Promise<void> {
     let hitFrameIndex: number | null = null;
     let overCapDurationMs: number | null = null;
+    let overCapFrames: { estimated: number | null } | null = null;
     let frameOverBudget = false;
     let coverage: { screened: number; required: number } | null = null;
     let failure: unknown = null;
@@ -850,18 +903,33 @@ export class VideoAssetsService {
       const probe = await session.probe();
       if (probe.durationMs > this.maxScreeningDurationMs) {
         // Gate BEFORE any frame extraction: a clip longer than the
-        // screening ceiling cannot have EVERY started second screened
+        // screening ceiling cannot have EVERY source frame screened
         // inside the synchronous request — fail closed, decode nothing.
         overCapDurationMs = probe.durationMs;
+      } else if (
+        Math.ceil((probe.fps * probe.durationMs) / 1000) >
+        this.maxScreeningFrames
+      ) {
+        // Frame-budget gate, ALSO before any decode: the screen decodes
+        // EVERY source frame, so the probe's own fps × duration estimate
+        // already proves the clip cannot be exhaustively screened inside
+        // the configured budget — fail closed, decode nothing.
+        overCapFrames = {
+          estimated: Math.ceil((probe.fps * probe.durationMs) / 1000),
+        };
       } else {
-        // COMPLETE coverage is the contract: one frame per STARTED second
-        // (ceil — a 1.9 s clip has TWO started seconds; a zero-probed
-        // duration still requires one screenable frame, or nothing was
-        // actually screened). Frame i is second i (timestamp i*1000 ms).
+        // The completeness FLOOR: a full decode of any real clip yields at
+        // least one frame per STARTED second (ceil — a 1.9 s clip has TWO
+        // started seconds; a zero-probed duration still requires one
+        // screenable frame), so fewer decoded frames than that proves the
+        // stream was NOT exhaustively screened.
         const requiredFrames = Math.max(1, Math.ceil(probe.durationMs / 1000));
         let frames: Buffer[] = [];
         try {
-          frames = await session.extractFramesPerSecond({
+          // EXHAUSTIVE decode — every source frame, no sampling; the
+          // adapter enforces both budgets per the port contract.
+          frames = await session.extractAllFrames({
+            maxFrames: this.maxScreeningFrames,
             maxBytesPerFrame: PRESTORE_SCREENING_MAX_FRAME_BYTES,
           });
         } catch (error) {
@@ -873,21 +941,42 @@ export class VideoAssetsService {
             // A frame that cannot fit the screening budget cannot be
             // inspected — and an uninspected frame is never stored.
             frameOverBudget = true;
+          } else if (error instanceof FrameCountExceededError) {
+            // The exhaustive decode ran past the frame budget even though
+            // the estimate passed the pre-gate (VFR clips can exceed
+            // ceil(fps × duration)) — the same fail-closed frame-budget
+            // verdict, decided by the decode instead of the estimate.
+            overCapFrames = { estimated: null };
           } else {
             throw error;
           }
         }
-        if (!frameOverBudget) {
+        if (!frameOverBudget && overCapFrames === null) {
           if (frames.length < requiredFrames) {
-            // PARTIAL coverage is NOT enough: every started second must
-            // have been screened before the bytes may persist.
+            // BELOW the sanity floor: the stream cannot have been
+            // exhaustively screened, so the bytes may not persist.
             coverage = { screened: frames.length, required: requiredFrames };
           } else {
+            // OCR every UNIQUE frame once: byte-identical PNGs decode to
+            // identical pixels and thus an identical OCR verdict, so
+            // sha256-deduping collapses static scenes massively without
+            // weakening the screen. Iteration order means the first
+            // occurrence of each digest is the one recognized — so a hit
+            // is attributed to the FIRST frame index carrying those
+            // bytes. Early-stop on the first hit as before.
+            const screenedDigests = new Set<string>();
             for (
               let index = 0;
               index < frames.length && hitFrameIndex === null;
               index += 1
             ) {
+              const digest = createHash('sha256')
+                .update(frames[index])
+                .digest('hex');
+              if (screenedDigests.has(digest)) {
+                continue;
+              }
+              screenedDigests.add(digest);
               const text = await this.recognizer.recognize(frames[index]);
               if (containsSensitiveFreeText(text)) {
                 hitFrameIndex = index;
@@ -924,8 +1013,8 @@ export class VideoAssetsService {
       );
     }
     if (overCapDurationMs !== null) {
-      // FAIL CLOSED — the clip is too long to fully screen: every started
-      // second must be screened before storage, and a clip over the
+      // FAIL CLOSED — the clip is too long to fully screen: every source
+      // frame must be screened before storage, and a clip over the
       // configured ceiling cannot be. Rejected BEFORE any frame decode or
       // storage write; same audited rejection path as a hit, distinct
       // reason.
@@ -938,12 +1027,40 @@ export class VideoAssetsService {
           'Pre-storage frame screening refused the upload: the probed ' +
           `duration (${overCapDurationMs} ms) exceeds the configured ` +
           `VIDEO_MAX_SCREENING_DURATION_MS ceiling of ` +
-          `${this.maxScreeningDurationMs} ms — every started second must ` +
+          `${this.maxScreeningDurationMs} ms — every source frame must ` +
           'be screened before storage, so an unscreenable-length clip is ' +
           'never stored; the media never reached durable storage',
         responseMessage:
           'The video exceeds the Phase 10 screening duration limit of ' +
           `${this.maxScreeningDurationMs} ms; nothing was stored`,
+      });
+    }
+    if (overCapFrames !== null) {
+      // FAIL CLOSED — too many frames to screen: the exhaustive screen
+      // must inspect EVERY source frame, and a clip past the configured
+      // frame budget cannot be inspected inside the synchronous request.
+      // One audited verdict covers both detection points: the pre-decode
+      // fps × duration estimate (nothing was decoded) and the exhaustive
+      // decode itself running past the budget (VFR clips can exceed the
+      // estimate).
+      throw await this.rejectStagedUpload(tenantId, assetId, actor, {
+        errorMessage:
+          'Pre-storage frame screening refused this upload: the video ' +
+          'exceeds the Phase 10 screening frame budget; its media never ' +
+          'reached durable storage',
+        auditReason:
+          'Pre-storage frame screening refused the upload: ' +
+          (overCapFrames.estimated !== null
+            ? `the estimated source frame count (${overCapFrames.estimated}` +
+              ', ceil(fps × duration) from the probe) exceeds'
+            : 'the exhaustive decode yielded more source frames than') +
+          ` the configured VIDEO_MAX_SCREENING_FRAMES budget of ` +
+          `${this.maxScreeningFrames} — every source frame must be ` +
+          'screened before storage, so an unscreenable clip is never ' +
+          'stored; the media never reached durable storage',
+        responseMessage:
+          'The video exceeds the Phase 10 screening frame budget of ' +
+          `${this.maxScreeningFrames} frames; nothing was stored`,
       });
     }
     if (frameOverBudget) {
@@ -967,23 +1084,26 @@ export class VideoAssetsService {
     }
     if (coverage !== null) {
       // FAIL CLOSED — incomplete frame coverage (zero frames included):
-      // the probe accepted the container but the 1 fps pass yielded fewer
-      // frames than the clip has started seconds, so at least one second
-      // was NEVER screened. Partial coverage is not a pass.
+      // the probe accepted the container but the exhaustive decode
+      // yielded fewer frames than the clip has started seconds — below
+      // the one-frame-per-second sanity floor any real full decode
+      // clears — so the stream was NOT exhaustively screened. Partial
+      // coverage is not a pass.
       throw await this.rejectStagedUpload(tenantId, assetId, actor, {
         errorMessage:
           'Pre-storage frame screening refused this upload: incomplete ' +
           'frame coverage; its media never reached durable storage',
         auditReason:
           'Pre-storage frame screening refused the upload: incomplete ' +
-          `frame coverage — ${coverage.screened} of ${coverage.required} ` +
-          'started second(s) yielded a screenable frame, and EVERY ' +
-          'started second must be screened (an unscreened upload is never ' +
-          'stored); the media never reached durable storage',
+          'frame coverage — the exhaustive decode yielded ' +
+          `${coverage.screened} of ${coverage.required} floor frame(s) ` +
+          '(at least one per started second), and EVERY source frame ' +
+          'must be screened (an unscreened upload is never stored); the ' +
+          'media never reached durable storage',
         responseMessage:
           'Pre-storage frame screening refused the upload: incomplete ' +
-          'frame coverage — not every started second of the clip could ' +
-          'be screened; nothing was stored',
+          'frame coverage — the clip could not be exhaustively screened; ' +
+          'nothing was stored',
       });
     }
     if (hitFrameIndex !== null) {
@@ -993,14 +1113,14 @@ export class VideoAssetsService {
       // else touches PENDING_MEDIA); either way the media never lands and
       // the controlled 400 below is the truthful outcome. NO recognized
       // text is recorded anywhere — it is (potential) card data; only
-      // WHICH frame (= which second) tripped the screen.
+      // WHICH frame of the decoded stream tripped the screen.
       throw await this.rejectStagedUpload(tenantId, assetId, actor, {
         errorMessage:
           'Pre-storage frame screening rejected this upload; its media ' +
           'never reached durable storage',
         auditReason:
           'Pre-storage frame screening rejected the upload: frame ' +
-          `${hitFrameIndex} (second ${hitFrameIndex} of the clip) carries ` +
+          `${hitFrameIndex} of the decoded source frame stream carries ` +
           'credential- or payment-bearing text (the recognized text is ' +
           'never recorded); the media never reached durable storage',
         responseMessage:
@@ -1013,8 +1133,9 @@ export class VideoAssetsService {
 
   /**
    * Shared audited rejection for every fail-closed PRE-STORAGE screening
-   * verdict (hit, over-cap duration, incomplete coverage, over-budget
-   * frame): the audited CAS PENDING_MEDIA → REJECTED with the stable
+   * verdict (hit, over-cap duration, over-budget frame count, incomplete
+   * coverage, over-budget frame): the audited CAS PENDING_MEDIA →
+   * REJECTED with the stable
    * PRESTORE_SCREENING_REJECTED code — REJECTED (not a bare 400) because
    * that is the module's terminal "this content was refused" state, it is
    * exactly how the quarantine screening rejection records its verdict,
@@ -2173,6 +2294,14 @@ export class VideoAssetsService {
       dto.jobType ??
       (artifact.reason ? REASON_TO_JOB_TYPE[artifact.reason] : undefined) ??
       InferenceJobType.PRODUCT_RECOGNITION;
+    // Resolve the requested PRIORITY the same way, and for the same reason:
+    // priority is queue-ordering behaviour the caller asked for, so a retry
+    // that asks for a different one is NOT answered by the original job —
+    // reporting it as a successful replay would silently drop the change.
+    // `?? DEFAULT_PRIORITY` mirrors exactly what the inference module
+    // persists at creation, so an explicit request for the default replays
+    // an implicitly-defaulted job (and vice versa).
+    const priority = dto.priority ?? DEFAULT_PRIORITY;
     if (artifact.inferenceJobId) {
       const job = await this.inferenceJobsService.findById(
         tenantId,
@@ -2193,6 +2322,16 @@ export class VideoAssetsService {
           `This crop is linked to a ${job.sourceType} inference job, not ` +
             `the server-derived ${CROP_JOB_SOURCE_TYPE} provenance a crop ` +
             'job carries; the link cannot be replayed',
+        );
+      }
+      // Same rule as jobType/sourceType: the linked job must answer THIS
+      // request. A retry asking for a different priority is a 409, never a
+      // "successful replay" of a job queued at another priority.
+      if (job.priority !== priority) {
+        throw new ConflictException(
+          `This crop is already linked to an inference job queued at ` +
+            `priority ${job.priority}; a retry must resolve to the same ` +
+            'priority',
         );
       }
       return { artifact, job, replayed: true };
@@ -2230,7 +2369,9 @@ export class VideoAssetsService {
         unitId: asset.unitId ?? undefined,
         deviceId: asset.deviceId ?? undefined,
         sessionId: asset.sessionId ?? undefined,
-        priority: dto.priority,
+        // The RESOLVED priority (never the raw optional): creation and the
+        // replay matchers must compare the identical value.
+        priority,
         // EXPLICIT server-derived provenance (never client-tunable, never
         // a schema default): crop-created jobs are VISION evidence, and
         // the replay matchers below require exactly this value.
@@ -2253,7 +2394,9 @@ export class VideoAssetsService {
     // REPLAY that job. The COMPLETE server-derived descriptor AND the job's
     // source/context bindings must match before the one-shot link is
     // stamped; lineage integrity beats availability here.
-    if (!this.jobMatchesCrop(job, expectedDescriptor, asset, jobType)) {
+    if (
+      !this.jobMatchesCrop(job, expectedDescriptor, asset, jobType, priority)
+    ) {
       throw new ConflictException(
         'The idempotency key for this crop is already used by an unrelated ' +
           'inference job; the crop was not linked',
@@ -2320,6 +2463,15 @@ export class VideoAssetsService {
               'provenance a crop job carries; the link cannot be replayed',
           );
         }
+        // Mirror of the pre-replay priority guard: a concurrently stamped
+        // link queued at another priority does not answer this request.
+        if (existing.priority !== priority) {
+          throw new ConflictException(
+            `This crop is already linked to an inference job queued at ` +
+              `priority ${existing.priority}; a retry must resolve to the ` +
+              'same priority',
+          );
+        }
         return { artifact: current, job: existing, replayed: true };
       }
       throw new ConflictException('The crop artifact changed concurrently');
@@ -2351,6 +2503,16 @@ export class VideoAssetsService {
    * marker CAS would always lose and never write — the service then skips
    * the completion recording for that case (deletePrefix still runs
    * idempotently for stragglers).
+   * SECOND EXCEPTION — a STAGED upload (PENDING_MEDIA): its durable media
+   * write is undecided, so a put that passed its liveness check before
+   * this soft-delete committed can still land bytes just after the
+   * cleanup. The removal runs, but the completion marker is deliberately
+   * LEFT UNSET and the delete audit says so — the (soft-deleted) row plus
+   * its recorded storage key is the drain marker, and because DELETE is
+   * idempotently repeatable over an already-deleted row, replaying it
+   * re-runs the removal and records the completion once no new put can
+   * start. Without this the cleanup could be stamped complete before the
+   * bytes it was supposed to remove even existed.
    * Before the media is removed, inference jobs linked through the asset's
    * crop artifacts are retired (QUEUED → CANCELLED; a claimed job is
    * audited as an orphan condition) so deleted media never leaves
@@ -2380,6 +2542,33 @@ export class VideoAssetsService {
     // the AUTHORITATIVE marker read from inside softDelete's locked
     // transaction for a fresh delete.
     let removalAlreadyRecorded = Boolean(internal.mediaRemovedAt);
+    // STAGED-UPLOAD DRAIN (crash window between an upload's media write and
+    // its publish CAS): a PENDING_MEDIA row is an upload whose durable
+    // media write is still UNDECIDED — the bytes may not exist yet, or an
+    // in-flight put whose advisory-lock liveness check passed BEFORE this
+    // soft-delete commits may land them moments after this cleanup runs.
+    // Recording completion here would therefore be a LIE that is also
+    // unrepairable: the marker CAS is exactly-once, so a later replay could
+    // never record the real completion, and the recreated bytes would sit
+    // under a soft-deleted row whose cleanup is already stamped complete.
+    // So a FRESH delete of a PENDING_MEDIA row removes the media but leaves
+    // the completion marker UNSET and audits the cleanup as pending — the
+    // asset row (which already carries the storageKey) IS the drain
+    // marker, and DELETE is idempotently repeatable over an
+    // already-soft-deleted row, so replaying it re-runs the removal and
+    // records completion then. A REPLAY may record it: the soft-delete is
+    // durably committed by then, so every liveness check taken since
+    // returns 'deleted' and no NEW put can start; a put that had already
+    // passed its check runs its own compensating removal (whose failure is
+    // itself audited and escalated as a 503), which is the backstop for
+    // that last narrow overlap.
+    // Seeded from the pre-delete read (it decides the idempotent-replay
+    // path and the lost-race path), then replaced by the AUTHORITATIVE
+    // status read inside softDelete's locked transaction — the same view
+    // the audit-entry builder below words its reason from, so the audit and
+    // the completion decision can never disagree.
+    let stagedMediaWriteUndecided =
+      !internal.deletedAt && internal.status === VideoAssetStatus.PENDING_MEDIA;
     if (!internal.deletedAt) {
       const marked = await this.repository.softDelete(
         tenantId,
@@ -2404,13 +2593,22 @@ export class VideoAssetsService {
                 'removed by an earlier screening rejection and its removal ' +
                 'completion is recorded in the audit trail — metadata-only ' +
                 'deletion, nothing left to remove'
-              : 'Video asset deletion requested: media cleanup pending, ' +
-                'metadata kept (cleanup completion is recorded in the ' +
-                'audit trail)',
+              : before.status === VideoAssetStatus.PENDING_MEDIA
+                ? 'Video asset deletion requested: media cleanup runs but ' +
+                  'stays PENDING — this is a STAGED upload (PENDING_MEDIA) ' +
+                  'whose media write is undecided, so an in-flight upload ' +
+                  'may still land bytes under this prefix; no completion ' +
+                  'is recorded here, and replaying DELETE drains the ' +
+                  'prefix and records the completion'
+                : 'Video asset deletion requested: media cleanup pending, ' +
+                  'metadata kept (cleanup completion is recorded in the ' +
+                  'audit trail)',
           }),
       );
       if (marked) {
         removalAlreadyRecorded = marked.mediaAlreadyRemoved;
+        stagedMediaWriteUndecided =
+          marked.asset.status === VideoAssetStatus.PENDING_MEDIA;
       }
       // !marked: lost a race with another delete — the row is durably
       // deleted; fall through to the idempotent file cleanup with the
@@ -2454,7 +2652,13 @@ export class VideoAssetsService {
     // metadata-only, no completion is owed, and the CAS attempt is skipped
     // — consistent with the wording, and any concurrent claim still stays
     // at ONE completion entry ('already-recorded' writes nothing).
-    if (!removalAlreadyRecorded) {
+    // ...and ONLY when no in-flight staged media write can still land bytes
+    // under the prefix we just drained (see stagedMediaWriteUndecided): a
+    // fresh delete of a PENDING_MEDIA row deliberately leaves the marker
+    // unset so the obligation stays visible and re-drainable, and the
+    // idempotent DELETE replay records the completion once the staging
+    // outcome is settled.
+    if (!removalAlreadyRecorded && !stagedMediaWriteUndecided) {
       await this.recordMediaRemovalCompleted(
         tenantId,
         id,
@@ -2478,12 +2682,21 @@ export class VideoAssetsService {
     expectedDescriptor: Record<string, unknown>,
     asset: VideoAssetView,
     expectedJobType: InferenceJobType,
+    expectedPriority: number,
   ): boolean {
     // A preclaimed job with the right descriptor but a DIFFERENT job type
     // would permanently link the crop to the wrong operation (an OCR crop
     // to product recognition). Retries must therefore request the same
     // jobType the original creation resolved to.
     if (job.jobType !== expectedJobType) {
+      return false;
+    }
+    // PRIORITY is part of what the caller asked for: a preclaimed job at a
+    // different queue priority does not answer this request, so it must not
+    // be linked and replayed as if it did. Compared against the RESOLVED
+    // value (dto.priority ?? DEFAULT_PRIORITY) — the exact value the
+    // creation above passes.
+    if (job.priority !== expectedPriority) {
       return false;
     }
     // PROVENANCE is server-derived, never negotiable: crop-created jobs
@@ -2760,6 +2973,11 @@ export class VideoAssetsService {
    * append-only artifact rows mean a partial batch could never be cleaned
    * up, so no row may commit unless all of them do; a failed request
    * retries without duplicating committed artifacts.
+   *
+   * The whole staging → publication → cleanup section runs under the
+   * OPERATION advisory lock, so two attempts that share the deterministic
+   * keys (identical requests) can never have one's cleanup observe the
+   * other's still-uncommitted batch.
    */
   private async persistArtifactsBatch(
     tenantId: string,
@@ -2826,6 +3044,85 @@ export class VideoAssetsService {
         }),
       )
       .digest('hex');
+    // SERIALIZED PER OPERATION: staging, publication, and cleanup run under
+    // the operation advisory lock (tenant + asset + the SAME operation hash
+    // the staging keys are derived from). Deterministic keys mean two
+    // identical attempts stage to the SAME files, and without serialization
+    // a failing attempt could run its committed-owner lookup while the
+    // winner's batch transaction was still uncommitted, see no owner, and
+    // delete the shared key out from under the winner's append-only rows.
+    // With the lock the loser always reaches cleanup after the winner
+    // COMMITTED, so the committed-owner check (kept as defense in depth)
+    // sees the winner's keys and keeps the files. The lock transaction
+    // holds no other lock, so it cannot participate in a cycle.
+    try {
+      return await this.repository.runUnderExtractionOperationLock(
+        tenantId,
+        videoAssetId,
+        operationHash,
+        () =>
+          this.stagePublishAndCleanup(
+            tenantId,
+            assetDir,
+            operationHash,
+            videoAssetId,
+            actor,
+            inputs,
+            reason,
+            idempotencyKey,
+            requestFingerprint,
+          ),
+      );
+    } catch (error) {
+      // Lock-transaction trouble (contention past the hold ceiling, pool
+      // exhaustion) is ENVIRONMENTAL, not a caller error: a retryable 503,
+      // never an uncontrolled 500. Callback errors carry their own codes
+      // and fall through untouched.
+      const code = prismaErrorCode(error);
+      if (code === 'P2024' || code === 'P2028') {
+        throw new ServiceUnavailableException(
+          'The extraction could not acquire its operation lock in time; ' +
+            'nothing was published — retry the request',
+        );
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * The serialized critical section of `persistArtifactsBatch`: stage every
+   * artifact file under the operation's deterministic keys, publish the
+   * batch atomically, and clean up staged files that never became rows.
+   * Runs under the operation advisory lock — see
+   * `runUnderExtractionOperationLock`.
+   */
+  private async stagePublishAndCleanup(
+    tenantId: string,
+    assetDir: string,
+    operationHash: string,
+    videoAssetId: string,
+    actor: AuditActor | undefined,
+    inputs: {
+      artifactType: VideoArtifactType;
+      image: {
+        data: Buffer;
+        width: number;
+        height: number;
+        mimeType: string;
+        timestampMs: number;
+      };
+      reason?: VideoCropReason;
+      crop?: { x: number; y: number; width: number; height: number };
+    }[],
+    reason: string,
+    idempotencyKey?: string,
+    requestFingerprint?: string,
+  ): Promise<{
+    asset: VideoAssetView;
+    artifacts: VideoArtifactView[];
+    replayed: boolean;
+    requestFingerprint?: string | null;
+  }> {
     const staged: string[] = [];
     try {
       const items = [];

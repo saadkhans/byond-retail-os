@@ -1,5 +1,10 @@
 import { VideoArtifactType, VideoAssetStatus } from '@prisma/client';
-import { VideoAssetsRepository } from './video-assets.repository';
+import {
+  EXTRACTION_OPERATION_LOCK_MAX_WAIT_MS,
+  EXTRACTION_OPERATION_LOCK_TIMEOUT_MS,
+  VideoAssetsRepository,
+  videoExtractionOperationLockKey,
+} from './video-assets.repository';
 
 /**
  * Pins the two repository behaviors Codex review called out:
@@ -96,7 +101,14 @@ function makeTx(overrides: Partial<Record<string, unknown>> = {}): TxStub {
 
 function makeRepository(tx: TxStub) {
   const prisma = {
-    $transaction: jest.fn(async (fn: (t: TxStub) => Promise<unknown>) => fn(tx)),
+    // The options argument is captured too: the operation lock passes
+    // explicit wait/hold ceilings with its interactive transaction.
+    $transaction: jest.fn(
+      async (
+        fn: (t: TxStub) => Promise<unknown>,
+        _options?: { maxWait: number; timeout: number },
+      ) => fn(tx),
+    ),
     // Non-transactional reads — capture the where clauses for scoping tests.
     videoArtifact: {
       findFirst: jest.fn(async () => null),
@@ -1175,5 +1187,74 @@ describe('VideoAssetsRepository.createArtifactsBatch', () => {
       () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
     );
     expect(result).toBe('key-conflict');
+  });
+});
+
+describe('extraction operation advisory lock', () => {
+  // Codex P1: with DETERMINISTIC staging keys, a failing attempt's cleanup
+  // could run its committed-owner lookup while the winning attempt's
+  // artifact transaction was still uncommitted, see no owner, and delete
+  // the SHARED key — leaving append-only artifact rows whose file is gone.
+  // The service therefore runs staging → publication → cleanup under an
+  // advisory lock keyed on the OPERATION (tenant + asset + the very hash
+  // the staging keys are derived from).
+  it('derives the operation lock key from tenant, asset, and the staging operation hash', () => {
+    expect(videoExtractionOperationLockKey(TENANT, 'asset-1', 'abc123')).toBe(
+      `video-extraction-op:${TENANT}:asset-1:abc123`,
+    );
+  });
+
+  it('takes pg_advisory_xact_lock on the operation key BEFORE running the section, and holds it across it', async () => {
+    const tx = makeTx();
+    const { repository } = makeRepository(tx);
+    const run = jest.fn(async () => 'section-result');
+    const result = await repository.runUnderExtractionOperationLock(
+      TENANT,
+      'asset-1',
+      'hash-1',
+      run,
+    );
+    expect(result).toBe('section-result');
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    // Tagged template: calls[0][1] is the interpolated lock key.
+    expect(tx.$queryRaw.mock.calls[0][1]).toBe(
+      `video-extraction-op:${TENANT}:asset-1:hash-1`,
+    );
+    // The lock is acquired first, and the transaction that holds it is
+    // still open while the section runs (the callback is invoked inside).
+    expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      run.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('bounds how long the lock may be waited for and held', async () => {
+    const tx = makeTx();
+    const { repository, prisma } = makeRepository(tx);
+    await repository.runUnderExtractionOperationLock(
+      TENANT,
+      'asset-1',
+      'hash-1',
+      async () => undefined,
+    );
+    expect(prisma.$transaction.mock.calls[0][1]).toEqual({
+      maxWait: EXTRACTION_OPERATION_LOCK_MAX_WAIT_MS,
+      timeout: EXTRACTION_OPERATION_LOCK_TIMEOUT_MS,
+    });
+  });
+
+  it('propagates the section\u2019s error unchanged (the lock transaction rolls back, the caller keeps its compensation)', async () => {
+    const tx = makeTx();
+    const { repository } = makeRepository(tx);
+    const boom = new Error('section failed');
+    await expect(
+      repository.runUnderExtractionOperationLock(
+        TENANT,
+        'asset-1',
+        'hash-1',
+        async () => {
+          throw boom;
+        },
+      ),
+    ).rejects.toBe(boom);
   });
 });

@@ -158,6 +158,21 @@ class EnvironmentVariables {
   @Min(1000)
   @Max(300_000)
   VIDEO_MAX_SCREENING_DURATION_MS?: number;
+
+  // Ceiling on the DECODED FRAME COUNT eligible for the mandatory
+  // pre-storage upload frame screen: the screen decodes and OCR-inspects
+  // EVERY source frame (no sampling), so this caps the synchronous
+  // per-upload OCR work. Clips whose estimated frame count
+  // (ceil(fps × duration)) exceeds it are a controlled 400 BEFORE any
+  // decode, and an exhaustive decode that still yields more frames (VFR
+  // clips) is the same controlled rejection. Default 900 (30 fps × 30 s);
+  // bounds 30 .. 3600 so a deployment typo fails at boot instead of making
+  // uploads either unscreenable or unboundedly slow.
+  @IsOptional()
+  @IsInt()
+  @Min(30)
+  @Max(3600)
+  VIDEO_MAX_SCREENING_FRAMES?: number;
 }
 
 // Placeholder markers — banned in EVERY environment (staging and preview

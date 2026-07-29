@@ -209,6 +209,14 @@ export class DevicesService {
         'A RETIRED device is terminal and cannot change status; provision a new device instead',
       );
     }
+    if (updated !== null && 'rejection' in updated) {
+      throw new ConflictException(
+        `Device still has ${updated.assetCount} live video asset(s) referencing it ` +
+          'and cannot move to another unit; Phase 10 assets pin the ' +
+          'store/unit/device hierarchy they were captured under — delete ' +
+          'those assets first',
+      );
+    }
     if (!updated) {
       throw new NotFoundException(`Device "${id}" not found`);
     }

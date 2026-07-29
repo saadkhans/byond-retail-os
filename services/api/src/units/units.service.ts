@@ -205,6 +205,14 @@ export class UnitsService {
           'RETIRED is terminal. Delete a DRAFT unit instead of retiring it.',
       );
     }
+    if (updated !== null && 'rejection' in updated) {
+      throw new ConflictException(
+        `Unit still has ${updated.assetCount} live video asset(s) referencing it ` +
+          'and cannot move to another store; Phase 10 assets pin the ' +
+          'store/unit/device hierarchy they were captured under — delete ' +
+          'those assets first',
+      );
+    }
     if (!updated) {
       throw new NotFoundException(`Unit "${id}" not found`);
     }

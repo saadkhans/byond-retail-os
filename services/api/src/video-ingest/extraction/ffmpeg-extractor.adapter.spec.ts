@@ -1,9 +1,9 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { LocalVideoStorageAdapter } from '../storage/local-video-storage.adapter';
 import {
+  buildAllFramesArgs,
   buildCropArgs,
   buildFrameArgs,
-  buildFramesPerSecondArgs,
   buildProbeArgs,
   classifyCommandError,
   FfmpegVideoFrameExtractor,
@@ -36,6 +36,7 @@ import {
   ExtractionFailedError,
   ExtractionInfrastructureError,
   ExtractorUnavailableError,
+  FrameCountExceededError,
   FrameExceedsBudgetError,
   FrameUnavailableError,
 } from './video-frame-extractor.port';
@@ -581,7 +582,7 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
       await session.close();
     });
 
-    it('splits the single-pass fps=1 PNG stdout into N ordered frames, fed from stdin', async () => {
+    it('splits the single-pass EVERY-frame PNG stdout into N ordered frames, fed from stdin — no fps filter', async () => {
       const calls: RunnerCall[] = [];
       const stream = Buffer.concat([fakePng(1), fakePng(2), fakePng(3)]);
       const extractor = new FfmpegVideoFrameExtractor(
@@ -590,7 +591,8 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
       );
       const data = Buffer.from('unscreened');
       const session = await extractor.inspectBuffer(data);
-      const frames = await session.extractFramesPerSecond({
+      const frames = await session.extractAllFrames({
+        maxFrames: 900,
         maxBytesPerFrame: 1024,
       });
       expect(frames).toHaveLength(3);
@@ -599,13 +601,16 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
         expect(frame.subarray(0, 8).equals(PNG_SIG)).toBe(true);
         expect(frame[8]).toBe(i + 1);
       });
-      // ONE ffmpeg pass (after the memoized probe), reading stdin, fps=1,
-      // PNGs to stdout — no path anywhere in the vector.
-      expect(calls).toHaveLength(2);
-      const ffmpegCall = calls[1];
+      // ONE ffmpeg pass, reading stdin, EVERY decoded source frame — the
+      // Codex P1 regression pin: NO fps filter (fps=1 dropped the frames
+      // between one-second samples, so a PAN visible only between samples
+      // passed) — PNGs to stdout, no path anywhere in the vector.
+      expect(calls).toHaveLength(1);
+      const ffmpegCall = calls[0];
       expect(ffmpegCall.binary).toBe('ffmpeg');
-      expect(ffmpegCall.args).toEqual(buildFramesPerSecondArgs());
-      expect(ffmpegCall.args).toContain('fps=1');
+      expect(ffmpegCall.args).toEqual(buildAllFramesArgs());
+      expect(ffmpegCall.args).not.toContain('-vf');
+      expect(ffmpegCall.args).not.toContain('fps=1');
       expect(ffmpegCall.args[ffmpegCall.args.indexOf('-i') + 1]).toBe(
         'pipe:0',
       );
@@ -615,31 +620,65 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
       await session.close();
     });
 
-    it('sizes the exec maxBuffer as ceil(duration)×perFrame, clamped by the aggregate ceiling', async () => {
+    it('sizes the exec maxBuffer as (maxFrames+1)×perFrame, clamped by the aggregate ceiling', async () => {
       const calls: RunnerCall[] = [];
       const extractor = new FfmpegVideoFrameExtractor(
         storageStub,
-        recordingRunner(calls, fakePng(1), '10.0'),
+        recordingRunner(calls, fakePng(1)),
       );
       const session = await extractor.inspectBuffer(Buffer.from('x'));
-      await session.extractFramesPerSecond({ maxBytesPerFrame: 1000 });
-      // 10 expected frames × 1000 B budget.
-      expect(calls[1].maxOutputBytes).toBe(10_000);
+      await session.extractAllFrames({ maxFrames: 9, maxBytesPerFrame: 1000 });
+      // (9 maxFrames + 1) × 1000 B budget: an in-cap stream always fits,
+      // and a runaway stream trips the exec cap instead of buffering
+      // unbounded output.
+      expect(calls[0].maxOutputBytes).toBe(10_000);
       await session.close();
 
-      // A long clip at the full per-frame ceiling clamps to the aggregate
-      // multi-frame ceiling, never beyond it.
+      // A large frame cap at the full per-frame ceiling clamps to the
+      // aggregate multi-frame ceiling, never beyond it.
       const longCalls: RunnerCall[] = [];
       const longExtractor = new FfmpegVideoFrameExtractor(
         storageStub,
-        recordingRunner(longCalls, fakePng(1), '3600'),
+        recordingRunner(longCalls, fakePng(1)),
       );
       const longSession = await longExtractor.inspectBuffer(Buffer.from('x'));
-      await longSession.extractFramesPerSecond({
+      await longSession.extractAllFrames({
+        maxFrames: 3600,
         maxBytesPerFrame: MAX_OUTPUT_BYTES,
       });
-      expect(longCalls[1].maxOutputBytes).toBe(MAX_TOTAL_EXTRACTION_BYTES);
+      expect(longCalls[0].maxOutputBytes).toBe(MAX_TOTAL_EXTRACTION_BYTES);
       await longSession.close();
+    });
+
+    it('throws FrameCountExceededError when the split yields more frames than maxFrames', async () => {
+      // The stream FIT the exec buffer but still decodes to more frames
+      // than the caller can screen — the controlled frame-count verdict,
+      // never a silent truncation (a truncated screen is no screen).
+      const stream = Buffer.concat([fakePng(1), fakePng(2), fakePng(3)]);
+      const extractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        recordingRunner([], stream),
+      );
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      await expect(
+        session.extractAllFrames({ maxFrames: 2, maxBytesPerFrame: 1024 }),
+      ).rejects.toBeInstanceOf(FrameCountExceededError);
+      await session.close();
+    });
+
+    it('rejects a degenerate maxFrames cap WITHOUT running any tooling', async () => {
+      const runner = jest.fn(() =>
+        Promise.resolve({ stdout: fakePng(1) }),
+      );
+      const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      for (const maxFrames of [0, -1, 1.5, Number.NaN]) {
+        await expect(
+          session.extractAllFrames({ maxFrames, maxBytesPerFrame: 1024 }),
+        ).rejects.toBeInstanceOf(FrameCountExceededError);
+      }
+      expect(runner).not.toHaveBeenCalled();
+      await session.close();
     });
 
     it('throws FrameExceedsBudgetError when a split frame overruns the per-frame budget', async () => {
@@ -650,7 +689,7 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
       );
       const session = await extractor.inspectBuffer(Buffer.from('x'));
       await expect(
-        session.extractFramesPerSecond({ maxBytesPerFrame: 64 }),
+        session.extractAllFrames({ maxFrames: 900, maxBytesPerFrame: 64 }),
       ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
       await session.close();
     });
@@ -662,20 +701,22 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
       );
       const session = await extractor.inspectBuffer(Buffer.from('x'));
       await expect(
-        session.extractFramesPerSecond({ maxBytesPerFrame: 1024 }),
+        session.extractAllFrames({ maxFrames: 900, maxBytesPerFrame: 1024 }),
       ).rejects.toBeInstanceOf(FrameUnavailableError);
       await session.close();
     });
 
-    it('returns FEWER frames than the probed duration expects AS-IS (service decides completeness)', async () => {
-      // 10 s clip → 10 expected; the decoder legitimately yielded 3.
+    it('returns FEW frames AS-IS (the service decides sufficiency against its floor)', async () => {
+      // The decoder legitimately yielded 3 frames; whether that is enough
+      // is the SERVICE's verdict (it holds the probe and the floor).
       const stream = Buffer.concat([fakePng(1), fakePng(2), fakePng(3)]);
       const extractor = new FfmpegVideoFrameExtractor(
         storageStub,
         recordingRunner([], stream, '10.0'),
       );
       const session = await extractor.inspectBuffer(Buffer.from('x'));
-      const frames = await session.extractFramesPerSecond({
+      const frames = await session.extractAllFrames({
+        maxFrames: 900,
         maxBytesPerFrame: 1024,
       });
       expect(frames).toHaveLength(3);
@@ -687,32 +728,37 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
         new RangeError('stdout maxBuffer length exceeded'),
         { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' },
       );
-      const runnerFor = (durationSeconds: string) => (binary: string) =>
+      const rejectingRunner = (binary: string) =>
         binary === 'ffprobe'
           ? Promise.resolve({
-              stdout: Buffer.from(probeJson(durationSeconds)),
+              stdout: Buffer.from(probeJson('10.0')),
             })
           : Promise.reject(overflow);
-      // 10 s × 1000 B cap sits below the aggregate ceiling → the caller's
-      // budget is what fired, a skip-this-upload verdict for the caller.
+      // A (900+1) × 1000 B cap sits below the aggregate ceiling → the
+      // caller's budget is what fired — a runaway stream stopped early by
+      // the budget-derived cap, a fail-closed verdict for the caller.
       const budget = new FfmpegVideoFrameExtractor(
         storageStub,
-        runnerFor('10.0'),
+        rejectingRunner,
       );
       const budgetSession = await budget.inspectBuffer(Buffer.from('x'));
       await expect(
-        budgetSession.extractFramesPerSecond({ maxBytesPerFrame: 1000 }),
+        budgetSession.extractAllFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 1000,
+        }),
       ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
       await budgetSession.close();
       // At the clamped aggregate ceiling the overflow is the adapter's OWN
       // cap → infrastructure, exactly as on the storage-key paths.
       const ceiling = new FfmpegVideoFrameExtractor(
         storageStub,
-        runnerFor('3600'),
+        rejectingRunner,
       );
       const ceilingSession = await ceiling.inspectBuffer(Buffer.from('x'));
       await expect(
-        ceilingSession.extractFramesPerSecond({
+        ceilingSession.extractAllFrames({
+          maxFrames: 3600,
           maxBytesPerFrame: MAX_OUTPUT_BYTES,
         }),
       ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
@@ -747,7 +793,7 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
         );
         const session = await extractor.inspectBuffer(Buffer.from('x'));
         await expect(
-          session.extractFramesPerSecond({ maxBytesPerFrame: 1024 }),
+          session.extractAllFrames({ maxFrames: 900, maxBytesPerFrame: 1024 }),
         ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
         await session.close();
       }
@@ -761,7 +807,7 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
       const session = await extractor.inspectBuffer(Buffer.from('x'));
       for (const maxBytesPerFrame of [0, -1, 1.5, Number.NaN]) {
         await expect(
-          session.extractFramesPerSecond({ maxBytesPerFrame }),
+          session.extractAllFrames({ maxFrames: 900, maxBytesPerFrame }),
         ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
       }
       expect(runner).not.toHaveBeenCalled();
@@ -780,7 +826,7 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
         ExtractionFailedError,
       );
       await expect(
-        session.extractFramesPerSecond({ maxBytesPerFrame: 1024 }),
+        session.extractAllFrames({ maxFrames: 900, maxBytesPerFrame: 1024 }),
       ).rejects.toBeInstanceOf(ExtractionFailedError);
       expect(runner).not.toHaveBeenCalled();
       expect(mkdtemp).not.toHaveBeenCalled();
