@@ -78,16 +78,29 @@ export const MAX_STREAMING_DEADLINE_MS = 120_000;
 // without a restart, long enough that a request burst costs one exec.
 export const TOOLING_READY_TTL_MS = 60_000;
 
-// The readiness invocation is `-version`: it reads no input, decodes
-// nothing, and returns in milliseconds, so its kill timeout is far tighter
-// than the work ceiling — a host where `ffmpeg -version` needs seconds is
-// not a host that can screen an upload inside a request.
+// The readiness invocations read NO user input: `-version` prints a banner,
+// and the capability probe encodes one 16×16 synthetic frame. Both return in
+// milliseconds, so their kill timeout is far tighter than the work ceiling —
+// a host that needs seconds to encode a 16×16 frame is not a host that can
+// screen an upload inside a request.
 export const TOOLING_READY_TIMEOUT_MS = 2_000;
 
-// `-version` prints a banner plus the build's configure flags — a few KiB.
-// The cap is generous for that and still bounds a hostile PATH entry; an
-// overrun rejects, which reads as NOT ready (fail-closed, never a pass).
+// `-version` prints a banner plus the build's configure flags — a few KiB —
+// and the capability probe's 16×16 PNG is a few hundred bytes. The cap is
+// generous for both and still bounds a hostile PATH entry; an overrun
+// rejects, which reads as NOT ready (fail-closed, never a pass).
 const TOOLING_READY_MAX_OUTPUT_BYTES = 256 * 1024;
+
+// Slop allowance when deciding whether the adapter's OWN kill timer is what
+// killed a child. The runner seam takes a timeout and returns only the
+// failure, so the adapter cannot observe WHICH side sent the signal; it
+// measures instead. Timers fire a beat late, `Date.now()` has millisecond
+// granularity, and the runner's own bookkeeping costs a tick or two, so an
+// elapsed time a hair UNDER the configured timeout is still that timer
+// firing. Anything killed materially earlier than the configured timeout
+// was killed by SOMEONE ELSE (OOM killer, operator SIGKILL, a supervisor),
+// which is an infrastructure failure and must stay retryable.
+export const TIMEOUT_ATTRIBUTION_TOLERANCE_MS = 50;
 
 // Probe ceilings for controlled TEST clips. ffprobe output is derived from
 // attacker-supplied container metadata: without upper bounds a tiny crafted
@@ -131,10 +144,15 @@ export function buildProbeArgs(internalPath: string): string[] {
 }
 
 /**
- * The READINESS vector: a fixed, single flag that makes the tool print its
- * banner and exit. No input, no path, no user-influenced value, no decode —
- * the cheapest possible proof that the binary exists, is executable, and
- * runs. Exported for tests.
+ * The EXECUTABILITY vector: a fixed, single flag that makes the tool print
+ * its banner and exit. No input, no path, no user-influenced value, no
+ * decode — the cheapest possible proof that the binary exists, is
+ * executable, and runs. Exported for tests.
+ *
+ * It proves only that the binary STARTS. For ffmpeg that is not enough (a
+ * build can start and still lack the encoder screening needs), so the
+ * readiness check runs this against ffprobe and the richer capability probe
+ * below against ffmpeg — see buildCapabilityProbeArgs.
  */
 export function buildVersionArgs(): string[] {
   return ['-version'];
@@ -218,6 +236,48 @@ export function buildAllFramesArgs(): string[] {
   ];
 }
 
+/**
+ * The readiness CAPABILITY probe's synthetic input: ffmpeg's OWN built-in
+ * lavfi generator produces one tiny black frame from nothing — no fixture
+ * file in the repo, no path, no network, no user-influenced value, and no
+ * bytes on disk. The geometry is deliberately minimal: this must stay a
+ * cheap gate, not a decode.
+ */
+const CAPABILITY_PROBE_INPUT = 'color=c=black:s=16x16:d=1';
+
+/**
+ * The READINESS CAPABILITY vector: generate one frame internally and encode
+ * it through the EXACT codec/format path the screening decode uses —
+ * `-f image2pipe -vcodec png pipe:1`, the same tail buildAllFramesArgs()
+ * emits. `-version` only proves the binary STARTS; a build can start and
+ * still be missing the PNG encoder or the image2pipe muxer, in which case
+ * the gate would admit the upload and the real decode would fail AFTER
+ * Multer had already buffered the whole body. Running the actual pipeline
+ * (and requiring real PNG bytes back — see startsWithPngSignature) is what
+ * makes readiness mean "screening will work", not "a binary exists".
+ *
+ * Exported for tests; input-free and fixed, so nothing user-supplied can
+ * ever reach it.
+ */
+export function buildCapabilityProbeArgs(): string[] {
+  return [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-f',
+    'lavfi',
+    '-i',
+    CAPABILITY_PROBE_INPUT,
+    '-frames:v',
+    '1',
+    '-f',
+    'image2pipe',
+    '-vcodec',
+    'png',
+    'pipe:1',
+  ];
+}
+
 // PNG stream signature (89 50 4E 47 0D 0A 1A 0A): every PNG in the
 // image2pipe output starts with these eight bytes, and the sequence cannot
 // occur inside a well-formed PNG's chunk stream by accident often enough to
@@ -225,6 +285,22 @@ export function buildAllFramesArgs(): string[] {
 const PNG_SIGNATURE = Buffer.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
 ]);
+
+/**
+ * Does this output actually BEGIN a PNG? The readiness capability probe
+ * requires it: a zero exit proves the process ended happily, not that it
+ * produced an image — a build lacking the encoder can exit 0 with empty
+ * stdout, and a hostile PATH entry can exit 0 with anything at all. Both
+ * must read as NOT ready. Defensive about the shape because the runner is
+ * an injected seam: anything that is not a Buffer of PNG bytes is a no.
+ */
+function startsWithPngSignature(output: unknown): boolean {
+  return (
+    Buffer.isBuffer(output) &&
+    output.length >= PNG_SIGNATURE.length &&
+    output.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)
+  );
+}
 
 const EMPTY = Buffer.alloc(0);
 
@@ -256,13 +332,12 @@ export interface StreamFramesResult {
 type AbortReason = 'stop' | 'frame-bytes' | 'frame-count' | 'deadline' | 'callback';
 
 /**
- * Why an exec'd PROBE would have been killed BY THE BUDGET rather than by
- * the adapter's own fixed command ceiling. Recorded BEFORE the child can
- * exist — exactly the bookkeeping-first discipline streamFrames uses — so a
- * kill under a binding aggregate budget is read as the DEADLINE verdict and
- * a kill at the fixed ceiling keeps the infrastructure classification. The
- * two can never be confused because the reason is decided by which bound
- * was actually in force, not by inspecting the kill after the fact.
+ * Which bound WOULD make an exec'd PROBE's kill a budget verdict: the
+ * caller's aggregate budget rather than the adapter's own fixed command
+ * ceiling. Recorded BEFORE the child can exist — exactly the
+ * bookkeeping-first discipline streamFrames uses — so the question "whose
+ * bound was in force?" is answered without inspecting the kill after the
+ * fact.
  *
  * A TIE (remaining budget EXACTLY the command ceiling — the default 30 s
  * screening budget hits this on its very first probe) is the CALLER's
@@ -270,6 +345,18 @@ type AbortReason = 'stop' | 'frame-bytes' | 'frame-count' | 'deadline' | 'callba
  * at that instant is the caller's allowance running out, not the host
  * misbehaving. Only a budget STRICTLY GREATER than the ceiling (or no
  * budget at all) leaves the adapter's own ceiling as the binding bound.
+ *
+ * A BINDING budget is NECESSARY BUT NOT SUFFICIENT for the deadline
+ * verdict. Binding says only that the caller's allowance is the bound the
+ * configured timer expresses; it says nothing about whether that timer ever
+ * fired. A process killed EXTERNALLY (OOM killer, an operator's SIGKILL, a
+ * supervisor reaping the tree) presents to the runner seam as exactly the
+ * same kill, and reporting that as a deadline would turn an infrastructure
+ * outage into a content-style pre-storage rejection — permanently refusing
+ * a perfectly good upload instead of asking the client to retry. So the
+ * elapsed wall clock must ALSO have reached the configured timeout (within
+ * TIMEOUT_ATTRIBUTION_TOLERANCE_MS); a kill arriving materially earlier
+ * keeps the retryable ExtractionInfrastructureError classification.
  */
 type ProbeAbortReason = 'deadline';
 
@@ -529,6 +616,18 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
    * upload, and reporting ready on the strength of one would recreate the
    * very "the gate passed, then the work failed" hole this closes.
    *
+   * And ffmpeg is checked by CAPABILITY, not merely by executability: it is
+   * asked to generate one synthetic frame and encode it through the exact
+   * `-f image2pipe -vcodec png pipe:1` path streamFrames() uses, and the
+   * answer is ready ONLY if it exits zero AND returns bytes that really
+   * begin a PNG. A build that starts but lacks the PNG encoder or the
+   * image2pipe muxer would otherwise pass `-version`, open the gate, and
+   * fail the real decode after Multer had already buffered the upload —
+   * the same "gate passed, work failed" hole, one layer deeper. ffprobe
+   * keeps the cheap `-version` executability check: its work (reading
+   * container metadata) has no comparable optional-component failure mode,
+   * and a probe capability check would need input bytes.
+   *
    * MEMOIZED for TOOLING_READY_TTL_MS — negatives included. Never throws:
    * every failure shape (ENOENT, EACCES, nonzero exit, timeout kill,
    * output overrun, a runner that rejects with anything at all) is simply
@@ -563,25 +662,47 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
     return check;
   }
 
-  /** One uncached readiness pass over both binaries. Never rejects. */
+  /**
+   * One uncached readiness pass over both binaries — TWO execs, not three:
+   * ffprobe's `-version` proves it starts, and ffmpeg's executability is
+   * proved IMPLICITLY by the richer capability probe (a missing or
+   * non-executable binary rejects there exactly as it would on `-version`),
+   * so the separate `ffmpeg -version` call is redundant and dropped. Fewer
+   * execs keeps the pre-buffer gate cheap. Never rejects.
+   */
   private async runToolingReadyProbe(): Promise<boolean> {
-    for (const binary of [FFPROBE_BINARY, FFMPEG_BINARY]) {
-      try {
-        await this.runCommand(
-          binary,
-          buildVersionArgs(),
-          TOOLING_READY_MAX_OUTPUT_BYTES,
-          undefined,
-          TOOLING_READY_TIMEOUT_MS,
-        );
-      } catch {
-        // Deliberately UNBOUND: the error is never read, let alone
-        // returned or logged. Missing, non-executable, killed, chatty,
-        // or exiting nonzero — all of it is one word: not ready.
-        return false;
-      }
+    try {
+      await this.runCommand(
+        FFPROBE_BINARY,
+        buildVersionArgs(),
+        TOOLING_READY_MAX_OUTPUT_BYTES,
+        undefined,
+        TOOLING_READY_TIMEOUT_MS,
+      );
+    } catch {
+      // Deliberately UNBOUND: the error is never read, let alone returned
+      // or logged. Missing, non-executable, killed, chatty, or exiting
+      // nonzero — all of it is one word: not ready.
+      return false;
     }
-    return true;
+    try {
+      const { stdout } = await this.runCommand(
+        FFMPEG_BINARY,
+        buildCapabilityProbeArgs(),
+        TOOLING_READY_MAX_OUTPUT_BYTES,
+        undefined,
+        TOOLING_READY_TIMEOUT_MS,
+      );
+      // A zero exit is NOT the answer on its own: the run must have
+      // produced real PNG bytes. Empty or non-PNG stdout means the encode
+      // path this adapter depends on is not there — not ready, fail-closed.
+      return startsWithPngSignature(stdout);
+    } catch {
+      // Same unbound discard as above, and the destructure itself is
+      // inside the try so even a runner resolving with a nonsense shape
+      // reads as not ready rather than escaping.
+      return false;
+    }
   }
 
   private async run(
@@ -876,6 +997,15 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
    * failure can never be reclassified as an infrastructure failure by the
    * 'close' handler. Only exits and signals we did NOT initiate go through
    * classifyCommandError.
+   *
+   * That ownership also makes this path immune to the external-kill
+   * confusion the exec'd probe had to measure its way out of: here the
+   * adapter holds the timer and sends the signal itself, so `aborted` is
+   * 'deadline' if and ONLY IF our own timer fired. A kill from anywhere
+   * else (OOM killer, an operator's SIGKILL) arrives with `aborted` still
+   * null and lands in classifyCommandError → the retryable
+   * ExtractionInfrastructureError. No elapsed-time attribution is needed or
+   * wanted here — do not add one.
    */
   private streamFramesFromStdin(
     bytes: Buffer,
@@ -1229,6 +1359,17 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
    * counts as caller-bound (see below): the infrastructure classification
    * is reserved for a budget STRICTLY GREATER than the ceiling, or none.
    *
+   * A binding budget alone does NOT make a kill a deadline. The runner is
+   * an injected seam that takes a timeout and hands back only the failure,
+   * so the adapter cannot see WHICH side sent the signal — an externally
+   * killed probe (OOM killer, operator SIGKILL) is indistinguishable from
+   * a timer kill by shape alone, and calling it a deadline would convert an
+   * infrastructure outage into a permanent pre-storage rejection of a valid
+   * upload. So the elapsed wall clock is MEASURED across the invocation and
+   * the deadline verdict requires that the configured timeout actually ran
+   * out (within TIMEOUT_ATTRIBUTION_TOLERANCE_MS of it). A kill well inside
+   * the budget is somebody else's signal and stays retryable.
+   *
    * Nothing here proves the clip safe: a probe reports geometry and
    * duration only.
    */
@@ -1265,6 +1406,16 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
       }
     }
     let stdout: Buffer;
+    // Taken IMMEDIATELY before the invocation and read again on failure:
+    // the elapsed span is the only evidence available at this seam for
+    // whether the configured timer is what killed the child. Date.now() is
+    // this codebase's clock idiom; the residual risk is that it is a WALL
+    // clock, so an NTP step or a manual clock change during a single
+    // sub-30-second probe could skew the measurement. The consequence is
+    // bounded and one-sided by design: a skew only ever misfiles one kill
+    // between two already-controlled verdicts, and no path, timing, or
+    // errno is echoed either way.
+    const startedAtMs = Date.now();
     try {
       ({ stdout } = await this.runCommand(
         FFPROBE_BINARY,
@@ -1274,9 +1425,25 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
         timeoutMs,
       ));
     } catch (error) {
-      if (abortReason === 'deadline' && isProcessKill(error)) {
-        // Killed while the caller's budget was the binding bound: the
-        // screen did not fit its time, nothing about the host is broken.
+      const elapsedMs = Date.now() - startedAtMs;
+      if (
+        abortReason === 'deadline' &&
+        isProcessKill(error) &&
+        // The timer must actually have RUN OUT. A binding budget says the
+        // configured timeout expresses the caller's allowance; it does not
+        // say the timeout fired. An external SIGKILL (OOM killer, operator,
+        // supervisor) arrives with the same `killed`/`signal` shape but
+        // well before the timeout, and it is an INFRASTRUCTURE failure that
+        // must stay retryable rather than a content-style rejection of a
+        // valid upload. The tolerance absorbs timer/clock/reporting slop
+        // only. (For a very small budget the threshold can go negative,
+        // which is correct: inside a few tens of milliseconds every kill is
+        // the deadline.)
+        elapsedMs >= timeoutMs - TIMEOUT_ATTRIBUTION_TOLERANCE_MS
+      ) {
+        // Killed by the timer while the caller's budget was the binding
+        // bound: the screen did not fit its time, nothing about the host is
+        // broken.
         throw new ScreeningDeadlineExceededError();
       }
       const classified = classifyCommandError(error);

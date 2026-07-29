@@ -1,9 +1,10 @@
 import {
   buildRecognizeArgs,
-  buildVersionArgs,
+  buildToolingReadyArgs,
   classifyRecognizerError,
   MAX_RECOGNIZED_TEXT_BYTES,
   TesseractFrameTextRecognizer,
+  toolingReadyProbeImage,
   TOOLING_READY_TIMEOUT_MS,
   TOOLING_READY_TTL_MS,
 } from './tesseract-recognizer.adapter';
@@ -108,6 +109,15 @@ describe('TesseractFrameTextRecognizer', () => {
    * the host it is still true — so the guard passed and multer buffered the
    * entire upload before anything failed. checkToolingReady is the runtime
    * half: it actually runs the binary.
+   *
+   * THE SECOND, SHARPER FINDING: running the binary is not enough if the
+   * invocation is `--version`. A version banner prints fine on a host whose
+   * default OCR LANGUAGE DATA is missing or unreadable — the most likely
+   * real-world misconfiguration — so the gate admitted the upload, multer
+   * buffered the file, and the first genuine recognize() call was what
+   * finally failed. The probe therefore drives the SAME argv over the SAME
+   * stdin/stdout wiring a real recognition uses, feeding a synthetic
+   * in-memory image, so it fails wherever a real recognition would.
    */
   describe('checkToolingReady', () => {
     interface Invocation {
@@ -120,8 +130,10 @@ describe('TesseractFrameTextRecognizer', () => {
 
     const recordingRunner = (
       calls: Invocation[],
+      // What a correctly configured tool returns for the blank probe image:
+      // exit zero, essentially no text. The text is never inspected.
       outcome: () => Promise<{ stdout: Buffer }> = () =>
-        Promise.resolve({ stdout: Buffer.from('tesseract 5.3.0') }),
+        Promise.resolve({ stdout: Buffer.from('\n\f', 'utf8') }),
     ) =>
       jest.fn(
         (
@@ -141,7 +153,103 @@ describe('TesseractFrameTextRecognizer', () => {
         Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }),
       );
 
-    it('reports ready when the version invocation succeeds', async () => {
+    /**
+     * An INDEPENDENT CRC32 (the checksum the image chunk format specifies),
+     * written here rather than imported, so the spec validates the generated
+     * bytes instead of agreeing with the adapter's own arithmetic.
+     */
+    const crc32 = (bytes: Buffer): number => {
+      let crc = 0xffffffff;
+      for (const byte of bytes) {
+        crc ^= byte;
+        for (let bit = 0; bit < 8; bit += 1) {
+          crc = (crc & 1) !== 0 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+        }
+        crc >>>= 0;
+      }
+      return (crc ^ 0xffffffff) >>> 0;
+    };
+
+    /** The 8 bytes every file of this format opens with. */
+    const IMAGE_SIGNATURE = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    ]);
+
+    interface ImageChunk {
+      type: string;
+      payload: Buffer;
+      crcValid: boolean;
+    }
+
+    /** Walk the chunk stream, verifying each declared length and checksum. */
+    const parseImageChunks = (image: Buffer): ImageChunk[] => {
+      const chunks: ImageChunk[] = [];
+      let offset = IMAGE_SIGNATURE.length;
+      while (offset < image.length) {
+        const length = image.readUInt32BE(offset);
+        const type = image.subarray(offset + 4, offset + 8).toString('ascii');
+        const payload = image.subarray(offset + 8, offset + 8 + length);
+        const stored = image.readUInt32BE(offset + 8 + length);
+        chunks.push({
+          type,
+          payload,
+          crcValid:
+            stored ===
+            crc32(Buffer.concat([Buffer.from(type, 'ascii'), payload])),
+        });
+        offset += 12 + length;
+      }
+      // A truncated trailing chunk would leave offset past the end.
+      expect(offset).toBe(image.length);
+      return chunks;
+    };
+
+    /**
+     * The probe input is SYNTHETIC and GENERATED — no fixture file, no
+     * sample media, no new dependency. This pins that it really is a
+     * plausible minimal image of the declared format, not arbitrary bytes a
+     * tool would reject before ever touching its language data.
+     */
+    it('feeds a generated, plausible minimal image — never a fixture or sample media', () => {
+      const image = toolingReadyProbeImage();
+      expect(image.subarray(0, 8)).toEqual(IMAGE_SIGNATURE);
+      // Spelled out, so a silent format swap fails right here.
+      expect([...image.subarray(0, 8)]).toEqual([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      ]);
+      const chunks = parseImageChunks(image);
+      expect(chunks.map((chunk) => chunk.type)).toEqual([
+        'IHDR',
+        'IDAT',
+        'IEND',
+      ]);
+      expect(chunks.every((chunk) => chunk.crcValid)).toBe(true);
+      const header = chunks[0].payload;
+      expect(header).toHaveLength(13);
+      const width = header.readUInt32BE(0);
+      const height = header.readUInt32BE(4);
+      expect(width).toBeGreaterThan(0);
+      expect(height).toBeGreaterThan(0);
+      // Tiny on purpose: the probe must stay CHEAP.
+      expect(width).toBeLessThanOrEqual(64);
+      expect(height).toBeLessThanOrEqual(64);
+      expect(header.readUInt8(8)).toBe(8); // 8 bits per sample
+      expect(header.readUInt8(9)).toBe(0); // greyscale
+      expect(header.readUInt8(10)).toBe(0); // deflate
+      expect(header.readUInt8(11)).toBe(0); // adaptive filtering
+      expect(header.readUInt8(12)).toBe(0); // not interlaced
+      expect(chunks[1].payload.length).toBeGreaterThan(0);
+      expect(chunks[2].payload).toHaveLength(0);
+      // A whole image in well under a kilobyte — nothing here is media.
+      expect(image.length).toBeLessThan(512);
+    });
+
+    it('builds the probe image AT MOST ONCE per process', () => {
+      // Same Buffer identity across calls: a module-level lazy constant.
+      expect(toolingReadyProbeImage()).toBe(toolingReadyProbeImage());
+    });
+
+    it('probes with the SAME vector recognize() uses, over the generated image', async () => {
       const calls: Invocation[] = [];
       const recognizer = new TesseractFrameTextRecognizer(
         recordingRunner(calls),
@@ -150,13 +258,83 @@ describe('TesseractFrameTextRecognizer', () => {
       expect(ready).toBe(true);
       expect(calls).toHaveLength(1);
       expect(calls[0].binary).toBe('tesseract');
-      // A fixed, input-free vector: no frame, no path, no user value.
-      expect(calls[0].args).toEqual(buildVersionArgs());
-      expect(calls[0].args).toEqual(['--version']);
-      // No frame is fed to a readiness check.
-      expect(calls[0].stdinData.length).toBe(0);
-      // Far tighter than the recognition ceiling — this must stay CHEAP.
+      // THE POINT OF THE FIX: identical to the recognition vector, so the
+      // probe resolves the same DEFAULT language data a real recognition
+      // does. No `--version`, no language override, no user-influenced value.
+      expect(calls[0].args).toEqual(buildToolingReadyArgs());
+      expect(calls[0].args).toEqual(buildRecognizeArgs());
+      expect(calls[0].args).toEqual(['stdin', 'stdout']);
+      expect(calls[0].args).not.toContain('--version');
+      // A real, decodable image travels over STDIN — the same seam a frame
+      // uses, so nothing touches a disk path.
+      expect(calls[0].stdinData.subarray(0, 8)).toEqual(IMAGE_SIGNATURE);
+      expect(calls[0].stdinData).toBe(toolingReadyProbeImage());
+      expect(
+        parseImageChunks(calls[0].stdinData).map((chunk) => chunk.type),
+      ).toEqual(['IHDR', 'IDAT', 'IEND']);
+      // Bounded like every other invocation, and killed far short of the
+      // recognition ceiling — this must stay CHEAP.
+      expect(calls[0].maxOutputBytes).toBeGreaterThan(0);
+      expect(calls[0].maxOutputBytes).toBeLessThan(MAX_RECOGNIZED_TEXT_BYTES);
       expect(calls[0].timeoutMs).toBe(TOOLING_READY_TIMEOUT_MS);
+    });
+
+    /**
+     * THE REGRESSION THIS FIX EXISTS FOR: the binary is installed and
+     * executable — `--version` would have exited zero and reported READY —
+     * but its default language data is missing or unreadable, so the real
+     * invocation exits nonzero. The pre-buffer gate must catch that here,
+     * not after multer has buffered the upload.
+     */
+    it('reports NOT ready when the binary RUNS but its language data fails to initialize', async () => {
+      const runner = jest.fn(() =>
+        Promise.reject(
+          Object.assign(
+            new Error(
+              'Error opening data file /usr/share/tessdata/eng.traineddata\n' +
+                "Failed loading language 'eng'\n" +
+                'Could not initialize tesseract.',
+            ),
+            // The tool RAN and reported failure: a NUMERIC exit code, not a
+            // spawn errno. `--version` would have exited 0 on this host.
+            { code: 1, killed: false, signal: null },
+          ),
+        ),
+      );
+      const recognizer = new TesseractFrameTextRecognizer(runner);
+      const ready = await recognizer.checkToolingReady();
+      expect(typeof ready).toBe('boolean');
+      expect(ready).toBe(false);
+      expect(runner).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports ready when the binary AND its data initialization both succeed', async () => {
+      const recognizer = new TesseractFrameTextRecognizer(
+        jest.fn(() => Promise.resolve({ stdout: Buffer.from('\n\f', 'utf8') })),
+      );
+      await expect(recognizer.checkToolingReady()).resolves.toBe(true);
+    });
+
+    /**
+     * Readiness is EXIT STATUS, never content. A runner that resolves with
+     * text must still yield exactly `true`: no OCR output and no host detail
+     * may ride back through this seam.
+     */
+    it('returns a bare boolean — recognized text never escapes the probe', async () => {
+      const recognizer = new TesseractFrameTextRecognizer(
+        jest.fn(() =>
+          Promise.resolve({
+            stdout: Buffer.from(
+              'CUSTOMER 4111111111111111 /secret/path tesseract',
+              'utf8',
+            ),
+          }),
+        ),
+      );
+      const ready: unknown = await recognizer.checkToolingReady();
+      expect(typeof ready).toBe('boolean');
+      expect(ready).toBe(true);
+      expect(JSON.stringify(ready)).toBe('true');
     });
 
     it.each([
@@ -207,9 +385,7 @@ describe('TesseractFrameTextRecognizer', () => {
     it('re-checks once the TTL has elapsed', async () => {
       let missing = true;
       const runner = jest.fn(() =>
-        missing
-          ? enoent()
-          : Promise.resolve({ stdout: Buffer.from('tesseract 5.3.0') }),
+        missing ? enoent() : Promise.resolve({ stdout: Buffer.from('\n\f') }),
       );
       const recognizer = new TesseractFrameTextRecognizer(runner);
       const now = jest.spyOn(Date, 'now');
