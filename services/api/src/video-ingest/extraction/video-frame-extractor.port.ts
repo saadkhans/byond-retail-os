@@ -196,7 +196,11 @@ export interface BufferInspectionSession {
    * probe is abandoned because THIS budget expired the rejection is
    * ScreeningDeadlineExceededError (the same fail-closed verdict
    * streamFrames gives), never an infrastructure failure: nothing about the
-   * host is broken, the clip simply did not fit the time it was given.
+   * host is broken, the clip simply did not fit the time it was given. A
+   * remaining budget EQUAL to the implementation's own ceiling still counts
+   * as caller-bound — the caller asked for at most that much wall clock, so
+   * the deadline verdict applies at the tie too; only a budget STRICTLY
+   * ABOVE the ceiling leaves the implementation's own bound in force.
    * Omitting the option keeps the implementation's own fixed ceiling as the
    * only bound — the pre-existing behavior.
    *
@@ -290,6 +294,30 @@ export abstract class VideoFrameExtractorPort {
    * placeholder images would be a blind attestation.
    */
   abstract readonly readsRealBytes: boolean;
+
+  /**
+   * Cheap, cached check that the underlying tooling can actually run.
+   *
+   * `readsRealBytes` is a STATIC CAPABILITY CLAIM — "this strategy decodes
+   * the real bytes" — and it stays true even on a host where the binaries
+   * are missing, non-executable, or broken. A pre-buffer upload gate that
+   * trusts the flag alone therefore lets the whole multipart body be
+   * buffered before anything discovers there is nothing to screen with.
+   * This is the RUNTIME half: it actually invokes the tooling (a trivial
+   * version/no-op call) and reports whether it ran.
+   *
+   * Contract for implementations:
+   * - MEMOIZE the answer for a short TTL — NEGATIVE results included. A
+   *   per-request spawn would defeat the point of a cheap gate, and an
+   *   uncached negative turns a missing binary into a spawn storm.
+   * - NEVER throw and never reject: an unusable tool is `false`, not an
+   *   error the caller must classify.
+   * - Return a BOOLEAN and nothing else — no paths, argv, errno text, or
+   *   stderr may escape through this seam. The caller composes the
+   *   controlled message.
+   * - It proves the tooling RUNS, never that a clip is safe.
+   */
+  abstract checkToolingReady(): Promise<boolean>;
 
   abstract probe(storageKey: string): Promise<VideoProbeResult>;
 

@@ -21,6 +21,22 @@ export class SimulatedFrameTextRecognizer extends FrameTextRecognizerPort {
   // must refuse to rely on this adapter.
   readonly readsRealPixels = false;
 
+  /**
+   * Trivially TRUE: there is no external tooling to be missing — no binary,
+   * no child process, no npm dependency — so nothing about this adapter can
+   * fail to "run", and a check that spawned something to say so would be a
+   * lie about what this strategy is.
+   *
+   * That is NOT a claim it can screen anything. `readsRealPixels` is false
+   * above, and the capability flag is what the pre-buffer upload gate
+   * refuses on — readiness is the SECOND half of that gate (does the tool
+   * the flag promises actually run?), never a substitute for the first.
+   * Reporting ready here can therefore open nothing.
+   */
+  checkToolingReady(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+
   recognize(frame: Buffer): Promise<string> {
     // The buffer is unused except to keep the contract honest — a
     // simulated recognizer never reads the pixels.

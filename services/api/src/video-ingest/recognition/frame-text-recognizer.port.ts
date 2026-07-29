@@ -65,6 +65,28 @@ export abstract class FrameTextRecognizerPort {
   abstract readonly readsRealPixels: boolean;
 
   /**
+   * Cheap, cached check that the underlying tooling can actually run.
+   *
+   * `readsRealPixels` is a STATIC CAPABILITY CLAIM — "this strategy reads
+   * the pixels" — and it stays true even on a host where the OCR binary is
+   * missing, non-executable, or broken. A pre-buffer upload gate that
+   * trusts the flag alone therefore lets the whole multipart body be
+   * buffered before anything discovers there is nothing to screen with.
+   * This is the RUNTIME half: it actually invokes the tooling (a trivial
+   * version/no-op call) and reports whether it ran.
+   *
+   * Contract for implementations — identical to the extraction port's:
+   * - MEMOIZE the answer for a short TTL, NEGATIVE results included (a
+   *   per-request spawn would defeat a cheap gate; an uncached negative
+   *   turns a missing binary into a spawn storm).
+   * - NEVER throw and never reject: an unusable tool is `false`.
+   * - Return a BOOLEAN and nothing else — no paths, argv, errno text, or
+   *   stderr may escape through this seam.
+   * - It proves the tooling RUNS, never that a frame is clean.
+   */
+  abstract checkToolingReady(): Promise<boolean>;
+
+  /**
    * Recognize the text visible in one decoded frame image (PNG bytes from
    * the extraction port). Returns the recognized text — possibly empty —
    * and NEVER persists or logs the frame or the text.

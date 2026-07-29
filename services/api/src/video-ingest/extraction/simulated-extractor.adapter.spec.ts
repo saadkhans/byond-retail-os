@@ -1,3 +1,4 @@
+import { execFile, spawn } from 'node:child_process';
 import {
   SIMULATED_PROBE,
   SimulatedVideoFrameExtractor,
@@ -7,6 +8,16 @@ import {
   FrameExceedsBudgetError,
   ScreeningDeadlineExceededError,
 } from './video-frame-extractor.port';
+
+// This adapter has NO tooling: the module is mocked purely so the specs can
+// ASSERT that nothing is ever spawned — including by the readiness check.
+jest.mock('node:child_process', () => ({
+  execFile: jest.fn(),
+  spawn: jest.fn(),
+}));
+
+const execFileMock = execFile as unknown as jest.Mock;
+const spawnMock = spawn as unknown as jest.Mock;
 
 describe('SimulatedVideoFrameExtractor', () => {
   const extractor = new SimulatedVideoFrameExtractor();
@@ -20,6 +31,20 @@ describe('SimulatedVideoFrameExtractor', () => {
     // The discriminator behind the informed-screening gate: placeholder
     // frames must never stand in for the footage a screener approves.
     expect(extractor.readsRealBytes).toBe(false);
+  });
+
+  it('reports tooling READY trivially, without invoking anything', async () => {
+    // There is no external tooling here to be missing, so nothing can fail
+    // to run — and a check that spawned something to say so would be a lie
+    // about what this strategy is. Reporting ready OPENS NOTHING: the
+    // pre-buffer upload gate refuses on readsRealBytes=false above, and
+    // readiness is only the second half of that gate (does the tool the
+    // capability flag promises actually run?), never a substitute for it.
+    const ready = await extractor.checkToolingReady();
+    expect(typeof ready).toBe('boolean');
+    expect(ready).toBe(true);
+    expect(execFileMock).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
   });
 
   /** Collecting screener: the pull-based contract's simplest consumer. */

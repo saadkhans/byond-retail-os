@@ -8,6 +8,7 @@ import {
   buildCropArgs,
   buildFrameArgs,
   buildProbeArgs,
+  buildVersionArgs,
   classifyCommandError,
   COMMAND_TIMEOUT_MS,
   FfmpegVideoFrameExtractor,
@@ -16,6 +17,8 @@ import {
   MAX_PROBE_DURATION_MS,
   MAX_TOTAL_EXTRACTION_BYTES,
   parseProbeOutput,
+  TOOLING_READY_TIMEOUT_MS,
+  TOOLING_READY_TTL_MS,
   UNSTREAMABLE_CONTAINER_MESSAGE,
 } from './ffmpeg-extractor.adapter';
 
@@ -727,7 +730,12 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
         // Memoization means one probe per session — a session each.
         const generous = await extractor.inspectBuffer(Buffer.from('x'));
         await generous.probe({ deadlineMs: COMMAND_TIMEOUT_MS * 4 });
-        // Exactly at the ceiling: the ceiling is still what bounds it.
+        // Exactly at the ceiling: min() picks the SAME NUMBER either way,
+        // so the invocation's kill timeout is unchanged here — but the
+        // bound that BINDS at a tie is the caller's budget, which is a
+        // CLASSIFICATION question, pinned below ('classifies a kill at a
+        // TIE ... as the DEADLINE verdict'). This assertion is about the
+        // number handed to the runner, not about whose bound it is.
         const tie = await extractor.inspectBuffer(Buffer.from('x'));
         await tie.probe({ deadlineMs: COMMAND_TIMEOUT_MS });
         // No budget at all → the pre-existing behavior, unchanged.
@@ -771,6 +779,40 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
         await session.close();
       });
 
+      it('classifies a kill at a TIE (remaining budget EXACTLY the command ceiling) as the DEADLINE verdict', async () => {
+        // The Codex finding: the tie was decided by a STRICT `<`, so the
+        // abort reason stayed unset and a probe timeout became a retryable
+        // INFRASTRUCTURE failure (503). The tie is not exotic — the
+        // DEFAULT 30 s aggregate screening budget IS COMMAND_TIMEOUT_MS,
+        // so the first probe of every default screen lands exactly here.
+        // At a tie the caller's allowance is what MEANS something: it
+        // asked for at most that much wall clock, so running out of it is
+        // the controlled pre-storage screening rejection.
+        const timeoutKill = Object.assign(new Error('killed /secret/x.mp4'), {
+          killed: true,
+          signal: 'SIGTERM',
+        });
+        const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+          Promise.reject(timeoutKill),
+        );
+        const session = await extractor.inspectBuffer(Buffer.from('x'));
+        const error: Error = await session
+          .probe({ deadlineMs: COMMAND_TIMEOUT_MS })
+          .then(
+            () => {
+              throw new Error('expected rejection');
+            },
+            (caught: Error) => caught,
+          );
+        expect(error).toBeInstanceOf(ScreeningDeadlineExceededError);
+        expect(error).not.toBeInstanceOf(ExtractionInfrastructureError);
+        expect(error.message).toBe(
+          'The screening decode exceeded its time budget',
+        );
+        expect(error.message).not.toContain('/secret');
+        await session.close();
+      });
+
       it('keeps a kill at the adapter OWN fixed ceiling infrastructure-classified', async () => {
         const timeoutKill = Object.assign(new Error('killed'), {
           killed: true,
@@ -779,6 +821,15 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
         const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
           Promise.reject(timeoutKill),
         );
+        // Infrastructure is reserved for a budget STRICTLY GREATER than
+        // the ceiling (or none at all): only then is the adapter's own
+        // bound what fired, so the existing retryable classification
+        // stands. One millisecond over is enough to be strictly greater.
+        const barely = await extractor.inspectBuffer(Buffer.from('x'));
+        await expect(
+          barely.probe({ deadlineMs: COMMAND_TIMEOUT_MS + 1 }),
+        ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+        await barely.close();
         // A budget WIDER than the ceiling: the ceiling is what fired, so
         // the existing retryable classification stands.
         const generous = await extractor.inspectBuffer(Buffer.from('x'));
@@ -1488,5 +1539,212 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
     expect(budgets.length).toBe(3);
     expect(budgets[2]).toBe(MAX_TOTAL_EXTRACTION_BYTES - 2 * frameBytes);
     expect(budgets[2]).toBeLessThan(budgets[0]);
+  });
+});
+
+/**
+ * The Codex finding this closes: the pre-Multer upload guard only consulted
+ * the CAPABILITY FLAGS (readsRealBytes / readsRealPixels). Those are static
+ * claims about the STRATEGY — with VIDEO_FFMPEG_ENABLED=true and no ffmpeg
+ * on the host the flag is still true — so the guard passed and multer
+ * buffered the entire upload before anything failed. checkToolingReady is
+ * the runtime half: it actually runs the binaries.
+ *
+ * The invariants pinned here: BOTH binaries are exercised, every failure
+ * shape is a plain `false`, the answer (positive AND negative) is memoized
+ * for the TTL so the gate stays cheap and a missing binary cannot cause a
+ * spawn storm, and NOTHING but a boolean ever comes back — no path, argv,
+ * errno, or stderr.
+ */
+describe('FfmpegVideoFrameExtractor.checkToolingReady', () => {
+  /** One recorded runner invocation. */
+  interface Invocation {
+    binary: string;
+    args: string[];
+    maxOutputBytes: number;
+    stdin?: Buffer;
+    timeoutMs?: number;
+  }
+
+  const recordingRunner = (
+    calls: Invocation[],
+    outcome: (binary: string) => Promise<{ stdout: Buffer }> = () =>
+      Promise.resolve({ stdout: Buffer.from('ffmpeg version 6.0') }),
+  ) =>
+    jest.fn(
+      (
+        binary: string,
+        args: string[],
+        maxOutputBytes: number,
+        stdin?: Buffer,
+        timeoutMs?: number,
+      ) => {
+        calls.push({ binary, args, maxOutputBytes, stdin, timeoutMs });
+        return outcome(binary);
+      },
+    );
+
+  const enoent = () =>
+    Promise.reject(
+      Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }),
+    );
+
+  it('reports ready when the version invocation of BOTH binaries succeeds', async () => {
+    const calls: Invocation[] = [];
+    const extractor = new FfmpegVideoFrameExtractor(
+      storageStub,
+      recordingRunner(calls),
+    );
+    const ready = await extractor.checkToolingReady();
+    expect(ready).toBe(true);
+    // A screen needs the probe AND the decode, so both binaries are proved.
+    expect(calls.map((call) => call.binary)).toEqual(['ffprobe', 'ffmpeg']);
+    for (const call of calls) {
+      // A fixed, input-free vector: no path, no user-influenced value.
+      expect(call.args).toEqual(buildVersionArgs());
+      expect(call.args).toEqual(['-version']);
+      // No bytes are fed to a readiness check.
+      expect(call.stdin).toBeUndefined();
+      // Far tighter than the work ceiling — this must stay CHEAP.
+      expect(call.timeoutMs).toBe(TOOLING_READY_TIMEOUT_MS);
+      expect(call.timeoutMs as number).toBeLessThan(COMMAND_TIMEOUT_MS);
+    }
+    // The readiness check itself never spawns or touches disk.
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(mkdtemp).not.toHaveBeenCalled();
+    expect(writeFile).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    // Missing binary.
+    ['ENOENT (missing binary)', { code: 'ENOENT' }],
+    // Present but not executable.
+    ['EACCES (non-executable)', { code: 'EACCES' }],
+    // The tool ran and exited nonzero.
+    ['a nonzero exit', { code: 1, killed: false, signal: null }],
+    // Killed by the readiness timeout (or any external signal).
+    ['a timeout kill', { killed: true, signal: 'SIGTERM' }],
+    // Output overran the parent cap — fail-closed, never a pass.
+    ['an output overrun', { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }],
+  ])('reports NOT ready on %s, without throwing', async (_label, failure) => {
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.reject(
+        Object.assign(
+          new Error('spawn /usr/local/bin/ffprobe failed at /secret/path'),
+          failure,
+        ),
+      ),
+    );
+    const ready = await extractor.checkToolingReady();
+    // A BARE boolean: no error escapes, and nothing that could carry a
+    // path, argv, errno string, or stderr comes back through this seam.
+    expect(typeof ready).toBe('boolean');
+    expect(ready).toBe(false);
+  });
+
+  it('reports NOT ready when only ONE of the two binaries runs', async () => {
+    // ffprobe present, ffmpeg missing: probing would work and the DECODE
+    // would not, so the screen cannot run — reporting ready on the strength
+    // of one binary would recreate the very hole this check closes.
+    const calls: Invocation[] = [];
+    const runner = recordingRunner(calls, (binary) =>
+      binary === 'ffmpeg'
+        ? enoent()
+        : Promise.resolve({ stdout: Buffer.from('ffprobe version 6.0') }),
+    );
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+    await expect(extractor.checkToolingReady()).resolves.toBe(false);
+    expect(calls.map((call) => call.binary)).toEqual(['ffprobe', 'ffmpeg']);
+  });
+
+  it('short-circuits: a failing FIRST binary never invokes the second', async () => {
+    const calls: Invocation[] = [];
+    const runner = recordingRunner(calls, enoent);
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+    await expect(extractor.checkToolingReady()).resolves.toBe(false);
+    expect(calls.map((call) => call.binary)).toEqual(['ffprobe']);
+  });
+
+  it('MEMOIZES a positive result: later calls within the TTL never re-invoke the runner', async () => {
+    const calls: Invocation[] = [];
+    const runner = recordingRunner(calls);
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+    await expect(extractor.checkToolingReady()).resolves.toBe(true);
+    expect(runner).toHaveBeenCalledTimes(2); // one per binary
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await expect(extractor.checkToolingReady()).resolves.toBe(true);
+    }
+    // A per-request spawn would defeat the point of a CHEAP pre-buffer gate.
+    expect(runner).toHaveBeenCalledTimes(2);
+  });
+
+  it('MEMOIZES a NEGATIVE result too — a missing binary cannot cause a spawn storm', async () => {
+    const runner = jest.fn(enoent);
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+    for (let request = 0; request < 25; request += 1) {
+      await expect(extractor.checkToolingReady()).resolves.toBe(false);
+    }
+    // ONE failed exec for 25 refused uploads, not 25.
+    expect(runner).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-checks once the TTL has elapsed (an operator installing the tool need not restart)', async () => {
+    const calls: Invocation[] = [];
+    let missing = true;
+    const runner = recordingRunner(calls, () =>
+      missing ? enoent() : Promise.resolve({ stdout: Buffer.from('version') }),
+    );
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+    const now = jest.spyOn(Date, 'now');
+    try {
+      now.mockReturnValue(1_000_000);
+      await expect(extractor.checkToolingReady()).resolves.toBe(false);
+      expect(runner).toHaveBeenCalledTimes(1);
+      // One millisecond short of the TTL: still the cached answer.
+      now.mockReturnValue(1_000_000 + TOOLING_READY_TTL_MS - 1);
+      await expect(extractor.checkToolingReady()).resolves.toBe(false);
+      expect(runner).toHaveBeenCalledTimes(1);
+      // At the TTL the answer is stale — the tooling is consulted again.
+      missing = false;
+      now.mockReturnValue(1_000_000 + TOOLING_READY_TTL_MS);
+      await expect(extractor.checkToolingReady()).resolves.toBe(true);
+      expect(runner).toHaveBeenCalledTimes(3); // 1 failed + 2 binaries
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('collapses CONCURRENT checks on a cold cache onto one invocation', async () => {
+    const calls: Invocation[] = [];
+    const runner = recordingRunner(calls);
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+    const results = await Promise.all([
+      extractor.checkToolingReady(),
+      extractor.checkToolingReady(),
+      extractor.checkToolingReady(),
+    ]);
+    expect(results).toEqual([true, true, true]);
+    expect(runner).toHaveBeenCalledTimes(2); // one per binary, not per call
+  });
+
+  it('never rejects, even when the runner throws SYNCHRONOUSLY or rejects with a non-Error', async () => {
+    const hostile: (() => Promise<{ stdout: Buffer }>)[] = [
+      () => {
+        throw Object.assign(new Error('/secret/ffmpeg exploded'), {
+          code: 'EACCES',
+        });
+      },
+      () =>
+        Promise.reject(
+          'a bare string naming /secret/path',
+        ) as Promise<{ stdout: Buffer }>,
+      () => Promise.reject(undefined) as Promise<{ stdout: Buffer }>,
+    ];
+    for (const runner of hostile) {
+      const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+      const ready = await extractor.checkToolingReady();
+      expect(typeof ready).toBe('boolean');
+      expect(ready).toBe(false);
+    }
   });
 });

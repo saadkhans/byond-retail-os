@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { Request } from 'express';
+import { isEnvFlagEnabled } from '../config/env.validation';
 import { VideoFrameExtractorPort } from './extraction/video-frame-extractor.port';
 import { FrameTextRecognizerPort } from './recognition/frame-text-recognizer.port';
 
@@ -39,6 +40,37 @@ export const SCREENING_TOOLING_UNAVAILABLE_MESSAGE =
   'do not read the real media — configure VIDEO_FFMPEG_ENABLED=true ' +
   'and VIDEO_OCR_ENABLED=true (uploads are never stored unscreened ' +
   'in any environment)';
+
+/**
+ * The screening-tooling READINESS 503 — a SEPARATE condition from the one
+ * above, and deliberately a separate message.
+ *
+ * WHY NOT REUSE `SCREENING_TOOLING_UNAVAILABLE_MESSAGE`: that message's
+ * remediation is "set VIDEO_FFMPEG_ENABLED=true and VIDEO_OCR_ENABLED=true".
+ * This condition only ever fires when those flags are ALREADY true — the
+ * real adapters were selected, they simply cannot run right now (the
+ * toolchain is absent, not executable, or otherwise unusable on this host).
+ * Serving the flag message here would send the operator to re-set flags they
+ * already set and hide the actual fault; the two failures have genuinely
+ * different fixes, so they get different words.
+ *
+ * WHAT IT DELIBERATELY DOES NOT SAY: nothing about the host. No paths, no
+ * binary names or locations, no argv, no errno/signal/stderr. The readiness
+ * probe itself returns a BARE BOOLEAN for exactly this reason — there is no
+ * host detail available here to leak even by accident. The disclosure
+ * delta versus the flag message is nil in any case: both say only "the
+ * screening toolchain cannot run on this deployment", and both are reachable
+ * ONLY by a caller who already passed the global auth guard and holds
+ * `video-asset:manage` on a deployment that has explicitly opted into
+ * test-media ingestion.
+ */
+export const SCREENING_TOOLING_NOT_READY_MESSAGE =
+  'Uploads are refused: pre-storage frame screening is configured to use ' +
+  'real media tooling, but that tooling cannot currently run on this ' +
+  'deployment, so the screen cannot happen and nothing is stored (uploads ' +
+  'are never stored unscreened in any environment). This is a deployment ' +
+  'condition rather than a problem with the request — retry once the ' +
+  'screening toolchain is operational';
 
 /**
  * The four REQUIRED operator attestations, carried as REQUEST HEADERS so
@@ -112,13 +144,33 @@ function isAffirmedHeader(value: string | string[] | undefined): boolean {
 /**
  * THE PRE-BUFFER UPLOAD GATE.
  *
+ * WHAT IT COVERS — all four layers, and every one of them BEFORE A SINGLE
+ * BYTE OF THE BODY IS READ:
+ *   1. DEPLOYMENT POLICY — the controlled test-media opt-in plus an
+ *      explicitly non-production NODE_ENV.
+ *   2. CAPABILITY FLAGS — the configured adapters claim to read the real
+ *      media (`readsRealBytes` / `readsRealPixels`); this is what rejects
+ *      the simulated adapters, whose "no text found" would be a blind pass.
+ *   3. ACTUAL TOOLING READINESS — the claimed toolchain can genuinely RUN
+ *      here (`checkToolingReady()` on both ports). A flag that enables the
+ *      real decode/OCR adapters is a statement of INTENT; with the
+ *      underlying tooling missing or non-executable the capability flags
+ *      still read true — the adapter was selected, it just cannot run. Before
+ *      this layer existed the guard passed, multer buffered the entire
+ *      upload, and the failure only surfaced after parsing — defeating the
+ *      point of a pre-buffer gate.
+ *   4. OPERATOR ATTESTATIONS — the four declaration headers.
+ *
  * Nest's request lifecycle runs GUARDS BEFORE INTERCEPTORS: in
  * `@nestjs/core`'s `RouterExecutionContext.create`, the returned handler
  * awaits `fnCanActivate([req, res, next])` and only then calls
  * `interceptorsConsumer.intercept(...)`. `FileInterceptor` (multer) is an
  * INTERCEPTOR, so a guard that throws here rejects the request while the
  * multipart body is still unread on the socket — nothing has been buffered
- * into process memory.
+ * into process memory. That `await` is also why this guard may be ASYNC
+ * (layer 3 is a promise) without weakening the guarantee: Nest waits for the
+ * guard to settle before it constructs the interceptor chain, so multer has
+ * still not looked at the socket while the readiness probe is in flight.
  *
  * That ordering is what makes the documented "refused before any byte"
  * behaviour true. The identical checks inside `VideoAssetsService.upload`
@@ -133,6 +185,13 @@ function isAffirmedHeader(value: string | string[] | undefined): boolean {
  * `request.file`, or the underlying stream (there is nothing parsed to
  * touch yet), so it cannot itself cause the buffering it exists to prevent.
  *
+ * COST: the checks are ordered cheapest-first and short-circuit, so a
+ * request that fails layer 1 or 2 never probes readiness at all, and a
+ * request that reaches layer 3 costs at most ONE awaited call per port.
+ * The probes are memoized behind a short TTL INSIDE the adapters — this
+ * guard deliberately keeps no cache of its own, so there is exactly one
+ * definition of "recently checked" in the process.
+ *
  * Applied to the upload route ONLY. Route-level guards run after the
  * globally registered auth/permission guards, so `video-asset:manage` is
  * still enforced ahead of this one — an unauthenticated or unauthorized
@@ -143,11 +202,22 @@ export class TestMediaGateGuard implements CanActivate {
   /**
    * TRUE only when the CONTROLLED TEST-MEDIA POLICY GATE is open — the
    * same two-part, fail-closed condition `VideoAssetsService` computes:
-   * the explicit opt-in (VIDEO_TEST_MEDIA_INGEST_ENABLED, strictly the
-   * literal "true") AND an explicitly non-production runtime (NODE_ENV
-   * exactly 'development' or 'test'). Startup validation already refuses
-   * the flag elsewhere; re-deriving it here keeps the gate local and
-   * fail-closed on anything unexpected.
+   * the explicit opt-in (VIDEO_TEST_MEDIA_INGEST_ENABLED) AND an explicitly
+   * non-production runtime (NODE_ENV exactly 'development' or 'test').
+   * Startup validation already refuses the flag elsewhere; re-deriving it
+   * here keeps the gate local and fail-closed on anything unexpected.
+   *
+   * THE FLAG IS READ THROUGH `isEnvFlagEnabled` — the codebase's ONE
+   * definition of an enabled boolean env var (trim + case-fold), shared with
+   * startup validation, the video-ingest module's adapter factories, and
+   * `VideoAssetsService`'s copy of this gate. The former local `=== 'true'`
+   * compare disagreed with all three: a deployment configured
+   * `VIDEO_TEST_MEDIA_INGEST_ENABLED=TRUE` passes boot validation, selects
+   * the real tooling, and passes the service gate, yet this guard shut and
+   * 503'd every upload before multer ever ran. NODE_ENV is intentionally
+   * still an EXACT match — it is a validated enum, not a boolean flag, so
+   * the boolean helper does not apply to it and 'TEST'/'Development' keep
+   * the gate closed.
    */
   private readonly testMediaIngestGateOpen: boolean;
 
@@ -158,11 +228,11 @@ export class TestMediaGateGuard implements CanActivate {
   ) {
     const nodeEnv = config.get<string>('NODE_ENV');
     this.testMediaIngestGateOpen =
-      config.get<string>('VIDEO_TEST_MEDIA_INGEST_ENABLED') === 'true' &&
+      isEnvFlagEnabled(config.get<string>('VIDEO_TEST_MEDIA_INGEST_ENABLED')) &&
       (nodeEnv === 'development' || nodeEnv === 'test');
   }
 
-  canActivate(context: ExecutionContext): boolean {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     // 1. THE DEPLOYMENT GATE. With it shut the endpoint accepts nothing at
     //    all — and now refuses without the body ever being read.
     if (!this.testMediaIngestGateOpen) {
@@ -178,7 +248,26 @@ export class TestMediaGateGuard implements CanActivate {
         SCREENING_TOOLING_UNAVAILABLE_MESSAGE,
       );
     }
-    // 3. THE OPERATOR ATTESTATIONS, from headers only — the multipart
+    // 3. THE TOOLING ITSELF. The flags above are a statement of INTENT —
+    //    "the real adapters are selected". They stay true when the
+    //    underlying decode/OCR tooling is missing or not executable, in
+    //    which case the
+    //    screen still cannot run and the upload must be refused BEFORE the
+    //    body is taken in; without this the guard passed, multer buffered
+    //    the whole file, and the failure only surfaced after parsing.
+    //    Ordered AFTER the flag checks so the cheap in-memory conditions
+    //    fail fast and this is never probed for a request the deployment
+    //    gate already refuses. Each probe is one awaited call, memoized
+    //    with a short TTL inside the adapter (no second cache here), never
+    //    throws, and yields a bare boolean — there is no host detail in
+    //    hand to leak into the response.
+    if (
+      !(await this.extractor.checkToolingReady()) ||
+      !(await this.recognizer.checkToolingReady())
+    ) {
+      throw new ServiceUnavailableException(SCREENING_TOOLING_NOT_READY_MESSAGE);
+    }
+    // 4. THE OPERATOR ATTESTATIONS, from headers only — the multipart
     //    fields do not exist yet, and waiting for them is precisely the
     //    bug this guard closes.
     const { headers } = context.switchToHttp().getRequest<Request>();

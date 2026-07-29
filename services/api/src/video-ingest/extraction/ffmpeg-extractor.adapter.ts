@@ -69,6 +69,26 @@ export const MAX_TOTAL_EXTRACTION_BYTES = 128 * 1024 * 1024;
 // synchronous upload request indefinitely.
 export const MAX_STREAMING_DEADLINE_MS = 120_000;
 
+// How long a READINESS answer (see checkToolingReady) stays good. The check
+// exists so a pre-buffer upload gate can refuse BEFORE the multipart body is
+// read; spawning a child on EVERY upload request would defeat the point of a
+// cheap gate, and — worse — an unmemoized NEGATIVE would turn one missing
+// binary into a spawn storm, one failed exec per rejected request. A minute
+// is short enough that an operator installing ffmpeg sees the gate open
+// without a restart, long enough that a request burst costs one exec.
+export const TOOLING_READY_TTL_MS = 60_000;
+
+// The readiness invocation is `-version`: it reads no input, decodes
+// nothing, and returns in milliseconds, so its kill timeout is far tighter
+// than the work ceiling — a host where `ffmpeg -version` needs seconds is
+// not a host that can screen an upload inside a request.
+export const TOOLING_READY_TIMEOUT_MS = 2_000;
+
+// `-version` prints a banner plus the build's configure flags — a few KiB.
+// The cap is generous for that and still bounds a hostile PATH entry; an
+// overrun rejects, which reads as NOT ready (fail-closed, never a pass).
+const TOOLING_READY_MAX_OUTPUT_BYTES = 256 * 1024;
+
 // Probe ceilings for controlled TEST clips. ffprobe output is derived from
 // attacker-supplied container metadata: without upper bounds a tiny crafted
 // upload can claim an arbitrarily large duration (overflowing the
@@ -108,6 +128,16 @@ export function buildProbeArgs(internalPath: string): string[] {
     'v:0',
     internalPath,
   ];
+}
+
+/**
+ * The READINESS vector: a fixed, single flag that makes the tool print its
+ * banner and exit. No input, no path, no user-influenced value, no decode —
+ * the cheapest possible proof that the binary exists, is executable, and
+ * runs. Exported for tests.
+ */
+export function buildVersionArgs(): string[] {
+  return ['-version'];
 }
 
 export function buildFrameArgs(
@@ -233,6 +263,13 @@ type AbortReason = 'stop' | 'frame-bytes' | 'frame-count' | 'deadline' | 'callba
  * a kill at the fixed ceiling keeps the infrastructure classification. The
  * two can never be confused because the reason is decided by which bound
  * was actually in force, not by inspecting the kill after the fact.
+ *
+ * A TIE (remaining budget EXACTLY the command ceiling — the default 30 s
+ * screening budget hits this on its very first probe) is the CALLER's
+ * budget: the caller asked for no more than that much wall clock, so a kill
+ * at that instant is the caller's allowance running out, not the host
+ * misbehaving. Only a budget STRICTLY GREATER than the ceiling (or no
+ * budget at all) leaves the adapter's own ceiling as the binding bound.
  */
 type ProbeAbortReason = 'deadline';
 
@@ -455,6 +492,22 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
   // (the quarantine screening preview) may serve from this adapter.
   readonly readsRealBytes = true;
 
+  /**
+   * The memoized readiness answer and the wall-clock instant it was taken,
+   * held per ADAPTER INSTANCE (the module registers one, so the cache is
+   * process-wide in practice without a module-level global that tests would
+   * have to reset between cases).
+   */
+  private toolingReadyCache: { ready: boolean; checkedAtMs: number } | null =
+    null;
+
+  /**
+   * The in-flight check, so a burst of concurrent uploads arriving on a cold
+   * cache collapses onto ONE exec instead of one each — the same "cheap
+   * gate" reason the TTL exists.
+   */
+  private toolingReadyInFlight: Promise<boolean> | null = null;
+
   constructor(
     // The CONCRETE local adapter, not the neutral port: only local storage
     // has filesystem paths, and this adapter is local-only by definition.
@@ -462,6 +515,73 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
     private readonly runCommand: RunCommand = defaultRunCommand,
   ) {
     super();
+  }
+
+  /**
+   * Does the extraction tooling ACTUALLY run on this host? `readsRealBytes`
+   * only says this strategy decodes real bytes when it works — with
+   * VIDEO_FFMPEG_ENABLED=true and no ffmpeg installed the flag is still
+   * true, so a gate keyed on it alone buffers an entire upload before
+   * anything fails. This runs the binaries.
+   *
+   * BOTH binaries are checked, ffprobe AND ffmpeg: a screen needs the probe
+   * AND the decode, so a host with only one of them cannot screen an
+   * upload, and reporting ready on the strength of one would recreate the
+   * very "the gate passed, then the work failed" hole this closes.
+   *
+   * MEMOIZED for TOOLING_READY_TTL_MS — negatives included. Never throws:
+   * every failure shape (ENOENT, EACCES, nonzero exit, timeout kill,
+   * output overrun, a runner that rejects with anything at all) is simply
+   * NOT READY. The error object is DISCARDED unexamined, so no path, argv,
+   * errno, or stderr can escape through this seam — the answer is a bare
+   * boolean and the caller composes the controlled message.
+   *
+   * Readiness says the TOOLING RUNS. It says nothing about any clip.
+   */
+  checkToolingReady(): Promise<boolean> {
+    const cached = this.toolingReadyCache;
+    if (
+      cached !== null &&
+      Date.now() - cached.checkedAtMs < TOOLING_READY_TTL_MS
+    ) {
+      return Promise.resolve(cached.ready);
+    }
+    if (this.toolingReadyInFlight !== null) {
+      return this.toolingReadyInFlight;
+    }
+    const check = this.runToolingReadyProbe()
+      // Belt and braces: the probe below already converts every rejection
+      // to `false`, and this guarantees the promise this method hands out
+      // can never reject even if that changes.
+      .catch(() => false)
+      .then((ready) => {
+        this.toolingReadyCache = { ready, checkedAtMs: Date.now() };
+        this.toolingReadyInFlight = null;
+        return ready;
+      });
+    this.toolingReadyInFlight = check;
+    return check;
+  }
+
+  /** One uncached readiness pass over both binaries. Never rejects. */
+  private async runToolingReadyProbe(): Promise<boolean> {
+    for (const binary of [FFPROBE_BINARY, FFMPEG_BINARY]) {
+      try {
+        await this.runCommand(
+          binary,
+          buildVersionArgs(),
+          TOOLING_READY_MAX_OUTPUT_BYTES,
+          undefined,
+          TOOLING_READY_TIMEOUT_MS,
+        );
+      } catch {
+        // Deliberately UNBOUND: the error is never read, let alone
+        // returned or logged. Missing, non-executable, killed, chatty,
+        // or exiting nonzero — all of it is one word: not ready.
+        return false;
+      }
+    }
+    return true;
   }
 
   private async run(
@@ -1105,7 +1225,9 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
    * attributed without guessing: killed under a BINDING aggregate budget →
    * ScreeningDeadlineExceededError, the same fail-closed verdict the
    * caller already handles for streamFrames; killed at the adapter's own
-   * fixed ceiling → the existing ExtractionInfrastructureError.
+   * fixed ceiling → the existing ExtractionInfrastructureError. EQUALITY
+   * counts as caller-bound (see below): the infrastructure classification
+   * is reserved for a budget STRICTLY GREATER than the ceiling, or none.
    *
    * Nothing here proves the clip safe: a probe reports geometry and
    * duration only.
@@ -1126,9 +1248,19 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
         throw new ScreeningDeadlineExceededError();
       }
       timeoutMs = Math.min(COMMAND_TIMEOUT_MS, deadlineMs);
-      if (timeoutMs < COMMAND_TIMEOUT_MS) {
+      if (deadlineMs <= COMMAND_TIMEOUT_MS) {
         // The aggregate budget — not the fixed ceiling — is what will kill
         // this child, so a kill is the DEADLINE verdict.
+        //
+        // The comparison is `<=`, NOT `<`: at a TIE the two bounds expire
+        // at the same instant, and the caller's allowance is the one that
+        // MEANS something — it asked for at most this much wall clock, so
+        // running out of it is the controlled pre-storage screening
+        // rejection, never a claim that the host is broken. The tie is not
+        // exotic: the default 30 s aggregate screening budget IS
+        // COMMAND_TIMEOUT_MS, so the very first probe of every default
+        // screen lands exactly here. Classifying it as infrastructure
+        // turned an ordinary slow clip into a retryable 503.
         abortReason = 'deadline';
       }
     }
