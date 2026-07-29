@@ -79,12 +79,18 @@ export async function api<T>(
  * Multipart upload variant of api(): the browser sets the Content-Type
  * (with boundary) itself, so no explicit header is sent. Same Bearer token
  * and error envelope handling as api().
+ *
+ * `extraHeaders` exists for gates the server must evaluate BEFORE it reads
+ * the body — a multipart field cannot be one, because reaching it requires
+ * parsing (and buffering) the whole upload first. Optional, so existing
+ * call sites are unaffected.
  */
 export async function apiUpload<T>(
   path: string,
   formData: FormData,
+  extraHeaders: Record<string, string> = {},
 ): Promise<T> {
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { ...extraHeaders };
   const token = getToken();
   if (token) {
     headers.Authorization = `Bearer ${token}`;

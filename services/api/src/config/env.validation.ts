@@ -258,6 +258,33 @@ export function parseCorsOrigins(value: string | undefined): string[] {
   return origins.length > 0 ? origins : ['http://localhost:5173'];
 }
 
+/**
+ * SINGLE SOURCE OF TRUTH for how the Phase 10 `'true'|'false'` env flags
+ * (VIDEO_TEST_MEDIA_INGEST_ENABLED, VIDEO_FFMPEG_ENABLED, VIDEO_OCR_ENABLED,
+ * VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS) are interpreted as booleans.
+ *
+ * INVARIANT: startup validation (the assertions below), the video-ingest
+ * module's adapter factories, and the upload gate in the video-assets service
+ * MUST all agree on what "enabled" means. This helper IS that definition —
+ * every consumer should call it rather than hand-comparing the raw string.
+ * A mismatch is a real outage class: a deployment configured with
+ * `VIDEO_TEST_MEDIA_INGEST_ENABLED=TRUE` boots fine and selects the real
+ * tooling, yet a gate that compares the exact string `'true'` stays closed
+ * and 503s every upload.
+ *
+ * Normalization matches exactly what `@Matches(/^(true|false)$/i)` admits:
+ * trim, case-insensitive, `'true'` -> true. `'false'`, `undefined`, and the
+ * empty string -> false.
+ *
+ * FAILS CLOSED on anything else ('yes', '1', 'on', ...) -> false. Such values
+ * cannot reach here in a running process — validateSync rejects them at boot
+ * — but the helper must never widen "enabled" beyond the validated spelling
+ * if it is ever called on unvalidated input.
+ */
+export function isEnvFlagEnabled(value: string | undefined): boolean {
+  return value?.trim().toLowerCase() === 'true';
+}
+
 export function assertJwtSecretUsable(secret: string): void {
   // Never echo the secret value in errors.
   if (PLACEHOLDER_JWT_PATTERNS.some((pattern) => pattern.test(secret))) {
@@ -280,7 +307,7 @@ export function assertJwtSecretUsable(secret: string): void {
 export function assertScreeningBypassUnsupported(
   bypass: string | undefined,
 ): void {
-  if (bypass?.toLowerCase() === 'true') {
+  if (isEnvFlagEnabled(bypass)) {
     throw new Error(
       'VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS is not supported because ' +
         'raw media cannot be persisted before screening.',
@@ -297,12 +324,17 @@ export function assertScreeningBypassUnsupported(
  * upload-accepting environment). Non-enum NODE_ENV values never reach here:
  * the NodeEnv enum rejects them upstream in validateSync. false/unset is
  * always fine, in every environment.
+ *
+ * "true" here means isEnvFlagEnabled — the SAME definition the video-ingest
+ * module adapter factories and the upload gate must use, so a `TRUE` spelling
+ * can never be enabled at startup yet read as disabled by a consumer (or
+ * vice versa).
  */
 export function assertTestMediaIngestNonProduction(
   enabled: string | undefined,
   nodeEnv: NodeEnv | undefined,
 ): void {
-  if (enabled?.toLowerCase() !== 'true') {
+  if (!isEnvFlagEnabled(enabled)) {
     return;
   }
   if (nodeEnv === NodeEnv.Development || nodeEnv === NodeEnv.Test) {

@@ -1212,6 +1212,61 @@ describe('VideoAssetsRepository.createArtifactsBatch', () => {
     expect(auditLog.record).not.toHaveBeenCalled();
   });
 
+  it('reports parent-deleted (not a bare null) when the publication loses to a soft-delete', async () => {
+    // Codex P1: the caller must be able to tell the ONE terminal
+    // publication failure — a deleted parent — from an ordinary CAS loss,
+    // because it is the only one that authorizes removing the files it
+    // staged (deletion is irreversible, so no rival attempt can ever
+    // publish them, and the delete's recursive prefix removal owns
+    // everything under the asset prefix).
+    const tx = makeTx();
+    tx.videoAsset.findFirst = jest
+      .fn()
+      // The guarded read (deletedAt: null) finds nothing...
+      .mockResolvedValueOnce(null)
+      // ...and the unguarded re-read proves WHY.
+      .mockResolvedValueOnce({ deletedAt: new Date() });
+    const { repository, auditLog } = makeRepository(tx);
+    const result = await repository.createArtifactsBatch(
+      TENANT,
+      'asset-1',
+      'op-hash-1',
+      [VideoAssetStatus.VALIDATED, VideoAssetStatus.READY],
+      undefined,
+      items,
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
+    );
+    expect(result).toBe('parent-deleted');
+    expect(tx.videoArtifact.create).not.toHaveBeenCalled();
+    expect(auditLog.record).not.toHaveBeenCalled();
+  });
+
+  it('stays null when the CAS loses to a STATUS change on a live asset (fail closed, files kept)', async () => {
+    const tx = makeTx();
+    tx.videoAsset.findFirst = jest
+      .fn()
+      .mockResolvedValueOnce({
+        id: 'asset-1',
+        status: VideoAssetStatus.UPLOADED, // not in the expected set
+      })
+      // The re-read finds the row alive: an ordinary CAS loss.
+      .mockResolvedValueOnce({ deletedAt: null });
+    const { repository } = makeRepository(tx);
+    await expect(
+      repository.createArtifactsBatch(
+        TENANT,
+        'asset-1',
+        'op-hash-1',
+        [VideoAssetStatus.VALIDATED, VideoAssetStatus.READY],
+        undefined,
+        items,
+        () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+        () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
+      ),
+    ).resolves.toBeNull();
+  });
+
   it('publishes every row, every artifact audit, and the READY flip together', async () => {
     const tx = makeTx();
     const { repository, auditLog } = makeRepository(tx);
@@ -1227,7 +1282,7 @@ describe('VideoAssetsRepository.createArtifactsBatch', () => {
     );
     expect(result).not.toBeNull();
     expect(result).not.toBe('key-conflict');
-    const batch = result as Exclude<typeof result, 'key-conflict' | null>;
+    const batch = result as Exclude<typeof result, 'key-conflict' | 'parent-deleted' | null>;
     expect(batch.artifacts).toHaveLength(2);
     expect(tx.videoArtifact.create).toHaveBeenCalledTimes(2);
     // Two artifact audits + one asset transition audit, all inside the tx.
@@ -1253,7 +1308,7 @@ describe('VideoAssetsRepository.createArtifactsBatch', () => {
       () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
       () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
     );
-    const batch = result as Exclude<typeof result, 'key-conflict' | null>;
+    const batch = result as Exclude<typeof result, 'key-conflict' | 'parent-deleted' | null>;
     expect(batch.replayed).toBe(false);
     const [{ data }] = tx.videoExtractionRequest.create.mock.calls[0] as [
       { data: { idempotencyKey: string; artifactIds: string[] } },
@@ -1289,7 +1344,7 @@ describe('VideoAssetsRepository.createArtifactsBatch', () => {
       () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
       () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
     );
-    const batch = result as Exclude<typeof result, 'key-conflict' | null>;
+    const batch = result as Exclude<typeof result, 'key-conflict' | 'parent-deleted' | null>;
     expect(batch.replayed).toBe(true);
     expect(batch.artifacts.map((artifact) => artifact.id)).toEqual([
       'artifact-9',
@@ -1407,7 +1462,7 @@ describe('extraction operation advisory lock', () => {
       () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
       () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
     );
-    const batch = result as Exclude<typeof result, 'key-conflict' | null>;
+    const batch = result as Exclude<typeof result, 'key-conflict' | 'parent-deleted' | null>;
     expect(batch.committedStagedKeys).toEqual([items[0].storageKey]);
     const [{ where, select }] = tx.videoArtifact.findMany.mock
       .calls[0] as unknown as [

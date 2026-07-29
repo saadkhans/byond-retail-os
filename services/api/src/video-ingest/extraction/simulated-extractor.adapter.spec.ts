@@ -68,6 +68,23 @@ describe('SimulatedVideoFrameExtractor', () => {
     await expect(session.close()).resolves.toBeUndefined();
   });
 
+  it('accepts (and ignores) a probe deadline, keeping the session contract shape identical', async () => {
+    // The aggregate screening budget covers probe AND decode on the real
+    // adapter; the simulated session must take the same option so callers
+    // wire without special cases. Nothing here runs a tool, so no budget
+    // can be consumed — the result is the same constant every time, which
+    // also satisfies the memoization contract trivially.
+    const session = await extractor.inspectBuffer(Buffer.from('ignored'));
+    await expect(session.probe()).resolves.toEqual(SIMULATED_PROBE);
+    await expect(session.probe({ deadlineMs: 1 })).resolves.toEqual(
+      SIMULATED_PROBE,
+    );
+    await expect(session.probe({ deadlineMs: 300_000 })).resolves.toEqual(
+      SIMULATED_PROBE,
+    );
+    await session.close();
+  });
+
   it('honors an early stop from the screener without an error', async () => {
     const session = await extractor.inspectBuffer(Buffer.from('ignored'));
     const frames: Buffer[] = [];

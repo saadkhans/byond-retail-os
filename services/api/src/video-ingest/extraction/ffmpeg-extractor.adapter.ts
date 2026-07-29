@@ -45,7 +45,12 @@ export const UNSTREAMABLE_CONTAINER_MESSAGE =
 // cap exists so a hostile container cannot balloon the parent process.
 // Exported: it is the ceiling every caller-supplied maxBytes is clamped to.
 export const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
-const COMMAND_TIMEOUT_MS = 30_000;
+
+// The adapter's OWN fixed ceiling on ONE exec'd command. It bounds a hung
+// tool; it is NOT a screening budget. Exported because it is the value a
+// caller-supplied screening deadline is clamped AGAINST: the effective
+// ffprobe timeout is min(remaining aggregate budget, this) — never more.
+export const COMMAND_TIMEOUT_MS = 30_000;
 
 // Request-wide decoded-byte budget for the STORAGE-KEY multi-frame batch
 // (extractFrames over already-screened, already-stored media): the
@@ -220,6 +225,17 @@ export interface StreamFramesResult {
  */
 type AbortReason = 'stop' | 'frame-bytes' | 'frame-count' | 'deadline' | 'callback';
 
+/**
+ * Why an exec'd PROBE would have been killed BY THE BUDGET rather than by
+ * the adapter's own fixed command ceiling. Recorded BEFORE the child can
+ * exist — exactly the bookkeeping-first discipline streamFrames uses — so a
+ * kill under a binding aggregate budget is read as the DEADLINE verdict and
+ * a kill at the fixed ceiling keeps the infrastructure classification. The
+ * two can never be confused because the reason is decided by which bound
+ * was actually in force, not by inspecting the kill after the fact.
+ */
+type ProbeAbortReason = 'deadline';
+
 interface ProbeStream {
   width?: number;
   height?: number;
@@ -304,6 +320,10 @@ type RunCommand = (
   /** When present, the child's ENTIRE stdin — the in-memory inspection
    *  path feeds unscreened bytes this way so they never touch disk. */
   stdin?: Buffer,
+  /** Wall-clock kill timeout for THIS invocation. Absent means the
+   *  adapter's own fixed ceiling (COMMAND_TIMEOUT_MS); the screening
+   *  probe passes min(remaining aggregate budget, that ceiling). */
+  timeoutMs?: number,
 ) => Promise<{ stdout: Buffer }>;
 
 /** Error shape execFile produces: exit failures carry a NUMERIC code, spawn/
@@ -331,6 +351,18 @@ export function isMaxBufferOverflow(error: unknown): boolean {
 }
 
 /**
+ * The child was KILLED rather than allowed to exit: a timeout kill sets
+ * `killed` (plus a signal), an external SIGKILL sets the signal alone.
+ * Recognized separately so a kill that happened under a BINDING screening
+ * budget can map to the deadline verdict instead of the infrastructure
+ * classification — the timing analogue of isMaxBufferOverflow.
+ */
+export function isProcessKill(error: unknown): boolean {
+  const failure = (error ?? {}) as CommandError;
+  return failure.killed === true || typeof failure.signal === 'string';
+}
+
+/**
  * Classify a child-process failure so INFRASTRUCTURE problems stay
  * retryable instead of permanently rejecting a valid asset:
  *
@@ -355,7 +387,7 @@ export function classifyCommandError(error: unknown): Error {
   if (failure.code === 'ENOENT') {
     return new ExtractorUnavailableError();
   }
-  if (failure.killed === true || typeof failure.signal === 'string') {
+  if (isProcessKill(error)) {
     return new ExtractionInfrastructureError();
   }
   if (isMaxBufferOverflow(error)) {
@@ -367,7 +399,13 @@ export function classifyCommandError(error: unknown): Error {
   return new ExtractionFailedError();
 }
 
-const defaultRunCommand: RunCommand = (binary, args, maxOutputBytes, stdin) =>
+const defaultRunCommand: RunCommand = (
+  binary,
+  args,
+  maxOutputBytes,
+  stdin,
+  timeoutMs,
+) =>
   new Promise((resolvePromise, rejectPromise) => {
     const child = execFile(
       binary,
@@ -377,7 +415,9 @@ const defaultRunCommand: RunCommand = (binary, args, maxOutputBytes, stdin) =>
         // The caller passes the REMAINING request budget, so a single
         // invocation can never allocate past the aggregate ceiling.
         maxBuffer: maxOutputBytes,
-        timeout: COMMAND_TIMEOUT_MS,
+        // Likewise for TIME: the caller passes the already-clamped
+        // effective timeout, and no caller can raise the fixed ceiling.
+        timeout: timeoutMs ?? COMMAND_TIMEOUT_MS,
         windowsHide: true,
         // No shell: arguments reach the binary as a vector, so no value can
         // be reinterpreted as shell syntax.
@@ -616,15 +656,25 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
    * probe() does, memoized — and close() only releases references, so it
    * is trivially idempotent and a crash can leak nothing.
    *
+   * TIME BUDGET: the caller's aggregate screening allowance covers BOTH
+   * tool stages. probe() takes the remaining slice as `deadlineMs` and
+   * clamps the ffprobe timeout to min(that, COMMAND_TIMEOUT_MS);
+   * streamFrames() takes what is left after probing. Either stage running
+   * out gives the same ScreeningDeadlineExceededError verdict, so no
+   * external tool can run past the upload-wide bound on its own ceiling.
+   *
    * The frames this session yields are a REJECTION signal only: they let
    * the caller refuse an upload whose pixels show card or credential
-   * content. A stream that trips nothing proves NOTHING about the clip.
+   * content. A stream that trips nothing proves NOTHING about the clip,
+   * and neither does a successful probe.
    */
   inspectBuffer(data: Buffer): Promise<BufferInspectionSession> {
     let bytes: Buffer | null = data;
     let memoizedProbe: Promise<VideoProbeResult> | undefined;
 
-    const probe = (): Promise<VideoProbeResult> => {
+    const probe = (options?: {
+      deadlineMs?: number;
+    }): Promise<VideoProbeResult> => {
       if (memoizedProbe === undefined) {
         if (bytes === null) {
           // Closed session: the bytes are gone, a controlled content
@@ -632,8 +682,13 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
           return Promise.reject(new ExtractionFailedError());
         }
         // Memoized INCLUDING failure — the verdict on these bytes cannot
-        // change, so the tooling never re-runs for the same session.
-        memoizedProbe = this.probeFromStdin(bytes);
+        // change, so the tooling never re-runs for the same session. The
+        // FIRST call's budget is therefore the only one that ever applies:
+        // later calls return this same settled promise and their own
+        // options are deliberately IGNORED (re-running under a second
+        // budget would re-run the tooling, which this memoization exists
+        // to prevent).
+        memoizedProbe = this.probeFromStdin(bytes, options?.deadlineMs);
       }
       return memoizedProbe;
     };
@@ -1032,11 +1087,51 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
     });
   }
 
-  /** STDIN probe for the in-memory inspection: the tool running and
-   *  refusing the piped container (numeric exit — moov-at-end MP4s land
-   *  here) is the controlled unstreamable-container content failure;
-   *  spawn/timeout/errno/maxBuffer keep the standard classification. */
-  private async probeFromStdin(bytes: Buffer): Promise<VideoProbeResult> {
+  /**
+   * STDIN probe for the in-memory inspection: the tool running and
+   * refusing the piped container (numeric exit — moov-at-end MP4s land
+   * here) is the controlled unstreamable-container content failure;
+   * spawn/errno/maxBuffer keep the standard classification.
+   *
+   * TIME: probing is the FIRST external-tool stage of a screen, so it runs
+   * INSIDE the caller's aggregate wall-clock budget, not beside it. The
+   * effective ffprobe timeout is min(remaining aggregate budget, the
+   * adapter's own fixed COMMAND_TIMEOUT_MS ceiling) — a caller budget only
+   * ever tightens, never raises. Without `deadlineMs` the fixed ceiling is
+   * the only bound (unchanged behavior for the storage-key callers).
+   *
+   * Which bound is in force is recorded BEFORE the child can be spawned
+   * (the same bookkeeping-first rule streamFrames follows), so a kill is
+   * attributed without guessing: killed under a BINDING aggregate budget →
+   * ScreeningDeadlineExceededError, the same fail-closed verdict the
+   * caller already handles for streamFrames; killed at the adapter's own
+   * fixed ceiling → the existing ExtractionInfrastructureError.
+   *
+   * Nothing here proves the clip safe: a probe reports geometry and
+   * duration only.
+   */
+  private async probeFromStdin(
+    bytes: Buffer,
+    deadlineMs?: number,
+  ): Promise<VideoProbeResult> {
+    // Recorded BEFORE any spawn; stays null when the adapter's own fixed
+    // ceiling is the binding bound, so the two kill causes cannot mix.
+    let abortReason: ProbeAbortReason | null = null;
+    let timeoutMs = COMMAND_TIMEOUT_MS;
+    if (deadlineMs !== undefined) {
+      if (!Number.isInteger(deadlineMs) || deadlineMs <= 0) {
+        // A degenerate/EXPIRED remaining budget leaves no time to probe
+        // anything — the time-budget verdict, decided before any spawn,
+        // exactly as streamFrames decides a degenerate deadlineMs.
+        throw new ScreeningDeadlineExceededError();
+      }
+      timeoutMs = Math.min(COMMAND_TIMEOUT_MS, deadlineMs);
+      if (timeoutMs < COMMAND_TIMEOUT_MS) {
+        // The aggregate budget — not the fixed ceiling — is what will kill
+        // this child, so a kill is the DEADLINE verdict.
+        abortReason = 'deadline';
+      }
+    }
     let stdout: Buffer;
     try {
       ({ stdout } = await this.runCommand(
@@ -1044,8 +1139,14 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
         buildProbeArgs(PIPE_INPUT),
         MAX_OUTPUT_BYTES,
         bytes,
+        timeoutMs,
       ));
     } catch (error) {
+      if (abortReason === 'deadline' && isProcessKill(error)) {
+        // Killed while the caller's budget was the binding bound: the
+        // screen did not fit its time, nothing about the host is broken.
+        throw new ScreeningDeadlineExceededError();
+      }
       const classified = classifyCommandError(error);
       if (classified instanceof ExtractionFailedError) {
         throw new ExtractionFailedError(UNSTREAMABLE_CONTAINER_MESSAGE);

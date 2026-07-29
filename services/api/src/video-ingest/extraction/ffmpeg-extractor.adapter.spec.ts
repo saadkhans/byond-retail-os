@@ -9,6 +9,7 @@ import {
   buildFrameArgs,
   buildProbeArgs,
   classifyCommandError,
+  COMMAND_TIMEOUT_MS,
   FfmpegVideoFrameExtractor,
   MAX_OUTPUT_BYTES,
   MAX_PROBE_DIMENSION,
@@ -676,6 +677,215 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
         ExtractionInfrastructureError,
       );
       await killedSession.close();
+    });
+
+    /**
+     * The Codex P2 fix: the AGGREGATE screening budget must cover PROBING
+     * too. Before this, probe() took no deadline and ran on the adapter's
+     * fixed 30 s command timeout, so a 1 s configured budget still allowed
+     * ~30 s inside ffprobe — the promised upload-wide bound did not reach
+     * the FIRST external-tool stage.
+     */
+    describe('probe deadline (the aggregate budget covers probing too)', () => {
+      /** Runner recording the TIMEOUT each invocation was handed. */
+      const timeoutRecordingRunner =
+        (timeouts: (number | undefined)[], duration = '10.0') =>
+        (
+          _binary: string,
+          _args: string[],
+          _maxOutputBytes: number,
+          _stdin?: Buffer,
+          timeoutMs?: number,
+        ) => {
+          timeouts.push(timeoutMs);
+          return Promise.resolve({ stdout: Buffer.from(probeJson(duration)) });
+        };
+
+      it('clamps the ffprobe timeout DOWN to the remaining aggregate budget', async () => {
+        const timeouts: (number | undefined)[] = [];
+        const extractor = new FfmpegVideoFrameExtractor(
+          storageStub,
+          timeoutRecordingRunner(timeouts),
+        );
+        const session = await extractor.inspectBuffer(Buffer.from('x'));
+        await expect(session.probe({ deadlineMs: 1000 })).resolves.toMatchObject(
+          { durationMs: 10_000 },
+        );
+        // THE regression pin: the invocation's kill timeout is the caller's
+        // remaining budget, not the adapter's 30 s ceiling.
+        expect(timeouts).toEqual([1000]);
+        expect(timeouts[0]).toBeLessThan(COMMAND_TIMEOUT_MS);
+        await session.close();
+      });
+
+      it('keeps the adapter fixed ceiling when the remaining budget is larger (a caller budget never RAISES it)', async () => {
+        const timeouts: (number | undefined)[] = [];
+        const extractor = new FfmpegVideoFrameExtractor(
+          storageStub,
+          timeoutRecordingRunner(timeouts),
+        );
+        // Memoization means one probe per session — a session each.
+        const generous = await extractor.inspectBuffer(Buffer.from('x'));
+        await generous.probe({ deadlineMs: COMMAND_TIMEOUT_MS * 4 });
+        // Exactly at the ceiling: the ceiling is still what bounds it.
+        const tie = await extractor.inspectBuffer(Buffer.from('x'));
+        await tie.probe({ deadlineMs: COMMAND_TIMEOUT_MS });
+        // No budget at all → the pre-existing behavior, unchanged.
+        const none = await extractor.inspectBuffer(Buffer.from('x'));
+        await none.probe();
+        expect(timeouts).toEqual([
+          COMMAND_TIMEOUT_MS,
+          COMMAND_TIMEOUT_MS,
+          COMMAND_TIMEOUT_MS,
+        ]);
+        await generous.close();
+        await tie.close();
+        await none.close();
+      });
+
+      it('rejects ScreeningDeadlineExceededError when the kill happened under a BINDING aggregate budget', async () => {
+        // The caller's budget — not the fixed ceiling — is what bounded
+        // this child, so the kill is the same fail-closed DEADLINE verdict
+        // streamFrames gives, never a retryable infrastructure failure.
+        const timeoutKill = Object.assign(
+          new Error('killed /secret/upload.mp4'),
+          { killed: true, signal: 'SIGTERM' },
+        );
+        const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+          Promise.reject(timeoutKill),
+        );
+        const session = await extractor.inspectBuffer(Buffer.from('x'));
+        const error: Error = await session.probe({ deadlineMs: 1000 }).then(
+          () => {
+            throw new Error('expected rejection');
+          },
+          (caught: Error) => caught,
+        );
+        expect(error).toBeInstanceOf(ScreeningDeadlineExceededError);
+        // Same controlled message as the decode deadline — no timings or
+        // paths echoed.
+        expect(error.message).toBe(
+          'The screening decode exceeded its time budget',
+        );
+        expect(error.message).not.toContain('/secret');
+        await session.close();
+      });
+
+      it('keeps a kill at the adapter OWN fixed ceiling infrastructure-classified', async () => {
+        const timeoutKill = Object.assign(new Error('killed'), {
+          killed: true,
+          signal: 'SIGTERM',
+        });
+        const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+          Promise.reject(timeoutKill),
+        );
+        // A budget WIDER than the ceiling: the ceiling is what fired, so
+        // the existing retryable classification stands.
+        const generous = await extractor.inspectBuffer(Buffer.from('x'));
+        await expect(
+          generous.probe({ deadlineMs: COMMAND_TIMEOUT_MS * 4 }),
+        ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+        // No budget at all: unchanged behavior.
+        const none = await extractor.inspectBuffer(Buffer.from('x'));
+        await expect(none.probe()).rejects.toBeInstanceOf(
+          ExtractionInfrastructureError,
+        );
+        await generous.close();
+        await none.close();
+      });
+
+      it('rejects a degenerate/EXPIRED remaining budget WITHOUT spawning anything', async () => {
+        const runner = jest.fn(() =>
+          Promise.resolve({ stdout: Buffer.from(probeJson('10.0')) }),
+        );
+        const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+        // An expired budget (<= 0) and non-integer shapes alike: nothing
+        // can be probed inside them, decided BEFORE any tool runs. One
+        // session per case — the verdict is memoized per session.
+        for (const deadlineMs of [0, -1, -5000, 1.5, Number.NaN]) {
+          const session = await extractor.inspectBuffer(Buffer.from('x'));
+          await expect(session.probe({ deadlineMs })).rejects.toBeInstanceOf(
+            ScreeningDeadlineExceededError,
+          );
+          await session.close();
+        }
+        expect(runner).not.toHaveBeenCalled();
+        expect(spawnMock).not.toHaveBeenCalled();
+        // And nothing was ever materialized on disk.
+        expect(mkdtemp).not.toHaveBeenCalled();
+        expect(writeFile).not.toHaveBeenCalled();
+      });
+
+      it('memoizes the FIRST probe: a later call with different options returns it without re-running the tool', async () => {
+        const timeouts: (number | undefined)[] = [];
+        const extractor = new FfmpegVideoFrameExtractor(
+          storageStub,
+          timeoutRecordingRunner(timeouts),
+        );
+        const session = await extractor.inspectBuffer(Buffer.from('x'));
+        const first = await session.probe({ deadlineMs: 1000 });
+        const second = await session.probe({ deadlineMs: 25 });
+        const third = await session.probe();
+        expect(second).toEqual(first);
+        expect(third).toEqual(first);
+        // Only the FIRST call's budget ever reached the tool.
+        expect(timeouts).toEqual([1000]);
+        await session.close();
+      });
+
+      it('memoizes a probe DEADLINE failure too — a later generous budget never re-runs the tool', async () => {
+        const runner = jest.fn(() =>
+          Promise.resolve({ stdout: Buffer.from(probeJson('10.0')) }),
+        );
+        const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+        const session = await extractor.inspectBuffer(Buffer.from('x'));
+        await expect(session.probe({ deadlineMs: 0 })).rejects.toBeInstanceOf(
+          ScreeningDeadlineExceededError,
+        );
+        // The verdict on these bytes cannot change mid-session: the
+        // memoized failure stands and the tooling stays unspawned.
+        await expect(
+          session.probe({ deadlineMs: COMMAND_TIMEOUT_MS }),
+        ).rejects.toBeInstanceOf(ScreeningDeadlineExceededError);
+        expect(runner).not.toHaveBeenCalled();
+        expect(spawnMock).not.toHaveBeenCalled();
+        await session.close();
+      });
+
+      it('keeps NON-kill failures classified as before under a binding budget', async () => {
+        // The deadline attribution keys on a KILL under a binding budget —
+        // it must not swallow the other classifications.
+        const cases: [unknown, unknown][] = [
+          [
+            Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }),
+            ExtractorUnavailableError,
+          ],
+          [
+            Object.assign(new Error('spawn EACCES'), { code: 'EACCES' }),
+            ExtractionInfrastructureError,
+          ],
+          [
+            // The tool RAN and refused the piped container: still the
+            // controlled unstreamable-container content failure.
+            Object.assign(new Error('ffprobe exited 1: moov atom not found'), {
+              code: 1,
+              killed: false,
+              signal: null,
+            }),
+            ExtractionFailedError,
+          ],
+        ];
+        for (const [rejection, expected] of cases) {
+          const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+            Promise.reject(rejection),
+          );
+          const session = await extractor.inspectBuffer(Buffer.from('x'));
+          await expect(
+            session.probe({ deadlineMs: 1000 }),
+          ).rejects.toBeInstanceOf(expected as new () => Error);
+          await session.close();
+        }
+      });
     });
 
     it('close() is idempotent; a closed session fails controlled, never touching tooling or disk', async () => {

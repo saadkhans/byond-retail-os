@@ -26,6 +26,7 @@ import {
   SYSTEM_ACTOR_EMAIL,
 } from '../common/audit/audit-log.service';
 import { containsSensitiveValue } from '../common/sensitive-keys';
+import { isEnvFlagEnabled } from '../config/env.validation';
 import { DEFAULT_PRIORITY } from '../inference/dto/create-inference-job.dto';
 import { InferenceJobsService } from '../inference/inference-jobs.service';
 import { InferenceJobDetail } from '../inference/inference-jobs.repository';
@@ -79,6 +80,10 @@ import {
   VideoStoragePort,
 } from './storage/video-storage.port';
 import {
+  SCREENING_TOOLING_UNAVAILABLE_MESSAGE,
+  TEST_MEDIA_GATE_CLOSED_MESSAGE,
+} from './test-media-gate.guard';
+import {
   AssetReferenceRejection,
   VideoArtifactView,
   VideoAssetsRepository,
@@ -93,6 +98,15 @@ export const DEFAULT_MAX_UPLOAD_BYTES = 52_428_800; // 50 MiB — test clips onl
  * enforces its own budget while looping).
  */
 export const MAX_TOTAL_ARTIFACT_BYTES = 128 * 1024 * 1024;
+
+/**
+ * How many hex characters of an artifact's sha256 name its CONTENT-ADDRESSED
+ * staging key (see `stagePublishAndCleanup`). 32 hex chars = 128 bits — far
+ * past any collision an adapter could produce, while keeping the key short
+ * enough to stay comfortably inside filesystem name limits. The artifact row
+ * still records the FULL digest; this is only the file's name.
+ */
+export const STAGED_ARTIFACT_KEY_DIGEST_CHARS = 32;
 
 /**
  * Hard cap on quarantine screening-preview frames per request: enough to
@@ -498,8 +512,12 @@ export class VideoAssetsService {
    * TRUE only when the CONTROLLED TEST-MEDIA POLICY GATE is open — the
    * ONLY thing in Phase 10 that authorizes storing an uploaded clip.
    * Requires BOTH the explicit opt-in (VIDEO_TEST_MEDIA_INGEST_ENABLED,
-   * strictly the literal "true"; any other spelling leaves the gate shut)
-   * AND an explicitly non-production runtime (NODE_ENV exactly
+   * read through the codebase's ONE flag helper `isEnvFlagEnabled` —
+   * trimmed and case-folded, so `TRUE`/` true ` mean what the operator
+   * plainly intended and every other value leaves the gate shut; the
+   * former local `=== 'true'` compare made a `=TRUE` deployment boot fine,
+   * select the real tooling, and then 503 every single upload) AND an
+   * explicitly non-production runtime (NODE_ENV exactly
    * 'development' or 'test'). Startup validation already refuses the flag
    * outside development/test; the NODE_ENV re-check here is DEFENSE IN
    * DEPTH so a config that somehow carries true in production — a
@@ -568,7 +586,7 @@ export class VideoAssetsService {
     // unexpected (an unset or unrecognized value keeps the gate shut).
     const nodeEnv = config.get<string>('NODE_ENV');
     this.testMediaIngestGateOpen =
-      config.get<string>('VIDEO_TEST_MEDIA_INGEST_ENABLED') === 'true' &&
+      isEnvFlagEnabled(config.get<string>('VIDEO_TEST_MEDIA_INGEST_ENABLED')) &&
       (nodeEnv === 'development' || nodeEnv === 'test');
   }
 
@@ -606,16 +624,14 @@ export class VideoAssetsService {
     // that none is there: rotated, blurred, stylized, occluded, or
     // low-quality digits defeat it routinely. With the gate shut the
     // endpoint accepts nothing at all.
+    // ONE definition of the refusal wording, imported from the guard that
+    // raises it first (see TEST_MEDIA_GATE_CLOSED_MESSAGE): the gate runs
+    // in two places — the pre-buffer route guard and this defense-in-depth
+    // re-check for any non-HTTP caller — and the two must be
+    // indistinguishable from the outside, which a second copy of the
+    // string cannot guarantee.
     if (!this.testMediaIngestGateOpen) {
-      throw new ServiceUnavailableException(
-        'Uploads are disabled: Phase 10 accepts CONTROLLED INTERNAL TEST ' +
-          'MEDIA ONLY, under an explicit policy gate that is not enabled ' +
-          'on this deployment. Enable it by setting ' +
-          'VIDEO_TEST_MEDIA_INGEST_ENABLED=true with NODE_ENV explicitly ' +
-          'development or test (it is refused at startup anywhere else). ' +
-          'That gate is what authorizes storing a clip — text/OCR ' +
-          'screening only ever rejects one, so nothing else can open this',
-      );
+      throw new ServiceUnavailableException(TEST_MEDIA_GATE_CLOSED_MESSAGE);
     }
     // FAIL CLOSED, ALSO BEFORE any row or byte: filename and
     // container-text checks cannot see a PAN shown IN THE PIXELS, so the
@@ -629,12 +645,9 @@ export class VideoAssetsService {
     // (the former unscreened-upload override is unsupported and rejected
     // at startup).
     if (!this.extractor.readsRealBytes || !this.recognizer.readsRealPixels) {
+      // Same single-definition rule as the gate above.
       throw new ServiceUnavailableException(
-        'Uploads are refused: pre-storage frame screening cannot run ' +
-          'because the configured extractor and/or frame-text recognizer ' +
-          'do not read the real media — configure VIDEO_FFMPEG_ENABLED=true ' +
-          'and VIDEO_OCR_ENABLED=true (uploads are never stored unscreened ' +
-          'in any environment)',
+        SCREENING_TOOLING_UNAVAILABLE_MESSAGE,
       );
     }
     if (!file || !file.buffer || file.size === 0) {
@@ -1109,9 +1122,10 @@ export class VideoAssetsService {
    *    deliberate abandonment (a detection, or the deadline) that
    *    legitimately screens fewer frames and already has its own verdict.
    * 5b. THE UPLOAD-WIDE DEADLINE (VIDEO_SCREENING_TIMEOUT_MS, default
-   *    30 s) covers decode AND OCR together and is fixed ONCE, at
-   *    screening start, as an absolute wall-clock instant. The remaining
-   *    budget is handed to streamFrames as `deadlineMs` AND re-checked
+   *    30 s) covers the PROBE, the decode AND the OCR together and is
+   *    fixed ONCE, at screening start, as an absolute wall-clock instant.
+   *    The remaining budget is handed to BOTH external-tool stages —
+   *    probe and streamFrames — as `deadlineMs` AND re-checked
    *    inside `onFrame` before every recognizer call, so an expiry
    *    abandons the rest of the stream instead of letting a sequential
    *    per-frame timeout multiply into hours on one request. Expiry —
@@ -1168,8 +1182,34 @@ export class VideoAssetsService {
     const deadlineAt = Date.now() + this.screeningTimeoutMs;
     try {
       session = await this.extractor.inspectBuffer(buffer);
-      const probe = await session.probe();
-      if (probe.durationMs > this.maxScreeningDurationMs) {
+      // THE PROBE IS INSIDE THE BUDGET TOO. It spawns the same external
+      // tooling the decode does, so an unbudgeted probe on a wedged binary
+      // could hold the request open for the adapter's own command timeout
+      // ON TOP of the whole screening allowance the audit promises. The
+      // port takes the REMAINING slice of the absolute deadline fixed
+      // above (a degenerate/expired remainder rejects before anything is
+      // spawned — same verdict, cheaper).
+      //
+      // The rejection is caught HERE rather than left to the outer catch:
+      // `mapPrestoreScreeningError` has no branch for
+      // ScreeningDeadlineExceededError, so a probe expiry falling through
+      // it would surface as an uncontrolled 500. Setting the SAME flag the
+      // streamFrames catch sets lands it on the existing audited
+      // fail-closed rejection that names VIDEO_SCREENING_TIMEOUT_MS.
+      let probe: VideoProbeResult | null = null;
+      try {
+        probe = await session.probe({ deadlineMs: deadlineAt - Date.now() });
+      } catch (error) {
+        if (!(error instanceof ScreeningDeadlineExceededError)) {
+          throw error;
+        }
+        deadlineExceeded = true;
+      }
+      if (probe === null) {
+        // The probe outlived the upload-wide budget: nothing was decoded,
+        // nothing was stored, and the fail-closed deadline verdict below
+        // refuses the upload exactly as an expiry inside the decode does.
+      } else if (probe.durationMs > this.maxScreeningDurationMs) {
         // Gate BEFORE any frame extraction: a clip longer than the
         // screening ceiling cannot have EVERY source frame screened
         // inside the synchronous request — fail closed, decode nothing.
@@ -1618,24 +1658,27 @@ export class VideoAssetsService {
    *
    * WHEN IT MAY RUN AT ALL is the safety-critical part. Staging keys are
    * DETERMINISTIC per request (asset + idempotency key + canonical
-   * fingerprint), so the keys this attempt staged can be the very keys
-   * another attempt of the SAME operation staged — and is about to record
-   * as committed artifact rows. Deleting a key a concurrent publication is
-   * about to commit destroys media that live, append-only rows reference,
-   * and no transaction can be held across these deletes to prevent it. So
-   * the caller may only reach this method with a verdict that is
-   * TERMINAL for the operation (see `stagePublishAndCleanup`): a consumed
-   * idempotency key, whose every future attempt replays instead of
-   * publishing. `committedStagedKeys` — computed inside that same
-   * lock-ordered publish transaction — names the keys a committed batch
-   * already owns; they are kept, everything else is surplus and removed.
+   * fingerprint + the artifact index and its content digest), so the keys
+   * this attempt staged can be the very keys another attempt of the SAME
+   * operation staged — and is about to record as committed artifact rows.
+   * Deleting a key a concurrent publication is about to commit destroys
+   * media that live, append-only rows reference, and no transaction can be
+   * held across these deletes to prevent it. So the caller may only reach
+   * this method with a verdict that is TERMINAL for the operation (see
+   * `stagePublishAndCleanup`): a consumed idempotency key, whose every
+   * future attempt replays instead of publishing — `committedStagedKeys`,
+   * computed inside that same lock-ordered publish transaction, then names
+   * the keys a committed batch already owns, they are kept, and everything
+   * else is surplus and removed — or a SOFT-DELETED parent, which is
+   * terminal and irreversible and under which no key has a surviving owner
+   * at all (the caller passes an empty owner list).
    *
-   * Every other outcome (publication failed outright, CAS lost, staging
-   * itself failed) FAILS CLOSED with the files KEPT: they sit at
+   * Every other outcome (publication failed outright, status CAS lost,
+   * staging itself failed) FAILS CLOSED with the files KEPT: they sit at
    * deterministic keys under the asset's `artifacts/<hash>/` prefix, an
-   * identical retry overwrites them, and asset deletion removes the whole
-   * prefix — keeping them is always recoverable, deleting them when a
-   * rival attempt may still publish is not.
+   * identical retry re-puts identical bytes over them, and asset deletion
+   * removes the whole prefix — keeping them is always recoverable, deleting
+   * them when a rival attempt may still publish is not.
    */
   private async cleanupStagedArtifacts(
     staged: string[],
@@ -3059,11 +3102,12 @@ export class VideoAssetsService {
     // lost publish CAS (audited and escalated as a 503 when it fails) stays
     // the backstop for bytes that landed after a delete's cleanup.
     // Seeded from the pre-delete read (which also decides the
-    // idempotent-replay and lost-race paths), then replaced for a fresh
-    // delete by the AUTHORITATIVE read inside softDelete's locked
-    // transaction — the same value the audit-entry builder below words its
-    // reason from, so the audit and the completion decision can never
-    // disagree.
+    // idempotent-replay path), then replaced for a fresh delete by the
+    // AUTHORITATIVE read inside softDelete's locked transaction — the same
+    // value the audit-entry builder below words its reason from, so the
+    // audit and the completion decision can never disagree. A delete that
+    // LOSES that CAS re-reads the row instead of trusting its own pre-read
+    // (see below): the pre-read can be arbitrarily stale by then.
     let mediaWriteUndecided =
       internal.mediaWriteState === VideoMediaWriteState.PENDING;
     if (!internal.deletedAt) {
@@ -3107,10 +3151,43 @@ export class VideoAssetsService {
       if (marked) {
         removalAlreadyRecorded = marked.mediaAlreadyRemoved;
         mediaWriteUndecided = marked.mediaWriteUndecided;
+      } else {
+        // LOST THE SOFT-DELETE CAS to a concurrent delete — and the
+        // PRE-READ ABOVE IS NOW STALE, which used to be silently fatal.
+        // Interleaving: this delete pre-read `mediaWriteState = NULL`, an
+        // upload then CLAIMED its put (PENDING), the rival delete won the
+        // CAS and — reading inside its locked transaction — correctly
+        // observed the pending write and withheld its completion marker.
+        // Carrying our stale `mediaWriteUndecided = false` from here would
+        // drain the (still empty) prefix and RECORD the exactly-once
+        // completion while the put is in flight: a crash after those bytes
+        // land leaves media sitting behind a completion marker, with no
+        // pending obligation anywhere for a replay or an operator to find.
+        // So the state is re-read AUTHORITATIVELY from the (already
+        // soft-deleted) row before anything is decided.
+        //
+        // FAIL CLOSED on anything unreadable — a vanished row, a failing
+        // read — by treating the write as UNDECIDED: withholding a
+        // completion is always repairable (DELETE is idempotent and the
+        // replay records it once the state resolves), recording one
+        // wrongly never is.
+        //
+        // No audit entry is owed here: whenever this fresh read says
+        // PENDING, the claim provably preceded the WINNER's locked read
+        // (both take the same per-asset lock), so the winner's own delete
+        // audit already names the outstanding drain obligation.
+        try {
+          const fresh = await this.repository.findByIdInternalIncludingDeleted(
+            tenantId,
+            id,
+          );
+          removalAlreadyRecorded = Boolean(fresh?.mediaRemovedAt);
+          mediaWriteUndecided =
+            !fresh || fresh.mediaWriteState === VideoMediaWriteState.PENDING;
+        } catch {
+          mediaWriteUndecided = true;
+        }
       }
-      // !marked: lost a race with another delete — the row is durably
-      // deleted; fall through to the idempotent file cleanup with the
-      // pre-read marker deciding the completion recording.
     }
     // BEFORE the media disappears: retire inference jobs already linked
     // through this asset's crop artifacts. A QUEUED job whose crop input
@@ -3561,11 +3638,11 @@ export class VideoAssetsService {
     // between leaves files no row references. Random keys made those
     // files unfindable forever (a retry staged NEW UUIDs); deriving the
     // key from the request identity — the REQUIRED idempotency key plus
-    // the canonical request fingerprint — plus the artifact
-    // index means a replayed IDENTICAL request re-puts over the SAME keys
-    // (storage.put publishes atomically via temp+rename, so the overwrite
-    // is safe), self-healing the crash window instead of orphaning more
-    // files. The KEY is what makes that overwrite safe: without it the
+    // the canonical request fingerprint — plus the artifact index AND the
+    // digest of the exact bytes being written (see the staging loop) means
+    // a replayed IDENTICAL request re-puts over the SAME keys with the
+    // SAME content, self-healing the crash window instead of orphaning
+    // more files. The KEY is what makes that overwrite safe: without it the
     // hash would derive from the fingerprint alone, so every later
     // identical KEYLESS request would land on the keys an already-committed
     // append-only batch recorded and rewrite its bytes underneath its
@@ -3579,9 +3656,12 @@ export class VideoAssetsService {
     // crashed or parameter-changed attempt stay discoverable under the
     // asset's `artifacts/<sha256>/` prefix (see README — reconcilable by
     // key shape; no scavenger job), and asset deletion's recursive
-    // prefix removal cleans them with everything else. The hash input is
-    // the request IDENTITY only — never descriptor content, filenames, or
-    // free text — so no media-policy-relevant value shapes a key.
+    // prefix removal cleans them with everything else. The PREFIX hash's
+    // input is the request IDENTITY only — never descriptor content,
+    // filenames, or free text — and the per-file segment adds nothing but
+    // the artifact index and a ONE-WAY sha256 of the decoded image bytes
+    // (the very digest the artifact row already records as
+    // `checksumSha256`), so no media-policy-relevant value shapes a key.
     const operationHash = createHash('sha256')
       .update(JSON.stringify({ idempotencyKey, requestFingerprint }))
       .digest('hex');
@@ -3636,31 +3716,44 @@ export class VideoAssetsService {
    * became rows.
    *
    * WHY CLEANUP IS CONDITIONAL. The staging keys are shared by every
-   * attempt of the same operation, the deletes cannot run under a lock (no
-   * transaction may be held across file I/O), and there is therefore no
-   * ordering that makes "delete a key no committed row owns YET" safe in
-   * general: a rival attempt that staged the same bytes could publish right
-   * afterwards and end up with rows pointing at a deleted file. The cleanup
-   * is authorized ONLY where the operation is provably TERMINAL — the
-   * publish returned `replayed`, which requires an idempotency key that is
-   * now CONSUMED, so every present and future attempt of this operation
-   * replays the recorded batch and none can ever publish these keys again.
-   * That precondition is now UNCONDITIONAL rather than incidental: the key
-   * is REQUIRED on both extraction endpoints, so a `replayed` outcome can
-   * never arise from a keyless request whose keys a future attempt could
-   * still publish.
-   * The verdict it acts on (`committedStagedKeys`) was computed inside that
-   * same locked publish transaction, so it cannot have missed a batch that
-   * was mid-commit.
+   * attempt of the same operation that produced IDENTICAL BYTES (they are
+   * content-addressed — see the staging loop), the deletes cannot run under
+   * a lock (no transaction may be held across file I/O), and there is
+   * therefore no ordering that makes "delete a key no committed row owns
+   * YET" safe in general: a rival attempt that staged the same bytes could
+   * publish right afterwards and end up with rows pointing at a deleted
+   * file. Cleanup is authorized on exactly TWO provably TERMINAL outcomes:
    *
-   * Every other outcome — the publish threw, the CAS was lost, the
+   * 1. `replayed` — the idempotency key is now CONSUMED, so every present
+   *    and future attempt of this operation replays the recorded batch and
+   *    none can ever publish these keys again. That precondition is
+   *    UNCONDITIONAL rather than incidental: the key is REQUIRED on both
+   *    extraction endpoints, so a `replayed` outcome can never arise from a
+   *    keyless request whose keys a future attempt could still publish.
+   *    Content addressing does not weaken it — a rival attempt of the same
+   *    operation whose bytes DIFFER stages under DIFFERENT keys that are
+   *    not in our `staged` list at all, and one whose bytes are IDENTICAL
+   *    shares our keys but is bound by the same consumed key, so it will
+   *    replay too and never commit them. The verdict this path acts on
+   *    (`committedStagedKeys`) was computed inside the locked publish
+   *    transaction, so it cannot have missed a batch that was mid-commit,
+   *    and the keys it names are kept.
+   * 2. `parent-deleted` — the asset is soft-deleted. Deletion is terminal
+   *    and irreversible, so no attempt of any operation can publish under
+   *    this parent again, and the delete flow's recursive prefix removal
+   *    owns EVERYTHING under the asset prefix: keeping recreated files
+   *    there would leave media with no live row and (once the delete's
+   *    `mediaRemovedAt` marker is claimed) no pending obligation either.
+   *    Here the removal covers every staged key, no exemptions.
+   *
+   * Every other outcome — the publish threw, the status CAS was lost, the
    * idempotency key belongs to another asset, a staging put failed
    * part-way — FAILS CLOSED with the staged files KEPT. That is the same
    * rule the ownership check already used when it could not run, and it is
    * always recoverable: the files sit at deterministic keys under
-   * `artifacts/<operation hash>/`, an identical retry overwrites them (the
-   * adapter's put is an atomic temp+rename), and asset deletion removes the
-   * whole prefix.
+   * `artifacts/<operation hash>/`, an identical retry re-puts identical
+   * bytes over them (the adapter's put is an atomic temp+rename), and asset
+   * deletion removes the whole prefix.
    */
   private async stagePublishAndCleanup(
     tenantId: string,
@@ -3693,12 +3786,37 @@ export class VideoAssetsService {
     try {
       const items = [];
       // STAGING — plain storage writes with NO transaction open and no
-      // lock held. Deterministic keys make concurrent identical attempts
-      // write identical bytes to identical keys (the adapter's put
-      // publishes atomically via temp+rename), so overlapping staging is
-      // safe by construction and needs no serialization of its own.
+      // lock held. Staging keys are CONTENT-ADDRESSED: the operation
+      // prefix and the artifact index locate the file, and a strong hash
+      // of THE EXACT BYTES BEING WRITTEN names it.
+      //
+      // WHY (Codex P1). Two first attempts of the same operation (same
+      // idempotency key, same fingerprint) reach staging concurrently, and
+      // neither holds the publication lock yet — the lock is taken inside
+      // the publish transaction on purpose, because holding it across this
+      // file I/O is the pool-exhaustion deadlock fixed last pass. With the
+      // key derived from the index alone, both attempts wrote the SAME
+      // key, and the extractor port promises NOTHING about byte-for-byte
+      // determinism (an encoder/adapter upgrade, any nondeterministic
+      // implementation): attempt B could overwrite the file while attempt A
+      // committed a checksum computed from A's bytes — silent, permanent
+      // corruption of an append-only lineage. The atomic temp+rename put
+      // prevents TORN files, never last-writer-wins.
+      //
+      // THE INVARIANT CONTENT ADDRESSING BUYS: a committed artifact row's
+      // `checksumSha256` always describes the bytes at its `storageKey` BY
+      // CONSTRUCTION. Differing bytes cannot collide on one key (the
+      // digest differs, so the keys differ), and identical bytes produce
+      // an identical key whose content is byte-identical, so any overwrite
+      // is a no-op. Concurrency, retries, and crash-window replays are all
+      // covered by that one property — no serialization of staging needed.
       for (const [index, input] of inputs.entries()) {
-        const storageKey = `${assetDir}/artifacts/${operationHash}/${index}.png`;
+        const checksumSha256 = createHash('sha256')
+          .update(input.image.data)
+          .digest('hex');
+        const storageKey =
+          `${assetDir}/artifacts/${operationHash}/${index}-` +
+          `${checksumSha256.slice(0, STAGED_ARTIFACT_KEY_DIGEST_CHARS)}.png`;
         await this.storage.put(storageKey, input.image.data);
         staged.push(storageKey);
         items.push({
@@ -3713,9 +3831,8 @@ export class VideoAssetsService {
           height: input.image.height,
           mimeType: input.image.mimeType,
           sizeBytes: input.image.data.length,
-          checksumSha256: createHash('sha256')
-            .update(input.image.data)
-            .digest('hex'),
+          // The SAME digest the key embeds — recorded in full.
+          checksumSha256,
           storageKey,
           createdById: actor?.id,
         });
@@ -3760,10 +3877,36 @@ export class VideoAssetsService {
           'This idempotency key was already used for a different video asset',
         );
       }
+      if (published === 'parent-deleted') {
+        // DELETION WON THE PUBLICATION RACE, and this is the ONE failure
+        // path where keeping the staged files is the wrong answer. The
+        // sequence: extraction passed `requireProcessable()`, a DELETE then
+        // soft-deleted the asset and removed its prefix, and the staging
+        // puts above RECREATED files underneath that already-drained
+        // prefix. Deletion is TERMINAL — no rival attempt of this operation
+        // can ever publish them (the parent never comes back), so the
+        // usual "a rival may still commit these keys" argument does not
+        // apply — and the DELETE may already have recorded its
+        // `mediaRemovedAt` completion, which leaves the recreated media
+        // with neither a live artifact row nor a pending cleanup marker
+        // anywhere. So they go now, unconditionally: nothing under a
+        // deleted asset's prefix has an owner (the delete flow's recursive
+        // removal owns all of it), which is also why no committed-owner
+        // verdict is needed to exempt any key here.
+        await this.removeStagedArtifactsAfterParentDeleted(
+          tenantId,
+          videoAssetId,
+          actor,
+          staged,
+        );
+        throw new ConflictException(
+          'The video asset changed concurrently; retry the extraction',
+        );
+      }
       if (!published) {
-        // CAS lost (concurrent transition or delete) — nothing committed by
-        // us, and a rival attempt could still publish these very keys once
-        // the status moves back into the expected set. Files KEPT.
+        // CAS lost (concurrent transition) — nothing committed by us, and a
+        // rival attempt could still publish these very keys once the status
+        // moves back into the expected set. Files KEPT.
         throw new ConflictException(
           'The video asset changed concurrently; retry the extraction',
         );
@@ -3816,6 +3959,44 @@ export class VideoAssetsService {
       if (error instanceof VideoStorageOperationError) {
         throw new ServiceUnavailableException(error.message);
       }
+      throw error;
+    }
+  }
+
+  /**
+   * Compensating removal of staged artifact files whose publication lost to
+   * a DELETE (see the `parent-deleted` branch above). Modelled exactly on
+   * the upload's compensating removal after a lost publish CAS: the failure
+   * is NEVER swallowed — `cleanupStagedArtifacts` already retries once per
+   * file and escalates a retryable 503 — and when it does fail the durable
+   * cleanup OBLIGATION is recorded in the audit trail before that 503
+   * propagates, naming the recovery path (replaying the idempotent DELETE
+   * re-runs the same recursive prefix removal). No key is exempted: under a
+   * deleted parent nothing has a surviving owner.
+   */
+  private async removeStagedArtifactsAfterParentDeleted(
+    tenantId: string,
+    videoAssetId: string,
+    actor: AuditActor | undefined,
+    staged: string[],
+  ): Promise<void> {
+    try {
+      await this.cleanupStagedArtifacts(staged, []);
+    } catch (error) {
+      await this.auditLog.record(
+        this.auditEntry(tenantId, actor, {
+          action: AuditAction.UPDATE,
+          entityType: 'VideoAsset',
+          entityId: videoAssetId,
+          reason:
+            'Extraction publication lost to a concurrent delete and the ' +
+            'compensating removal of its staged artifact files failed: ' +
+            'the staged media remains orphaned under the deleted asset\'s ' +
+            'storage prefix — a durable cleanup obligation, discharged by ' +
+            'replaying the idempotent DELETE /video-assets/:id prefix ' +
+            'removal',
+        }),
+      );
       throw error;
     }
   }

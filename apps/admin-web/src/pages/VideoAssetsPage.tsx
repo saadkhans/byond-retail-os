@@ -49,6 +49,7 @@ const ACCEPTED_EXTENSIONS = '.mp4,.m4v,.mov,.webm,.mkv,.avi,.mpg,.mpeg';
 const UPLOAD_ATTESTATIONS = [
   {
     field: 'controlledTestMedia',
+    header: 'x-controlled-test-media',
     label: 'Controlled internal test media I staged and own',
     title:
       'Phase 10 ingests controlled internal test clips only — footage you ' +
@@ -57,6 +58,7 @@ const UPLOAD_ATTESTATIONS = [
   },
   {
     field: 'noPaymentCardsVisible',
+    header: 'x-no-payment-cards-visible',
     label: 'No payment card is visible anywhere in this clip',
     title:
       'Your declaration as the operator. The API does not verify it: its ' +
@@ -65,6 +67,7 @@ const UPLOAD_ATTESTATIONS = [
   },
   {
     field: 'noCustomerPII',
+    header: 'x-no-customer-pii',
     label: 'No customer personal data in this clip',
     title:
       'No identifiable customers, documents, or screens showing personal ' +
@@ -72,6 +75,7 @@ const UPLOAD_ATTESTATIONS = [
   },
   {
     field: 'attestNoSensitiveContent',
+    header: 'x-attest-no-sensitive-content',
     label: 'No payment-card or credential content in the frames',
     title:
       'Your declaration, recorded in the audit trail. Not a safety ' +
@@ -153,8 +157,16 @@ export function VideoAssetsPage() {
       // without all four. They record the policy the clip was accepted
       // under; the authorization itself is the server's controlled
       // test-media gate, and text screening only ever rejects.
-      for (const { field } of UPLOAD_ATTESTATIONS) {
+      //
+      // They travel TWICE, deliberately: as HEADERS, which the API's
+      // pre-buffer gate reads before it accepts a single byte of the body
+      // (a multipart field cannot gate that — reaching one means the whole
+      // upload was already parsed into memory), and as the multipart
+      // FIELDS, which remain the audited record stored with the asset.
+      const attestationHeaders: Record<string, string> = {};
+      for (const { field, header } of UPLOAD_ATTESTATIONS) {
         formData.append(field, 'true');
+        attestationHeaders[header] = 'true';
       }
       if (locationId.trim()) {
         formData.append('locationId', locationId.trim());
@@ -168,7 +180,11 @@ export function VideoAssetsPage() {
       if (sessionId.trim()) {
         formData.append('sessionId', sessionId.trim());
       }
-      const asset = await apiUpload<VideoAsset>('/video-assets', formData);
+      const asset = await apiUpload<VideoAsset>(
+        '/video-assets',
+        formData,
+        attestationHeaders,
+      );
       navigate(`/video-assets/${asset.id}`);
     } catch (err) {
       setUploadError(errorMessage(err));

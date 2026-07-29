@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   BadRequestException,
   ConflictException,
@@ -34,10 +35,15 @@ import {
 import { VideoScreeningDecision } from './dto/screen-video-asset.dto';
 import { VideoStorageOperationError } from './storage/video-storage.port';
 import {
+  SCREENING_TOOLING_UNAVAILABLE_MESSAGE,
+  TEST_MEDIA_GATE_CLOSED_MESSAGE,
+} from './test-media-gate.guard';
+import {
   PRESTORE_SCREENING_MAX_FRAME_BYTES,
   SCREENING_PREVIEW_MAX_FRAMES,
   SCREENING_PREVIEW_MIN_FRAME_BYTES,
   SCREENING_PREVIEW_TOTAL_BYTES,
+  STAGED_ARTIFACT_KEY_DIGEST_CHARS,
   UploadedVideoFile,
   VideoAssetsService,
 } from './video-assets.service';
@@ -59,6 +65,21 @@ const ATTEST = {
 
 /** Every attestation field, for the per-field refusal matrix. */
 const ATTESTATION_FIELDS = Object.keys(ATTEST) as (keyof typeof ATTEST)[];
+
+/**
+ * The CONTENT-ADDRESSED staging key shape (Codex P1): the asset prefix, the
+ * operation directory (sha256 hex of the request identity), then the
+ * artifact index joined to a truncated sha256 OF THE BYTES BEING WRITTEN.
+ * The digest segment is what makes two concurrent first attempts producing
+ * DIFFERENT bytes land on DIFFERENT files instead of overwriting each other
+ * before either reaches the publication lock.
+ */
+function stagedKeyShape(index = 0): RegExp {
+  return new RegExp(
+    `^${TENANT}/uuid-1/artifacts/[0-9a-f]{64}/${index}-` +
+      `[0-9a-f]{${STAGED_ARTIFACT_KEY_DIGEST_CHARS}}\\.png$`,
+  );
+}
 
 function mp4Buffer(): Buffer {
   return Buffer.concat([
@@ -434,10 +455,17 @@ function buildService(overrides: {
     extractor.inspectBuffer = jest.fn(async (data: Buffer) => {
       void data;
       let probed: Promise<unknown> | null = null;
-      const probe = () =>
-        (probed ??= (extractor.probe as (key: string) => Promise<unknown>)(
-          'in-memory-upload',
-        ));
+      // The probe is a BUDGETED external-tool stage exactly like the
+      // decode, so the session forwards the caller's options (its
+      // `deadlineMs` slice of the upload-wide budget) to the shared probe
+      // mock — memoized on the first call, per the port contract.
+      const probe = (options?: { deadlineMs?: number }) =>
+        (probed ??= (
+          extractor.probe as (
+            key: string,
+            options?: { deadlineMs?: number },
+          ) => Promise<unknown>
+        )('in-memory-upload', options));
       return {
         probe,
         streamFrames: async (options: {
@@ -1116,7 +1144,7 @@ describe('VideoAssetsService.upload controlled test-media policy gate', () => {
     expect(storage.put).not.toHaveBeenCalled();
   });
 
-  it.each(['false', 'FALSE', 'TRUE', 'true ', '1', ''])(
+  it.each(['false', 'FALSE', '1', '', 'yes', 'enabled'])(
     'keeps the gate CLOSED (503, nothing persisted) for the flag value %p',
     async (testMediaIngestEnabled) => {
       const { service, repository, storage, extractor } = buildService({
@@ -1130,6 +1158,61 @@ describe('VideoAssetsService.upload controlled test-media policy gate', () => {
       expect(storage.put).not.toHaveBeenCalled();
     },
   );
+
+  it.each(['TRUE', 'True', ' true ', 'true\n'])(
+    'NORMALIZES the flag: %p opens the gate under a non-production runtime',
+    async (testMediaIngestEnabled) => {
+      // Codex P2: the gate used to compare the RAW value against 'true', so
+      // a development deployment configured with `=TRUE` booted fine, wired
+      // up the real screening tooling, and then 503'd every single upload —
+      // a config typo that looks like an outage. The flag is now read
+      // through the codebase's ONE helper (isEnvFlagEnabled: trimmed,
+      // case-folded, fail-closed on anything else), the same way every
+      // other flag in this module is read.
+      const { service, storage } = buildService({
+        testMediaIngestEnabled,
+        nodeEnv: 'development',
+      });
+      const asset = await service.upload(TENANT, uploadFile(), { ...ATTEST });
+      expect((asset as { status: VideoAssetStatus }).status).toBe(
+        VideoAssetStatus.QUARANTINED,
+      );
+      expect(storage.put).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(['TRUE', ' true '])(
+    'a normalized flag value %p still cannot open the gate in production',
+    async (testMediaIngestEnabled) => {
+      const { service, repository, storage } = buildService({
+        testMediaIngestEnabled,
+        nodeEnv: 'production',
+      });
+      await expect(
+        service.upload(TENANT, uploadFile(), { ...ATTEST }),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(repository.createAsset).not.toHaveBeenCalled();
+      expect(storage.put).not.toHaveBeenCalled();
+    },
+  );
+
+  it('raises the gate and tooling 503s with the EXACT messages the pre-buffer guard exports', async () => {
+    // The gate runs in two places — the route guard (before the multipart
+    // body is read) and this defense-in-depth service check — and they must
+    // be indistinguishable from the outside. The service now IMPORTS the
+    // guard's constants instead of holding a second copy of each string, so
+    // the two can no longer drift apart.
+    const closed = buildService({ testMediaIngestEnabled: undefined });
+    await expect(
+      closed.service.upload(TENANT, uploadFile(), { ...ATTEST }),
+    ).rejects.toThrow(TEST_MEDIA_GATE_CLOSED_MESSAGE);
+    const untooled = buildService({
+      extractor: { readsRealBytes: false },
+    });
+    await expect(
+      untooled.service.upload(TENANT, uploadFile(), { ...ATTEST }),
+    ).rejects.toThrow(SCREENING_TOOLING_UNAVAILABLE_MESSAGE);
+  });
 
   it.each(['production', undefined])(
     'DEFENSE IN DEPTH: the gate stays CLOSED under NODE_ENV=%s even with the flag true',
@@ -2254,6 +2337,116 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
     expect(data.status).toBe(VideoAssetStatus.REJECTED);
     expect(data.errorCode).toBe('PRESTORE_SCREENING_REJECTED');
     expect(auditReason).toContain('VIDEO_SCREENING_TIMEOUT_MS');
+  });
+
+  it('bounds the PROBE with the same upload-wide budget (the deadline the port actually receives)', async () => {
+    // Codex P2: the probe spawns the same external tooling the decode
+    // does, and it used to run unbudgeted — a wedged binary could hold the
+    // request for the adapter's own command timeout ON TOP of the whole
+    // screening allowance the audit promises. `options` is OPTIONAL on the
+    // port, so nothing but this assertion can catch the wiring going away.
+    const { service, extractor } = buildService({ screeningTimeoutMs: '1000' });
+    await service.upload(TENANT, uploadFile(), { ...ATTEST });
+    const [key, options] = (extractor.probe as jest.Mock).mock.calls[0] as [
+      string,
+      { deadlineMs: number } | undefined,
+    ];
+    expect(key).toBe('in-memory-upload');
+    expect(options?.deadlineMs).toBeGreaterThan(0);
+    expect(options?.deadlineMs).toBeLessThanOrEqual(1000);
+    // The decode gets what is LEFT of the same absolute deadline.
+    const decodeDeadline = (
+      (extractor.streamFrames as jest.Mock).mock.calls[0][0] as {
+        deadlineMs: number;
+      }
+    ).deadlineMs;
+    expect(decodeDeadline).toBeLessThanOrEqual(options?.deadlineMs ?? 0);
+  });
+
+  it('rejects fail-closed (400, audited) when the PROBE outlives the deadline — never an uncontrolled 500', async () => {
+    // The probe's ScreeningDeadlineExceededError has no branch in
+    // mapPrestoreScreeningError, so letting it fall through would surface
+    // the raw error as a 500. It is caught at the call site and lands on
+    // the SAME audited fail-closed rejection as a decode expiry.
+    let auditReason: string | undefined;
+    const transitionStatus = jest.fn(
+      async (
+        _t: string,
+        _id: string,
+        _expected: unknown,
+        data: { status: VideoAssetStatus },
+        build: (b: unknown, a: unknown) => { reason?: string },
+      ) => {
+        const after = assetRow({ ...data });
+        auditReason = build(
+          assetRow({ status: VideoAssetStatus.PENDING_MEDIA }),
+          after,
+        ).reason;
+        return after;
+      },
+    );
+    const { service, repository, storage, extractor, recognizer } = buildService(
+      {
+        extractor: {
+          probe: jest.fn(async () => {
+            throw new ScreeningDeadlineExceededError();
+          }),
+        },
+        repository: { transitionStatus },
+      },
+    );
+    const error: Error = await service
+      .upload(TENANT, uploadFile(), { ...ATTEST })
+      .then(() => {
+        throw new Error('expected rejection');
+      })
+      .catch((caught: Error) => caught);
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect(error.message).toContain('screening time budget');
+    // Nothing was decoded, recognized, or stored.
+    expect(extractor.streamFrames).not.toHaveBeenCalled();
+    expect(recognizer.recognize).not.toHaveBeenCalled();
+    expect(storage.put).not.toHaveBeenCalled();
+    const [, , expected, data] = repository.transitionStatus.mock
+      .calls[0] as unknown as [
+      string,
+      string,
+      VideoAssetStatus[],
+      { status: VideoAssetStatus; errorCode: string },
+    ];
+    expect(expected).toEqual([VideoAssetStatus.PENDING_MEDIA]);
+    expect(data.status).toBe(VideoAssetStatus.REJECTED);
+    expect(data.errorCode).toBe('PRESTORE_SCREENING_REJECTED');
+    expect(auditReason).toContain('VIDEO_SCREENING_TIMEOUT_MS');
+  });
+
+  it('refuses BEFORE spawning the probe when the budget is already spent', async () => {
+    // A degenerate/expired remaining budget reaches the port as a
+    // non-positive deadline, which the adapter refuses without spawning —
+    // the mock stands in for that contract, and the verdict is the same.
+    const probe = jest.fn(async (_key: string, options?: { deadlineMs?: number }) => {
+      if ((options?.deadlineMs ?? Infinity) <= 0) {
+        throw new ScreeningDeadlineExceededError();
+      }
+      return { durationMs: 10_000, width: 1280, height: 720, fps: 30 };
+    });
+    const { service, storage } = buildService({
+      screeningTimeoutMs: '1000',
+      extractor: { probe },
+    });
+    const nowSpy = jest.spyOn(Date, 'now');
+    const base = Date.now();
+    // First call fixes the absolute deadline; every later reading is past it.
+    nowSpy.mockReturnValueOnce(base).mockReturnValue(base + 5000);
+    try {
+      await expect(
+        service.upload(TENANT, uploadFile(), { ...ATTEST }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    } finally {
+      nowSpy.mockRestore();
+    }
+    expect((probe.mock.calls[0][1] as { deadlineMs: number }).deadlineMs).toBeLessThanOrEqual(0);
+    expect(storage.put).not.toHaveBeenCalled();
   });
 
   it('hands the streaming decode the configured budget, clamped to the adapter-enforceable ceiling', async () => {
@@ -3696,12 +3889,14 @@ describe('VideoAssetsService crop & frame extraction', () => {
     expect(items[0].cropWidth).toBe(300);
     expect(items[0].reason).toBe(VideoCropReason.PRODUCT_PICKUP);
     expect(items[0].checksumSha256).toMatch(/^[0-9a-f]{64}$/);
-    // DETERMINISTIC staging key: under the ASSET's prefix, an operation
-    // directory derived from the request identity (sha256 hex), then the
-    // artifact index — never a random UUID (crash-recoverable staging).
-    expect(items[0].storageKey).toMatch(
-      new RegExp(`^${TENANT}/uuid-1/artifacts/[0-9a-f]{64}/0\\.png$`),
-    );
+    // DETERMINISTIC, CONTENT-ADDRESSED staging key: under the ASSET's
+    // prefix, an operation directory derived from the request identity
+    // (sha256 hex), then the artifact index AND the digest of the exact
+    // bytes — never a random UUID (crash-recoverable staging).
+    expect(items[0].storageKey).toMatch(stagedKeyShape());
+    // The recorded checksum IS the digest the key embeds: the row can
+    // never describe bytes other than the ones stored at its key.
+    expect(items[0].storageKey).toContain(`/0-${items[0].checksumSha256.slice(0, 32)}.png`);
     expect(storage.put).toHaveBeenCalled();
   });
 
@@ -4244,13 +4439,12 @@ describe('deterministic artifact staging keys (crash-recoverable staging)', () =
   // no row referenced and no retry could ever find (a retry staged NEW
   // UUIDs). Keys are now DETERMINISTIC from the request identity —
   // idempotency key when supplied, else the canonical fingerprint — plus
-  // the artifact index, so an identical retry re-puts over the SAME keys
-  // (the adapter's temp+rename put overwrites atomically) and committed
-  // rows record the deterministic keys directly (no promotion step).
+  // the artifact index AND the content digest, so an identical retry
+  // re-puts identical bytes over the SAME keys (the adapter's temp+rename
+  // put overwrites atomically) and committed rows record the deterministic
+  // keys directly (no promotion step).
   const cropDto = { timestampMs: 1000, x: 0, y: 0, width: 10, height: 10 };
-  const keyShape = new RegExp(
-    `^${TENANT}/uuid-1/artifacts/[0-9a-f]{64}/0\\.png$`,
-  );
+  const keyShape = stagedKeyShape();
 
   it('a retried identical request stages over the SAME keys after a simulated crash (put succeeded, batch never committed)', async () => {
     const createArtifactsBatch = jest
@@ -4278,6 +4472,205 @@ describe('deterministic artifact staging keys (crash-recoverable staging)', () =
     // key shape is the deterministic asset-prefixed operation directory.
     expect(retryKey).toBe(firstKey);
     expect(firstKey).toMatch(keyShape);
+  });
+
+  it('two concurrent first attempts producing DIFFERENT bytes stage under DIFFERENT keys: neither can overwrite the other', async () => {
+    // Codex P1: with the file named by its index alone, two first attempts
+    // of the SAME operation wrote the SAME key before either reached the
+    // publication lock (the lock cannot be held across file I/O — that is
+    // the pool-exhaustion deadlock fixed last pass). The extractor port
+    // promises nothing about byte-for-byte determinism, so attempt B could
+    // overwrite the file while attempt A committed a checksum taken from
+    // A's bytes. The key now embeds the digest OF THE BYTES, so differing
+    // bytes simply cannot collide.
+    const committed = new Set<string>();
+    const chain = { tail: Promise.resolve() as Promise<unknown> };
+    let publishes = 0;
+    let releaseWinner: () => void = () => undefined;
+    const winnerGate = new Promise<void>((resolve) => {
+      releaseWinner = resolve;
+    });
+    const createArtifactsBatch = jest.fn(
+      (
+        _t: string,
+        _id: string,
+        _hash: string,
+        _expected: unknown,
+        _key: string | undefined,
+        items: { storageKey: string }[],
+      ) => {
+        const next = chain.tail.then(async () => {
+          publishes += 1;
+          if (publishes === 1) {
+            await winnerGate;
+            for (const item of items) {
+              committed.add(item.storageKey);
+            }
+            return {
+              asset: assetRow({ status: VideoAssetStatus.READY }),
+              artifacts: [artifactRow()],
+              replayed: false,
+              committedStagedKeys: [],
+            };
+          }
+          return {
+            asset: assetRow({ status: VideoAssetStatus.READY }),
+            artifacts: [artifactRow()],
+            replayed: true,
+            requestFingerprint: cropFingerprint(cropDto),
+            committedStagedKeys: items
+              .map((item) => item.storageKey)
+              .filter((key) => committed.has(key)),
+          };
+        });
+        chain.tail = next.then(
+          () => undefined,
+          () => undefined,
+        );
+        return next;
+      },
+    );
+    // A NON-deterministic extractor: each call encodes different bytes.
+    let encodes = 0;
+    const { service, storage } = buildService({
+      repository: { createArtifactsBatch },
+      extractor: {
+        extractCrop: jest.fn(
+          async (
+            _k: string,
+            _p: unknown,
+            ts: number,
+            box: { width: number; height: number },
+          ) => {
+            encodes += 1;
+            return {
+              data: Buffer.from(`encoder-output-${encodes}`),
+              width: box.width,
+              height: box.height,
+              mimeType: 'image/png',
+              timestampMs: ts,
+            };
+          },
+        ),
+      },
+    });
+    const dto = { ...cropDto, idempotencyKey: 'op-1' };
+    const attempts = [
+      service.createCrop(TENANT, 'asset-1', dto),
+      service.createCrop(TENANT, 'asset-1', dto),
+    ];
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(storage.put).toHaveBeenCalledTimes(2);
+    releaseWinner();
+    await Promise.all(attempts);
+    const [keyA] = storage.put.mock.calls[0] as unknown as [string];
+    const [keyB] = storage.put.mock.calls[1] as unknown as [string];
+    // SAME operation directory (the lock's granularity), DIFFERENT files.
+    expect(keyA.slice(0, keyA.lastIndexOf('/'))).toBe(
+      keyB.slice(0, keyB.lastIndexOf('/')),
+    );
+    expect(keyA).not.toBe(keyB);
+    expect(keyA).toMatch(keyShape);
+    expect(keyB).toMatch(keyShape);
+    // The committed key was never written twice, so the recorded checksum
+    // still describes the bytes at it...
+    const committedKey = [...committed][0];
+    const writtenKeys = (storage.put.mock.calls as unknown as [string][]).map(
+      ([key]) => key,
+    );
+    expect(writtenKeys.filter((key) => key === committedKey)).toHaveLength(1);
+    // ...and the loser removed only its OWN surplus file.
+    expect(storage.delete).toHaveBeenCalledTimes(1);
+    expect(storage.delete).not.toHaveBeenCalledWith(committedKey);
+  });
+
+  it('identical bytes produce an IDENTICAL key whose overwrite is a no-op', async () => {
+    // The other half of content addressing: a retry (or a rival attempt)
+    // that encodes the SAME bytes lands on the SAME key with byte-identical
+    // content, so the atomic temp+rename put changes nothing at all.
+    const { service, storage } = buildService();
+    const dto = { ...cropDto, idempotencyKey: 'op-1' };
+    await service.createCrop(TENANT, 'asset-1', dto);
+    await service.createCrop(TENANT, 'asset-1', dto);
+    expect(storage.put).toHaveBeenCalledTimes(2);
+    // Same key AND same payload — an overwrite that cannot change a byte.
+    expect(storage.put.mock.calls[1]).toEqual(storage.put.mock.calls[0]);
+  });
+
+  it('a committed artifact’s recorded checksum matches the bytes stored at its key (by construction)', async () => {
+    const { service, repository, storage } = buildService();
+    await service.createCrop(TENANT, 'asset-1', {
+      ...cropDto,
+      idempotencyKey: 'op-1',
+    });
+    const [, , , , , items] = repository.createArtifactsBatch.mock
+      .calls[0] as unknown as [
+      string,
+      string,
+      string,
+      unknown,
+      string | undefined,
+      { checksumSha256: string; storageKey: string }[],
+    ];
+    const [storageKey, data] = storage.put.mock.calls[0] as unknown as [
+      string,
+      Buffer,
+    ];
+    const digest = createHash('sha256').update(data).digest('hex');
+    // The row's checksum IS the digest of the bytes that were written...
+    expect(items[0].checksumSha256).toBe(digest);
+    expect(items[0].storageKey).toBe(storageKey);
+    // ...and the key NAMES that digest, so no other bytes can ever occupy
+    // it: the row can never describe content other than what is stored.
+    expect(storageKey).toContain(
+      `/0-${digest.slice(0, STAGED_ARTIFACT_KEY_DIGEST_CHARS)}.png`,
+    );
+  });
+
+  it('a replay returns the RECORDED artifacts, never a rival attempt’s re-encoded content', async () => {
+    // The committed batch's key is content-addressed to the WINNER's bytes.
+    // This attempt re-encodes differently, so its file is a different key
+    // the publish reports as surplus: the committed file is untouched and
+    // the recorded artifacts come back.
+    const recorded = artifactRow({ id: 'artifact-committed' });
+    const { service, storage } = buildService({
+      extractor: {
+        extractCrop: jest.fn(
+          async (
+            _k: string,
+            _p: unknown,
+            ts: number,
+            box: { width: number; height: number },
+          ) => ({
+            data: Buffer.from('re-encoded-differently'),
+            width: box.width,
+            height: box.height,
+            mimeType: 'image/png',
+            timestampMs: ts,
+          }),
+        ),
+      },
+      repository: {
+        createArtifactsBatch: jest.fn(async () => ({
+          asset: assetRow({ status: VideoAssetStatus.READY }),
+          artifacts: [recorded],
+          replayed: true,
+          requestFingerprint: cropFingerprint(cropDto),
+          // The committed batch owns a DIFFERENT (winner-bytes) key.
+          committedStagedKeys: [],
+        })),
+      },
+    });
+    const result = await service.createCrop(TENANT, 'asset-1', {
+      ...cropDto,
+      idempotencyKey: 'op-1',
+    });
+    expect(result.replayed).toBe(true);
+    expect(result.artifact.id).toBe('artifact-committed');
+    const [stagedKey] = storage.put.mock.calls[0] as unknown as [string];
+    // Only our own surplus re-encode was removed.
+    expect(storage.delete).toHaveBeenCalledTimes(1);
+    expect(storage.delete).toHaveBeenCalledWith(stagedKey);
   });
 
   it('derives DIFFERENT operation prefixes for different request identities', async () => {
@@ -4393,8 +4786,15 @@ describe('extraction operation lock (publication serialization, no nested transa
     expect(tenantId).toBe(TENANT);
     expect(assetId).toBe('asset-1');
     const [stagedKey] = storage.put.mock.calls[0] as unknown as [string];
-    // The lock's granularity IS the staging prefix: same hash, same files.
-    expect(stagedKey).toBe(`${TENANT}/uuid-1/artifacts/${operationHash}/0.png`);
+    // The lock's granularity IS the staging PREFIX: same hash, same
+    // operation directory (the file name inside it is content-addressed,
+    // which is deliberately finer than the lock — see the staging loop).
+    expect(stagedKey).toMatch(
+      new RegExp(
+        `^${TENANT}/uuid-1/artifacts/${operationHash}/0-` +
+          `[0-9a-f]{${STAGED_ARTIFACT_KEY_DIGEST_CHARS}}\\.png$`,
+      ),
+    );
   });
 
   it('stages with NO transaction open: every file write happens before the locked publish transaction starts', async () => {
@@ -4583,6 +4983,53 @@ describe('extraction operation lock (publication serialization, no nested transa
     expect(storage.delete).not.toHaveBeenCalled();
   });
 
+  it('REMOVES staged files when DELETION won the publication race (terminal — no rival can ever publish them)', async () => {
+    // Codex P1: extraction passed requireProcessable(), a DELETE then
+    // soft-deleted the asset and removed its prefix, and these staging puts
+    // RECREATED files underneath it. Keeping them (the fail-closed rule for
+    // every other outcome) is wrong here: deletion is terminal, so no rival
+    // attempt can ever publish them, and the delete may already have
+    // recorded its mediaRemovedAt completion — the recreated media would
+    // then have neither a live artifact row nor a pending cleanup marker.
+    const { service, storage } = buildService({
+      repository: {
+        createArtifactsBatch: jest.fn(async () => 'parent-deleted' as const),
+      },
+    });
+    await expect(
+      service.createCrop(TENANT, 'asset-1', cropDto),
+    ).rejects.toBeInstanceOf(ConflictException);
+    const [stagedKey] = storage.put.mock.calls[0] as unknown as [string];
+    expect(storage.delete).toHaveBeenCalledTimes(1);
+    expect(storage.delete).toHaveBeenCalledWith(stagedKey);
+  });
+
+  it('never SWALLOWS a failed post-deletion cleanup: retryable 503 + a durable cleanup-obligation audit', async () => {
+    // Same contract as the upload's compensating removal after a lost
+    // publish CAS: one retry per file, then the obligation is recorded in
+    // the audit trail and a retryable 503 propagates.
+    const del = jest.fn(async () => {
+      throw new Error('EACCES');
+    });
+    const { service, auditLog } = buildService({
+      storage: { delete: del },
+      repository: {
+        createArtifactsBatch: jest.fn(async () => 'parent-deleted' as const),
+      },
+    });
+    await expect(
+      service.createCrop(TENANT, 'asset-1', cropDto),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    // One retry, then escalation — never an unbounded loop.
+    expect(del).toHaveBeenCalledTimes(2);
+    const [entry] = auditLog.record.mock.calls.at(-1) as unknown as [
+      { entityId: string; reason: string },
+    ];
+    expect(entry.entityId).toBe('asset-1');
+    expect(entry.reason).toContain('lost to a concurrent delete');
+    expect(entry.reason).toContain('DELETE /video-assets/:id');
+  });
+
   it('KEEPS staged files when the idempotency key belongs to another asset (key-conflict)', async () => {
     const { service, storage } = buildService({
       repository: {
@@ -4690,9 +5137,7 @@ describe('extraction idempotency key is REQUIRED', () => {
     };
     const first = await stagedFor('op-A');
     const second = await stagedFor('op-B');
-    expect(first).toMatch(
-      new RegExp(`^${TENANT}/uuid-1/artifacts/[0-9a-f]{64}/0\\.png$`),
-    );
+    expect(first).toMatch(stagedKeyShape());
     expect(second).not.toBe(first);
   });
 
@@ -5964,6 +6409,108 @@ describe('VideoAssetsService.delete', () => {
     });
     expect(inference.cancelOrphanedJob).not.toHaveBeenCalled();
     expect(auditLog.record).not.toHaveBeenCalled();
+  });
+
+  it('a delete that LOSES the soft-delete CAS re-reads the row: a stale NULL pre-read never stamps a completion over a PENDING write', async () => {
+    // Codex P1. Two DELETEs overlap an upload: DELETE-A pre-reads
+    // mediaWriteState = NULL, the upload then CLAIMS its put (PENDING),
+    // DELETE-B wins the CAS and — reading inside its locked transaction —
+    // correctly observes the pending write and withholds its completion
+    // marker. DELETE-A gets null back from softDelete, and carrying its
+    // STALE "decided" pre-read from there drained the (still empty) prefix
+    // and RECORDED the exactly-once completion while the put was in
+    // flight: a crash after those bytes landed left media behind a
+    // completion marker with no discoverable obligation. The lost-CAS path
+    // now re-reads the (already soft-deleted) row and recomputes from the
+    // FRESH state.
+    const findByIdInternalIncludingDeleted = jest
+      .fn()
+      // The PRE-READ: still live, no media write claimed yet.
+      .mockResolvedValueOnce(
+        assetRow({
+          status: VideoAssetStatus.PENDING_MEDIA,
+          mediaWriteState: null,
+        }),
+      )
+      // The AUTHORITATIVE re-read after losing the CAS: the upload claimed
+      // its put in between, and the winning delete is already committed.
+      .mockResolvedValueOnce(
+        assetRow({
+          status: VideoAssetStatus.PENDING_MEDIA,
+          deletedAt: new Date(),
+          mediaRemovedAt: null,
+          mediaWriteState: VideoMediaWriteState.PENDING,
+        }),
+      );
+    const { service, storage, repository } = buildService({
+      repository: {
+        findByIdInternalIncludingDeleted,
+        // Lost the CAS to the concurrent delete.
+        softDelete: jest.fn(async () => null),
+      },
+    });
+    await expect(service.delete(TENANT, 'asset-1')).resolves.toEqual({
+      deleted: true,
+    });
+    expect(findByIdInternalIncludingDeleted).toHaveBeenCalledTimes(2);
+    // The drain still runs (idempotent), the completion does NOT: the
+    // obligation stays open and re-drainable, and the WINNER's own delete
+    // audit already names it.
+    expect(storage.deletePrefix).toHaveBeenCalledWith(`${TENANT}/uuid-1`);
+    expect(repository.recordMediaRemovalCompleted).not.toHaveBeenCalled();
+  });
+
+  it('a lost-CAS delete whose FRESH row says the write RESOLVED records the completion exactly as before', async () => {
+    // The re-read must not make the loser paranoid: SUCCEEDED/FAILED
+    // provably means no bytes are in flight, so the completion is owed.
+    for (const mediaWriteState of [
+      VideoMediaWriteState.SUCCEEDED,
+      VideoMediaWriteState.FAILED,
+    ]) {
+      const { service, repository } = buildService({
+        repository: {
+          findByIdInternalIncludingDeleted: jest
+            .fn()
+            .mockResolvedValueOnce(assetRow({ mediaWriteState: null }))
+            .mockResolvedValueOnce(
+              assetRow({
+                deletedAt: new Date(),
+                mediaRemovedAt: null,
+                mediaWriteState,
+              }),
+            ),
+          softDelete: jest.fn(async () => null),
+        },
+      });
+      await service.delete(TENANT, 'asset-1');
+      expect(repository.recordMediaRemovalCompleted).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('a lost-CAS re-read that finds NO row (or throws) FAILS CLOSED to undecided: no completion is recorded', async () => {
+    // Unreadable state is never treated as "decided". Withholding a
+    // completion is repairable (DELETE is idempotent and a later replay
+    // records it once); recording one wrongly never is.
+    for (const reReadable of [false, true]) {
+      const { service, repository } = buildService({
+        repository: {
+          findByIdInternalIncludingDeleted: jest
+            .fn()
+            .mockResolvedValueOnce(assetRow({ mediaWriteState: null }))
+            .mockImplementationOnce(async () => {
+              if (reReadable) {
+                throw new Error('db unreachable');
+              }
+              return null;
+            }),
+          softDelete: jest.fn(async () => null),
+        },
+      });
+      await expect(service.delete(TENANT, 'asset-1')).resolves.toEqual({
+        deleted: true,
+      });
+      expect(repository.recordMediaRemovalCompleted).not.toHaveBeenCalled();
+    }
   });
 
   it('a fresh delete whose media write is UNDECIDED (PENDING) audits the cleanup as pending and records NO completion', async () => {

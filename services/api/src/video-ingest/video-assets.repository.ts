@@ -895,9 +895,12 @@ export class VideoAssetsRepository extends TenantScopedRepository {
    * request row that makes the batch REPLAYABLE — all land or none do.
    * Artifact rows are append-only, so a partially-committed batch could
    * never be cleaned up, and a retried request must replay, not re-append.
-   * Returns null when the asset is gone or its status left the expected set
-   * (CAS lost); a pre-existing identical key is replayed inside the same
-   * transaction ('key-conflict' when the key belongs to another asset).
+   * Returns null when the status left the expected set (CAS lost) — and
+   * 'parent-deleted' for the one CAS loss that is TERMINAL, a soft-deleted
+   * asset, which is the only outcome that authorizes the caller to remove
+   * the files it staged (see `publicationBlockedBy` below); a pre-existing
+   * identical key is replayed inside the same transaction ('key-conflict'
+   * when the key belongs to another asset).
    * Two concurrent firsts race on the (tenantId, idempotencyKey) unique —
    * the loser's P2002 rolls its batch back and the caller replays.
    *
@@ -970,6 +973,7 @@ export class VideoAssetsRepository extends TenantScopedRepository {
         committedStagedKeys: string[];
       }
     | 'key-conflict'
+    | 'parent-deleted'
     | null
   > {
     const scopedTenantId = this.requireTenantId(tenantId);
@@ -982,6 +986,25 @@ export class VideoAssetsRepository extends TenantScopedRepository {
           videoAssetId,
           operationHash,
         )}))`;
+        // WHY A PUBLICATION COULD NOT PROCEED — 'parent-deleted' ONLY when
+        // the row is PROVABLY soft-deleted, otherwise the fail-closed null.
+        // The distinction is what lets the caller REMOVE the files it just
+        // staged: deletion is TERMINAL (no rival attempt of this operation
+        // can ever publish under a deleted parent, and the asset can never
+        // come back), so files recreated under a prefix the delete flow
+        // already drained would otherwise sit there with neither a live
+        // artifact row nor a pending cleanup marker. Every other CAS loss
+        // (a status transition, a concurrent flip) stays null: a rival may
+        // still publish those very keys, so the files must be kept.
+        // Read inside this transaction at READ COMMITTED, so a delete that
+        // committed after this transaction began is visible.
+        const publicationBlockedBy = async () => {
+          const row = await tx.videoAsset.findFirst({
+            where: { id: videoAssetId, tenantId: scopedTenantId },
+            select: { deletedAt: true },
+          });
+          return row?.deletedAt ? ('parent-deleted' as const) : null;
+        };
         // Committed-owner verdict BEFORE this batch writes anything: the
         // answer is "keys some EARLIER committed batch owns", which is
         // exactly what the caller's staged-file cleanup must preserve.
@@ -1013,7 +1036,7 @@ export class VideoAssetsRepository extends TenantScopedRepository {
               select: VIDEO_ASSET_SELECT,
             });
             if (!asset) {
-              return null;
+              return await publicationBlockedBy();
             }
             const ids = (existing.artifactIds as string[]) ?? [];
             const found = await tx.videoArtifact.findMany({
@@ -1041,7 +1064,7 @@ export class VideoAssetsRepository extends TenantScopedRepository {
           select: VIDEO_ASSET_SELECT,
         });
         if (!before || !expectedStatuses.includes(before.status)) {
-          return null;
+          return await publicationBlockedBy();
         }
         const flipped = await tx.videoAsset.updateMany({
           where: {
@@ -1055,7 +1078,7 @@ export class VideoAssetsRepository extends TenantScopedRepository {
           data: { status: VideoAssetStatus.READY, errorCode: null, errorMessage: null },
         });
         if (flipped.count === 0) {
-          return null;
+          return await publicationBlockedBy();
         }
         const artifacts: VideoArtifactView[] = [];
         for (const item of items) {

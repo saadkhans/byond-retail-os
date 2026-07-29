@@ -1,9 +1,11 @@
 import 'reflect-metadata';
+import { GUARDS_METADATA, INTERCEPTORS_METADATA } from '@nestjs/common/constants';
 import {
   REQUIRED_MODULE_KEY,
   REQUIRED_PERMISSIONS_KEY,
   TENANT_ONLY_KEY,
 } from '../auth/decorators/access-policy.decorators';
+import { TestMediaGateGuard } from './test-media-gate.guard';
 import { VideoAssetsController } from './video-assets.controller';
 import { VideoCropsController } from './video-crops.controller';
 
@@ -49,6 +51,41 @@ describe('VideoAssetsController access policy', () => {
         ],
       ),
     ).toEqual(permissions);
+  });
+
+  /**
+   * The upload route carries BOTH the pre-buffer gate guard and the
+   * multipart interceptor. Nest runs guards BEFORE interceptors
+   * (RouterExecutionContext awaits `fnCanActivate` and only then calls
+   * `interceptorsConsumer.intercept`, which is what runs multer), so this
+   * pairing is what keeps the policy/tooling/attestation checks ahead of
+   * any byte being buffered. Behaviour is covered by
+   * test-media-gate.guard.spec; this pins the wiring.
+   */
+  it('gates the upload route with TestMediaGateGuard alongside the file interceptor', () => {
+    expect(
+      Reflect.getMetadata(GUARDS_METADATA, VideoAssetsController.prototype.upload),
+    ).toEqual([TestMediaGateGuard]);
+    expect(
+      Reflect.getMetadata(
+        INTERCEPTORS_METADATA,
+        VideoAssetsController.prototype.upload,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('applies the pre-buffer gate to the upload route ONLY', () => {
+    const handlers = Object.getOwnPropertyNames(
+      VideoAssetsController.prototype,
+    ).filter((name) => name !== 'constructor' && name !== 'upload');
+    for (const name of handlers) {
+      expect(
+        Reflect.getMetadata(
+          GUARDS_METADATA,
+          VideoAssetsController.prototype[name as keyof VideoAssetsController],
+        ),
+      ).toBeUndefined();
+    }
   });
 
   it('exposes no public route (default-deny: every handler carries permissions)', () => {

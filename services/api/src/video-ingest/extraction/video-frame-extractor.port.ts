@@ -129,14 +129,17 @@ export class FrameCountExceededError extends Error {
 }
 
 /**
- * Controlled failure: the streaming screening decode did not finish inside
- * the caller-supplied wall-clock budget (streamFrames deadlineMs). The
- * decode is ABANDONED — the child is killed — so the screen is INCOMPLETE
- * and the caller must fail closed. Distinct from
- * ExtractionInfrastructureError (nothing about the host is broken) and from
- * the byte/count budget verdicts: this one says "screening this clip did
- * not fit its time budget". The message is fixed and echoes no timings,
- * paths, or tool output.
+ * Controlled failure: a screening stage did not finish inside the
+ * caller-supplied wall-clock budget. The budget is AGGREGATE and covers
+ * BOTH external-tool stages of an inspection session — the PROBE
+ * (probe deadlineMs) and the streaming DECODE (streamFrames deadlineMs) —
+ * so a caller that slices one upload-wide allowance across the two gets the
+ * SAME verdict whichever stage runs out of time. The stage is ABANDONED —
+ * any child is killed — so the screen is INCOMPLETE and the caller must
+ * fail closed. Distinct from ExtractionInfrastructureError (nothing about
+ * the host is broken) and from the byte/count budget verdicts: this one
+ * says "screening this clip did not fit its time budget". The message is
+ * fixed and echoes no timings, paths, or tool output.
  */
 export class ScreeningDeadlineExceededError extends Error {
   constructor() {
@@ -169,13 +172,49 @@ export interface ExtractFrameAtOptions {
  * writing unscreened bytes to disk. close() releases the in-memory
  * references and is trivially idempotent (there is no disk state to
  * recover; a crash leaks nothing).
+ *
+ * TIME BUDGET: both external-tool stages — probe() and streamFrames() —
+ * take a `deadlineMs`, so ONE aggregate screening allowance can be sliced
+ * across the whole session (remaining budget at each call) and no stage can
+ * silently run on its own fixed ceiling instead. Whichever stage runs out
+ * rejects with the SAME ScreeningDeadlineExceededError verdict.
+ *
+ * Nothing this session returns proves a clip SAFE: the probe reports
+ * geometry, the frames are a rejection signal, and a session that trips
+ * nothing is the absence of evidence — never evidence of absence.
  */
 export interface BufferInspectionSession {
-  /** Probe the in-memory bytes. Memoized: repeated calls never re-run the
-   *  tooling. Failure classification matches the storage-key probe, except
-   *  that a tool-ran-and-refused outcome is reported as a controlled
-   *  unstreamable/unsupported-container content failure. */
-  probe(): Promise<VideoProbeResult>;
+  /**
+   * Probe the in-memory bytes — the FIRST external-tool stage of a screen,
+   * and therefore inside the caller's aggregate time budget, not outside it.
+   *
+   * `deadlineMs` is the REMAINING slice of that aggregate wall-clock budget
+   * at the moment of the call. Implementations must treat it as a CEILING
+   * they may clamp DOWN to their own fixed command timeout but never up, and
+   * a non-positive/degenerate remaining budget must fail fast — with
+   * ScreeningDeadlineExceededError, BEFORE any tool is spawned. When the
+   * probe is abandoned because THIS budget expired the rejection is
+   * ScreeningDeadlineExceededError (the same fail-closed verdict
+   * streamFrames gives), never an infrastructure failure: nothing about the
+   * host is broken, the clip simply did not fit the time it was given.
+   * Omitting the option keeps the implementation's own fixed ceiling as the
+   * only bound — the pre-existing behavior.
+   *
+   * MEMOIZED: the FIRST call performs the work under the budget IT supplied
+   * and its outcome (success OR failure) is retained; every later call
+   * returns that memoized result and IGNORES its own options — a second
+   * call never re-runs the tooling and never re-times it. Callers that care
+   * about the budget must therefore pass it on the first call.
+   *
+   * Failure classification matches the storage-key probe, except that a
+   * tool-ran-and-refused outcome is reported as a controlled
+   * unstreamable/unsupported-container content failure.
+   *
+   * A successful probe proves NOTHING about the clip's safety — it reports
+   * geometry and duration only; the frames are the rejection signal (see
+   * streamFrames), and their absence is never evidence of safety.
+   */
+  probe(options?: { deadlineMs?: number }): Promise<VideoProbeResult>;
 
   /**
    * EXHAUSTIVE, STREAMING decode: every decoded source frame (no fps
@@ -211,9 +250,11 @@ export interface BufferInspectionSession {
    * - `maxFrames` bounds the total; one frame past it abandons the decode
    *   with FrameCountExceededError (never a silent truncation — a
    *   truncated screen is no screen).
-   * - `deadlineMs` is the wall-clock budget for the WHOLE decode; overrun
-   *   abandons it with ScreeningDeadlineExceededError. Implementations may
-   *   clamp it down to their own ceiling but never up.
+   * - `deadlineMs` is the wall-clock budget for the WHOLE decode — the
+   *   REMAINING slice of the caller's aggregate screening budget once
+   *   probing has taken its share; overrun abandons the decode with
+   *   ScreeningDeadlineExceededError. Implementations may clamp it down to
+   *   their own ceiling but never up.
    * - FEW frames resolve normally with the count seen — SUFFICIENCY is the
    *   SERVICE's verdict (it holds the probe and the configured screening
    *   budget); only ZERO frames from an otherwise successful decode is

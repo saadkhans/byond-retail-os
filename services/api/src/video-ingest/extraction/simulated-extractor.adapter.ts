@@ -73,7 +73,16 @@ export class SimulatedVideoFrameExtractor extends VideoFrameExtractorPort {
     // ever touches disk.
     void data;
     return Promise.resolve({
-      probe: () => Promise.resolve({ ...SIMULATED_PROBE }),
+      probe: (options?: { deadlineMs?: number }) => {
+        // The aggregate screening budget covers probe AND decode in the
+        // real adapter; here the option is ACCEPTED and ignored — no tool
+        // runs, so no wall-clock budget can be consumed and no deadline
+        // can be exceeded. Ignoring it also keeps the memoization contract
+        // trivially true: the result is a constant, identical on every
+        // call whatever options are passed.
+        void options;
+        return Promise.resolve({ ...SIMULATED_PROBE });
+      },
       streamFrames: async (options: {
         maxFrames: number;
         maxBytesPerFrame: number;

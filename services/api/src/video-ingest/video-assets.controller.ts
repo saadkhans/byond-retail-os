@@ -7,16 +7,20 @@ import {
   Post,
   Query,
   UploadedFile,
+  UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import {
+  ApiBadRequestResponse,
   ApiBearerAuth,
   ApiConflictResponse,
   ApiConsumes,
   ApiCreatedResponse,
+  ApiHeader,
   ApiNotFoundResponse,
   ApiOperation,
+  ApiServiceUnavailableResponse,
   ApiTags,
 } from '@nestjs/swagger';
 import {
@@ -34,6 +38,10 @@ import { ExtractFramesDto } from './dto/extract-frames.dto';
 import { QueryVideoAssetsDto } from './dto/query-video-assets.dto';
 import { ScreenVideoAssetDto } from './dto/screen-video-asset.dto';
 import { UploadVideoAssetDto } from './dto/upload-video-asset.dto';
+import {
+  TestMediaGateGuard,
+  UPLOAD_ATTESTATION_HEADERS,
+} from './test-media-gate.guard';
 import {
   ScreeningPreviewResult,
   UploadedVideoFile,
@@ -54,8 +62,49 @@ export class VideoAssetsController {
 
   @Post()
   @RequirePermissions('video-asset:manage')
+  // ORDERING IS THE POINT, and it is a Nest LIFECYCLE fact, not a
+  // decorator-order one: guards run BEFORE interceptors
+  // (RouterExecutionContext awaits `fnCanActivate` and only then calls
+  // `interceptorsConsumer.intercept`, which is what runs FileInterceptor /
+  // multer). So the policy, tooling, and attestation gates below execute
+  // while the multipart body is still unread — no byte of a refused upload
+  // is ever buffered into process memory. The permission guard above
+  // already relied on the same ordering; the multer memory limit remains
+  // configured exactly as before, now as a backstop rather than the first
+  // gate. Pinned by test-media-gate.guard.spec.ts.
+  @UseGuards(TestMediaGateGuard)
   @UseInterceptors(FileInterceptor('file'))
   @ApiConsumes('multipart/form-data')
+  @ApiHeader({
+    name: 'x-controlled-test-media',
+    required: true,
+    description:
+      'Operator DECLARATION (literal "true") that this clip is controlled ' +
+      'internal test media. Read BEFORE the body is buffered; the ' +
+      'matching multipart field remains the audited record.',
+  })
+  @ApiHeader({
+    name: 'x-no-payment-cards-visible',
+    required: true,
+    description:
+      'Operator DECLARATION (literal "true") that no payment card is ' +
+      'visible in the clip. Nothing inspects the frames to confirm it.',
+  })
+  @ApiHeader({
+    name: 'x-no-customer-pii',
+    required: true,
+    description:
+      'Operator DECLARATION (literal "true") that the clip carries no ' +
+      'customer personal data. Nothing inspects the frames to confirm it.',
+  })
+  @ApiHeader({
+    name: 'x-attest-no-sensitive-content',
+    required: true,
+    description:
+      'Operator DECLARATION (literal "true") that the frames carry no ' +
+      'payment-card or credential content. Nothing inspects the frames to ' +
+      'confirm it.',
+  })
   @ApiOperation({
     summary: 'Upload a controlled test video',
     description:
@@ -72,7 +121,18 @@ export class VideoAssetsController {
       'attestations `controlledTestMedia`, `noPaymentCardsVisible`, ' +
       '`noCustomerPII`, and `attestNoSensitiveContent` (each the literal ' +
       '"true"; any missing/other value is a controlled 400 before any row ' +
-      'or byte). That gate — not any screening result — is what ' +
+      'or byte). Those gates are enforced by a route GUARD, which Nest ' +
+      'runs BEFORE the multipart interceptor, so a refused upload is ' +
+      'refused with its body still unread — nothing is buffered into ' +
+      'memory. Because multipart fields do not exist before parsing, the ' +
+      'attestations must ALSO be sent as request headers (' +
+      UPLOAD_ATTESTATION_HEADERS.map(({ header }) => `\`${header}\``).join(
+        ', ',
+      ) +
+      ', each "true" after trimming/lowercasing): the HEADERS are the ' +
+      'pre-buffer gate, the multipart FIELDS stay required as the audited ' +
+      'record the service persists and re-checks. That gate — not any ' +
+      'screening result — is what ' +
       'authorizes storing a clip; without it the endpoint is a controlled ' +
       '503. The asset is then staged PENDING_MEDIA and its frames are ' +
       'text/OCR-SCREENED BEFORE any byte reaches durable storage. That ' +
@@ -93,6 +153,16 @@ export class VideoAssetsController {
   })
   @ApiCreatedResponse({
     description: 'Asset created (QUARANTINED pending screening)',
+  })
+  @ApiBadRequestResponse({
+    description:
+      'A required attestation header is missing or is not "true" — ' +
+      'refused before the upload body is read',
+  })
+  @ApiServiceUnavailableResponse({
+    description:
+      'The controlled test-media policy gate is closed, or the screening ' +
+      'toolchain cannot run — refused before the upload body is read',
   })
   upload(
     @CurrentTenantId() tenantId: string,

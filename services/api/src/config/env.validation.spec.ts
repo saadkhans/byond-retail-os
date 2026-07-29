@@ -1,6 +1,10 @@
 import 'reflect-metadata';
 import { randomBytes } from 'node:crypto';
-import { parseTrustProxy, validateEnv } from './env.validation';
+import {
+  isEnvFlagEnabled,
+  parseTrustProxy,
+  validateEnv,
+} from './env.validation';
 
 describe('validateEnv', () => {
   // Generated at runtime so no secret-looking literal is ever committed;
@@ -340,6 +344,69 @@ describe('validateEnv', () => {
       ).toThrow(messageFor('production'));
     });
 
+    describe('spelling parity: TRUE behaves EXACTLY like true (isEnvFlagEnabled)', () => {
+      // The outage this pins: a `TRUE` deployment that boots and selects the
+      // real tooling must not read as "disabled" anywhere downstream — the
+      // startup rule and the upload gate share one definition of enabled.
+      it.each(['development', 'test'])(
+        'accepts TRUE when NODE_ENV=%s, exactly as it accepts true',
+        (nodeEnv) => {
+          const validated = validateEnv({
+            ...validConfig,
+            NODE_ENV: nodeEnv,
+            VIDEO_TEST_MEDIA_INGEST_ENABLED: 'TRUE',
+          });
+          // whitelist:true strips undeclared keys — the gate must survive,
+          // and the raw spelling is preserved for the consumer to normalize.
+          expect(validated.VIDEO_TEST_MEDIA_INGEST_ENABLED).toBe('TRUE');
+          expect(
+            isEnvFlagEnabled(validated.VIDEO_TEST_MEDIA_INGEST_ENABLED),
+          ).toBe(true);
+        },
+      );
+
+      it.each(['true', 'TRUE', 'True'])(
+        'rejects %s at startup when NODE_ENV=production',
+        (value) => {
+          expect(() =>
+            validateEnv({
+              ...validConfig,
+              NODE_ENV: 'production',
+              VIDEO_TEST_MEDIA_INGEST_ENABLED: value,
+            }),
+          ).toThrow(messageFor('production'));
+        },
+      );
+
+      it.each(['true', 'TRUE', 'True'])(
+        'rejects %s at startup when NODE_ENV is UNSET',
+        (value) => {
+          const { NODE_ENV: _omit, ...withoutNodeEnv } = validConfig;
+          expect(() =>
+            validateEnv({
+              ...withoutNodeEnv,
+              VIDEO_TEST_MEDIA_INGEST_ENABLED: value,
+            }),
+          ).toThrow(messageFor('unset'));
+        },
+      );
+
+      it.each(['false', 'FALSE', 'False'])(
+        'accepts %s in every environment (disabled spellings agree too)',
+        (value) => {
+          for (const nodeEnv of ['development', 'test', 'production']) {
+            expect(() =>
+              validateEnv({
+                ...validConfig,
+                NODE_ENV: nodeEnv,
+                VIDEO_TEST_MEDIA_INGEST_ENABLED: value,
+              }),
+            ).not.toThrow();
+          }
+        },
+      );
+    });
+
     it.each(['development', 'test', 'production'])(
       'accepts NODE_ENV=%s with the flag false or unset',
       (nodeEnv) => {
@@ -586,5 +653,56 @@ describe('validateEnv', () => {
     expect(() =>
       validateEnv({ ...validConfig, LOGIN_THROTTLE_IP_LIMIT: '0' }),
     ).toThrow(/LOGIN_THROTTLE_IP_LIMIT/);
+  });
+});
+
+describe('isEnvFlagEnabled (single source of truth for Phase 10 boolean flags)', () => {
+  // Startup validation, the video-ingest module adapter factories, and the
+  // upload gate must all agree on what "enabled" means. Anything looser here
+  // silently widens every gate; anything stricter reopens the
+  // TRUE-boots-but-503s-every-upload bug.
+  it.each(['true', 'TRUE', 'True', 'tRuE'])(
+    'treats %j as enabled (case-insensitive, matching @Matches(/^(true|false)$/i))',
+    (value) => {
+      expect(isEnvFlagEnabled(value)).toBe(true);
+    },
+  );
+
+  it.each([' true ', '\ttrue\n', ' TRUE '])(
+    'trims surrounding whitespace before comparing: %j',
+    (value) => {
+      expect(isEnvFlagEnabled(value)).toBe(true);
+    },
+  );
+
+  it.each(['false', 'FALSE', 'False', ' false ', ''])(
+    'treats %j as disabled',
+    (value) => {
+      expect(isEnvFlagEnabled(value)).toBe(false);
+    },
+  );
+
+  it('treats an unset flag as disabled (off by default)', () => {
+    expect(isEnvFlagEnabled(undefined)).toBe(false);
+  });
+
+  it.each(['yes', '1', 'on', 'enabled', 'truthy', 'y'])(
+    'FAILS CLOSED on unexpected value %j (validateSync rejects these at boot)',
+    (value) => {
+      expect(isEnvFlagEnabled(value)).toBe(false);
+    },
+  );
+
+  it('matches how the video-ingest module factories normalize today', () => {
+    // Module factories: config.get<string>(FLAG)?.toLowerCase() === 'true'.
+    // The helper additionally trims, which can only differ on values the env
+    // validator already rejects at boot — so the two agree on every value a
+    // running process can observe.
+    const factoryNormalize = (value: string | undefined) =>
+      value?.toLowerCase() === 'true';
+    for (const value of ['true', 'TRUE', 'True', 'false', 'FALSE', '']) {
+      expect(isEnvFlagEnabled(value)).toBe(factoryNormalize(value));
+    }
+    expect(isEnvFlagEnabled(undefined)).toBe(factoryNormalize(undefined));
   });
 });

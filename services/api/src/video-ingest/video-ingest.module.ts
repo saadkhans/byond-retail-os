@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { MulterModule } from '@nestjs/platform-express';
+import { isEnvFlagEnabled } from '../config/env.validation';
 import { InferenceModule } from '../inference/inference.module';
 import { PlatformModulesModule } from '../platform-modules/platform-modules.module';
 import { FfmpegVideoFrameExtractor } from './extraction/ffmpeg-extractor.adapter';
@@ -11,6 +12,7 @@ import { SimulatedFrameTextRecognizer } from './recognition/simulated-recognizer
 import { TesseractFrameTextRecognizer } from './recognition/tesseract-recognizer.adapter';
 import { LocalVideoStorageAdapter } from './storage/local-video-storage.adapter';
 import { VideoStoragePort } from './storage/video-storage.port';
+import { TestMediaGateGuard } from './test-media-gate.guard';
 import { DEFAULT_MAX_UPLOAD_BYTES } from './video-assets.service';
 import { VideoAssetsController } from './video-assets.controller';
 import { VideoAssetsRepository } from './video-assets.repository';
@@ -63,6 +65,11 @@ import { VideoCropsController } from './video-crops.controller';
   providers: [
     VideoAssetsService,
     VideoAssetsRepository,
+    // The PRE-BUFFER upload gate. Nest instantiates route-level guards
+    // through the declaring module's injector, so it must be a provider
+    // here to receive ConfigService + the extractor/recognizer ports it
+    // shares with the service. Registered on the upload route only.
+    TestMediaGateGuard,
     SimulatedVideoFrameExtractor,
     LocalVideoStorageAdapter,
     // The port stays provider-neutral (bytes + keys only); the optional
@@ -87,7 +94,11 @@ import { VideoCropsController } from './video-crops.controller';
         simulated: SimulatedVideoFrameExtractor,
         localStorage: LocalVideoStorageAdapter,
       ) =>
-        config.get<string>('VIDEO_FFMPEG_ENABLED')?.toLowerCase() === 'true'
+        // ONE definition of "is this env flag on" for the whole codebase
+        // (trimmed + case-folded, fail-closed on anything else) — the same
+        // helper the service's policy gate reads its flag through, so no
+        // two flags in this module can drift apart on spelling.
+        isEnvFlagEnabled(config.get<string>('VIDEO_FFMPEG_ENABLED'))
           ? new FfmpegVideoFrameExtractor(localStorage)
           : simulated,
     },
@@ -105,7 +116,8 @@ import { VideoCropsController } from './video-crops.controller';
         config: ConfigService,
         simulated: SimulatedFrameTextRecognizer,
       ) =>
-        config.get<string>('VIDEO_OCR_ENABLED')?.toLowerCase() === 'true'
+        // Same shared flag helper as the extractor factory above.
+        isEnvFlagEnabled(config.get<string>('VIDEO_OCR_ENABLED'))
           ? new TesseractFrameTextRecognizer()
           : simulated,
     },
