@@ -36,6 +36,50 @@ const CROP_REASONS = [
 
 const ACCEPTED_EXTENSIONS = '.mp4,.m4v,.mov,.webm,.mkv,.avi,.mpg,.mpeg';
 
+/**
+ * The FOUR attestations the upload API requires. They are the operator's
+ * DECLARATIONS about controlled internal test media, recorded in the audit
+ * trail as the policy the clip was accepted under — NOT a safety
+ * guarantee: nothing inspects the footage to confirm them, and the API's
+ * text/OCR screen can only REJECT a clip when it DETECTS card or
+ * credential text. Detecting nothing proves nothing (rotated, blurred,
+ * stylized or low-quality digits defeat recognition), so the honest
+ * control is that these clips are ones YOU staged and control.
+ */
+const UPLOAD_ATTESTATIONS = [
+  {
+    field: 'controlledTestMedia',
+    label: 'Controlled internal test media I staged and own',
+    title:
+      'Phase 10 ingests controlled internal test clips only — footage you ' +
+      'staged and can account for. Never real customer footage, never ' +
+      'third-party material.',
+  },
+  {
+    field: 'noPaymentCardsVisible',
+    label: 'No payment card is visible anywhere in this clip',
+    title:
+      'Your declaration as the operator. The API does not verify it: its ' +
+      'text/OCR screen can only reject a clip when it DETECTS card text, ' +
+      'and detecting nothing is not evidence that nothing is there.',
+  },
+  {
+    field: 'noCustomerPII',
+    label: 'No customer personal data in this clip',
+    title:
+      'No identifiable customers, documents, or screens showing personal ' +
+      'records. Your declaration — nothing checks it for you.',
+  },
+  {
+    field: 'attestNoSensitiveContent',
+    label: 'No payment-card or credential content in the frames',
+    title:
+      'Your declaration, recorded in the audit trail. Not a safety ' +
+      'guarantee — the upload still lands QUARANTINED until an audited ' +
+      'screening decision releases it.',
+  },
+] as const;
+
 function errorMessage(err: unknown): string {
   return err instanceof ApiError ? err.message : 'Unexpected error';
 }
@@ -69,9 +113,10 @@ export function VideoAssetsPage() {
   const [unitId, setUnitId] = useState('');
   const [deviceId, setDeviceId] = useState('');
   const [sessionId, setSessionId] = useState('');
-  const [attested, setAttested] = useState(false);
+  const [attested, setAttested] = useState<Record<string, boolean>>({});
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const allAttested = UPLOAD_ATTESTATIONS.every(({ field }) => attested[field]);
 
   const { data, error, loading } = useLoad<Paginated<VideoAsset>>(
     () =>
@@ -89,10 +134,13 @@ export function VideoAssetsPage() {
       setUploadError('Choose a test video file first.');
       return;
     }
-    if (!attested) {
+    if (!allAttested) {
       setUploadError(
-        'Confirm the attestation: the staged test clip must contain no ' +
-          'payment-card or credential content in its frames.',
+        'Confirm all four operator attestations: this must be controlled ' +
+          'internal test media you staged, with no payment card visible, ' +
+          'no customer personal data, and no payment-card or credential ' +
+          'content in its frames. They are declarations you make — the API ' +
+          'records them, it does not verify them.',
       );
       return;
     }
@@ -101,9 +149,13 @@ export function VideoAssetsPage() {
     try {
       const formData = new FormData();
       formData.append('file', file);
-      // Required, audited operator attestation — the API refuses to store
-      // without it (text screening cannot inspect pixels).
-      formData.append('attestNoSensitiveContent', 'true');
+      // Required, audited operator DECLARATIONS — the API refuses to store
+      // without all four. They record the policy the clip was accepted
+      // under; the authorization itself is the server's controlled
+      // test-media gate, and text screening only ever rejects.
+      for (const { field } of UPLOAD_ATTESTATIONS) {
+        formData.append(field, 'true');
+      }
       if (locationId.trim()) {
         formData.append('locationId', locationId.trim());
       }
@@ -162,29 +214,41 @@ export function VideoAssetsPage() {
           value={sessionId}
           onChange={(e) => setSessionId(e.target.value)}
         />
-        <label
-          style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}
-          title={
-            'Required attestation: the API refuses to store a clip without ' +
-            'it. Defense-in-depth only — the upload still lands QUARANTINED ' +
-            'until an audited screening decision approves it.'
-          }
-        >
-          <input
-            type="checkbox"
-            checked={attested}
-            onChange={(e) => setAttested(e.target.checked)}
-          />
-          Staged test clip — no card/credential content in frames
-        </label>
+        {UPLOAD_ATTESTATIONS.map(({ field, label, title }) => (
+          <label
+            key={field}
+            style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}
+            title={title}
+          >
+            <input
+              type="checkbox"
+              checked={attested[field] ?? false}
+              onChange={(e) =>
+                setAttested((current) => ({
+                  ...current,
+                  [field]: e.target.checked,
+                }))
+              }
+            />
+            {label}
+          </label>
+        ))}
         <button
           className="primary"
           type="submit"
-          disabled={uploading || !attested}
+          disabled={uploading || !allAttested}
         >
           {uploading ? 'Uploading…' : 'Upload test video'}
         </button>
       </form>
+      <p className="muted">
+        Uploads accept CONTROLLED INTERNAL TEST MEDIA only, and are disabled
+        unless the server has the test-media policy gate enabled (a 503
+        otherwise). The four boxes are your declarations, not a safety
+        guarantee — the API records them and screens frame text, but that
+        screen can only REJECT a clip: detecting nothing is not evidence
+        that nothing is there.
+      </p>
       {uploadError ? <div className="error">{uploadError}</div> : null}
       <div className="toolbar">
         <select

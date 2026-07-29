@@ -53,7 +53,14 @@ export class VideoCropsController {
       'box — opaque references only; the Phase 9 media policy screens it ' +
       'again) and enqueues through the EXISTING inference contract. ' +
       'One-shot: the crop links to its job once; retries replay the linked ' +
-      'job. Requires the inference module enabled.',
+      'job. Creation is TWO-PHASE and crash-recoverable: the job is created ' +
+      'in the NON-CLAIMABLE PENDING_LINK state (never claimable by a ' +
+      'worker), the crop→job link commits, and only then is the job ' +
+      'published PENDING_LINK → QUEUED. A crash between the phases leaves ' +
+      'no claimable work and nothing unreachable — a retry finishes the ' +
+      'interrupted publish, and DELETE /video-assets/:id discovers such a ' +
+      'job by its deterministic key and cancels it. Requires the inference ' +
+      'module enabled.',
   })
   @ApiCreatedResponse({ description: 'Job queued (or replayed)' })
   @ApiNotFoundResponse({ description: 'Artifact not found in this tenant' })

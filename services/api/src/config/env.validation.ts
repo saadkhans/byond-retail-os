@@ -133,6 +133,21 @@ class EnvironmentVariables {
   })
   VIDEO_OCR_ENABLED?: string;
 
+  // Master switch for the ONLY upload mode Phase 10 supports: controlled
+  // INTERNAL TEST clips. Off by default — with it unset/false the ingestion
+  // endpoint accepts nothing at all. Same strict boolean idiom as
+  // VIDEO_FFMPEG_ENABLED / VIDEO_OCR_ENABLED, and MUST stay declared here
+  // (validateSync runs with whitelist:true, so an undeclared key is
+  // STRIPPED before ConfigService is constructed and the gate would read as
+  // permanently off). assertTestMediaIngestNonProduction below additionally
+  // FAILS startup whenever it is true outside an explicit
+  // development/test NODE_ENV.
+  @IsOptional()
+  @Matches(/^(true|false)$/i, {
+    message: 'VIDEO_TEST_MEDIA_INGEST_ENABLED must be true or false',
+  })
+  VIDEO_TEST_MEDIA_INGEST_ENABLED?: string;
+
   // UNSUPPORTED — the historical unscreened-upload bypass is GONE in every
   // environment. The variable stays DECLARED (whitelist compatibility:
   // env files that carry it as false/unset must still boot), but
@@ -173,6 +188,20 @@ class EnvironmentVariables {
   @Min(30)
   @Max(3600)
   VIDEO_MAX_SCREENING_FRAMES?: number;
+
+  // UPLOAD-WIDE screening deadline (ms): the aggregate wall-clock budget for
+  // decoding + OCR-screening ONE upload, not a per-frame or per-probe
+  // allowance. Without it a pathologically slow clip (or a wedged external
+  // binary) could hold an HTTP request open and pin CPU indefinitely, so the
+  // whole screen is abandoned — a controlled rejection BEFORE any byte
+  // reaches durable storage — once the budget is spent. Default 30000
+  // (30 s); bounds 1 s .. 5 min so a deployment typo fails at boot instead
+  // of making uploads either unscreenable or unboundedly slow.
+  @IsOptional()
+  @IsInt()
+  @Min(1000)
+  @Max(300_000)
+  VIDEO_SCREENING_TIMEOUT_MS?: number;
 }
 
 // Placeholder markers — banned in EVERY environment (staging and preview
@@ -259,6 +288,35 @@ export function assertScreeningBypassUnsupported(
   }
 }
 
+/**
+ * Startup rule (same post-validate idiom as assertScreeningBypassUnsupported):
+ * controlled test-media ingestion is a NON-PRODUCTION capability. The flag may
+ * only be true when NODE_ENV is EXPLICITLY development or test — production
+ * fails, and so does an UNSET/absent NODE_ENV, which is the same hole as
+ * production (a deployment that forgets NODE_ENV must not silently become an
+ * upload-accepting environment). Non-enum NODE_ENV values never reach here:
+ * the NodeEnv enum rejects them upstream in validateSync. false/unset is
+ * always fine, in every environment.
+ */
+export function assertTestMediaIngestNonProduction(
+  enabled: string | undefined,
+  nodeEnv: NodeEnv | undefined,
+): void {
+  if (enabled?.toLowerCase() !== 'true') {
+    return;
+  }
+  if (nodeEnv === NodeEnv.Development || nodeEnv === NodeEnv.Test) {
+    return;
+  }
+  const environment = nodeEnv === undefined ? 'unset' : nodeEnv;
+  throw new Error(
+    'VIDEO_TEST_MEDIA_INGEST_ENABLED is not supported when NODE_ENV is ' +
+      `${environment} because controlled test-media ingestion is ` +
+      'non-production only; it is allowed solely when NODE_ENV is ' +
+      'explicitly development or test.',
+  );
+}
+
 export function validateEnv(
   config: Record<string, unknown>,
 ): EnvironmentVariables {
@@ -277,6 +335,10 @@ export function validateEnv(
   assertJwtSecretUsable(validated.JWT_SECRET);
   assertScreeningBypassUnsupported(
     validated.VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS,
+  );
+  assertTestMediaIngestNonProduction(
+    validated.VIDEO_TEST_MEDIA_INGEST_ENABLED,
+    validated.NODE_ENV,
   );
   return validated;
 }

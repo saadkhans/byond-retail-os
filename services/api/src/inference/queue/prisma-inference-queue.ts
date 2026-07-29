@@ -22,6 +22,7 @@ import {
   InferenceJobDetail,
 } from '../inference-jobs.repository';
 import {
+  CANCELLABLE_STATUSES,
   CancelQueuedRejection,
   EnqueueJobInput,
   EnqueueRejection,
@@ -30,6 +31,7 @@ import {
   INFERENCE_JOB_MAX_ATTEMPTS,
   InferenceQueuePort,
   LEASE_EXPIRED_ERROR_CODE,
+  PublishPendingLinkRejection,
   TransitionRejection,
 } from './inference-queue.port';
 
@@ -67,11 +69,16 @@ export class PrismaInferenceQueue
   }
 
   /**
-   * Creates a QUEUED job after tenant-scoped reference checks, all inside
-   * the insert transaction (with the composite same-tenant FKs in migration
+   * Creates a job after tenant-scoped reference checks, all inside the
+   * insert transaction (with the composite same-tenant FKs in migration
    * SQL as the backstop). Idempotent: at-least-once trigger delivery with
    * the same key replays the original job untouched — no duplicate, no
-   * audit row.
+   * audit row — whatever status that job currently holds.
+   *
+   * The row lands QUEUED (the column default — Phase 9 creation writes no
+   * status at all) unless `input.pendingLink` asks for the NON-CLAIMABLE
+   * PENDING_LINK state, in which case the caller must publish it with
+   * publishPendingLink() after its downstream link commits.
    */
   enqueue(
     tenantId: string,
@@ -196,6 +203,11 @@ export class PrismaInferenceQueue
           inputDescriptor: input.inputDescriptor,
           idempotencyKey: input.idempotencyKey,
           createdById: input.createdById,
+          // Absent unless the caller opted in: Phase 9 creation keeps the
+          // schema default (QUEUED) and stays byte-identical.
+          ...(input.pendingLink
+            ? { status: InferenceJobStatus.PENDING_LINK }
+            : {}),
         },
         include: INFERENCE_JOB_DETAIL_INCLUDE,
       });
@@ -318,6 +330,10 @@ export class PrismaInferenceQueue
       const candidate = await this.prisma.inferenceJob.findFirst({
         where: {
           tenantId: scopedTenantId,
+          // QUEUED and nothing else: a PENDING_LINK job (two-phase
+          // creation, downstream link not committed yet) is invisible to
+          // every claim, and markRunning re-pins the same status in its
+          // compare-and-set.
           status: InferenceJobStatus.QUEUED,
           ...(jobType ? { jobType } : {}),
         },
@@ -535,16 +551,71 @@ export class PrismaInferenceQueue
   }
 
   /**
-   * QUEUED → CANCELLED compare-and-set for the orphaned-job compensation
-   * path (see InferenceJobsService.cancelOrphanedJob). In THIS
+   * PENDING_LINK → QUEUED compare-and-set: the second phase of two-phase
+   * creation (see InferenceJobsService.publishPendingLinkJob). In THIS
+   * implementation the InferenceJob table IS the queue, so flipping the row
+   * QUEUED is what makes the work claimable; a broker-backed port would
+   * publish its message here instead — which is exactly why the job must
+   * not be deliverable before this call. No timestamps move (the job has
+   * still never started: the unclaimed-timestamps CHECK holds), no lease is
+   * taken, and attempts stay at 0 — claiming remains markRunning's job.
+   * Only a PENDING_LINK job publishes; anything else (before or during the
+   * CAS) returns 'not-pending' without writing or auditing.
+   */
+  publishPendingLink(
+    tenantId: string,
+    jobId: string,
+    buildAuditEntry: (
+      before: InferenceJobDetail,
+      after: InferenceJobDetail,
+    ) => AuditEntry,
+  ): Promise<InferenceJobDetail | PublishPendingLinkRejection | null> {
+    const scopedTenantId = this.requireTenantId(tenantId);
+    return this.prisma.$transaction(async (tx) => {
+      const before = await tx.inferenceJob.findFirst({
+        where: { id: jobId, tenantId: scopedTenantId },
+        include: INFERENCE_JOB_DETAIL_INCLUDE,
+      });
+      if (!before) {
+        return null;
+      }
+      if (before.status !== InferenceJobStatus.PENDING_LINK) {
+        return 'not-pending' as const;
+      }
+      const updated = await tx.inferenceJob.updateMany({
+        where: {
+          id: jobId,
+          tenantId: scopedTenantId,
+          status: InferenceJobStatus.PENDING_LINK,
+        },
+        data: { status: InferenceJobStatus.QUEUED },
+      });
+      if (updated.count === 0) {
+        // Lost the CAS to a concurrent cancellation (or a second publish).
+        return 'not-pending' as const;
+      }
+      const after = await tx.inferenceJob.findFirstOrThrow({
+        where: { id: jobId, tenantId: scopedTenantId },
+        include: INFERENCE_JOB_DETAIL_INCLUDE,
+      });
+      await this.auditLog.record(buildAuditEntry(before, after), tx);
+      return after;
+    });
+  }
+
+  /**
+   * PENDING_LINK/QUEUED → CANCELLED compare-and-set for the orphaned-job
+   * compensation path (see InferenceJobsService.cancelOrphanedJob). In THIS
    * implementation the InferenceJob table is the queue, so flipping the
    * row terminal IS the message withdrawal; a broker-backed port would
    * additionally drop/tombstone its message here. CANCELLED is a terminal
    * status, so completedAt is stamped with the flip (DB CHECK: every
    * terminal job has completedAt); errorCode stays NULL (errors exist
-   * exactly on FAILED) and no lease is involved (QUEUED jobs carry none).
-   * Only a QUEUED job cancels — a job that was claimed or finished
-   * (before or during the CAS) returns 'not-queued' without writing.
+   * exactly on FAILED) and no lease is involved (neither state carries
+   * one). A PENDING_LINK job cancels exactly like a QUEUED one — that is
+   * what retires a crash-window job whose downstream link never committed
+   * — while a job that was claimed or finished (before or during the CAS)
+   * returns 'not-queued' without writing.
    */
   cancelQueued(
     tenantId: string,
@@ -563,14 +634,14 @@ export class PrismaInferenceQueue
       if (!before) {
         return null;
       }
-      if (before.status !== InferenceJobStatus.QUEUED) {
+      if (!CANCELLABLE_STATUSES.includes(before.status)) {
         return 'not-queued' as const;
       }
       const updated = await tx.inferenceJob.updateMany({
         where: {
           id: jobId,
           tenantId: scopedTenantId,
-          status: InferenceJobStatus.QUEUED,
+          status: { in: [...CANCELLABLE_STATUSES] },
         },
         data: {
           status: InferenceJobStatus.CANCELLED,
@@ -578,7 +649,8 @@ export class PrismaInferenceQueue
         },
       });
       if (updated.count === 0) {
-        // Lost the CAS to a concurrent claim — the job left QUEUED.
+        // Lost the CAS to a concurrent claim — the job left the
+        // cancellable set (PENDING_LINK/QUEUED).
         return 'not-queued' as const;
       }
       const after = await tx.inferenceJob.findFirstOrThrow({

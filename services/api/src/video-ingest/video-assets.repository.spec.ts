@@ -1,4 +1,8 @@
-import { VideoArtifactType, VideoAssetStatus } from '@prisma/client';
+import {
+  VideoArtifactType,
+  VideoAssetStatus,
+  VideoMediaWriteState,
+} from '@prisma/client';
 import {
   EXTRACTION_OPERATION_LOCK_MAX_WAIT_MS,
   EXTRACTION_OPERATION_LOCK_TIMEOUT_MS,
@@ -114,7 +118,12 @@ function makeRepository(tx: TxStub) {
       findFirst: jest.fn(async () => null),
       findMany: jest.fn(async () => []),
     },
-    videoAsset: { findFirst: jest.fn(async () => null) },
+    videoAsset: {
+      findFirst: jest.fn(async () => null),
+      // Media-write resolution is a plain, connection-cheap update on the
+      // ROOT client — no transaction, no advisory lock.
+      updateMany: jest.fn(async () => ({ count: 1 })),
+    },
     videoExtractionRequest: { findFirst: jest.fn(async () => null) },
   };
   const auditLog = { record: jest.fn(async () => undefined) };
@@ -854,12 +863,15 @@ describe('decision/preview serialization on the asset advisory lock', () => {
     expect(builder).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'asset-1' }),
       false,
+      false,
     );
-    // The marker is read alongside the safe select in ONE query.
+    // The marker AND the durable media-write state are read alongside the
+    // safe select in ONE query.
     const [{ select }] = tx.videoAsset.findFirst.mock.calls[0] as unknown as [
-      { select: { mediaRemovedAt: boolean } },
+      { select: { mediaRemovedAt: boolean; mediaWriteState: boolean } },
     ];
     expect(select.mediaRemovedAt).toBe(true);
+    expect(select.mediaWriteState).toBe(true);
   });
 
   it('softDelete reports an ALREADY-claimed removal marker (screening rejection removed the media first) and strips it from the audit snapshot', async () => {
@@ -881,7 +893,61 @@ describe('decision/preview serialization on the asset advisory lock', () => {
     expect(builder).toHaveBeenCalledWith(
       expect.not.objectContaining({ mediaRemovedAt: removedAt }),
       true,
+      false,
     );
+  });
+
+  it('softDelete reports an UNDECIDED media write (a claimed put has not resolved) and strips the column from the audit snapshot', async () => {
+    // Item 2: the claim is stamped under THIS lock immediately before the
+    // put, so reading it here is authoritative — PENDING means an upload
+    // can still land bytes just after the caller drains the prefix, and the
+    // caller must therefore withhold its exactly-once completion marker.
+    const tx = makeTx();
+    tx.videoAsset.findFirst.mockResolvedValue({
+      id: 'asset-1',
+      status: VideoAssetStatus.PENDING_MEDIA,
+      mediaRemovedAt: null,
+      mediaWriteState: VideoMediaWriteState.PENDING,
+    });
+    const { repository } = makeRepository(tx);
+    const builder = jest.fn(
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'DELETE' }) as never,
+    );
+    const result = await repository.softDelete(TENANT, 'asset-1', builder);
+    expect(result).toMatchObject({
+      mediaAlreadyRemoved: false,
+      mediaWriteUndecided: true,
+    });
+    expect(builder).toHaveBeenCalledWith(
+      expect.not.objectContaining({
+        mediaWriteState: VideoMediaWriteState.PENDING,
+      }),
+      false,
+      true,
+    );
+  });
+
+  it('softDelete treats a RESOLVED (or never-claimed) media write as decided', async () => {
+    for (const state of [
+      VideoMediaWriteState.SUCCEEDED,
+      VideoMediaWriteState.FAILED,
+      null,
+    ]) {
+      const tx = makeTx();
+      tx.videoAsset.findFirst.mockResolvedValue({
+        id: 'asset-1',
+        status: VideoAssetStatus.QUARANTINED,
+        mediaRemovedAt: null,
+        mediaWriteState: state,
+      });
+      const { repository } = makeRepository(tx);
+      const result = await repository.softDelete(
+        TENANT,
+        'asset-1',
+        () => ({ tenantId: TENANT, actorEmail: 'x', action: 'DELETE' }) as never,
+      );
+      expect(result).toMatchObject({ mediaWriteUndecided: false });
+    }
   });
 });
 
@@ -935,36 +1001,56 @@ describe('VideoAssetsRepository.recordMediaRemovalCompleted', () => {
   });
 });
 
-describe('VideoAssetsRepository.assetLivenessUnderLock', () => {
-  it('takes the SAME asset advisory lock BEFORE the read and reports a live asset', async () => {
-    // The upload's pre-put liveness check serializes with softDelete on
-    // this lock: a 'live' answer means no delete had committed at the
-    // moment of the read.
+describe('VideoAssetsRepository.beginMediaWriteUnderLock', () => {
+  it('takes the SAME asset advisory lock BEFORE the read and CLAIMS the media write on a live asset', async () => {
+    // The upload's pre-put step serializes with softDelete on this lock: a
+    // 'live' answer means no delete had committed at the moment of the
+    // read, and the PENDING claim it stamps in the same transaction is
+    // what a later delete OBSERVES instead of inferring the drain.
     const tx = makeTx();
     tx.videoAsset.findFirst.mockResolvedValue({ deletedAt: null });
     const { repository } = makeRepository(tx);
     await expect(
-      repository.assetLivenessUnderLock(TENANT, 'asset-1'),
+      repository.beginMediaWriteUnderLock(TENANT, 'asset-1'),
     ).resolves.toBe('live');
     expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
     expect(tx.$queryRaw.mock.calls[0][1]).toBe(`video-asset:${TENANT}:asset-1`);
     expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
       tx.videoAsset.findFirst.mock.invocationCallOrder[0],
     );
+    // The claim is written in the SAME locked transaction as the read, and
+    // re-asserts "not deleted" in the write itself.
+    const [{ where, data }] = tx.videoAsset.updateMany.mock
+      .calls[0] as unknown as [
+      { where: Record<string, unknown>; data: Record<string, unknown> },
+    ];
+    expect(where).toEqual({
+      id: 'asset-1',
+      tenantId: TENANT,
+      deletedAt: null,
+    });
+    expect(data).toEqual({ mediaWriteState: VideoMediaWriteState.PENDING });
+    expect(tx.videoAsset.findFirst.mock.invocationCallOrder[0]).toBeLessThan(
+      tx.videoAsset.updateMany.mock.invocationCallOrder[0],
+    );
   });
 
-  it('reports deleted and missing rows honestly (soft-deleted rows are still READ — no deletedAt filter)', async () => {
+  it('reports deleted and missing rows honestly and claims NOTHING for them (soft-deleted rows are still READ — no deletedAt filter)', async () => {
     const tx = makeTx();
     tx.videoAsset.findFirst
       .mockResolvedValueOnce({ deletedAt: new Date() })
       .mockResolvedValueOnce(null);
     const { repository } = makeRepository(tx);
     await expect(
-      repository.assetLivenessUnderLock(TENANT, 'asset-1'),
+      repository.beginMediaWriteUnderLock(TENANT, 'asset-1'),
     ).resolves.toBe('deleted');
     await expect(
-      repository.assetLivenessUnderLock(TENANT, 'asset-1'),
+      repository.beginMediaWriteUnderLock(TENANT, 'asset-1'),
     ).resolves.toBe('missing');
+    // No claim on either path: the caller skips the put entirely, so the
+    // state stays NULL ("no media write was ever attempted") and a delete
+    // may record its completion.
+    expect(tx.videoAsset.updateMany).not.toHaveBeenCalled();
     // Deliberately NO deletedAt filter in the where: the whole point is
     // to SEE a committed soft-delete, not to have it filtered into
     // "missing" ambiguity.
@@ -975,36 +1061,33 @@ describe('VideoAssetsRepository.assetLivenessUnderLock', () => {
   });
 });
 
-describe('VideoAssetsRepository.listArtifactStorageKeys', () => {
-  it('returns only committed rows’ keys, tenant-scoped, and skips the query entirely for an empty list', async () => {
-    // Staged-artifact cleanup consults this before deleting: deterministic
-    // staging keys can be the very keys an earlier committed batch
-    // recorded, and those must never be deleted.
-    const tx = makeTx();
-    const { repository, prisma } = makeRepository(tx);
-    const committedKey = 'tenant-1/u/artifacts/aa11/0.png';
-    const stagedKeys = [committedKey, 'tenant-1/u/artifacts/aa11/1.png'];
-    (prisma.videoArtifact.findMany as jest.Mock).mockResolvedValue([
-      { storageKey: committedKey },
-    ]);
-    await expect(
-      repository.listArtifactStorageKeys(TENANT, stagedKeys),
-    ).resolves.toEqual([committedKey]);
-    const [{ where, select }] = prisma.videoArtifact.findMany.mock
-      .calls[0] as unknown as [
-      { where: Record<string, unknown>; select: Record<string, unknown> },
-    ];
-    // Tenant-scoped, key-limited, and reading NOTHING but the key column.
-    expect(where).toEqual({
-      tenantId: TENANT,
-      storageKey: { in: stagedKeys },
+describe('VideoAssetsRepository.resolveMediaWrite', () => {
+  it('resolves PENDING → SUCCEEDED and PENDING → FAILED with a compare-and-set on the claim', async () => {
+    const { repository, prisma } = makeRepository(makeTx());
+    const updateMany = prisma.videoAsset.updateMany;
+    await repository.resolveMediaWrite(TENANT, 'asset-1', 'SUCCEEDED');
+    await repository.resolveMediaWrite(TENANT, 'asset-1', 'FAILED');
+    const calls = updateMany.mock.calls as unknown as [
+      { where: Record<string, unknown>; data: Record<string, unknown> },
+    ][];
+    for (const [call] of calls) {
+      // CAS on the claim: a stale resolution can never decide a state the
+      // row never claimed, nor overwrite an already-decided one.
+      expect(call.where).toEqual({
+        id: 'asset-1',
+        tenantId: TENANT,
+        mediaWriteState: VideoMediaWriteState.PENDING,
+      });
+    }
+    expect(calls[0][0].data).toEqual({
+      mediaWriteState: VideoMediaWriteState.SUCCEEDED,
     });
-    expect(select).toEqual({ storageKey: true });
-    // Empty input never issues a query (an `in: []` scan is pointless).
-    await expect(
-      repository.listArtifactStorageKeys(TENANT, []),
-    ).resolves.toEqual([]);
-    expect(prisma.videoArtifact.findMany).toHaveBeenCalledTimes(1);
+    expect(calls[1][0].data).toEqual({
+      mediaWriteState: VideoMediaWriteState.FAILED,
+    });
+    // No transaction, no advisory lock: nothing else writes this column,
+    // so the resolution stays a single connection-cheap statement.
+    expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 });
 
@@ -1043,6 +1126,46 @@ describe('VideoAssetsRepository.listLinkedInferenceJobs', () => {
   });
 });
 
+describe('VideoAssetsRepository.listCropArtifactIds', () => {
+  it('returns UNLINKED CROP artifact ids, WITHOUT a non-deleted-parent filter', async () => {
+    // The delete flow's crash-window sweep: a crop→job creation that died
+    // between the job commit and the link transaction leaves a job nothing
+    // references, so the caller probes each unlinked crop under its
+    // deterministic `video-crop:<artifactId>` idempotency key. Same
+    // deleted-parent reasoning as listLinkedInferenceJobs — this runs after
+    // the soft-delete committed. Linked crops are excluded: their jobs
+    // already come back from listLinkedInferenceJobs.
+    const { repository, prisma } = makeRepository(makeTx());
+    prisma.videoArtifact.findMany.mockResolvedValue([
+      { id: 'artifact-1' },
+      { id: 'artifact-2' },
+    ] as never);
+    await expect(
+      repository.listCropArtifactIds(TENANT, 'asset-1'),
+    ).resolves.toEqual(['artifact-1', 'artifact-2']);
+    const [{ where, select }] = prisma.videoArtifact.findMany.mock
+      .calls[0] as unknown as [
+      {
+        where: {
+          tenantId: string;
+          videoAssetId: string;
+          artifactType: VideoArtifactType;
+          inferenceJobId: null;
+          videoAsset?: unknown;
+        };
+        select: Record<string, boolean>;
+      },
+    ];
+    expect(where.tenantId).toBe(TENANT);
+    expect(where.videoAssetId).toBe('asset-1');
+    expect(where.artifactType).toBe(VideoArtifactType.CROP);
+    expect(where.inferenceJobId).toBeNull();
+    expect(where.videoAsset).toBeUndefined();
+    // Ids only — no artifact metadata is read for the sweep.
+    expect(select).toEqual({ id: true });
+  });
+});
+
 describe('VideoAssetsRepository.createArtifactsBatch', () => {
   const items = [
     {
@@ -1077,6 +1200,7 @@ describe('VideoAssetsRepository.createArtifactsBatch', () => {
     const result = await repository.createArtifactsBatch(
       TENANT,
       'asset-1',
+      'op-hash-1',
       [VideoAssetStatus.VALIDATED, VideoAssetStatus.READY],
       undefined,
       items,
@@ -1094,6 +1218,7 @@ describe('VideoAssetsRepository.createArtifactsBatch', () => {
     const result = await repository.createArtifactsBatch(
       TENANT,
       'asset-1',
+      'op-hash-1',
       [VideoAssetStatus.VALIDATED],
       undefined,
       items,
@@ -1121,6 +1246,7 @@ describe('VideoAssetsRepository.createArtifactsBatch', () => {
     const result = await repository.createArtifactsBatch(
       TENANT,
       'asset-1',
+      'op-hash-1',
       [VideoAssetStatus.VALIDATED],
       'op-key-1',
       items,
@@ -1144,13 +1270,19 @@ describe('VideoAssetsRepository.createArtifactsBatch', () => {
       idempotencyKey: 'op-key-1',
       artifactIds: ['artifact-9'],
     });
-    tx.videoArtifact.findMany = jest.fn(async () => [
-      { id: 'artifact-9', artifactType: VideoArtifactType.FRAME },
-    ]);
+    tx.videoArtifact.findMany = jest
+      .fn()
+      // 1st findMany: the committed-owner verdict over the staged keys.
+      .mockResolvedValueOnce([{ storageKey: items[0].storageKey }])
+      // 2nd findMany: the recorded batch's artifact rows.
+      .mockResolvedValueOnce([
+        { id: 'artifact-9', artifactType: VideoArtifactType.FRAME },
+      ]);
     const { repository, auditLog } = makeRepository(tx);
     const result = await repository.createArtifactsBatch(
       TENANT,
       'asset-1',
+      'op-hash-1',
       [VideoAssetStatus.VALIDATED],
       'op-key-1',
       items,
@@ -1162,6 +1294,9 @@ describe('VideoAssetsRepository.createArtifactsBatch', () => {
     expect(batch.artifacts.map((artifact) => artifact.id)).toEqual([
       'artifact-9',
     ]);
+    // The replay carries the committed-owner verdict too — it is the ONLY
+    // outcome that authorizes the caller to delete staged files.
+    expect(batch.committedStagedKeys).toEqual([items[0].storageKey]);
     // Nothing appended, nothing re-audited, no status flip.
     expect(tx.videoArtifact.create).not.toHaveBeenCalled();
     expect(tx.videoAsset.updateMany).not.toHaveBeenCalled();
@@ -1180,6 +1315,7 @@ describe('VideoAssetsRepository.createArtifactsBatch', () => {
     const result = await repository.createArtifactsBatch(
       TENANT,
       'asset-1',
+      'op-hash-1',
       [VideoAssetStatus.VALIDATED],
       'op-key-1',
       items,
@@ -1191,50 +1327,147 @@ describe('VideoAssetsRepository.createArtifactsBatch', () => {
 });
 
 describe('extraction operation advisory lock', () => {
-  // Codex P1: with DETERMINISTIC staging keys, a failing attempt's cleanup
-  // could run its committed-owner lookup while the winning attempt's
-  // artifact transaction was still uncommitted, see no owner, and delete
-  // the SHARED key — leaving append-only artifact rows whose file is gone.
-  // The service therefore runs staging → publication → cleanup under an
-  // advisory lock keyed on the OPERATION (tenant + asset + the very hash
-  // the staging keys are derived from).
+  const items = [
+    {
+      artifactType: VideoArtifactType.FRAME,
+      timestampMs: 0,
+      width: 100,
+      height: 100,
+      mimeType: 'image/png',
+      sizeBytes: 10,
+      checksumSha256: 'abc',
+      storageKey: 'tenant-1/u/artifacts/hash-1/0.png',
+    },
+  ];
+
+  // Codex P1 (round 1): with DETERMINISTIC staging keys, a failing attempt's
+  // cleanup could run its committed-owner lookup while the winning attempt's
+  // artifact transaction was still uncommitted, see no owner, and delete the
+  // SHARED key — leaving append-only artifact rows whose file is gone.
+  // Codex P1 (round 2): the fix for that must NOT be an OUTER interactive
+  // transaction wrapped around the whole stage → publish → cleanup section —
+  // every DB call inside it then needed a SECOND pooled connection while the
+  // first was pinned, so pool-sized concurrency could deadlock the pool. The
+  // lock therefore lives INSIDE the publication transaction, which is the
+  // only place it has to be for the committed-owner verdict to be
+  // trustworthy.
   it('derives the operation lock key from tenant, asset, and the staging operation hash', () => {
     expect(videoExtractionOperationLockKey(TENANT, 'asset-1', 'abc123')).toBe(
       `video-extraction-op:${TENANT}:asset-1:abc123`,
     );
   });
 
-  it('takes pg_advisory_xact_lock on the operation key BEFORE running the section, and holds it across it', async () => {
+  it('takes pg_advisory_xact_lock on the operation key as the publication transaction’s FIRST statement', async () => {
     const tx = makeTx();
     const { repository } = makeRepository(tx);
-    const run = jest.fn(async () => 'section-result');
-    const result = await repository.runUnderExtractionOperationLock(
+    await repository.createArtifactsBatch(
       TENANT,
       'asset-1',
       'hash-1',
-      run,
+      [VideoAssetStatus.VALIDATED],
+      undefined,
+      items,
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
     );
-    expect(result).toBe('section-result');
     expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
-    // Tagged template: calls[0][1] is the interpolated lock key.
+    // Tagged template: calls[0][1] is the interpolated lock key — the SAME
+    // shape as before, so the granularity the staging keys rely on is
+    // unchanged.
     expect(tx.$queryRaw.mock.calls[0][1]).toBe(
       `video-extraction-op:${TENANT}:asset-1:hash-1`,
     );
-    // The lock is acquired first, and the transaction that holds it is
-    // still open while the section runs (the callback is invoked inside).
+    // FIRST: before the ownership verdict, before the CAS read, before any
+    // write. Every competing publication for this operation queues here.
     expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
-      run.mock.invocationCallOrder[0],
+      tx.videoArtifact.findMany.mock.invocationCallOrder[0],
     );
+    expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      tx.videoAsset.findFirst.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('decides the committed-owner verdict INSIDE that same locked transaction, before writing anything', async () => {
+    // This is what closes the reported race: the verdict the caller's
+    // staged-file cleanup acts on cannot observe a rival batch mid-commit
+    // (MVCC-invisible but about to land), because no rival publication can
+    // be open while this transaction holds the lock.
+    const tx = makeTx();
+    tx.videoArtifact.findMany = jest.fn(async () => [
+      { storageKey: items[0].storageKey },
+    ]);
+    const { repository } = makeRepository(tx);
+    const result = await repository.createArtifactsBatch(
+      TENANT,
+      'asset-1',
+      'hash-1',
+      [VideoAssetStatus.VALIDATED],
+      undefined,
+      items,
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
+    );
+    const batch = result as Exclude<typeof result, 'key-conflict' | null>;
+    expect(batch.committedStagedKeys).toEqual([items[0].storageKey]);
+    const [{ where, select }] = tx.videoArtifact.findMany.mock
+      .calls[0] as unknown as [
+      { where: Record<string, unknown>; select: Record<string, unknown> },
+    ];
+    // Tenant-scoped, limited to the staged keys, reading NOTHING but the
+    // key column, and NOT scoped to non-deleted parents (a soft-deleted
+    // asset's rows still own their files until the prefix is removed).
+    expect(where).toEqual({
+      tenantId: TENANT,
+      storageKey: { in: [items[0].storageKey] },
+    });
+    expect(select).toEqual({ storageKey: true });
+    // Before this batch's own rows exist: the answer must be "keys an
+    // EARLIER committed batch owns".
+    expect(tx.videoArtifact.findMany.mock.invocationCallOrder[0]).toBeLessThan(
+      tx.videoArtifact.create.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('runs the publication on ONE connection: no nested transaction, no root-client call inside the lock', async () => {
+    // Codex P1: the outer lock transaction pinned a connection while the
+    // callback's root-client publication and ownership queries each needed
+    // ANOTHER one — at pool-sized concurrency every connection could be
+    // held by a lock transaction while every callback waited for a second.
+    const tx = makeTx();
+    const { repository, prisma } = makeRepository(tx);
+    await repository.createArtifactsBatch(
+      TENANT,
+      'asset-1',
+      'hash-1',
+      [VideoAssetStatus.VALIDATED],
+      undefined,
+      items,
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
+    );
+    // Exactly ONE transaction for the whole locked publication...
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    // ...and the ROOT client is never touched while it is open: every read
+    // and write went through the transaction client.
+    expect(prisma.videoArtifact.findMany).not.toHaveBeenCalled();
+    expect(prisma.videoArtifact.findFirst).not.toHaveBeenCalled();
+    expect(prisma.videoAsset.findFirst).not.toHaveBeenCalled();
+    expect(prisma.videoAsset.updateMany).not.toHaveBeenCalled();
+    expect(prisma.videoExtractionRequest.findFirst).not.toHaveBeenCalled();
   });
 
   it('bounds how long the lock may be waited for and held', async () => {
     const tx = makeTx();
     const { repository, prisma } = makeRepository(tx);
-    await repository.runUnderExtractionOperationLock(
+    await repository.createArtifactsBatch(
       TENANT,
       'asset-1',
       'hash-1',
-      async () => undefined,
+      [VideoAssetStatus.VALIDATED],
+      undefined,
+      items,
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+      () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
     );
     expect(prisma.$transaction.mock.calls[0][1]).toEqual({
       maxWait: EXTRACTION_OPERATION_LOCK_MAX_WAIT_MS,
@@ -1242,18 +1475,21 @@ describe('extraction operation advisory lock', () => {
     });
   });
 
-  it('propagates the section\u2019s error unchanged (the lock transaction rolls back, the caller keeps its compensation)', async () => {
+  it('propagates the publication’s error unchanged (the transaction rolls back, the lock is released with it)', async () => {
     const tx = makeTx();
+    const boom = new Error('publish failed');
+    tx.videoArtifact.create.mockRejectedValue(boom);
     const { repository } = makeRepository(tx);
-    const boom = new Error('section failed');
     await expect(
-      repository.runUnderExtractionOperationLock(
+      repository.createArtifactsBatch(
         TENANT,
         'asset-1',
         'hash-1',
-        async () => {
-          throw boom;
-        },
+        [VideoAssetStatus.VALIDATED],
+        undefined,
+        items,
+        () => ({ tenantId: TENANT, actorEmail: 'x', action: 'CREATE' }) as never,
+        () => ({ tenantId: TENANT, actorEmail: 'x', action: 'UPDATE' }) as never,
       ),
     ).rejects.toBe(boom);
   });

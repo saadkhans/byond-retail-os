@@ -5,6 +5,7 @@ import {
 import {
   FrameCountExceededError,
   FrameExceedsBudgetError,
+  ScreeningDeadlineExceededError,
 } from './video-frame-extractor.port';
 
 describe('SimulatedVideoFrameExtractor', () => {
@@ -21,21 +22,40 @@ describe('SimulatedVideoFrameExtractor', () => {
     expect(extractor.readsRealBytes).toBe(false);
   });
 
-  it('provides a trivial in-memory inspection session (deterministic probe, EXHAUSTIVE placeholder frames, no-op close)', async () => {
+  /** Collecting screener: the pull-based contract's simplest consumer. */
+  const collector = (frames: Buffer[], stopAt?: number) => (
+    frame: Buffer,
+    index: number,
+  ): Promise<'continue' | 'stop'> => {
+    frames.push(frame);
+    return Promise.resolve(index === stopAt ? 'stop' : 'continue');
+  };
+
+  it('provides a trivial in-memory inspection session (deterministic probe, EXHAUSTIVE placeholder frames PUSHED one at a time, no-op close)', async () => {
     // The pre-storage screen refuses to TRUST this adapter anyway
     // (readsRealBytes=false), but the contract must still hold so the
     // module wires without special cases: the exhaustive-decode contract
-    // yields one placeholder per SOURCE frame — fps × duration — never a
-    // per-second sample.
+    // offers one placeholder per SOURCE frame — fps × duration — never a
+    // per-second sample, and never as one retained array.
     const session = await extractor.inspectBuffer(Buffer.from('ignored'));
     await expect(session.probe()).resolves.toEqual(SIMULATED_PROBE);
-    const frames = await session.extractAllFrames({
+    const frames: Buffer[] = [];
+    const indices: number[] = [];
+    const result = await session.streamFrames({
       maxFrames: 900,
       maxBytesPerFrame: 1024,
+      deadlineMs: 30_000,
+      onFrame: (frame, index) => {
+        indices.push(index);
+        return collector(frames)(frame, index);
+      },
     });
     // 30 fps × 10 s simulated clip → 300 placeholder source frames, each
-    // a PNG-signature-led buffer.
+    // a PNG-signature-led buffer, delivered in decode order.
+    expect(result).toEqual({ framesSeen: 300, stoppedEarly: false });
     expect(frames).toHaveLength(300);
+    expect(indices[0]).toBe(0);
+    expect(indices[299]).toBe(299);
     for (const frame of frames) {
       expect(frame.subarray(0, 8)).toEqual(
         Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
@@ -48,16 +68,42 @@ describe('SimulatedVideoFrameExtractor', () => {
     await expect(session.close()).resolves.toBeUndefined();
   });
 
+  it('honors an early stop from the screener without an error', async () => {
+    const session = await extractor.inspectBuffer(Buffer.from('ignored'));
+    const frames: Buffer[] = [];
+    const result = await session.streamFrames({
+      maxFrames: 900,
+      maxBytesPerFrame: 1024,
+      deadlineMs: 30_000,
+      onFrame: collector(frames, 2),
+    });
+    // The stopping frame counts as seen; the rest is never decoded.
+    expect(result).toEqual({ framesSeen: 3, stoppedEarly: true });
+    expect(frames).toHaveLength(3);
+    await session.close();
+  });
+
   it('applies the per-frame budget contract inside the inspection session', async () => {
     const session = await extractor.inspectBuffer(Buffer.from('ignored'));
+    const onFrame = () => Promise.resolve<'continue'>('continue');
     // A budget the placeholder cannot fit → the controlled budget verdict.
     await expect(
-      session.extractAllFrames({ maxFrames: 900, maxBytesPerFrame: 8 }),
+      session.streamFrames({
+        maxFrames: 900,
+        maxBytesPerFrame: 8,
+        deadlineMs: 30_000,
+        onFrame,
+      }),
     ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
     // Degenerate budgets are budget verdicts too, decided up front.
     for (const maxBytesPerFrame of [0, -1, 1.5, Number.NaN]) {
       await expect(
-        session.extractAllFrames({ maxFrames: 900, maxBytesPerFrame }),
+        session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame,
+          deadlineMs: 30_000,
+          onFrame,
+        }),
       ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
     }
     await session.close();
@@ -65,16 +111,43 @@ describe('SimulatedVideoFrameExtractor', () => {
 
   it('applies the frame-count contract inside the inspection session', async () => {
     const session = await extractor.inspectBuffer(Buffer.from('ignored'));
+    const onFrame = () => Promise.resolve<'continue'>('continue');
     // The 300-frame simulated stream past a smaller cap → the controlled
     // count verdict, mirroring the real adapter.
     await expect(
-      session.extractAllFrames({ maxFrames: 299, maxBytesPerFrame: 1024 }),
+      session.streamFrames({
+        maxFrames: 299,
+        maxBytesPerFrame: 1024,
+        deadlineMs: 30_000,
+        onFrame,
+      }),
     ).rejects.toBeInstanceOf(FrameCountExceededError);
     // Degenerate caps are count verdicts too, decided up front.
     for (const maxFrames of [0, -1, 1.5, Number.NaN]) {
       await expect(
-        session.extractAllFrames({ maxFrames, maxBytesPerFrame: 1024 }),
+        session.streamFrames({
+          maxFrames,
+          maxBytesPerFrame: 1024,
+          deadlineMs: 30_000,
+          onFrame,
+        }),
       ).rejects.toBeInstanceOf(FrameCountExceededError);
+    }
+    await session.close();
+  });
+
+  it('applies the deadline contract (contractual, never timed) inside the inspection session', async () => {
+    const session = await extractor.inspectBuffer(Buffer.from('ignored'));
+    const onFrame = () => Promise.resolve<'continue'>('continue');
+    for (const deadlineMs of [0, -1, 1.5, Number.NaN]) {
+      await expect(
+        session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 1024,
+          deadlineMs,
+          onFrame,
+        }),
+      ).rejects.toBeInstanceOf(ScreeningDeadlineExceededError);
     }
     await session.close();
   });

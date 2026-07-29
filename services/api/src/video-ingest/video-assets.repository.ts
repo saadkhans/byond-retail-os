@@ -5,6 +5,7 @@ import {
   VideoArtifactType,
   VideoAssetStatus,
   VideoCropReason,
+  VideoMediaWriteState,
 } from '@prisma/client';
 import {
   AuditEntry,
@@ -95,12 +96,15 @@ export type LinkArtifactRejection = 'already-linked';
  * operation-hash) triple whose hash also derives the DETERMINISTIC artifact
  * staging keys. Two attempts that stage to the same keys are, by
  * construction, the same operation, so this key is exactly the granularity
- * that must serialize: staging puts → batch publication → staged-file
- * cleanup. Without it, a FAILING attempt can run its committed-owner lookup
- * while the WINNING attempt's artifact transaction is still uncommitted,
- * observe no owner, delete the SHARED deterministic key, and leave the
- * winner's append-only artifact rows pointing at a file that no longer
- * exists.
+ * that must serialize the batch PUBLICATION. Taken as the FIRST statement
+ * of `createArtifactsBatch`'s own transaction (see there): the publication
+ * decision and the committed-owner verdict the caller's staged-file cleanup
+ * acts on are then produced ATOMICALLY inside one lock-ordered
+ * transaction. Without that ordering, a FAILING attempt could run its
+ * committed-owner lookup while the WINNING attempt's artifact transaction
+ * was still uncommitted, observe no owner, delete the SHARED deterministic
+ * key, and leave the winner's append-only artifact rows pointing at a file
+ * that no longer exists.
  *
  * Lives here rather than in `common/locks` on purpose: it is derived from
  * an operation hash that only this module computes (the staging-key hash),
@@ -116,11 +120,11 @@ export function videoExtractionOperationLockKey(
 }
 
 /**
- * How long the operation lock may be WAITED for and HELD. The guarded
- * section writes already-decoded, in-memory artifact buffers (bounded by
- * MAX_TOTAL_ARTIFACT_BYTES) to local storage and runs one batch
- * transaction — the expensive extractor-port work happens BEFORE it — so
- * these ceilings are pathological-case guards, not expected waits.
+ * How long the operation lock may be WAITED for and HELD. The lock is now
+ * taken INSIDE the publication transaction, which does DB work only (no
+ * storage I/O, no extractor work, no second connection), so the hold is a
+ * handful of statements and these ceilings are pathological-case guards,
+ * not expected waits.
  */
 export const EXTRACTION_OPERATION_LOCK_MAX_WAIT_MS = 10_000;
 export const EXTRACTION_OPERATION_LOCK_TIMEOUT_MS = 60_000;
@@ -372,17 +376,28 @@ export class VideoAssetsRepository extends TenantScopedRepository {
   }
 
   /**
-   * Advisory-lock-guarded liveness read for the upload publish path: takes
-   * the SAME per-asset advisory lock as softDelete/transitionStatus, then
-   * reads the row's deletedAt. Because a concurrent DELETE holds that lock
-   * through its soft-delete commit, a 'live' answer means no delete had
-   * committed at the moment of the read — the upload uses it to SHRINK
-   * (not close) the window in which its media write can race a delete's
-   * file cleanup. The publish CAS stays the authority for the race; this
-   * transaction is ONLY the locked read — the lock is never held across
-   * any file I/O.
+   * CLAIMS the upload's single durable media write, under the SAME per-asset
+   * advisory lock as softDelete/transitionStatus: one short transaction that
+   * (1) reads the row's deletedAt and (2) — only when the asset is still
+   * live — stamps `mediaWriteState = PENDING`.
+   *
+   * The two halves MUST be atomic, and that is the whole point of this
+   * method. The claim is what a later DELETE observes to decide whether a
+   * put can still be in flight, so it may not be written after a concurrent
+   * soft-delete already read the state: sharing the asset lock forces one of
+   * exactly two orders — the claim commits first (a soft-delete then reads
+   * PENDING and withholds its completion marker), or the soft-delete commits
+   * first (this read answers 'deleted', the caller skips the put entirely,
+   * and the state stays NULL, i.e. "no media write was ever attempted").
+   * There is no interleaving in which bytes can land under a prefix whose
+   * delete recorded completion.
+   *
+   * Doubles as the pre-put liveness pre-check it replaces (the publish CAS
+   * remains the authority for the delete race). The lock is never held
+   * across any file I/O: this transaction is the locked read + one update,
+   * and the put runs after it commits.
    */
-  assetLivenessUnderLock(
+  beginMediaWriteUnderLock(
     tenantId: string,
     id: string,
   ): Promise<'live' | 'deleted' | 'missing'> {
@@ -399,32 +414,48 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       if (!row) {
         return 'missing' as const;
       }
-      return row.deletedAt ? ('deleted' as const) : ('live' as const);
+      if (row.deletedAt) {
+        return 'deleted' as const;
+      }
+      await tx.videoAsset.updateMany({
+        // Re-asserted in the write itself, not just the read: the claim must
+        // never land on a row a delete claimed inside this transaction.
+        where: { id, tenantId: scopedTenantId, deletedAt: null },
+        data: { mediaWriteState: VideoMediaWriteState.PENDING },
+      });
+      return 'live' as const;
     });
   }
 
   /**
-   * Which of the given storage keys are referenced by a COMMITTED artifact
-   * row (tenant-scoped; soft-deleted parents included — their rows still
-   * own their files until the delete flow removes the whole asset prefix).
-   * Staged-artifact cleanup consults this before deleting: artifact staging
-   * keys are DETERMINISTIC per request, so a failed or replayed attempt's
-   * staged keys can be the very keys an earlier committed batch recorded —
-   * deleting those would destroy media that live rows reference. Internal
-   * only: the keys never leave the persistence/service layer.
+   * RESOLVES the claimed media write: SUCCEEDED the moment `storage.put`
+   * returned, FAILED when it threw. A single connection-cheap update (no
+   * transaction wrapper, no advisory lock — nothing else writes this
+   * column), guarded by a compare-and-set on the PENDING claim so a stale
+   * resolution can never overwrite a decided state or resurrect a state on
+   * a row that never claimed one. Once resolved, a DELETE (fresh or
+   * replayed) may record its media-removal completion: no put can still be
+   * in flight.
    */
-  async listArtifactStorageKeys(
+  async resolveMediaWrite(
     tenantId: string,
-    storageKeys: string[],
-  ): Promise<string[]> {
-    if (storageKeys.length === 0) {
-      return [];
-    }
-    const rows = await this.prisma.videoArtifact.findMany({
-      where: this.scope(tenantId, { storageKey: { in: storageKeys } }),
-      select: { storageKey: true },
+    id: string,
+    state: 'SUCCEEDED' | 'FAILED',
+  ): Promise<void> {
+    const scopedTenantId = this.requireTenantId(tenantId);
+    await this.prisma.videoAsset.updateMany({
+      where: {
+        id,
+        tenantId: scopedTenantId,
+        mediaWriteState: VideoMediaWriteState.PENDING,
+      },
+      data: {
+        mediaWriteState:
+          state === 'SUCCEEDED'
+            ? VideoMediaWriteState.SUCCEEDED
+            : VideoMediaWriteState.FAILED,
+      },
     });
-    return rows.map((row) => row.storageKey);
   }
 
   async list(
@@ -645,6 +676,37 @@ export class VideoAssetsRepository extends TenantScopedRepository {
   }
 
   /**
+   * The ids of THIS asset's CROP artifacts that carry NO committed
+   * inference-job link — the delete flow's crash-window sweep. Two-phase
+   * crop→job creation can leave an unpublished PENDING_LINK job behind when
+   * the process dies between the job's commit and the link transaction, and
+   * such a job is by definition unreachable through
+   * `listLinkedInferenceJobs` (the link is exactly what never committed).
+   * The caller probes each id under the deterministic
+   * `video-crop:<artifactId>` idempotency key instead. Deliberately NO
+   * non-deleted-parent scoping, for the same reason as
+   * `listLinkedInferenceJobs`: this runs AFTER the soft-delete committed.
+   * Only CROP artifacts can ever create jobs, and only unlinked ones can be
+   * in the crash window — linked ones already come back from
+   * `listLinkedInferenceJobs`.
+   */
+  async listCropArtifactIds(
+    tenantId: string,
+    videoAssetId: string,
+  ): Promise<string[]> {
+    const rows = await this.prisma.videoArtifact.findMany({
+      where: this.scope(tenantId, {
+        videoAssetId,
+        artifactType: VideoArtifactType.CROP,
+        inferenceJobId: null,
+      }),
+      select: { id: true },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+    });
+    return rows.map((row) => row.id);
+  }
+
+  /**
    * Soft delete: stamps deletedAt (CAS on "not yet deleted") and audits.
    * The metadata row is KEPT for lineage — artifacts stay append-only and
    * their rows keep referencing the asset; only the local files go away
@@ -666,6 +728,15 @@ export class VideoAssetsRepository extends TenantScopedRepository {
    * already claimed by the screening-rejection removal means this delete
    * is metadata-only and must neither promise nor later record a second
    * completion.
+   *
+   * The DURABLE media-write state is read in that same locked transaction
+   * and reported the same way. `beginMediaWriteUnderLock` claims PENDING
+   * under this very lock, so the read is authoritative: PENDING here means
+   * an upload's put is still in flight (it claimed before we committed) and
+   * can still land bytes just after the caller's prefix removal — the
+   * caller must then leave the exactly-once completion marker unset and say
+   * so in the audit. Anything else (SUCCEEDED/FAILED, or NULL for a row
+   * whose put never started) means the write is DECIDED.
    */
   softDelete(
     tenantId: string,
@@ -673,8 +744,13 @@ export class VideoAssetsRepository extends TenantScopedRepository {
     buildAuditEntry: (
       before: VideoAssetView,
       mediaAlreadyRemoved: boolean,
+      mediaWriteUndecided: boolean,
     ) => AuditEntry,
-  ): Promise<{ asset: VideoAssetView; mediaAlreadyRemoved: boolean } | null> {
+  ): Promise<{
+    asset: VideoAssetView;
+    mediaAlreadyRemoved: boolean;
+    mediaWriteUndecided: boolean;
+  } | null> {
     const scopedTenantId = this.requireTenantId(tenantId);
     return this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${videoAssetAdvisoryLockKey(
@@ -683,16 +759,23 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       )}))`;
       const row = await tx.videoAsset.findFirst({
         where: { id, tenantId: scopedTenantId, deletedAt: null },
-        // The safe select PLUS the removal marker — read under the lock;
-        // the marker is peeled off below so audit snapshots and the
-        // returned view keep the exact VIDEO_ASSET_SELECT shape.
-        select: { ...VIDEO_ASSET_SELECT, mediaRemovedAt: true },
+        // The safe select PLUS the removal marker and the durable
+        // media-write state — read under the lock; both are peeled off
+        // below so audit snapshots and the returned view keep the exact
+        // VIDEO_ASSET_SELECT shape.
+        select: {
+          ...VIDEO_ASSET_SELECT,
+          mediaRemovedAt: true,
+          mediaWriteState: true,
+        },
       });
       if (!row) {
         return null;
       }
-      const { mediaRemovedAt, ...before } = row;
+      const { mediaRemovedAt, mediaWriteState, ...before } = row;
       const mediaAlreadyRemoved = mediaRemovedAt != null;
+      const mediaWriteUndecided =
+        mediaWriteState === VideoMediaWriteState.PENDING;
       const updated = await tx.videoAsset.updateMany({
         where: { id, tenantId: scopedTenantId, deletedAt: null },
         data: {
@@ -708,8 +791,11 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       if (updated.count === 0) {
         return null;
       }
-      await this.auditLog.record(buildAuditEntry(before, mediaAlreadyRemoved), tx);
-      return { asset: before, mediaAlreadyRemoved };
+      await this.auditLog.record(
+        buildAuditEntry(before, mediaAlreadyRemoved, mediaWriteUndecided),
+        tx,
+      );
+      return { asset: before, mediaAlreadyRemoved, mediaWriteUndecided };
     });
   }
 
@@ -803,60 +889,6 @@ export class VideoAssetsRepository extends TenantScopedRepository {
   }
 
   /**
-   * Runs `run()` while holding the OPERATION advisory lock (see
-   * `videoExtractionOperationLockKey`), so one extraction/crop operation's
-   * staging puts, batch publication, and staged-file cleanup can never
-   * interleave with an identical concurrent attempt's. Serialized this way,
-   * a losing attempt always reaches its cleanup AFTER the winner's batch
-   * committed — it finds the winner through the in-transaction replay path
-   * and its committed-owner check keeps the shared deterministic keys
-   * instead of deleting the winner's files.
-   *
-   * LOCK STRATEGY — `pg_advisory_xact_lock` inside an interactive
-   * transaction whose ONLY job is to hold the lock while the callback runs,
-   * NOT the session-level `pg_advisory_lock`/`pg_advisory_unlock` pair. The
-   * session pair is unusable here: Prisma pins a connection only for the
-   * duration of an interactive transaction, so a later `pg_advisory_unlock`
-   * can be issued on a DIFFERENT pooled connection, silently fail, and leak
-   * the lock for the lifetime of the connection that took it — an
-   * unrecoverable module-wide stall. A transaction-scoped lock is released
-   * by the transaction's end, guaranteed on commit, rollback, timeout, and
-   * process death alike. The cost is that this ONE transaction is open
-   * across the section's file I/O; that is acceptable because the I/O is
-   * bounded local writes of buffers already held in memory (the extractor
-   * runs before the section), the hold is capped by an explicit timeout,
-   * and no OTHER lock is taken by this transaction (the callback's own
-   * transactions take the per-asset lock; a single-holder lock can never
-   * be part of a cycle).
-   *
-   * The callback's errors propagate UNCHANGED (Prisma rethrows them and
-   * rolls the lock transaction back) — the caller's cleanup/compensation
-   * semantics are untouched.
-   */
-  runUnderExtractionOperationLock<T>(
-    tenantId: string,
-    videoAssetId: string,
-    operationHash: string,
-    run: () => Promise<T>,
-  ): Promise<T> {
-    const scopedTenantId = this.requireTenantId(tenantId);
-    return this.prisma.$transaction(
-      async (tx) => {
-        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${videoExtractionOperationLockKey(
-          scopedTenantId,
-          videoAssetId,
-          operationHash,
-        )}))`;
-        return run();
-      },
-      {
-        maxWait: EXTRACTION_OPERATION_LOCK_MAX_WAIT_MS,
-        timeout: EXTRACTION_OPERATION_LOCK_TIMEOUT_MS,
-      },
-    );
-  }
-
-  /**
    * The WHOLE extraction result commits as ONE transaction: every artifact
    * row, every artifact audit entry, the asset's guarded status flip to
    * READY, and (when an idempotency key was supplied) the extraction-
@@ -868,10 +900,39 @@ export class VideoAssetsRepository extends TenantScopedRepository {
    * transaction ('key-conflict' when the key belongs to another asset).
    * Two concurrent firsts race on the (tenantId, idempotencyKey) unique —
    * the loser's P2002 rolls its batch back and the caller replays.
+   *
+   * OPERATION LOCK — `pg_advisory_xact_lock(operation key)` is this
+   * transaction's FIRST statement (the key is derived from the very
+   * operation hash the caller's DETERMINISTIC staging keys are built from,
+   * so lock granularity and file granularity are the same thing). Two
+   * attempts that stage to the same files therefore publish STRICTLY one
+   * after the other, and — because the lock is transaction-scoped — it is
+   * released by commit, rollback, timeout, and process death alike.
+   *
+   * NO NESTED TRANSACTION, NO SECOND CONNECTION. The lock used to be held
+   * by an OUTER interactive transaction wrapped around the caller's whole
+   * stage → publish → cleanup section, so the callback's own root-client
+   * calls each needed a SECOND pooled connection while the first was
+   * pinned; at pool-sized concurrency every connection could be held by an
+   * outer lock transaction while every callback waited for another one.
+   * Taking the lock HERE, inside the one transaction that already exists,
+   * costs exactly one connection per concurrent extraction — and the
+   * caller's file I/O now runs with NO transaction open at all.
+   *
+   * COMMITTED-OWNER VERDICT — the same transaction also reports which of
+   * the staged keys (the `items`' storageKeys) an ALREADY-COMMITTED
+   * artifact row owns. Staging keys are deterministic, so an identical
+   * attempt's staged files can BE a committed batch's files; the caller's
+   * cleanup must never delete those. Computing the verdict here, before
+   * this batch's own rows are written and under the same lock as every
+   * competing publication, is what makes it trustworthy: it cannot observe
+   * a rival batch mid-commit (MVCC-invisible but about to land), because
+   * no rival publication can be open while this transaction holds the lock.
    */
   createArtifactsBatch(
     tenantId: string,
     videoAssetId: string,
+    operationHash: string,
     expectedStatuses: VideoAssetStatus[],
     idempotencyKey: string | undefined,
     items: {
@@ -904,97 +965,136 @@ export class VideoAssetsRepository extends TenantScopedRepository {
         artifacts: VideoArtifactView[];
         replayed: boolean;
         requestFingerprint?: string | null;
+        // Which staged keys an ALREADY-COMMITTED batch owns — decided in
+        // this transaction, under the operation lock (see the doc above).
+        committedStagedKeys: string[];
       }
     | 'key-conflict'
     | null
   > {
     const scopedTenantId = this.requireTenantId(tenantId);
-    return this.prisma.$transaction(async (tx) => {
-      if (idempotencyKey) {
-        const existing = await tx.videoExtractionRequest.findFirst({
-          where: { tenantId: scopedTenantId, idempotencyKey },
-        });
-        if (existing) {
-          if (existing.videoAssetId !== videoAssetId) {
-            return 'key-conflict' as const;
-          }
-          const asset = await tx.videoAsset.findFirst({
-            where: { id: videoAssetId, tenantId: scopedTenantId, deletedAt: null },
-            select: VIDEO_ASSET_SELECT,
+    return this.prisma.$transaction(
+      async (tx) => {
+        // FIRST statement: every publication for this operation — and thus
+        // for these deterministic staging keys — serializes here.
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${videoExtractionOperationLockKey(
+          scopedTenantId,
+          videoAssetId,
+          operationHash,
+        )}))`;
+        // Committed-owner verdict BEFORE this batch writes anything: the
+        // answer is "keys some EARLIER committed batch owns", which is
+        // exactly what the caller's staged-file cleanup must preserve.
+        const stagedKeys = items.map((item) => item.storageKey);
+        const committedStagedKeys = stagedKeys.length
+          ? (
+              await tx.videoArtifact.findMany({
+                // Soft-deleted parents included on purpose: their artifact
+                // rows still own their files until the delete flow removes
+                // the whole asset prefix.
+                where: {
+                  tenantId: scopedTenantId,
+                  storageKey: { in: stagedKeys },
+                },
+                select: { storageKey: true },
+              })
+            ).map((row) => row.storageKey)
+          : [];
+        if (idempotencyKey) {
+          const existing = await tx.videoExtractionRequest.findFirst({
+            where: { tenantId: scopedTenantId, idempotencyKey },
           });
-          if (!asset) {
-            return null;
+          if (existing) {
+            if (existing.videoAssetId !== videoAssetId) {
+              return 'key-conflict' as const;
+            }
+            const asset = await tx.videoAsset.findFirst({
+              where: { id: videoAssetId, tenantId: scopedTenantId, deletedAt: null },
+              select: VIDEO_ASSET_SELECT,
+            });
+            if (!asset) {
+              return null;
+            }
+            const ids = (existing.artifactIds as string[]) ?? [];
+            const found = await tx.videoArtifact.findMany({
+              where: { tenantId: scopedTenantId, id: { in: ids } },
+              select: VIDEO_ARTIFACT_SELECT,
+            });
+            const byId = new Map(found.map((artifact) => [artifact.id, artifact]));
+            return {
+              asset,
+              artifacts: ids
+                .map((id) => byId.get(id))
+                .filter((artifact): artifact is VideoArtifactView =>
+                  Boolean(artifact),
+                ),
+              replayed: true,
+              // The recorded parameters ride along so the caller can reject a
+              // same-key request whose parameters changed.
+              requestFingerprint: existing.requestFingerprint ?? null,
+              committedStagedKeys,
+            };
           }
-          const ids = (existing.artifactIds as string[]) ?? [];
-          const found = await tx.videoArtifact.findMany({
-            where: { tenantId: scopedTenantId, id: { in: ids } },
+        }
+        const before = await tx.videoAsset.findFirst({
+          where: { id: videoAssetId, tenantId: scopedTenantId, deletedAt: null },
+          select: VIDEO_ASSET_SELECT,
+        });
+        if (!before || !expectedStatuses.includes(before.status)) {
+          return null;
+        }
+        const flipped = await tx.videoAsset.updateMany({
+          where: {
+            id: videoAssetId,
+            tenantId: scopedTenantId,
+            deletedAt: null,
+            status: { in: expectedStatuses },
+          },
+          // Clearing the error is REQUIRED when recovering from FAILED (the
+          // status/error CHECK constraint ties them together).
+          data: { status: VideoAssetStatus.READY, errorCode: null, errorMessage: null },
+        });
+        if (flipped.count === 0) {
+          return null;
+        }
+        const artifacts: VideoArtifactView[] = [];
+        for (const item of items) {
+          const created = await tx.videoArtifact.create({
+            data: { ...item, videoAssetId, tenantId: scopedTenantId },
             select: VIDEO_ARTIFACT_SELECT,
           });
-          const byId = new Map(found.map((artifact) => [artifact.id, artifact]));
-          return {
-            asset,
-            artifacts: ids
-              .map((id) => byId.get(id))
-              .filter((artifact): artifact is VideoArtifactView =>
-                Boolean(artifact),
-              ),
-            replayed: true,
-            // The recorded parameters ride along so the caller can reject a
-            // same-key request whose parameters changed.
-            requestFingerprint: existing.requestFingerprint ?? null,
-          };
+          await this.auditLog.record(buildArtifactAuditEntry(created), tx);
+          artifacts.push(created);
         }
-      }
-      const before = await tx.videoAsset.findFirst({
-        where: { id: videoAssetId, tenantId: scopedTenantId, deletedAt: null },
-        select: VIDEO_ASSET_SELECT,
-      });
-      if (!before || !expectedStatuses.includes(before.status)) {
-        return null;
-      }
-      const flipped = await tx.videoAsset.updateMany({
-        where: {
-          id: videoAssetId,
-          tenantId: scopedTenantId,
-          deletedAt: null,
-          status: { in: expectedStatuses },
-        },
-        // Clearing the error is REQUIRED when recovering from FAILED (the
-        // status/error CHECK constraint ties them together).
-        data: { status: VideoAssetStatus.READY, errorCode: null, errorMessage: null },
-      });
-      if (flipped.count === 0) {
-        return null;
-      }
-      const artifacts: VideoArtifactView[] = [];
-      for (const item of items) {
-        const created = await tx.videoArtifact.create({
-          data: { ...item, videoAssetId, tenantId: scopedTenantId },
-          select: VIDEO_ARTIFACT_SELECT,
+        if (idempotencyKey) {
+          // Same transaction as the batch: the request row and its artifacts
+          // are indivisible, so a replay can never observe half a batch.
+          await tx.videoExtractionRequest.create({
+            data: {
+              tenantId: scopedTenantId,
+              videoAssetId,
+              idempotencyKey,
+              artifactIds: artifacts.map((artifact) => artifact.id),
+              requestFingerprint,
+            },
+          });
+        }
+        const after = await tx.videoAsset.findFirstOrThrow({
+          where: { id: videoAssetId, tenantId: scopedTenantId },
+          select: VIDEO_ASSET_SELECT,
         });
-        await this.auditLog.record(buildArtifactAuditEntry(created), tx);
-        artifacts.push(created);
-      }
-      if (idempotencyKey) {
-        // Same transaction as the batch: the request row and its artifacts
-        // are indivisible, so a replay can never observe half a batch.
-        await tx.videoExtractionRequest.create({
-          data: {
-            tenantId: scopedTenantId,
-            videoAssetId,
-            idempotencyKey,
-            artifactIds: artifacts.map((artifact) => artifact.id),
-            requestFingerprint,
-          },
-        });
-      }
-      const after = await tx.videoAsset.findFirstOrThrow({
-        where: { id: videoAssetId, tenantId: scopedTenantId },
-        select: VIDEO_ASSET_SELECT,
-      });
-      await this.auditLog.record(buildAssetAuditEntry(before, after), tx);
-      return { asset: after, artifacts, replayed: false };
-    });
+        await this.auditLog.record(buildAssetAuditEntry(before, after), tx);
+        return { asset: after, artifacts, replayed: false, committedStagedKeys };
+      },
+      {
+        // The transaction now WAITS on the operation lock, so it carries
+        // the same explicit wait/hold ceilings the outer lock transaction
+        // used to: contention past them surfaces as a controlled 503
+        // instead of an unbounded stall.
+        maxWait: EXTRACTION_OPERATION_LOCK_MAX_WAIT_MS,
+        timeout: EXTRACTION_OPERATION_LOCK_TIMEOUT_MS,
+      },
+    );
   }
 
   /**

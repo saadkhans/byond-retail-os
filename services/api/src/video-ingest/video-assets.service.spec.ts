@@ -14,6 +14,7 @@ import {
   VideoArtifactType,
   VideoAssetStatus,
   VideoCropReason,
+  VideoMediaWriteState,
 } from '@prisma/client';
 import { DEFAULT_PRIORITY } from '../inference/dto/create-inference-job.dto';
 import {
@@ -23,6 +24,7 @@ import {
   FrameCountExceededError,
   FrameExceedsBudgetError,
   FrameUnavailableError,
+  ScreeningDeadlineExceededError,
 } from './extraction/video-frame-extractor.port';
 import { UNSTREAMABLE_CONTAINER_MESSAGE } from './extraction/ffmpeg-extractor.adapter';
 import {
@@ -42,8 +44,21 @@ import {
 
 const TENANT = 'tenant-1';
 
-// Required upload attestation (frame-content gate) — see UploadVideoAssetDto.
-const ATTEST = { attestNoSensitiveContent: 'true' };
+/**
+ * The FOUR required upload attestations — see UploadVideoAssetDto. They
+ * are the operator's DECLARATIONS about controlled test media, not a
+ * finding about the content; the thing that authorizes storing a clip is
+ * the controlled test-media POLICY GATE (see POLICY_GATE_OPEN below).
+ */
+const ATTEST = {
+  controlledTestMedia: 'true',
+  noPaymentCardsVisible: 'true',
+  noCustomerPII: 'true',
+  attestNoSensitiveContent: 'true',
+};
+
+/** Every attestation field, for the per-field refusal matrix. */
+const ATTESTATION_FIELDS = Object.keys(ATTEST) as (keyof typeof ATTEST)[];
 
 function mp4Buffer(): Buffer {
   return Buffer.concat([
@@ -94,6 +109,10 @@ function assetRow(overrides: Record<string, unknown> = {}) {
     // Media-removal completion marker — null by default (media present);
     // already-removed tests opt in.
     mediaRemovedAt: null,
+    // Durable media-write state — SUCCEEDED by default (the upload's put
+    // returned long ago, so nothing is in flight); the drain tests opt
+    // into PENDING/FAILED/null.
+    mediaWriteState: VideoMediaWriteState.SUCCEEDED,
     createdAt: new Date(),
     updatedAt: new Date(),
     ...overrides,
@@ -179,9 +198,15 @@ function buildService(overrides: {
   maxUploadBytes?: string;
   maxScreeningDurationMs?: string;
   maxScreeningFrames?: string;
-  // The unscreened-upload bypass is REMOVED: these two remain wired into
-  // the mock ConfigService ONLY so tests can prove the service ignores
-  // them completely in every environment.
+  screeningTimeoutMs?: string;
+  // The CONTROLLED TEST-MEDIA POLICY GATE — the only thing that authorizes
+  // an ingest. Defaults below open it ('true' + a non-production NODE_ENV)
+  // so the rest of the suite exercises the paths behind it; the policy-gate
+  // suite drives these explicitly.
+  testMediaIngestEnabled?: string;
+  // The unscreened-upload bypass is REMOVED: this remains wired into the
+  // mock ConfigService ONLY so tests can prove the service ignores it
+  // completely in every environment.
   allowUnscreenedUploads?: string;
   nodeEnv?: string;
 } = {}) {
@@ -201,10 +226,14 @@ function buildService(overrides: {
     findById: jest.fn(async () => assetRow()),
     findByIdInternal: jest.fn(async () => assetRow()),
     findByIdInternalIncludingDeleted: jest.fn(async () => assetRow()),
-    // Advisory-lock-guarded liveness read the upload takes immediately
-    // before its media write (delete-race window shrink) — 'live' by
+    // Advisory-lock-guarded liveness read + durable media-write CLAIM the
+    // upload takes immediately before its media write (delete-race window
+    // shrink, and the PENDING state a later delete OBSERVES) — 'live' by
     // default; the concurrent-delete tests override.
-    assetLivenessUnderLock: jest.fn(async () => 'live' as const),
+    beginMediaWriteUnderLock: jest.fn(async () => 'live' as const),
+    // Durable resolution of that claim: SUCCEEDED the moment the put
+    // returns, FAILED when it throws.
+    resolveMediaWrite: jest.fn(async () => undefined),
     list: jest.fn(async () => ({ items: [assetRow()], total: 1 })),
     transitionStatus: jest.fn(
       async (
@@ -226,11 +255,19 @@ function buildService(overrides: {
       async (
         _t: string,
         _id: string,
-        build: (b: unknown, mediaAlreadyRemoved: boolean) => unknown,
+        build: (
+          b: unknown,
+          mediaAlreadyRemoved: boolean,
+          mediaWriteUndecided: boolean,
+        ) => unknown,
       ) => {
         const before = assetRow();
-        build(before, false);
-        return { asset: before, mediaAlreadyRemoved: false };
+        build(before, false, false);
+        return {
+          asset: before,
+          mediaAlreadyRemoved: false,
+          mediaWriteUndecided: false,
+        };
       },
     ),
     // Exactly-once media-removal completion marker CAS (Findings I/K):
@@ -243,21 +280,15 @@ function buildService(overrides: {
         return 'recorded' as const;
       },
     ),
-    // Operation advisory lock around stage → publish → cleanup: the default
-    // simply runs the section (no contention in a single-attempt test);
-    // concurrency tests override it with a real serializing implementation.
-    runUnderExtractionOperationLock: jest.fn(
-      async (
-        _t: string,
-        _assetId: string,
-        _operationHash: string,
-        run: () => Promise<unknown>,
-      ) => run(),
-    ),
+    // The publication transaction: it takes the OPERATION advisory lock as
+    // its own first statement (there is no outer lock wrapper any more) and
+    // reports the committed-owner verdict for the staged keys alongside its
+    // outcome. Default: a clean first publish with no pre-existing owner.
     createArtifactsBatch: jest.fn(
       async (
         _t: string,
         videoAssetId: string,
+        _operationHash: string,
         _expected: unknown,
         _idempotencyKey: string | undefined,
         items: Record<string, unknown>[],
@@ -275,15 +306,22 @@ function buildService(overrides: {
         });
         const asset = assetRow({ status: VideoAssetStatus.READY });
         buildAssetAudit(assetRow(), asset);
-        return { asset, artifacts, replayed: false };
+        return {
+          asset,
+          artifacts,
+          replayed: false,
+          committedStagedKeys: [],
+        };
       },
     ),
     findExtractionReplay: jest.fn(async () => null),
     findArtifactById: jest.fn(async () => artifactRow()),
     listArtifacts: jest.fn(async () => [artifactRow()]),
-    listArtifactStorageKeys: jest.fn(async () => []),
     // No crop is linked to a job by default — delete-flow tests override.
     listLinkedInferenceJobs: jest.fn(async () => []),
+    // Crash-window sweep source: UNLINKED crop artifacts of the asset, each
+    // probed under its deterministic `video-crop:<id>` idempotency key.
+    listCropArtifactIds: jest.fn(async () => [] as string[]),
     // Final preview-serve guard: by default the asset is still QUARANTINED
     // and the audited READ commits (the builder runs inside the guarded
     // transaction in the real repository, which also stamps the inspection
@@ -336,20 +374,26 @@ function buildService(overrides: {
     // simulated-mode refusal test overrides this to false explicitly.
     readsRealBytes: true,
     probe: jest.fn(async () => ({ durationMs: 10_000, width: 1280, height: 720, fps: 30 })),
-    // ONE-pass EXHAUSTIVE decode backing the DEFAULT buffer-inspection
-    // session (pre-storage screening): the real contract yields EVERY
-    // source frame; the default mock yields one DISTINCT raw PNG buffer
-    // per STARTED second of the probed duration — the minimum stream that
-    // satisfies the service's completeness floor — so a test that
-    // overrides `probe` drives the frame count too, and per-test
-    // overrides supply denser streams. Frames are byte-distinct so the
-    // service's sha256 dedupe does not collapse them (dedupe tests
-    // override with identical buffers deliberately). Receives
-    // (options, durationMs) — the session derives durationMs from the
-    // shared probe mock.
-    extractAllFrames: jest.fn(
+    // EXHAUSTIVE STREAMING decode backing the DEFAULT buffer-inspection
+    // session (pre-storage screening). This mock supplies the FRAME
+    // STREAM (or throws a controlled decode failure); the session below
+    // drives the service's onFrame callback over it exactly as the real
+    // adapter does. The real contract yields EVERY source frame; the
+    // default mock yields one DISTINCT raw PNG buffer per STARTED second
+    // of the probed duration — the minimum stream that satisfies the
+    // service's completeness floor — so a test that overrides `probe`
+    // drives the frame count too, and per-test overrides supply denser
+    // streams. Frames are byte-distinct so the service's sha256 dedupe
+    // does not collapse them (dedupe tests override with identical
+    // buffers deliberately). Receives (options, durationMs) — the session
+    // derives durationMs from the shared probe mock.
+    streamFrames: jest.fn(
       async (
-        _options: { maxFrames: number; maxBytesPerFrame: number },
+        _options: {
+          maxFrames: number;
+          maxBytesPerFrame: number;
+          deadlineMs: number;
+        },
         durationMs: number,
       ) =>
         Array.from(
@@ -378,11 +422,15 @@ function buildService(overrides: {
   };
   if (!('inspectBuffer' in extractor)) {
     // Default IN-MEMORY inspection session (pinned session contract:
-    // opening runs no tooling; probe() is memoized; ONE
-    // extractAllFrames pass; idempotent close). Delegates to the
-    // SAME probe/extractAllFrames mocks (including per-test
-    // overrides), so a test that overrides one surface drives the
-    // pre-storage screen too.
+    // opening runs no tooling; probe() is memoized; ONE streaming
+    // decode; idempotent close). Delegates to the SAME probe/streamFrames
+    // mocks (including per-test overrides), so a test that overrides one
+    // surface drives the pre-storage screen too. The session DRIVES the
+    // callback per the port contract: one frame at a time in decode
+    // order, a 'stop' verdict abandons the rest and RESOLVES with
+    // stoppedEarly:true (never an error), an onFrame rejection propagates
+    // unchanged, and zero frames from an otherwise successful decode is
+    // FrameUnavailableError.
     extractor.inspectBuffer = jest.fn(async (data: Buffer) => {
       void data;
       let probed: Promise<unknown> | null = null;
@@ -392,17 +440,34 @@ function buildService(overrides: {
         ));
       return {
         probe,
-        extractAllFrames: async (options: {
+        streamFrames: async (options: {
           maxFrames: number;
           maxBytesPerFrame: number;
+          deadlineMs: number;
+          onFrame: (frame: Buffer, index: number) => Promise<'continue' | 'stop'>;
         }) => {
           const { durationMs } = (await probe()) as { durationMs: number };
-          return (
-            extractor.extractAllFrames as (
-              options: { maxFrames: number; maxBytesPerFrame: number },
+          const frames = await (
+            extractor.streamFrames as (
+              options: {
+                maxFrames: number;
+                maxBytesPerFrame: number;
+                deadlineMs: number;
+              },
               durationMs: number,
             ) => Promise<Buffer[]>
           )(options, durationMs);
+          let framesSeen = 0;
+          for (let index = 0; index < frames.length; index += 1) {
+            framesSeen += 1;
+            if ((await options.onFrame(frames[index], index)) === 'stop') {
+              return { framesSeen, stoppedEarly: true };
+            }
+          }
+          if (framesSeen === 0) {
+            throw new FrameUnavailableError();
+          }
+          return { framesSeen, stoppedEarly: false };
         },
         close: inspectClose,
       };
@@ -437,6 +502,8 @@ function buildService(overrides: {
           sessionId?: string;
           priority?: number;
         },
+        _actor?: unknown,
+        options?: { createPendingLink?: boolean },
       ) => ({
         id: 'job-1',
         jobType: dto.jobType,
@@ -446,17 +513,35 @@ function buildService(overrides: {
         // Mirrors the real create: the persisted priority is the dto's,
         // defaulted exactly as the inference module defaults it.
         priority: dto.priority ?? DEFAULT_PRIORITY,
+        // Two-phase creation: the opt-in lands the job in the NON-CLAIMABLE
+        // PENDING_LINK state (the real module's contract), so the mock must
+        // report it — the service gates its compensation on exactly this.
+        status:
+          options?.createPendingLink === true
+            ? InferenceJobStatus.PENDING_LINK
+            : InferenceJobStatus.QUEUED,
         locationId: dto.locationId ?? null,
         unitId: dto.unitId ?? null,
         deviceId: dto.deviceId ?? null,
         sessionId: dto.sessionId ?? null,
       }),
     ),
+    // PENDING_LINK → QUEUED CAS, run only after the link committed.
+    publishPendingLinkJob: jest.fn(async (_t: string, jobId: string) => ({
+      id: jobId,
+      jobType: InferenceJobType.PRODUCT_RECOGNITION,
+      sourceType: EvidenceSourceType.VISION,
+      priority: DEFAULT_PRIORITY,
+      status: InferenceJobStatus.QUEUED,
+    })),
+    // Crash-window discovery seam: no unlinked job by default.
+    findByIdempotencyKey: jest.fn(async () => null),
     findById: jest.fn(async () => ({
       id: 'job-1',
       jobType: InferenceJobType.PRODUCT_RECOGNITION,
       sourceType: EvidenceSourceType.VISION,
       priority: DEFAULT_PRIORITY,
+      status: InferenceJobStatus.QUEUED,
     })),
     cancelOrphanedJob: jest.fn(async () => ({
       id: 'job-1',
@@ -471,19 +556,23 @@ function buildService(overrides: {
   const auditLog = {
     record: jest.fn(async () => undefined),
   };
+  const configured: Record<string, string | undefined> = {
+    VIDEO_MAX_UPLOAD_BYTES: overrides.maxUploadBytes,
+    VIDEO_MAX_SCREENING_DURATION_MS: overrides.maxScreeningDurationMs,
+    VIDEO_MAX_SCREENING_FRAMES: overrides.maxScreeningFrames,
+    VIDEO_SCREENING_TIMEOUT_MS: overrides.screeningTimeoutMs,
+    VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: overrides.allowUnscreenedUploads,
+    // Policy gate OPEN by default so the suite reaches the code behind it.
+    // 'testMediaIngestEnabled' in overrides is checked (not ??) so a test
+    // can drive an EXPLICIT undefined — the "flag absent" case.
+    VIDEO_TEST_MEDIA_INGEST_ENABLED:
+      'testMediaIngestEnabled' in overrides
+        ? overrides.testMediaIngestEnabled
+        : 'true',
+    NODE_ENV: 'nodeEnv' in overrides ? overrides.nodeEnv : 'test',
+  };
   const config = {
-    get: (key: string) =>
-      key === 'VIDEO_MAX_UPLOAD_BYTES'
-        ? overrides.maxUploadBytes
-        : key === 'VIDEO_MAX_SCREENING_DURATION_MS'
-          ? overrides.maxScreeningDurationMs
-          : key === 'VIDEO_MAX_SCREENING_FRAMES'
-            ? overrides.maxScreeningFrames
-            : key === 'VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS'
-              ? overrides.allowUnscreenedUploads
-              : key === 'NODE_ENV'
-                ? overrides.nodeEnv
-                : undefined,
+    get: (key: string) => configured[key],
   } as unknown as ConfigService;
 
   const service = new VideoAssetsService(
@@ -578,17 +667,17 @@ describe('VideoAssetsService.upload', () => {
     expect(auditLog.record).not.toHaveBeenCalled();
   });
 
-  it('skips the media write with a controlled 409 when the locked pre-put liveness check observes a committed delete', async () => {
+  it('skips the media write with a controlled 409 when the locked media-write claim observes a committed delete', async () => {
     // Shrinks the delete/put race window: a DELETE that completed while
     // the upload was still screening in memory has already run its prefix
     // cleanup — writing the media NOW would recreate bytes under a prefix
     // whose delete caller was told cleanup completed. The advisory-locked
-    // liveness read (same per-asset lock as softDelete) catches that
-    // BEFORE the put: no byte is written, no publish is attempted, and
-    // the caller gets the same controlled 409 as a lost publish CAS.
+    // claim (same per-asset lock as softDelete) catches that BEFORE the
+    // put: no byte is written, no publish is attempted, and the caller
+    // gets the same controlled 409 as a lost publish CAS.
     const { service, storage, repository } = buildService({
       repository: {
-        assetLivenessUnderLock: jest.fn(async () => 'deleted' as const),
+        beginMediaWriteUnderLock: jest.fn(async () => 'deleted' as const),
       },
     });
     await expect(
@@ -597,15 +686,34 @@ describe('VideoAssetsService.upload', () => {
     expect(storage.put).not.toHaveBeenCalled();
     expect(repository.transitionStatus).not.toHaveBeenCalled();
     expect(storage.deletePrefix).not.toHaveBeenCalled();
+    // Nothing to resolve: the claim was never taken, so the durable state
+    // stays NULL (no media write was ever attempted) and a delete may
+    // record its completion.
+    expect(repository.resolveMediaWrite).not.toHaveBeenCalled();
   });
 
-  it('runs the locked liveness pre-check BETWEEN the in-memory screen and the media write', async () => {
+  it('claims the media write under the lock BETWEEN the in-memory screen and the put, then resolves it SUCCEEDED before the publish CAS', async () => {
     const { service, storage, repository } = buildService();
     await service.upload(TENANT, uploadFile(), { ...ATTEST });
-    const livenessOrder = (repository.assetLivenessUnderLock as jest.Mock)
-      .mock.invocationCallOrder[0];
+    const claimOrder = (repository.beginMediaWriteUnderLock as jest.Mock).mock
+      .invocationCallOrder[0];
     const putOrder = (storage.put as jest.Mock).mock.invocationCallOrder[0];
-    expect(livenessOrder).toBeLessThan(putOrder);
+    const resolveOrder = (repository.resolveMediaWrite as jest.Mock).mock
+      .invocationCallOrder[0];
+    const publishOrder = (repository.transitionStatus as jest.Mock).mock
+      .invocationCallOrder[0];
+    expect(claimOrder).toBeLessThan(putOrder);
+    // The put RETURNED before the state was resolved...
+    expect(putOrder).toBeLessThan(resolveOrder);
+    // ...and the resolution lands BEFORE the publish CAS, which can LOSE
+    // to a concurrent delete — folding it into the CAS would leave the
+    // state PENDING exactly when a delete is waiting to learn it drained.
+    expect(resolveOrder).toBeLessThan(publishOrder);
+    expect(repository.resolveMediaWrite).toHaveBeenCalledWith(
+      TENANT,
+      'asset-1',
+      'SUCCEEDED',
+    );
   });
 
   it('escalates a failed compensating removal after a lost publish as a retryable 503 with a durable cleanup-obligation audit', async () => {
@@ -653,20 +761,21 @@ describe('VideoAssetsService.upload', () => {
   });
 
   it('refuses to store WITHOUT the frame-content attestation', async () => {
-    // Text screening cannot inspect pixels: nothing reaches storage unless
-    // the operator explicitly attested the staged clip's frames carry no
-    // payment-card/credential content.
+    // Text screening cannot inspect pixels and never certifies a clip:
+    // nothing reaches storage unless the operator explicitly declared the
+    // staged clip's frames carry no payment-card/credential content.
     const { service, storage, repository } = buildService();
-    for (const dto of [
-      { attestNoSensitiveContent: '' },
-      { attestNoSensitiveContent: 'false' },
-      { attestNoSensitiveContent: 'TRUE ' },
-      {} as { attestNoSensitiveContent: string },
-    ]) {
+    for (const value of ['', 'false', 'TRUE ']) {
       await expect(
-        service.upload(TENANT, uploadFile(), dto),
+        service.upload(TENANT, uploadFile(), {
+          ...ATTEST,
+          attestNoSensitiveContent: value,
+        }),
       ).rejects.toBeInstanceOf(BadRequestException);
     }
+    await expect(
+      service.upload(TENANT, uploadFile(), {} as typeof ATTEST),
+    ).rejects.toBeInstanceOf(BadRequestException);
     expect(storage.put).not.toHaveBeenCalled();
     expect(repository.createAsset).not.toHaveBeenCalled();
   });
@@ -764,6 +873,59 @@ describe('VideoAssetsService.upload', () => {
       .invocationCallOrder[0];
     const putOrder = (storage.put as jest.Mock).mock.invocationCallOrder[0];
     expect(createOrder).toBeLessThan(putOrder);
+  });
+
+  it('resolves the media-write claim FAILED when the put throws, BEFORE the compensating removal and the FAILED transition', async () => {
+    // The claim must not be left PENDING on a write that will never land:
+    // every DELETE (fresh or replayed) withholds its media-removal
+    // completion while the state is PENDING, so an unresolved failure
+    // would be a permanently outstanding drain obligation for bytes that
+    // do not exist.
+    const put = jest.fn(async () => {
+      throw new VideoStorageOperationError();
+    });
+    const { service, repository, storage } = buildService({ storage: { put } });
+    await expect(
+      service.upload(TENANT, uploadFile(), { ...ATTEST }),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    expect(repository.resolveMediaWrite).toHaveBeenCalledWith(
+      TENANT,
+      'asset-1',
+      'FAILED',
+    );
+    const resolveOrder = (repository.resolveMediaWrite as jest.Mock).mock
+      .invocationCallOrder[0];
+    expect(resolveOrder).toBeGreaterThan(
+      (put as jest.Mock).mock.invocationCallOrder[0],
+    );
+    expect(resolveOrder).toBeLessThan(
+      (storage.deletePrefix as jest.Mock).mock.invocationCallOrder[0],
+    );
+    expect(resolveOrder).toBeLessThan(
+      (repository.transitionStatus as jest.Mock).mock.invocationCallOrder[0],
+    );
+  });
+
+  it('never lets a media-write resolution failure mask the storage error the caller must see', async () => {
+    // Best effort on the failing path: the durable FAILED row below is the
+    // operator-facing evidence, and the swallowed cost is honest (the
+    // state stays PENDING, so DELETE keeps reporting cleanup as pending
+    // instead of falsely recording a completion).
+    const { service } = buildService({
+      storage: {
+        put: jest.fn(async () => {
+          throw new VideoStorageOperationError();
+        }),
+      },
+      repository: {
+        resolveMediaWrite: jest.fn(async () => {
+          throw new Error('db down');
+        }),
+      },
+    });
+    await expect(
+      service.upload(TENANT, uploadFile(), { ...ATTEST }),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
   });
 
   it('marks the committed row FAILED (UPLOAD_INCOMPLETE) and 503s when the media write fails', async () => {
@@ -918,13 +1080,201 @@ describe('VideoAssetsService.upload', () => {
   });
 });
 
+describe('VideoAssetsService.upload controlled test-media policy gate', () => {
+  // THE authorization for a Phase 10 ingest. The strategy this suite pins:
+  // a quiet OCR result is NOT proof a clip is safe (rotated, blurred,
+  // stylized, occluded or low-quality digits defeat recognition), so
+  // storage is authorized by the POLICY GATE — controlled internal test
+  // media, explicit audited operator attestations, a non-production
+  // runtime opted in by configuration — and text screening only ever
+  // REJECTS on top of it.
+  const RECOGNIZER_SAYS_NOTHING = {
+    recognize: jest.fn(async () => 'aisle four shelf camera'),
+  };
+
+  it('refuses uploads with a controlled 503 when the gate flag is ABSENT — a quiet recognizer authorizes nothing', async () => {
+    const { service, repository, storage, extractor, recognizer } =
+      buildService({
+        testMediaIngestEnabled: undefined,
+        recognizer: { ...RECOGNIZER_SAYS_NOTHING },
+      });
+    const error: Error = await service
+      .upload(TENANT, uploadFile(), { ...ATTEST })
+      .then(() => {
+        throw new Error('expected rejection');
+      })
+      .catch((caught: Error) => caught);
+    expect(error).toBeInstanceOf(ServiceUnavailableException);
+    expect(error.message).toContain('VIDEO_TEST_MEDIA_INGEST_ENABLED');
+    expect(error.message).toContain('CONTROLLED INTERNAL TEST MEDIA');
+    // The refusal never suggests screening could substitute for the gate.
+    expect(error.message).not.toMatch(/\bsafe\b|verified|card-free/i);
+    // Refused BEFORE the row commit, any decode, any recognition, any byte.
+    expect(repository.createAsset).not.toHaveBeenCalled();
+    expect(extractor.inspectBuffer).not.toHaveBeenCalled();
+    expect(recognizer.recognize).not.toHaveBeenCalled();
+    expect(storage.put).not.toHaveBeenCalled();
+  });
+
+  it.each(['false', 'FALSE', 'TRUE', 'true ', '1', ''])(
+    'keeps the gate CLOSED (503, nothing persisted) for the flag value %p',
+    async (testMediaIngestEnabled) => {
+      const { service, repository, storage, extractor } = buildService({
+        testMediaIngestEnabled,
+      });
+      await expect(
+        service.upload(TENANT, uploadFile(), { ...ATTEST }),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(repository.createAsset).not.toHaveBeenCalled();
+      expect(extractor.inspectBuffer).not.toHaveBeenCalled();
+      expect(storage.put).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['production', undefined])(
+    'DEFENSE IN DEPTH: the gate stays CLOSED under NODE_ENV=%s even with the flag true',
+    async (nodeEnv) => {
+      // Startup validation already refuses the flag outside
+      // development/test; the service re-checks so a config that somehow
+      // carries true in production still ingests nothing.
+      const { service, repository, storage, extractor, recognizer } =
+        buildService({
+          testMediaIngestEnabled: 'true',
+          nodeEnv,
+          recognizer: { ...RECOGNIZER_SAYS_NOTHING },
+        });
+      const error: Error = await service
+        .upload(TENANT, uploadFile(), { ...ATTEST })
+        .then(() => {
+          throw new Error('expected rejection');
+        })
+        .catch((caught: Error) => caught);
+      expect(error).toBeInstanceOf(ServiceUnavailableException);
+      expect(error.message).toContain('CONTROLLED INTERNAL TEST MEDIA');
+      expect(repository.createAsset).not.toHaveBeenCalled();
+      expect(extractor.inspectBuffer).not.toHaveBeenCalled();
+      expect(recognizer.recognize).not.toHaveBeenCalled();
+      expect(storage.put).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['development', 'test'])(
+    'proceeds under NODE_ENV=%s with the flag true and EVERY attestation present',
+    async (nodeEnv) => {
+      const { service, storage } = buildService({
+        testMediaIngestEnabled: 'true',
+        nodeEnv,
+      });
+      const asset = await service.upload(TENANT, uploadFile(), { ...ATTEST });
+      expect((asset as { status: VideoAssetStatus }).status).toBe(
+        VideoAssetStatus.QUARANTINED,
+      );
+      expect(storage.put).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(ATTESTATION_FIELDS)(
+    'refuses with a controlled 400 and persists NOTHING when %s is missing or not "true"',
+    async (field) => {
+      for (const dto of [
+        { ...ATTEST, [field]: 'false' },
+        { ...ATTEST, [field]: '' },
+        (() => {
+          const partial = { ...ATTEST } as Record<string, string>;
+          delete partial[field];
+          return partial as typeof ATTEST;
+        })(),
+      ]) {
+        const { service, repository, storage, extractor, recognizer } =
+          buildService({ recognizer: { ...RECOGNIZER_SAYS_NOTHING } });
+        const error: Error = await service
+          .upload(TENANT, uploadFile(), dto as typeof ATTEST)
+          .then(() => {
+            throw new Error('expected rejection');
+          })
+          .catch((caught: Error) => caught);
+        expect(error).toBeInstanceOf(BadRequestException);
+        expect(error.message).toContain(field);
+        // Refused BEFORE any row, decode, recognition, or byte — and a
+        // recognizer that would have found nothing cannot substitute for
+        // the missing declaration.
+        expect(repository.createAsset).not.toHaveBeenCalled();
+        expect(extractor.inspectBuffer).not.toHaveBeenCalled();
+        expect(recognizer.recognize).not.toHaveBeenCalled();
+        expect(storage.put).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it('still REJECTS an OCR detection with the gate open and every attestation present', async () => {
+    // The gate authorizes the ingest; screening still rejects on top of it.
+    const pan = '4111 1111 1111 1111';
+    const { service, repository, storage } = buildService({
+      recognizer: {
+        recognize: jest.fn(async () => `PAY CARD ${pan} OK`),
+      },
+    });
+    const error: Error = await service
+      .upload(TENANT, uploadFile(), { ...ATTEST })
+      .then(() => {
+        throw new Error('expected rejection');
+      })
+      .catch((caught: Error) => caught);
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect(error.message).not.toContain('4111');
+    expect(storage.put).not.toHaveBeenCalled();
+    const [, , , data] = repository.transitionStatus.mock
+      .calls[0] as unknown as [
+      string,
+      string,
+      VideoAssetStatus[],
+      { status: VideoAssetStatus; errorCode: string },
+    ];
+    expect(data.status).toBe(VideoAssetStatus.REJECTED);
+    expect(data.errorCode).toBe('PRESTORE_SCREENING_REJECTED');
+  });
+
+  it('audits the ingest authorization HONESTLY: the policy gate and the operator declarations, never a safety finding', async () => {
+    // The persisted create reason must say what is true — accepted under
+    // the controlled test-media policy with the operator's attestations —
+    // and must claim NOTHING about the content having been verified.
+    let createReason: string | undefined;
+    const createAsset = jest.fn(
+      async (
+        _t: string,
+        data: unknown,
+        build: (a: unknown) => { reason?: string },
+      ) => {
+        const created = assetRow({
+          ...(data as Record<string, unknown>),
+          status: VideoAssetStatus.PENDING_MEDIA,
+        });
+        createReason = build(created).reason;
+        return created;
+      },
+    );
+    const { service } = buildService({ repository: { createAsset } });
+    await service.upload(TENANT, uploadFile(), { ...ATTEST });
+    expect(createReason).toContain('controlled test-media policy gate');
+    for (const field of ATTESTATION_FIELDS) {
+      expect(createReason).toContain(field);
+    }
+    // No safety/verification claim of any shape.
+    expect(createReason).not.toMatch(
+      /\bsafe\b|verified|card-free|screened clean|proves/i,
+    );
+    // And it says plainly that screening cannot certify the clip.
+    expect(createReason).toContain('can only reject');
+  });
+});
+
 describe('VideoAssetsService.upload pre-storage frame screening', () => {
   it('screens EVERY decoded source frame through OCR from the IN-MEMORY buffer: a 10 s 30 fps clip OCRs ALL 300 frames', async () => {
     // Codex P1 "screen every source frame before storing the video": the
     // fps=1 sample dropped the frames between one-second ticks, so a PAN
     // visible only between samples passed and the container persisted.
     // The mandatory pre-storage screen now decodes EVERY source frame in
-    // ONE exhaustive extractAllFrames pass and OCRs each unique frame —
+    // ONE exhaustive streamFrames pass and OCRs each unique frame —
     // no sampling of any kind. Each frame's recognized text runs through
     // the fused sensitive-text predicate, and only a clean, COMPLETE pass
     // reaches durable storage. The session is closed.
@@ -932,7 +1282,7 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
       buildService({
         extractor: {
           // A 10 s 30 fps clip decodes to 300 distinct source frames.
-          extractAllFrames: jest.fn(async () =>
+          streamFrames: jest.fn(async () =>
             Array.from({ length: 300 }, (_, index) =>
               Buffer.from(`source-frame-${index}`),
             ),
@@ -949,15 +1299,24 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
     expect(
       (extractor.inspectBuffer as jest.Mock).mock.calls[0][0],
     ).toBe(file.buffer);
-    // ONE exhaustive pass carrying the configured frame budget AND the
-    // derived per-frame byte budget.
-    expect(extractor.extractAllFrames).toHaveBeenCalledTimes(1);
-    expect(
-      (extractor.extractAllFrames as jest.Mock).mock.calls[0][0],
-    ).toEqual({
-      maxFrames: 900,
-      maxBytesPerFrame: PRESTORE_SCREENING_MAX_FRAME_BYTES,
-    });
+    // ONE exhaustive streaming pass carrying the configured frame budget,
+    // the derived per-frame byte budget, AND the remaining slice of the
+    // upload-wide screening deadline (default 30 s).
+    expect(extractor.streamFrames).toHaveBeenCalledTimes(1);
+    const streamOptions = (extractor.streamFrames as jest.Mock).mock
+      .calls[0][0] as {
+      maxFrames: number;
+      maxBytesPerFrame: number;
+      deadlineMs: number;
+      onFrame: unknown;
+    };
+    expect(streamOptions.maxFrames).toBe(900);
+    expect(streamOptions.maxBytesPerFrame).toBe(
+      PRESTORE_SCREENING_MAX_FRAME_BYTES,
+    );
+    expect(streamOptions.deadlineMs).toBeGreaterThan(0);
+    expect(streamOptions.deadlineMs).toBeLessThanOrEqual(30_000);
+    expect(typeof streamOptions.onFrame).toBe('function');
     // ALL 300 decoded (byte-distinct) frames OCR'd — not 10 one-second
     // samples, not 6 sparse previews.
     expect(recognizer.recognize).toHaveBeenCalledTimes(300);
@@ -1058,7 +1417,7 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
       'exceeds the Phase 10 screening duration limit',
     );
     // Refused before ANY frame extraction or OCR.
-    expect(extractor.extractAllFrames).not.toHaveBeenCalled();
+    expect(extractor.streamFrames).not.toHaveBeenCalled();
     expect(recognizer.recognize).not.toHaveBeenCalled();
     expect(storage.put).not.toHaveBeenCalled();
     expect(inspectClose).toHaveBeenCalledTimes(1);
@@ -1142,7 +1501,7 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
       'exceeds the Phase 10 screening frame budget',
     );
     // Refused before ANY frame extraction or OCR.
-    expect(extractor.extractAllFrames).not.toHaveBeenCalled();
+    expect(extractor.streamFrames).not.toHaveBeenCalled();
     expect(recognizer.recognize).not.toHaveBeenCalled();
     expect(storage.put).not.toHaveBeenCalled();
     expect(inspectClose).toHaveBeenCalledTimes(1);
@@ -1175,7 +1534,8 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
     });
     await service.upload(TENANT, uploadFile(), { ...ATTEST });
     // The default mock delivers the 30-frame floor stream; the point here
-    // is the pre-gate passed and the upload screened clean.
+    // is that the pre-gate did not fire and the screen detected nothing
+    // (which rejects nothing — the policy gate is what allowed the store).
     expect(recognizer.recognize).toHaveBeenCalledTimes(30);
     expect(storage.put).toHaveBeenCalledTimes(1);
   });
@@ -1204,7 +1564,7 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
     const { service, repository, storage, recognizer, inspectClose } =
       buildService({
         extractor: {
-          extractAllFrames: jest.fn(async () => {
+          streamFrames: jest.fn(async () => {
             throw new FrameCountExceededError();
           }),
         },
@@ -1243,7 +1603,7 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
     // every unique frame is still recognized exactly once.
     const { service, storage, recognizer } = buildService({
       extractor: {
-        extractAllFrames: jest.fn(async () =>
+        streamFrames: jest.fn(async () =>
           Array.from({ length: 300 }, (_, index) =>
             Buffer.from(`unique-${index % 3}`),
           ),
@@ -1280,7 +1640,7 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
     );
     const { service, repository, storage, recognizer } = buildService({
       extractor: {
-        extractAllFrames: jest.fn(async () =>
+        streamFrames: jest.fn(async () =>
           Array.from({ length: 300 }, (_, index) =>
             Buffer.from(index < 5 ? 'static-scene' : 'pan-scene'),
           ),
@@ -1343,7 +1703,7 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
     const { service, repository, storage, recognizer, inspectClose } =
       buildService({
         extractor: {
-          extractAllFrames: jest.fn(async () =>
+          streamFrames: jest.fn(async () =>
             Array.from({ length: 4 }, (_, index) =>
               Buffer.from(`frame-${index}`),
             ),
@@ -1359,9 +1719,11 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
       .catch((caught: Error) => caught);
     expect(error).toBeInstanceOf(BadRequestException);
     expect(error.message).toContain('incomplete frame coverage');
-    // Nothing was OCR'd (the incomplete pass is refused wholesale) and
-    // nothing was durably stored.
-    expect(recognizer.recognize).not.toHaveBeenCalled();
+    // The 4 frames that DID arrive were screened as they streamed (the
+    // count is only knowable once the stream ends), but a short stream is
+    // still refused wholesale — screening 4 of 10 required frames removes
+    // nothing and stores nothing.
+    expect(recognizer.recognize).toHaveBeenCalledTimes(4);
     expect(storage.put).not.toHaveBeenCalled();
     expect(inspectClose).toHaveBeenCalledTimes(1);
     const [, , expected, data] = repository.transitionStatus.mock
@@ -1401,7 +1763,7 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
     const { service, repository, storage, recognizer, inspectClose } =
       buildService({
         extractor: {
-          extractAllFrames: jest.fn(async () => {
+          streamFrames: jest.fn(async () => {
             throw new FrameUnavailableError();
           }),
         },
@@ -1451,7 +1813,7 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
     const { service, repository, storage, recognizer, inspectClose } =
       buildService({
         extractor: {
-          extractAllFrames: jest.fn(async () => {
+          streamFrames: jest.fn(async () => {
             throw new FrameExceedsBudgetError();
           }),
         },
@@ -1701,8 +2063,9 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
 
   it('fails closed (FAILED/UPLOAD_INCOMPLETE, 503) when the inspection-session cleanup fails', async () => {
     // The adapter could not release the session even after its internal
-    // retry — a pending PASS verdict is replaced by the same fail-closed
-    // contract as any other screening-infrastructure trouble.
+    // retry — a pending "nothing detected" verdict is replaced by the
+    // same fail-closed contract as any other screening-infrastructure
+    // trouble.
     const close = jest.fn(async () => {
       throw new ExtractionInfrastructureError();
     });
@@ -1715,10 +2078,14 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
             height: 720,
             fps: 30,
           }),
-          extractAllFrames: async () =>
-            Array.from({ length: 10 }, (_, index) =>
-              Buffer.from(`frame-${index}`),
-            ),
+          streamFrames: async (options: {
+            onFrame: (frame: Buffer, index: number) => Promise<'continue' | 'stop'>;
+          }) => {
+            for (let index = 0; index < 10; index += 1) {
+              await options.onFrame(Buffer.from(`frame-${index}`), index);
+            }
+            return { framesSeen: 10, stoppedEarly: false };
+          },
           close,
         })),
       },
@@ -1736,6 +2103,221 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
     ];
     expect(data.status).toBe(VideoAssetStatus.FAILED);
     expect(data.errorCode).toBe('UPLOAD_INCOMPLETE');
+    expect(storage.put).not.toHaveBeenCalled();
+  });
+
+  it('bounds the WHOLE screen with ONE upload-wide deadline: an expiry mid-stream stops the recognizer and rejects 400 with nothing stored', async () => {
+    // Codex P1 "bound the total OCR screening time": the sequential
+    // per-frame loop could otherwise spend a full recognizer timeout on
+    // EACH of up to VIDEO_MAX_SCREENING_FRAMES frames (900 × 30 s = 7.5
+    // hours). ONE absolute deadline, fixed at screening start, covers the
+    // decode AND every recognition; the callback re-checks it before each
+    // recognizer call and abandons the rest of the stream.
+    let clock = 1_700_000_000_000;
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => clock);
+    try {
+      let auditReason: string | undefined;
+      const transitionStatus = jest.fn(
+        async (
+          _t: string,
+          _id: string,
+          _expected: unknown,
+          data: { status: VideoAssetStatus },
+          build: (b: unknown, a: unknown) => { reason?: string },
+        ) => {
+          const after = assetRow({ ...data });
+          auditReason = build(
+            assetRow({ status: VideoAssetStatus.PENDING_MEDIA }),
+            after,
+          ).reason;
+          return after;
+        },
+      );
+      const {
+        service,
+        repository,
+        storage,
+        extractor,
+        recognizer,
+        inspectClose,
+      } = buildService({
+        screeningTimeoutMs: '5000',
+        extractor: {
+          streamFrames: jest.fn(async () =>
+            Array.from({ length: 300 }, (_, index) =>
+              Buffer.from(`slow-frame-${index}`),
+            ),
+          ),
+        },
+        recognizer: {
+          // Each recognition burns 2 s of the 5 s upload-wide budget.
+          recognize: jest.fn(async () => {
+            clock += 2000;
+            return 'aisle four';
+          }),
+        },
+        repository: { transitionStatus },
+      });
+      const error: Error = await service
+        .upload(TENANT, uploadFile(), { ...ATTEST })
+        .then(() => {
+          throw new Error('expected rejection');
+        })
+        .catch((caught: Error) => caught);
+      expect(error).toBeInstanceOf(BadRequestException);
+      expect(error.message).toContain('screening time budget');
+      // Three recognitions fit (t=0, 2000, 4000); the fourth frame is
+      // checked at t=6000 — past the 5 s deadline — so the recognizer is
+      // NEVER called again and the remaining 296 frames are abandoned.
+      expect(recognizer.recognize).toHaveBeenCalledTimes(3);
+      // The decode carried the SAME aggregate budget, not a per-frame one.
+      expect(
+        (
+          (extractor.streamFrames as jest.Mock).mock.calls[0][0] as {
+            deadlineMs: number;
+          }
+        ).deadlineMs,
+      ).toBe(5000);
+      // Fail closed: nothing durably stored, session closed, terminal
+      // REJECTED claim with the module's stable pre-storage code.
+      expect(storage.put).not.toHaveBeenCalled();
+      expect(inspectClose).toHaveBeenCalledTimes(1);
+      const [, , expected, data] = repository.transitionStatus.mock
+        .calls[0] as unknown as [
+        string,
+        string,
+        VideoAssetStatus[],
+        { status: VideoAssetStatus; errorCode: string },
+      ];
+      expect(expected).toEqual([VideoAssetStatus.PENDING_MEDIA]);
+      expect(data.status).toBe(VideoAssetStatus.REJECTED);
+      expect(data.errorCode).toBe('PRESTORE_SCREENING_REJECTED');
+      expect(auditReason).toContain('VIDEO_SCREENING_TIMEOUT_MS');
+      expect(auditReason).toContain('NOT screened end to end');
+      // An unfinished screen is never recorded as a pass.
+      expect(auditReason).not.toMatch(/\bsafe\b|verified|card-free/i);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('rejects fail-closed (400) when the DECODE itself outlives the deadline (ScreeningDeadlineExceededError)', async () => {
+    // The adapter kills a wedged decode and reports the controlled
+    // deadline error; the service treats it as the same fail-closed
+    // rejection as an expiry it observed itself — never infrastructure,
+    // never a pass.
+    let auditReason: string | undefined;
+    const transitionStatus = jest.fn(
+      async (
+        _t: string,
+        _id: string,
+        _expected: unknown,
+        data: { status: VideoAssetStatus },
+        build: (b: unknown, a: unknown) => { reason?: string },
+      ) => {
+        const after = assetRow({ ...data });
+        auditReason = build(
+          assetRow({ status: VideoAssetStatus.PENDING_MEDIA }),
+          after,
+        ).reason;
+        return after;
+      },
+    );
+    const { service, repository, storage, recognizer, inspectClose } =
+      buildService({
+        extractor: {
+          streamFrames: jest.fn(async () => {
+            throw new ScreeningDeadlineExceededError();
+          }),
+        },
+        repository: { transitionStatus },
+      });
+    const error: Error = await service
+      .upload(TENANT, uploadFile(), { ...ATTEST })
+      .then(() => {
+        throw new Error('expected rejection');
+      })
+      .catch((caught: Error) => caught);
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect(error.message).toContain('screening time budget');
+    expect(recognizer.recognize).not.toHaveBeenCalled();
+    expect(storage.put).not.toHaveBeenCalled();
+    expect(inspectClose).toHaveBeenCalledTimes(1);
+    const [, , expected, data] = repository.transitionStatus.mock
+      .calls[0] as unknown as [
+      string,
+      string,
+      VideoAssetStatus[],
+      { status: VideoAssetStatus; errorCode: string },
+    ];
+    expect(expected).toEqual([VideoAssetStatus.PENDING_MEDIA]);
+    expect(data.status).toBe(VideoAssetStatus.REJECTED);
+    expect(data.errorCode).toBe('PRESTORE_SCREENING_REJECTED');
+    expect(auditReason).toContain('VIDEO_SCREENING_TIMEOUT_MS');
+  });
+
+  it('hands the streaming decode the configured budget, clamped to the adapter-enforceable ceiling', async () => {
+    // The adapter clamps any deadline DOWN to its own 120 s ceiling and
+    // never up, so a larger configured budget would be unenforceable at
+    // the decode: the service clamps first, so what it audits is what is
+    // enforced.
+    const tight = buildService({ screeningTimeoutMs: '1000' });
+    await tight.service.upload(TENANT, uploadFile(), { ...ATTEST });
+    const tightDeadline = (
+      (tight.extractor.streamFrames as jest.Mock).mock.calls[0][0] as {
+        deadlineMs: number;
+      }
+    ).deadlineMs;
+    expect(tightDeadline).toBeGreaterThan(0);
+    expect(tightDeadline).toBeLessThanOrEqual(1000);
+
+    const wide = buildService({ screeningTimeoutMs: '300000' });
+    await wide.service.upload(TENANT, uploadFile(), { ...ATTEST });
+    const wideDeadline = (
+      (wide.extractor.streamFrames as jest.Mock).mock.calls[0][0] as {
+        deadlineMs: number;
+      }
+    ).deadlineMs;
+    expect(wideDeadline).toBeLessThanOrEqual(120_000);
+    expect(wideDeadline).toBeGreaterThan(119_000);
+  });
+
+  it('does NOT apply the completeness floor to a stream that stopped EARLY on a detection', async () => {
+    // An early stop legitimately screens fewer frames than the floor
+    // requires (that IS the point of stopping), so the detection verdict
+    // must stand on its own rather than being masked by an
+    // "incomplete coverage" rejection.
+    let auditReason: string | undefined;
+    const transitionStatus = jest.fn(
+      async (
+        _t: string,
+        _id: string,
+        _expected: unknown,
+        data: { status: VideoAssetStatus },
+        build: (b: unknown, a: unknown) => { reason?: string },
+      ) => {
+        const after = assetRow({ ...data });
+        auditReason = build(
+          assetRow({ status: VideoAssetStatus.PENDING_MEDIA }),
+          after,
+        ).reason;
+        return after;
+      },
+    );
+    const { service, storage, recognizer } = buildService({
+      // 10 s clip → a floor of 10 frames; the detection lands on frame 0,
+      // so only ONE frame is ever seen.
+      recognizer: {
+        recognize: jest.fn(async () => 'PAY CARD 4111 1111 1111 1111 OK'),
+      },
+      repository: { transitionStatus },
+    });
+    await expect(
+      service.upload(TENANT, uploadFile(), { ...ATTEST }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(recognizer.recognize).toHaveBeenCalledTimes(1);
+    expect(auditReason).toContain('frame 0');
+    expect(auditReason).not.toContain('incomplete frame coverage');
     expect(storage.put).not.toHaveBeenCalled();
   });
 });
@@ -2944,6 +3526,7 @@ describe('VideoAssetsService crop & frame extraction', () => {
         y: 0,
         width: 10,
         height: 10,
+        idempotencyKey: 'op-1',
       }),
     ).rejects.toBeInstanceOf(BadRequestException);
   });
@@ -2957,6 +3540,7 @@ describe('VideoAssetsService crop & frame extraction', () => {
         y: 0,
         width: 100, // 1200 + 100 > 1280
         height: 100,
+        idempotencyKey: 'op-1',
       }),
     ).rejects.toBeInstanceOf(BadRequestException);
   });
@@ -2972,7 +3556,10 @@ describe('VideoAssetsService crop & frame extraction', () => {
       },
     });
     await expect(
-      service.extractFrames(TENANT, 'asset-1', { timestampMs: 9_999 }),
+      service.extractFrames(TENANT, 'asset-1', {
+        timestampMs: 9_999,
+        idempotencyKey: 'op-1',
+      }),
     ).rejects.toBeInstanceOf(BadRequestException);
     // No FAILED transition was recorded.
     expect(repository.transitionStatus).not.toHaveBeenCalled();
@@ -2989,7 +3576,10 @@ describe('VideoAssetsService crop & frame extraction', () => {
       },
     });
     await expect(
-      service.extractFrames(TENANT, 'asset-1', { timestampMs: 500 }),
+      service.extractFrames(TENANT, 'asset-1', {
+        timestampMs: 500,
+        idempotencyKey: 'op-1',
+      }),
     ).rejects.toBeInstanceOf(ServiceUnavailableException);
     expect(repository.transitionStatus).not.toHaveBeenCalled();
   });
@@ -3003,7 +3593,7 @@ describe('VideoAssetsService crop & frame extraction', () => {
       },
     });
     await expect(
-      service.extractFrames(TENANT, 'asset-1', {}),
+      service.extractFrames(TENANT, 'asset-1', { idempotencyKey: 'op-1' }),
     ).rejects.toBeInstanceOf(ConflictException);
   });
 
@@ -3019,7 +3609,7 @@ describe('VideoAssetsService crop & frame extraction', () => {
       },
     });
     await expect(
-      service.extractFrames(TENANT, 'asset-1', {}),
+      service.extractFrames(TENANT, 'asset-1', { idempotencyKey: 'op-1' }),
     ).rejects.toBeInstanceOf(ConflictException);
     await expect(
       service.createCrop(TENANT, 'asset-1', {
@@ -3028,6 +3618,7 @@ describe('VideoAssetsService crop & frame extraction', () => {
         y: 0,
         width: 10,
         height: 10,
+        idempotencyKey: 'op-2',
       }),
     ).rejects.toBeInstanceOf(ConflictException);
     expect(extractor.extractFrames).not.toHaveBeenCalled();
@@ -3048,7 +3639,7 @@ describe('VideoAssetsService crop & frame extraction', () => {
       },
     });
     for (const attempt of [
-      () => service.extractFrames(TENANT, 'asset-1', {}),
+      () => service.extractFrames(TENANT, 'asset-1', { idempotencyKey: 'op-1' }),
       () =>
         service.createCrop(TENANT, 'asset-1', {
           timestampMs: 1000,
@@ -3056,6 +3647,7 @@ describe('VideoAssetsService crop & frame extraction', () => {
           y: 0,
           width: 10,
           height: 10,
+          idempotencyKey: 'op-2',
         }),
     ]) {
       const error: Error = await attempt()
@@ -3082,10 +3674,12 @@ describe('VideoAssetsService crop & frame extraction', () => {
       width: 300,
       height: 200,
       reason: VideoCropReason.PRODUCT_PICKUP,
+      idempotencyKey: 'op-1',
     });
     expect(artifact.artifactType).toBe(VideoArtifactType.CROP);
-    const [, , , , items] = repository.createArtifactsBatch.mock
+    const [, , , , , items] = repository.createArtifactsBatch.mock
       .calls[0] as unknown as [
+      string,
       string,
       string,
       VideoAssetStatus[],
@@ -3113,7 +3707,9 @@ describe('VideoAssetsService crop & frame extraction', () => {
 
   it('publishes frames atomically and marks the asset READY in the same batch', async () => {
     const { service, repository } = buildService();
-    const { asset, artifacts } = await service.extractFrames(TENANT, 'asset-1', {});
+    const { asset, artifacts } = await service.extractFrames(TENANT, 'asset-1', {
+      idempotencyKey: 'op-1',
+    });
     expect(artifacts).toHaveLength(1);
     expect(asset.status).toBe(VideoAssetStatus.READY);
     // ONE atomic publish call carries the rows AND the status flip.
@@ -3129,11 +3725,12 @@ describe('VideoAssetsService crop & frame extraction', () => {
         y: 0,
         width: 10,
         height: 10,
+        idempotencyKey: 'op-1',
       }),
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 
-  it('removes staged files when the atomic publish fails (nothing committed)', async () => {
+  it('KEEPS staged files when the atomic publish fails (nothing committed, no terminal verdict)', async () => {
     const { service, storage } = buildService({
       repository: {
         createArtifactsBatch: jest.fn(async () => {
@@ -3148,10 +3745,14 @@ describe('VideoAssetsService crop & frame extraction', () => {
         y: 0,
         width: 10,
         height: 10,
+        idempotencyKey: 'op-1',
       }),
     ).rejects.toThrow('db down');
-    // The staged artifact file was cleaned up — no orphaned media.
-    expect(storage.delete).toHaveBeenCalledTimes(1);
+    // FAIL CLOSED: a rival attempt of the same operation staged the SAME
+    // deterministic keys and may still publish them, and the deletes
+    // cannot run under the operation lock — so the file stays where an
+    // identical retry overwrites it and asset deletion removes it.
+    expect(storage.delete).not.toHaveBeenCalled();
   });
 
   it('rejects a batch whose decoded bytes exceed the per-request budget', async () => {
@@ -3174,6 +3775,7 @@ describe('VideoAssetsService crop & frame extraction', () => {
         y: 0,
         width: 10,
         height: 10,
+        idempotencyKey: 'op-1',
       }),
     ).rejects.toBeInstanceOf(ConflictException);
     expect(storage.put).not.toHaveBeenCalled();
@@ -3296,8 +3898,10 @@ describe('extraction idempotency', () => {
       idempotencyKey: 'op-1',
     });
     expect(result.replayed).toBe(true);
-    // The loser's staged file was cleaned up.
-    expect(storage.delete).toHaveBeenCalledTimes(1);
+    // The loser's staged file is KEPT: with deterministic keys it IS the
+    // winner's committed file, and the P2002 rollback returned no
+    // lock-ordered ownership verdict that could prove otherwise.
+    expect(storage.delete).not.toHaveBeenCalled();
   });
 
   it('rejects idempotency keys carrying sensitive content, including grouped PANs', async () => {
@@ -3533,6 +4137,9 @@ describe('extraction idempotency', () => {
           ],
           replayed: true,
           requestFingerprint: framesFingerprint({ intervalMs: 2000 }),
+          // The recorded batch owns none of OUR staged keys (different
+          // parameters, different operation prefix) — true surplus.
+          committedStagedKeys: [],
         })),
       },
     });
@@ -3554,8 +4161,8 @@ describe('extraction idempotency', () => {
       idempotencyKey: 'op-1',
     });
     const call = repository.createArtifactsBatch.mock.calls[0] as unknown[];
-    expect(call[3]).toBe('op-1');
-    expect(call[7]).toBe(
+    expect(call[4]).toBe('op-1');
+    expect(call[8]).toBe(
       cropFingerprint({
         timestampMs: 1000,
         x: 10,
@@ -3571,10 +4178,24 @@ describe('extraction idempotency', () => {
 describe('staged-artifact cleanup escalation', () => {
   const cropDto = { timestampMs: 1000, x: 0, y: 0, width: 10, height: 10 };
 
-  it('retries a transient staged-file cleanup failure and still surfaces the ORIGINAL error', async () => {
-    // Publish failed, first delete throws, the retry succeeds: the caller
-    // sees the original failure — the cleanup hiccup was transient and is
-    // NOT escalated.
+  // The cleanup only ever runs on the one TERMINAL outcome (a replay: the
+  // idempotency key is consumed, so no attempt of this operation can ever
+  // publish these keys again), so these escalation pins are driven through
+  // a replay whose committed batch does NOT own the staged keys.
+  function replayWithSurplusStagedFiles() {
+    return jest.fn(async () => ({
+      asset: assetRow({ status: VideoAssetStatus.READY }),
+      artifacts: [artifactRow()],
+      replayed: true,
+      requestFingerprint: cropFingerprint(cropDto),
+      // The recorded batch owns NOTHING we staged — true surplus.
+      committedStagedKeys: [],
+    }));
+  }
+
+  it('retries a transient staged-file cleanup failure and still surfaces the result', async () => {
+    // First delete throws, the retry succeeds: the cleanup hiccup was
+    // transient and is NOT escalated — the replayed batch is returned.
     const del = jest
       .fn()
       .mockRejectedValueOnce(new Error('EBUSY'))
@@ -3582,20 +4203,20 @@ describe('staged-artifact cleanup escalation', () => {
     const { service } = buildService({
       storage: { delete: del },
       repository: {
-        createArtifactsBatch: jest.fn(async () => {
-          throw new Error('db down');
-        }),
+        createArtifactsBatch: replayWithSurplusStagedFiles(),
       },
     });
-    await expect(service.createCrop(TENANT, 'asset-1', cropDto)).rejects.toThrow(
-      'db down',
-    );
+    const result = await service.createCrop(TENANT, 'asset-1', {
+      ...cropDto,
+      idempotencyKey: 'op-1',
+    });
+    expect(result.replayed).toBe(true);
     expect(del).toHaveBeenCalledTimes(2);
   });
 
   it('escalates a PERSISTENT staged-file cleanup failure as 503 (bounded attempts)', async () => {
-    // Publish failed AND both delete attempts failed: no row references
-    // the staged key, so silently reporting only the original error would
+    // Both delete attempts failed: no row will ever reference the surplus
+    // staged key (the operation is terminal), so silently succeeding would
     // strand orphaned media. The controlled 503 names the condition.
     const del = jest.fn(async () => {
       throw new Error('EACCES');
@@ -3603,13 +4224,14 @@ describe('staged-artifact cleanup escalation', () => {
     const { service } = buildService({
       storage: { delete: del },
       repository: {
-        createArtifactsBatch: jest.fn(async () => {
-          throw new Error('db down');
-        }),
+        createArtifactsBatch: replayWithSurplusStagedFiles(),
       },
     });
     await expect(
-      service.createCrop(TENANT, 'asset-1', cropDto),
+      service.createCrop(TENANT, 'asset-1', {
+        ...cropDto,
+        idempotencyKey: 'op-1',
+      }),
     ).rejects.toBeInstanceOf(ServiceUnavailableException);
     // One retry, then escalation — never an unbounded loop.
     expect(del).toHaveBeenCalledTimes(2);
@@ -3638,6 +4260,7 @@ describe('deterministic artifact staging keys (crash-recoverable staging)', () =
         asset: assetRow({ status: VideoAssetStatus.READY }),
         artifacts: [artifactRow()],
         replayed: false,
+        committedStagedKeys: [],
       });
     const { service, storage } = buildService({
       repository: { createArtifactsBatch },
@@ -3674,38 +4297,28 @@ describe('deterministic artifact staging keys (crash-recoverable staging)', () =
     expect(keyA).not.toBe(keyB);
   });
 
-  it('cleanup after a failed publish KEEPS staged keys that a committed batch recorded (shared deterministic keys)', async () => {
+  it('a replay KEEPS staged keys the committed batch recorded (shared deterministic keys)', async () => {
     // A keyless identical retry (or a same-key race loser) stages over
     // the very keys the earlier committed batch recorded — deleting them
-    // in the failure path would destroy media that live artifact rows
-    // reference. The cleanup consults the committed rows and skips them.
+    // would destroy media that live artifact rows reference. The verdict
+    // the locked publish transaction returned names them, and they stay.
     const { service, storage } = buildService({
       repository: {
-        createArtifactsBatch: jest.fn(async () => {
-          throw new Error('db down');
-        }),
-        listArtifactStorageKeys: jest.fn(
-          async (_t: string, keys: string[]) => keys,
-        ),
-      },
-    });
-    await expect(service.createCrop(TENANT, 'asset-1', cropDto)).rejects.toThrow(
-      'db down',
-    );
-    expect(storage.delete).not.toHaveBeenCalled();
-  });
-
-  it('an in-transaction replay of the IDENTICAL request keeps its staged files — they ARE the recorded batch', async () => {
-    const { service, storage } = buildService({
-      repository: {
-        createArtifactsBatch: jest.fn(async () => ({
-          asset: assetRow({ status: VideoAssetStatus.READY }),
-          artifacts: [artifactRow()],
-          replayed: true,
-          requestFingerprint: cropFingerprint(cropDto),
-        })),
-        listArtifactStorageKeys: jest.fn(
-          async (_t: string, keys: string[]) => keys,
+        createArtifactsBatch: jest.fn(
+          async (
+            _t: string,
+            _id: string,
+            _hash: string,
+            _expected: unknown,
+            _key: string | undefined,
+            items: { storageKey: string }[],
+          ) => ({
+            asset: assetRow({ status: VideoAssetStatus.READY }),
+            artifacts: [artifactRow()],
+            replayed: true,
+            requestFingerprint: cropFingerprint(cropDto),
+            committedStagedKeys: items.map((item) => item.storageKey),
+          }),
         ),
       },
     });
@@ -3716,26 +4329,6 @@ describe('deterministic artifact staging keys (crash-recoverable staging)', () =
     expect(result.replayed).toBe(true);
     // The staged puts overwrote the recorded keys with identical content;
     // deleting the "surplus" would delete the batch itself.
-    expect(storage.delete).not.toHaveBeenCalled();
-  });
-
-  it('fails CLOSED when staged-key ownership cannot be verified: 503, nothing deleted', async () => {
-    // Deleting blindly could destroy committed media; keeping the staged
-    // files is always recoverable (an identical retry overwrites them,
-    // asset deletion removes the whole prefix).
-    const { service, storage } = buildService({
-      repository: {
-        createArtifactsBatch: jest.fn(async () => {
-          throw new Error('db down');
-        }),
-        listArtifactStorageKeys: jest.fn(async () => {
-          throw new Error('db down');
-        }),
-      },
-    });
-    await expect(
-      service.createCrop(TENANT, 'asset-1', cropDto),
-    ).rejects.toBeInstanceOf(ServiceUnavailableException);
     expect(storage.delete).not.toHaveBeenCalled();
   });
 
@@ -3765,54 +4358,37 @@ describe('deterministic artifact staging keys (crash-recoverable staging)', () =
   });
 });
 
-describe('extraction operation lock (staging / publication / cleanup serialization)', () => {
-  // Codex P1: staging keys are DETERMINISTIC per operation, so a FAILING
-  // attempt could run its committed-owner lookup while the WINNING
+describe('extraction operation lock (publication serialization, no nested transaction)', () => {
+  // Codex P1 (round 1): staging keys are DETERMINISTIC per operation, so a
+  // FAILING attempt could run its committed-owner lookup while the WINNING
   // attempt's artifact transaction was still uncommitted, observe no owner,
   // and delete the shared key — leaving append-only artifact rows whose
-  // file is missing. The whole put → publish → cleanup section now runs
-  // under an advisory lock keyed on the OPERATION.
-  const cropDto = { timestampMs: 1000, x: 0, y: 0, width: 10, height: 10 };
+  // file is missing.
+  // Codex P1 (round 2): the outer lock transaction that fixed that held a
+  // pooled connection across the section's storage I/O while every DB call
+  // inside it needed a SECOND one. The lock now lives INSIDE the
+  // publication transaction: staging runs with NO transaction open, and
+  // the committed-owner verdict is decided in the same locked transaction
+  // as the publication decision.
+  const cropDto = {
+    timestampMs: 1000,
+    x: 0,
+    y: 0,
+    width: 10,
+    height: 10,
+    // REQUIRED on every crop request (see the DTO): the key is the
+    // operation's identity, so committed artifact files are never rewritten.
+    idempotencyKey: 'op-1',
+  };
 
-  function serializingLock(events: string[]) {
-    const chains = new Map<string, Promise<unknown>>();
-    return jest.fn(
-      (
-        _t: string,
-        _assetId: string,
-        operationHash: string,
-        run: () => Promise<unknown>,
-      ) => {
-        const previous = chains.get(operationHash) ?? Promise.resolve();
-        const next = previous.then(async () => {
-          events.push('enter');
-          try {
-            return await run();
-          } finally {
-            events.push('exit');
-          }
-        });
-        // One attempt's failure must not break the chain for the next.
-        chains.set(
-          operationHash,
-          next.then(
-            () => undefined,
-            () => undefined,
-          ),
-        );
-        return next;
-      },
-    );
-  }
-
-  it('locks on the SAME operation hash the deterministic staging keys are derived from', async () => {
+  it('passes the SAME operation hash the deterministic staging keys are derived from to the publish transaction', async () => {
     const { service, repository, storage } = buildService();
     await service.createCrop(TENANT, 'asset-1', {
       ...cropDto,
       idempotencyKey: 'op-1',
     });
     const [tenantId, assetId, operationHash] = (
-      repository.runUnderExtractionOperationLock as jest.Mock
+      repository.createArtifactsBatch as jest.Mock
     ).mock.calls[0] as unknown as [string, string, string];
     expect(tenantId).toBe(TENANT);
     expect(assetId).toBe('asset-1');
@@ -3821,68 +4397,97 @@ describe('extraction operation lock (staging / publication / cleanup serializati
     expect(stagedKey).toBe(`${TENANT}/uuid-1/artifacts/${operationHash}/0.png`);
   });
 
-  it('holds the lock across staging, publication AND cleanup', async () => {
+  it('stages with NO transaction open: every file write happens before the locked publish transaction starts', async () => {
     const events: string[] = [];
     const { service } = buildService({
       repository: {
-        runUnderExtractionOperationLock: serializingLock(events),
         createArtifactsBatch: jest.fn(async () => {
-          events.push('publish');
-          throw new Error('db down');
-        }),
-        listArtifactStorageKeys: jest.fn(async () => {
-          events.push('ownership-check');
-          return [];
+          events.push('publish-tx');
+          return {
+            asset: assetRow({ status: VideoAssetStatus.READY }),
+            artifacts: [artifactRow()],
+            replayed: false,
+            committedStagedKeys: [],
+          };
         }),
       },
       storage: {
         put: jest.fn(async () => {
           events.push('put');
         }),
+      },
+    });
+    await service.createCrop(TENANT, 'asset-1', cropDto);
+    // No lock wrapper exists any more, so there is nothing that could hold
+    // a transaction (and a pooled connection) across the put.
+    expect(events).toEqual(['put', 'publish-tx']);
+  });
+
+  it('needs NO second DB call for the cleanup decision: the verdict rides the publish result', async () => {
+    // The old cleanup issued its own root-client ownership query; inside a
+    // held lock transaction that required a SECOND pooled connection —
+    // the pool-exhaustion path Codex flagged. The verdict is now decided
+    // inside the publish transaction and handed back with the outcome.
+    const events: string[] = [];
+    const { service, storage } = buildService({
+      repository: {
+        createArtifactsBatch: jest.fn(async () => {
+          events.push('publish-tx');
+          return {
+            asset: assetRow({ status: VideoAssetStatus.READY }),
+            artifacts: [artifactRow()],
+            replayed: true,
+            requestFingerprint: cropFingerprint(cropDto),
+            committedStagedKeys: [],
+          };
+        }),
+      },
+      storage: {
         delete: jest.fn(async () => {
           events.push('delete');
         }),
       },
     });
-    await expect(service.createCrop(TENANT, 'asset-1', cropDto)).rejects.toThrow(
-      'db down',
-    );
-    // Cleanup — including the committed-owner check and the deletes it
-    // authorizes — happens INSIDE the lock, never after releasing it.
-    expect(events).toEqual([
-      'enter',
-      'put',
-      'publish',
-      'ownership-check',
-      'delete',
-      'exit',
-    ]);
+    await service.createCrop(TENANT, 'asset-1', {
+      ...cropDto,
+      idempotencyKey: 'op-1',
+    });
+    // Exactly one DB round trip, then the deletes — no ownership query.
+    expect(events).toEqual(['publish-tx', 'delete']);
+    expect(storage.delete).toHaveBeenCalledTimes(1);
   });
 
-  it('serializes two identical concurrent attempts: the second cannot stage until the first released the lock', async () => {
+  it('serializes two identical concurrent attempts on the publish transaction: the loser replays and both keep the shared files', async () => {
+    // The regression this exists for: the loser must never observe "no
+    // committed owner" for a key the winner is about to commit. The
+    // verdict is computed INSIDE the winner-ordered locked transaction, so
+    // the loser's answer already contains the winner's keys.
     const events: string[] = [];
     const committed = new Set<string>();
+    const chain = { tail: Promise.resolve() as Promise<unknown> };
     let publishes = 0;
     let releaseWinner: () => void = () => undefined;
     const winnerGate = new Promise<void>((resolve) => {
       releaseWinner = resolve;
     });
-    const { service, storage } = buildService({
-      repository: {
-        runUnderExtractionOperationLock: serializingLock(events),
-        createArtifactsBatch: jest.fn(
-          async (
-            _t: string,
-            _id: string,
-            _expected: unknown,
-            _key: string | undefined,
-            items: { storageKey: string }[],
-          ) => {
+    // Stands in for pg_advisory_xact_lock taken as the transaction's first
+    // statement: publications for one operation hash run strictly serially.
+    const createArtifactsBatch = jest.fn(
+      (
+        _t: string,
+        _id: string,
+        _hash: string,
+        _expected: unknown,
+        _key: string | undefined,
+        items: { storageKey: string }[],
+      ) => {
+        const next = chain.tail.then(async () => {
+          events.push('enter-tx');
+          try {
             publishes += 1;
             if (publishes === 1) {
-              // The winner's transaction is still UNCOMMITTED here — the
-              // window in which an unserialized loser used to delete the
-              // shared key.
+              // Still UNCOMMITTED here — the window in which an
+              // unserialized loser used to delete the shared key.
               await winnerGate;
               for (const item of items) {
                 committed.add(item.storageKey);
@@ -3892,6 +4497,7 @@ describe('extraction operation lock (staging / publication / cleanup serializati
                 asset: assetRow({ status: VideoAssetStatus.READY }),
                 artifacts: [artifactRow()],
                 replayed: false,
+                committedStagedKeys: [],
               };
             }
             events.push('replay');
@@ -3900,66 +4506,102 @@ describe('extraction operation lock (staging / publication / cleanup serializati
               artifacts: [artifactRow()],
               replayed: true,
               requestFingerprint: cropFingerprint(cropDto),
+              // Decided INSIDE this locked transaction, so it sees
+              // everything committed before it.
+              committedStagedKeys: items
+                .map((item) => item.storageKey)
+                .filter((key) => committed.has(key)),
             };
-          },
-        ),
-        // Honest committed-owner lookup over whatever has COMMITTED.
-        listArtifactStorageKeys: jest.fn(async (_t: string, keys: string[]) =>
-          keys.filter((key) => committed.has(key)),
-        ),
+          } finally {
+            events.push('exit-tx');
+          }
+        });
+        chain.tail = next.then(
+          () => undefined,
+          () => undefined,
+        );
+        return next;
       },
+    );
+    const { service, storage } = buildService({
+      repository: { createArtifactsBatch },
     });
     const dto = { ...cropDto, idempotencyKey: 'op-1' };
     const attempts = [
       service.createCrop(TENANT, 'asset-1', dto),
       service.createCrop(TENANT, 'asset-1', dto),
     ];
-    // Let every non-blocking step run: the second attempt is parked on the
-    // lock, so exactly ONE staging write can have happened.
+    // Staging is unserialized on purpose (identical bytes, identical keys,
+    // atomic temp+rename put), so BOTH attempts may have staged already.
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(storage.put).toHaveBeenCalledTimes(1);
+    expect(storage.put).toHaveBeenCalledTimes(2);
     releaseWinner();
     const [winner, loser] = await Promise.all(attempts);
 
     expect(winner.replayed).toBe(false);
     expect(loser.replayed).toBe(true);
-    // Strict serialization: the two sections never interleave.
+    // Strict serialization of the publications: they never interleave.
     expect(events).toEqual([
-      'enter',
+      'enter-tx',
       'publish',
-      'exit',
-      'enter',
+      'exit-tx',
+      'enter-tx',
       'replay',
-      'exit',
+      'exit-tx',
     ]);
-    // The loser reached its cleanup only AFTER the winner committed, so the
-    // ownership check saw the winner's keys and kept the shared files.
+    // The loser's verdict was decided after the winner committed, so the
+    // shared deterministic keys were KEPT.
     expect(storage.delete).not.toHaveBeenCalled();
-    expect(storage.put).toHaveBeenCalledTimes(2);
   });
 
-  it('still cleans up staged files when there is genuinely NO committed owner', async () => {
-    // Serialization must not turn the cleanup off: a failure with no
-    // committed batch behind it still removes the untracked staged file.
+  it('KEEPS staged files when the publication gives no terminal verdict (failed publish): nothing is deleted', async () => {
+    // Fail closed. A rival attempt of the same operation may still publish
+    // these very keys, and the deletes cannot run under the lock — so the
+    // files stay at their deterministic keys (an identical retry
+    // overwrites them, asset deletion removes the whole prefix).
     const { service, storage } = buildService({
       repository: {
         createArtifactsBatch: jest.fn(async () => {
           throw new Error('db down');
         }),
-        listArtifactStorageKeys: jest.fn(async () => []),
       },
     });
     await expect(service.createCrop(TENANT, 'asset-1', cropDto)).rejects.toThrow(
       'db down',
     );
-    const [stagedKey] = storage.put.mock.calls[0] as unknown as [string];
-    expect(storage.delete).toHaveBeenCalledWith(stagedKey);
+    expect(storage.put).toHaveBeenCalledTimes(1);
+    expect(storage.delete).not.toHaveBeenCalled();
   });
 
-  it('surfaces a lock-transaction failure as a retryable 503, never an uncontrolled 500', async () => {
+  it('KEEPS staged files when the status CAS is lost: a rival attempt could still publish these keys', async () => {
+    const { service, storage } = buildService({
+      repository: { createArtifactsBatch: jest.fn(async () => null) },
+    });
+    await expect(
+      service.createCrop(TENANT, 'asset-1', cropDto),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(storage.delete).not.toHaveBeenCalled();
+  });
+
+  it('KEEPS staged files when the idempotency key belongs to another asset (key-conflict)', async () => {
     const { service, storage } = buildService({
       repository: {
-        runUnderExtractionOperationLock: jest.fn(async () => {
+        createArtifactsBatch: jest.fn(async () => 'key-conflict' as const),
+      },
+    });
+    await expect(
+      service.createCrop(TENANT, 'asset-1', {
+        ...cropDto,
+        idempotencyKey: 'op-1',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(storage.delete).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a publish-transaction lock failure as a retryable 503, never an uncontrolled 500', async () => {
+    const { service, storage } = buildService({
+      repository: {
+        createArtifactsBatch: jest.fn(async () => {
           throw Object.assign(new Error('Transaction API error'), {
             code: 'P2028',
           });
@@ -3969,8 +4611,168 @@ describe('extraction operation lock (staging / publication / cleanup serializati
     await expect(
       service.createCrop(TENANT, 'asset-1', cropDto),
     ).rejects.toBeInstanceOf(ServiceUnavailableException);
-    // Nothing was staged — the section never ran.
+    // Nothing was published, and the staged file is kept (deterministic
+    // key — the retry the 503 asks for overwrites it).
+    expect(storage.delete).not.toHaveBeenCalled();
+  });
+});
+
+describe('extraction idempotency key is REQUIRED', () => {
+  // Codex P1: with no key the operation hash derived from the request
+  // FINGERPRINT alone, so every later identical keyless request staged to
+  // the very keys a committed append-only artifact row already recorded. If
+  // the extractor's encoded bytes ever differed (adapter upgrade, any
+  // nondeterministic port implementation) the second put rewrote the file
+  // under a row that keeps its old checksum — silent lineage corruption.
+  // The MVP fix is to REQUIRE the key on both extraction endpoints.
+  const box = { timestampMs: 1000, x: 0, y: 0, width: 10, height: 10 };
+
+  it('400s extract-frames with NO idempotencyKey, before anything is read, extracted, or staged', async () => {
+    const { service, repository, extractor, storage } = buildService();
+    await expect(
+      service.extractFrames(TENANT, 'asset-1', {} as never),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    // Nothing was created OR staged: not even the replay lookup ran.
+    expect(repository.findExtractionReplay).not.toHaveBeenCalled();
+    expect(repository.findByIdInternal).not.toHaveBeenCalled();
+    expect(repository.createArtifactsBatch).not.toHaveBeenCalled();
+    expect(extractor.extractFrames).not.toHaveBeenCalled();
+    expect(extractor.extractFrameAt).not.toHaveBeenCalled();
     expect(storage.put).not.toHaveBeenCalled();
+  });
+
+  it('400s crops with NO idempotencyKey, before anything is read, extracted, or staged', async () => {
+    const { service, repository, extractor, storage } = buildService();
+    await expect(
+      service.createCrop(TENANT, 'asset-1', { ...box } as never),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(repository.findExtractionReplay).not.toHaveBeenCalled();
+    expect(repository.findByIdInternal).not.toHaveBeenCalled();
+    expect(repository.createArtifactsBatch).not.toHaveBeenCalled();
+    expect(extractor.extractCrop).not.toHaveBeenCalled();
+    expect(storage.put).not.toHaveBeenCalled();
+  });
+
+  it('explains WHY the key is required (the 400 names the artifact-file rewrite it prevents)', async () => {
+    const { service } = buildService();
+    const error: Error = await service
+      .createCrop(TENANT, 'asset-1', { ...box } as never)
+      .then(() => {
+        throw new Error('expected rejection');
+      })
+      .catch((caught: Error) => caught);
+    expect(error.message).toContain('idempotencyKey is required');
+    expect(error.message).toContain('rewrite');
+  });
+
+  it('still SCREENS the required key: control characters and PAN-shaped keys are 400s', async () => {
+    // Requiring the key must not weaken the opaque-key screening.
+    const { service, repository } = buildService();
+    const pan = ['4111', '1111', '1111', '1111'].join('_');
+    for (const idempotencyKey of ['a\u0000b', pan]) {
+      await expect(
+        service.createCrop(TENANT, 'asset-1', { ...box, idempotencyKey }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
+    expect(repository.findExtractionReplay).not.toHaveBeenCalled();
+  });
+
+  it('derives the staging prefix from the KEY, so an identical request under a NEW key never lands on a committed batch’s artifact files', async () => {
+    // The regression pin: same parameters, different key ⇒ different
+    // operation hash ⇒ different staged files. Under the old keyless
+    // derivation both requests shared one prefix and the second put
+    // overwrote the first's committed artifact file.
+    const stagedFor = async (idempotencyKey: string) => {
+      const { service, storage } = buildService();
+      await service.createCrop(TENANT, 'asset-1', { ...box, idempotencyKey });
+      const [key] = storage.put.mock.calls[0] as unknown as [string];
+      return key;
+    };
+    const first = await stagedFor('op-A');
+    const second = await stagedFor('op-B');
+    expect(first).toMatch(
+      new RegExp(`^${TENANT}/uuid-1/artifacts/[0-9a-f]{64}/0\\.png$`),
+    );
+    expect(second).not.toBe(first);
+  });
+
+  it('keeps the FINGERPRINT in the hash: the same key with changed parameters stages under a DIFFERENT prefix', async () => {
+    // What the fingerprint-guard 409 relies on — the diverged attempt must
+    // never touch the committed attempt's files while the 409 is decided.
+    const stagedFor = async (timestampMs: number) => {
+      const { service, storage } = buildService();
+      await service.createCrop(TENANT, 'asset-1', {
+        ...box,
+        timestampMs,
+        idempotencyKey: 'op-1',
+      });
+      const [key] = storage.put.mock.calls[0] as unknown as [string];
+      return key;
+    };
+    expect(await stagedFor(1000)).not.toBe(await stagedFor(2000));
+  });
+
+  it('a same-key REPLAY short-circuits before any put: the committed artifact file is never rewritten', async () => {
+    const replayResult = {
+      asset: assetRow({ status: VideoAssetStatus.READY }),
+      artifacts: [artifactRow()],
+      replayed: true as const,
+      requestFingerprint: cropFingerprint(box),
+    };
+    const { service, storage, extractor, repository } = buildService({
+      repository: {
+        findExtractionReplay: jest.fn(async () => replayResult),
+      },
+    });
+    const result = await service.createCrop(TENANT, 'asset-1', {
+      ...box,
+      idempotencyKey: 'op-1',
+    });
+    expect(result.replayed).toBe(true);
+    expect(result.artifact).toEqual(replayResult.artifacts[0]);
+    // The short-circuit is what protects the file: no decode, no put, no
+    // second publish attempt.
+    expect(extractor.extractCrop).not.toHaveBeenCalled();
+    expect(storage.put).not.toHaveBeenCalled();
+    expect(repository.createArtifactsBatch).not.toHaveBeenCalled();
+  });
+
+  it('409s the same key with CHANGED parameters (frames and crops alike)', async () => {
+    const { service } = buildService({
+      repository: {
+        findExtractionReplay: jest.fn(async () => ({
+          asset: assetRow({ status: VideoAssetStatus.READY }),
+          artifacts: [artifactRow()],
+          replayed: true as const,
+          requestFingerprint: cropFingerprint(box),
+        })),
+      },
+    });
+    await expect(
+      service.createCrop(TENANT, 'asset-1', {
+        ...box,
+        timestampMs: 2000, // changed
+        idempotencyKey: 'op-1',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    const { service: frames } = buildService({
+      repository: {
+        findExtractionReplay: jest.fn(async () => ({
+          asset: assetRow({ status: VideoAssetStatus.READY }),
+          artifacts: [
+            artifactRow({ artifactType: VideoArtifactType.FRAME, cropX: null }),
+          ],
+          replayed: true as const,
+          requestFingerprint: framesFingerprint({ maxFrames: 5 }),
+        })),
+      },
+    });
+    await expect(
+      frames.extractFrames(TENANT, 'asset-1', {
+        maxFrames: 3, // changed
+        idempotencyKey: 'op-1',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
   });
 });
 
@@ -4505,6 +5307,260 @@ describe('VideoAssetsService.createInferenceJobFromCrop', () => {
       }),
     );
   });
+
+  // Codex P1: the job used to commit QUEUED before the artifact link was
+  // written in a SEPARATE transaction. A crash in between left claimable
+  // work that no later asset DELETE could discover (it enumerates only jobs
+  // reachable via VideoArtifact.inferenceJobId — the link that never
+  // committed) and no retry could repair (the artifact 404s once its asset
+  // is deleted). Two-phase creation closes it: PENDING_LINK → link →
+  // publish.
+  it('creates the job PENDING_LINK, links it, and only THEN publishes it QUEUED (strict ordering)', async () => {
+    const { service, inference, repository } = buildService();
+    const result = await service.createInferenceJobFromCrop(
+      TENANT,
+      'artifact-1',
+      {},
+      { id: 'u1', email: 'u@x.io' },
+    );
+    // Phase 1: the internal, service-only opt-in — no HTTP client can mint
+    // a non-claimable job, and the queue claim (pinned to QUEUED) can never
+    // hand a PENDING_LINK row to a worker.
+    const [, , actorArg, options] = inference.create.mock
+      .calls[0] as unknown as [
+      string,
+      unknown,
+      unknown,
+      { createPendingLink?: boolean },
+    ];
+    expect(options).toEqual({ createPendingLink: true });
+    expect(actorArg).toEqual({ id: 'u1', email: 'u@x.io' });
+    // Phase 2: published only AFTER the link transaction committed.
+    expect(inference.publishPendingLinkJob).toHaveBeenCalledWith(
+      TENANT,
+      'job-1',
+      { id: 'u1', email: 'u@x.io' },
+    );
+    const createOrder = (inference.create as jest.Mock).mock
+      .invocationCallOrder[0];
+    const linkOrder = (repository.linkArtifactToInferenceJob as jest.Mock).mock
+      .invocationCallOrder[0];
+    const publishOrder = (inference.publishPendingLinkJob as jest.Mock).mock
+      .invocationCallOrder[0];
+    expect(createOrder).toBeLessThan(linkOrder);
+    expect(linkOrder).toBeLessThan(publishOrder);
+    // The caller is handed the PUBLISHED row, never the PENDING_LINK one.
+    expect(result.replayed).toBe(false);
+    expect(result.job.status).toBe(InferenceJobStatus.QUEUED);
+  });
+
+  it("handles a 'not-pending' publish WITHOUT throwing, reporting the job's TRUE state", async () => {
+    // 'not-pending' means already published (a replayed publish) or
+    // cancelled by a concurrent asset delete — a controlled no-op, never an
+    // error. The stale in-memory PENDING_LINK row must not be reported, so
+    // the job is re-read.
+    const { service, inference } = buildService({
+      inference: {
+        publishPendingLinkJob: jest.fn(async () => 'not-pending' as const),
+        findById: jest.fn(async () => ({
+          id: 'job-1',
+          jobType: InferenceJobType.PRODUCT_RECOGNITION,
+          sourceType: EvidenceSourceType.VISION,
+          priority: DEFAULT_PRIORITY,
+          status: InferenceJobStatus.CANCELLED,
+        })),
+      },
+    });
+    const result = await service.createInferenceJobFromCrop(
+      TENANT,
+      'artifact-1',
+      {},
+    );
+    expect(inference.publishPendingLinkJob).toHaveBeenCalledTimes(1);
+    expect(result.job.status).toBe(InferenceJobStatus.CANCELLED);
+  });
+
+  it('CANCELS instead of publishing when the crop artifact changed concurrently (linked to nothing)', async () => {
+    const { service, inference } = buildService({
+      repository: {
+        linkArtifactToInferenceJob: jest.fn(async () => 'already-linked' as const),
+        // Post-link re-read: still visible, but carrying NO link.
+        findArtifactById: jest.fn(async () => artifactRow()),
+      },
+    });
+    await expect(
+      service.createInferenceJobFromCrop(TENANT, 'artifact-1', {}),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(inference.publishPendingLinkJob).not.toHaveBeenCalled();
+    expect(inference.cancelOrphanedJob).toHaveBeenCalledWith(
+      TENANT,
+      'job-1',
+      expect.any(String),
+      undefined,
+    );
+  });
+
+  it('CANCELS instead of publishing when the crop is linked to a DIFFERENT job', async () => {
+    const { service, inference } = buildService({
+      repository: {
+        linkArtifactToInferenceJob: jest.fn(async () => 'already-linked' as const),
+        findArtifactById: jest
+          .fn()
+          .mockResolvedValueOnce(artifactRow()) // initial resolve: unlinked
+          .mockResolvedValueOnce(artifactRow({ inferenceJobId: 'job-other' })),
+      },
+      inference: {
+        findById: jest.fn(async () => ({
+          id: 'job-other',
+          jobType: InferenceJobType.PRODUCT_RECOGNITION,
+          sourceType: EvidenceSourceType.VISION,
+          priority: DEFAULT_PRIORITY,
+          status: InferenceJobStatus.QUEUED,
+        })),
+      },
+    });
+    const result = await service.createInferenceJobFromCrop(
+      TENANT,
+      'artifact-1',
+      {},
+    );
+    expect(result.replayed).toBe(true);
+    expect(result.job.id).toBe('job-other');
+    // Our own PENDING_LINK row can never link now — it is retired, and the
+    // winner's already-QUEUED job is not re-published.
+    expect(inference.cancelOrphanedJob).toHaveBeenCalledWith(
+      TENANT,
+      'job-1',
+      expect.any(String),
+      undefined,
+    );
+    expect(inference.publishPendingLinkJob).not.toHaveBeenCalled();
+  });
+
+  it('never cancels a SQUATTED job on the crop-mismatch 409 (it is live work we do not own)', async () => {
+    // create() replayed a pre-existing squatted job, so it is not
+    // PENDING_LINK and is not ours to withdraw — the 409 stands and nothing
+    // is published or cancelled.
+    const { service, inference } = buildService({
+      inference: {
+        create: jest.fn(async () => ({
+          id: 'job-foreign',
+          jobType: InferenceJobType.PRODUCT_RECOGNITION,
+          sourceType: EvidenceSourceType.VISION,
+          priority: DEFAULT_PRIORITY,
+          status: InferenceJobStatus.QUEUED,
+          inputDescriptor: { cropArtifactId: 'someone-elses-crop' },
+        })),
+      },
+    });
+    await expect(
+      service.createInferenceJobFromCrop(TENANT, 'artifact-1', {}),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(inference.publishPendingLinkJob).not.toHaveBeenCalled();
+    expect(inference.cancelOrphanedJob).not.toHaveBeenCalled();
+  });
+
+  it('PUBLISHES-THEN-RETURNS an already-linked retry whose job never got published', async () => {
+    // The ordinary retry path (the crop was linked before this call even
+    // started): the first attempt committed its link and then died before
+    // the publish CAS, so the link is correct but the job is still
+    // unclaimable. The retry finishes the interrupted second phase rather
+    // than reporting a PENDING_LINK job as successfully linked work — and
+    // never creates a duplicate.
+    const { service, inference } = buildService({
+      repository: {
+        findArtifactById: jest.fn(async () =>
+          artifactRow({ inferenceJobId: 'job-9' }),
+        ),
+      },
+      inference: {
+        findById: jest.fn(async () => ({
+          id: 'job-9',
+          jobType: InferenceJobType.PRODUCT_RECOGNITION,
+          sourceType: EvidenceSourceType.VISION,
+          priority: DEFAULT_PRIORITY,
+          status: InferenceJobStatus.PENDING_LINK,
+        })),
+      },
+    });
+    const result = await service.createInferenceJobFromCrop(
+      TENANT,
+      'artifact-1',
+      {},
+    );
+    expect(result.replayed).toBe(true);
+    expect(inference.create).not.toHaveBeenCalled();
+    expect(inference.publishPendingLinkJob).toHaveBeenCalledWith(
+      TENANT,
+      'job-9',
+      undefined,
+    );
+    expect(result.job.status).toBe(InferenceJobStatus.QUEUED);
+  });
+
+  it('does NOT re-publish an already-published linked job on a replay', async () => {
+    // The seam is a no-op for anything that is not PENDING_LINK, so an
+    // ordinary replay costs no extra queue-lifecycle write.
+    const { service, inference } = buildService({
+      repository: {
+        findArtifactById: jest.fn(async () =>
+          artifactRow({ inferenceJobId: 'job-9' }),
+        ),
+      },
+      inference: {
+        findById: jest.fn(async () => ({
+          id: 'job-9',
+          jobType: InferenceJobType.PRODUCT_RECOGNITION,
+          sourceType: EvidenceSourceType.VISION,
+          priority: DEFAULT_PRIORITY,
+          status: InferenceJobStatus.QUEUED,
+        })),
+      },
+    });
+    await expect(
+      service.createInferenceJobFromCrop(TENANT, 'artifact-1', {}),
+    ).resolves.toMatchObject({ replayed: true });
+    expect(inference.publishPendingLinkJob).not.toHaveBeenCalled();
+  });
+
+  it('PUBLISHES-THEN-RETURNS a replay whose winner linked but crashed before publishing', async () => {
+    // The chosen behaviour for "a replayed crop whose job is still
+    // PENDING_LINK": never report it as successfully linked work while it
+    // is unclaimable — finish the winner's second phase instead (the CAS is
+    // idempotent). Consistent with the module's other "a retry completes an
+    // interrupted flow" idioms.
+    const { service, inference } = buildService({
+      repository: {
+        linkArtifactToInferenceJob: jest.fn(async () => 'already-linked' as const),
+        findArtifactById: jest
+          .fn()
+          .mockResolvedValueOnce(artifactRow())
+          .mockResolvedValueOnce(artifactRow({ inferenceJobId: 'job-1' })),
+      },
+      inference: {
+        findById: jest.fn(async () => ({
+          id: 'job-1',
+          jobType: InferenceJobType.PRODUCT_RECOGNITION,
+          sourceType: EvidenceSourceType.VISION,
+          priority: DEFAULT_PRIORITY,
+          status: InferenceJobStatus.PENDING_LINK,
+        })),
+      },
+    });
+    const result = await service.createInferenceJobFromCrop(
+      TENANT,
+      'artifact-1',
+      {},
+    );
+    expect(result.replayed).toBe(true);
+    expect(inference.publishPendingLinkJob).toHaveBeenCalledWith(
+      TENANT,
+      'job-1',
+      undefined,
+    );
+    expect(result.job.status).toBe(InferenceJobStatus.QUEUED);
+    expect(inference.cancelOrphanedJob).not.toHaveBeenCalled();
+  });
 });
 
 describe('VideoAssetsService.delete', () => {
@@ -4801,10 +5857,119 @@ describe('VideoAssetsService.delete', () => {
     expect(storage.deletePrefix).toHaveBeenCalledTimes(1);
   });
 
-  it('a fresh delete of a STAGED (PENDING_MEDIA) upload audits the cleanup as PENDING and records NO completion', async () => {
-    // Codex P1: the row is PENDING_MEDIA, so its durable media write is
-    // UNDECIDED — an in-flight upload whose liveness check passed before
-    // this soft-delete committed can still land bytes just after this
+  it('DISCOVERS the crop→job crash window by idempotency key and cancels the unpublished PENDING_LINK job', async () => {
+    // Codex P1 regression pin. The job committed but the artifact link
+    // never did, so `listLinkedInferenceJobs` cannot see it — its only
+    // handle is the DETERMINISTIC `video-crop:<artifactId>` key. Two-phase
+    // creation guarantees such a job is PENDING_LINK, i.e. NOT claimable,
+    // and this sweep is what finally retires it.
+    const findByIdempotencyKey = jest.fn(async () => ({
+      id: 'job-orphan',
+      status: InferenceJobStatus.PENDING_LINK,
+    }));
+    const { service, inference, repository, storage } = buildService({
+      repository: {
+        // No committed link exists — the crash window by construction.
+        listLinkedInferenceJobs: jest.fn(async () => []),
+        listCropArtifactIds: jest.fn(async () => ['artifact-1']),
+      },
+      inference: { findByIdempotencyKey },
+    });
+    await service.delete(TENANT, 'asset-1', { id: 'u1', email: 'u@x.io' });
+    expect(repository.listCropArtifactIds).toHaveBeenCalledWith(
+      TENANT,
+      'asset-1',
+    );
+    expect(findByIdempotencyKey).toHaveBeenCalledWith(
+      TENANT,
+      'video-crop:artifact-1',
+    );
+    expect(inference.cancelOrphanedJob).toHaveBeenCalledWith(
+      TENANT,
+      'job-orphan',
+      expect.stringContaining('deleted'),
+      { id: 'u1', email: 'u@x.io' },
+    );
+    // Retirement still precedes the media removal.
+    expect(
+      (inference.cancelOrphanedJob as jest.Mock).mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      (storage.deletePrefix as jest.Mock).mock.invocationCallOrder[0],
+    );
+  });
+
+  it('cancels a linked job that is still PENDING_LINK (link committed, publish crashed)', async () => {
+    // The other half of the two-phase crash window: the link committed but
+    // the publish did not. PENDING_LINK is in the inference module's
+    // CANCELLABLE set, so it retires exactly like a QUEUED job — never
+    // merely audited as an unreachable orphan.
+    const { service, inference, auditLog } = buildService({
+      repository: {
+        listLinkedInferenceJobs: jest.fn(async () => [
+          { id: 'job-1', status: InferenceJobStatus.PENDING_LINK },
+        ]),
+      },
+    });
+    await service.delete(TENANT, 'asset-1');
+    expect(inference.cancelOrphanedJob).toHaveBeenCalledWith(
+      TENANT,
+      'job-1',
+      expect.stringContaining('deleted'),
+      undefined,
+    );
+    expect(auditLog.record).not.toHaveBeenCalled();
+  });
+
+  it('visits a job found by BOTH discovery sources exactly once', async () => {
+    // A crop whose link committed is reachable both ways; the sweep dedupes
+    // by job id so a replay never double-cancels or double-audits.
+    const { service, inference } = buildService({
+      repository: {
+        listLinkedInferenceJobs: jest.fn(async () => [
+          { id: 'job-1', status: InferenceJobStatus.QUEUED },
+        ]),
+        listCropArtifactIds: jest.fn(async () => ['artifact-1']),
+      },
+      inference: {
+        findByIdempotencyKey: jest.fn(async () => ({
+          id: 'job-1',
+          status: InferenceJobStatus.QUEUED,
+        })),
+      },
+    });
+    await service.delete(TENANT, 'asset-1');
+    expect(inference.cancelOrphanedJob).toHaveBeenCalledTimes(1);
+  });
+
+  it('stays quiet when the key-discovered job is already TERMINAL (delete replay)', async () => {
+    // An earlier delete attempt already cancelled the crash-window job —
+    // replays must neither re-cancel it nor spam the orphan audit.
+    const { service, inference, auditLog } = buildService({
+      repository: {
+        findByIdInternalIncludingDeleted: jest.fn(async () =>
+          assetRow({ deletedAt: new Date() }),
+        ),
+        listLinkedInferenceJobs: jest.fn(async () => []),
+        listCropArtifactIds: jest.fn(async () => ['artifact-1']),
+      },
+      inference: {
+        findByIdempotencyKey: jest.fn(async () => ({
+          id: 'job-orphan',
+          status: InferenceJobStatus.CANCELLED,
+        })),
+      },
+    });
+    await expect(service.delete(TENANT, 'asset-1')).resolves.toEqual({
+      deleted: true,
+    });
+    expect(inference.cancelOrphanedJob).not.toHaveBeenCalled();
+    expect(auditLog.record).not.toHaveBeenCalled();
+  });
+
+  it('a fresh delete whose media write is UNDECIDED (PENDING) audits the cleanup as pending and records NO completion', async () => {
+    // Codex P1: while the durable media-write state is PENDING an upload
+    // has CLAIMED its put (under the same asset lock, before the put ran)
+    // and has not resolved it — so bytes can still land just after this
     // cleanup. Stamping the exactly-once completion marker here would
     // record a cleanup as complete over a prefix the bytes had not even
     // reached, and (because the CAS is exactly-once) no later replay could
@@ -4814,17 +5979,31 @@ describe('VideoAssetsService.delete', () => {
       async (
         _t: string,
         _id: string,
-        build: (b: unknown, mediaAlreadyRemoved: boolean) => unknown,
+        build: (
+          b: unknown,
+          mediaAlreadyRemoved: boolean,
+          mediaWriteUndecided: boolean,
+        ) => unknown,
       ) => {
-        const before = assetRow({ status: VideoAssetStatus.PENDING_MEDIA });
-        softDeleteEntry = build(before, false) as { reason?: string };
-        return { asset: before, mediaAlreadyRemoved: false };
+        const before = assetRow({
+          status: VideoAssetStatus.PENDING_MEDIA,
+          mediaWriteState: VideoMediaWriteState.PENDING,
+        });
+        softDeleteEntry = build(before, false, true) as { reason?: string };
+        return {
+          asset: before,
+          mediaAlreadyRemoved: false,
+          mediaWriteUndecided: true,
+        };
       },
     );
     const { service, storage, repository } = buildService({
       repository: {
         findByIdInternalIncludingDeleted: jest.fn(async () =>
-          assetRow({ status: VideoAssetStatus.PENDING_MEDIA }),
+          assetRow({
+            status: VideoAssetStatus.PENDING_MEDIA,
+            mediaWriteState: VideoMediaWriteState.PENDING,
+          }),
         ),
         softDelete,
       },
@@ -4835,18 +6014,20 @@ describe('VideoAssetsService.delete', () => {
     // The removal RUNS — only the completion evidence is withheld.
     expect(storage.deletePrefix).toHaveBeenCalledWith(`${TENANT}/uuid-1`);
     expect(repository.recordMediaRemovalCompleted).not.toHaveBeenCalled();
-    // ...and the audit says so, naming the drain path.
+    // ...and the audit names the undecided write and the drain path.
     expect(softDeleteEntry?.reason).toContain('PENDING');
-    expect(softDeleteEntry?.reason).toContain('STAGED upload');
+    expect(softDeleteEntry?.reason).toContain('UNDECIDED');
+    expect(softDeleteEntry?.reason).toContain('mediaWriteState');
     expect(softDeleteEntry?.reason).toContain('replaying DELETE');
   });
 
-  it('a replayed DELETE over the soft-deleted staged upload drains the prefix and THEN records the completion exactly once', async () => {
-    // The drain marker is the soft-deleted row itself (it already carries
-    // the storage key): DELETE stays idempotently repeatable over it, and
-    // because the first attempt left the completion marker unset, the
-    // replay is NOT silent — it re-runs the removal (draining bytes that
-    // landed after the first cleanup) and records the completion.
+  it('a DELETE REPLAY while the media write is still PENDING records NO completion either (the fix: durable observation, not deletedAt inference)', async () => {
+    // THE Codex P1. The row is already soft-deleted, so the old rule
+    // inferred "the staged write must have drained" and stamped the
+    // completion immediately — but a put that claimed liveness BEFORE the
+    // original soft-delete is still in flight, so the replay removed an
+    // empty prefix, recorded completion, and only THEN did the bytes land.
+    // Reading the durable state instead keeps the obligation open.
     const { service, storage, repository } = buildService({
       repository: {
         findByIdInternalIncludingDeleted: jest.fn(async () =>
@@ -4854,6 +6035,7 @@ describe('VideoAssetsService.delete', () => {
             status: VideoAssetStatus.PENDING_MEDIA,
             deletedAt: new Date(),
             mediaRemovedAt: null,
+            mediaWriteState: VideoMediaWriteState.PENDING,
           }),
         ),
       },
@@ -4861,10 +6043,33 @@ describe('VideoAssetsService.delete', () => {
     await expect(service.delete(TENANT, 'asset-1')).resolves.toEqual({
       deleted: true,
     });
-    // No second soft-delete — the row is already deleted.
+    // No second soft-delete, the drain still runs, no completion recorded.
     expect(repository.softDelete).not.toHaveBeenCalled();
     expect(storage.deletePrefix).toHaveBeenCalledWith(`${TENANT}/uuid-1`);
-    // Exactly one completion, and only AFTER the removal.
+    expect(repository.recordMediaRemovalCompleted).not.toHaveBeenCalled();
+  });
+
+  it('a put that lands AFTER the delete leaves the obligation discoverable: the replay that sees the write RESOLVED drains and records completion exactly once', async () => {
+    // The obligation is discharged by the idempotent DELETE replay once
+    // the staged write resolved (here: SUCCEEDED — the bytes landed after
+    // the first cleanup). Exactly one completion, and only after the drain.
+    const { service, storage, repository } = buildService({
+      repository: {
+        findByIdInternalIncludingDeleted: jest.fn(async () =>
+          assetRow({
+            status: VideoAssetStatus.PENDING_MEDIA,
+            deletedAt: new Date(),
+            mediaRemovedAt: null,
+            mediaWriteState: VideoMediaWriteState.SUCCEEDED,
+          }),
+        ),
+      },
+    });
+    await expect(service.delete(TENANT, 'asset-1')).resolves.toEqual({
+      deleted: true,
+    });
+    expect(repository.softDelete).not.toHaveBeenCalled();
+    expect(storage.deletePrefix).toHaveBeenCalledWith(`${TENANT}/uuid-1`);
     expect(repository.recordMediaRemovalCompleted).toHaveBeenCalledTimes(1);
     expect(
       (repository.recordMediaRemovalCompleted as jest.Mock).mock
@@ -4872,6 +6077,67 @@ describe('VideoAssetsService.delete', () => {
     ).toBeGreaterThan(
       (storage.deletePrefix as jest.Mock).mock.invocationCallOrder[0],
     );
+  });
+
+  it('a FAILED staged write is resolved too: the replay drains and records the completion', async () => {
+    // The put threw, so nothing more can land — the obligation is
+    // dischargeable exactly like a SUCCEEDED one.
+    const { service, repository } = buildService({
+      repository: {
+        findByIdInternalIncludingDeleted: jest.fn(async () =>
+          assetRow({
+            status: VideoAssetStatus.FAILED,
+            deletedAt: new Date(),
+            mediaRemovedAt: null,
+            mediaWriteState: VideoMediaWriteState.FAILED,
+          }),
+        ),
+      },
+    });
+    await service.delete(TENANT, 'asset-1');
+    expect(repository.recordMediaRemovalCompleted).toHaveBeenCalledTimes(1);
+  });
+
+  it('a row that never claimed a media write (state NULL) is decided: completion is recorded', async () => {
+    // Rejected by the pre-storage screen before any put, or a pre-existing
+    // row — either way no put was ever attempted, so nothing is in flight.
+    let softDeleteEntry: { reason?: string } | undefined;
+    const { service, repository } = buildService({
+      repository: {
+        findByIdInternalIncludingDeleted: jest.fn(async () =>
+          assetRow({
+            status: VideoAssetStatus.REJECTED,
+            mediaWriteState: null,
+          }),
+        ),
+        softDelete: jest.fn(
+          async (
+            _t: string,
+            _id: string,
+            build: (
+              b: unknown,
+              mediaAlreadyRemoved: boolean,
+              mediaWriteUndecided: boolean,
+            ) => unknown,
+          ) => {
+            const before = assetRow({
+              status: VideoAssetStatus.REJECTED,
+              mediaWriteState: null,
+            });
+            softDeleteEntry = build(before, false, false) as { reason?: string };
+            return {
+              asset: before,
+              mediaAlreadyRemoved: false,
+              mediaWriteUndecided: false,
+            };
+          },
+        ),
+      },
+    });
+    await service.delete(TENANT, 'asset-1');
+    expect(softDeleteEntry?.reason).toContain('media cleanup pending');
+    expect(softDeleteEntry?.reason).not.toContain('UNDECIDED');
+    expect(repository.recordMediaRemovalCompleted).toHaveBeenCalledTimes(1);
   });
 
   it('a replayed DELETE records NOTHING a second time once the completion marker is claimed', async () => {
@@ -4884,6 +6150,7 @@ describe('VideoAssetsService.delete', () => {
             status: VideoAssetStatus.PENDING_MEDIA,
             deletedAt: new Date(),
             mediaRemovedAt: new Date(),
+            mediaWriteState: VideoMediaWriteState.SUCCEEDED,
           }),
         ),
       },
@@ -4893,18 +6160,26 @@ describe('VideoAssetsService.delete', () => {
   });
 
   it('deleting a PUBLISHED (QUARANTINED) asset keeps the pending → completed behaviour unchanged', async () => {
-    // Past PENDING_MEDIA the media write is DECIDED: no in-flight put can
+    // The media write is RESOLVED (SUCCEEDED): no in-flight put can
     // follow, so the first delete both promises and records completion.
     let softDeleteEntry: { reason?: string } | undefined;
     const softDelete = jest.fn(
       async (
         _t: string,
         _id: string,
-        build: (b: unknown, mediaAlreadyRemoved: boolean) => unknown,
+        build: (
+          b: unknown,
+          mediaAlreadyRemoved: boolean,
+          mediaWriteUndecided: boolean,
+        ) => unknown,
       ) => {
         const before = assetRow({ status: VideoAssetStatus.QUARANTINED });
-        softDeleteEntry = build(before, false) as { reason?: string };
-        return { asset: before, mediaAlreadyRemoved: false };
+        softDeleteEntry = build(before, false, false) as { reason?: string };
+        return {
+          asset: before,
+          mediaAlreadyRemoved: false,
+          mediaWriteUndecided: false,
+        };
       },
     );
     const { service, repository } = buildService({
@@ -4919,6 +6194,32 @@ describe('VideoAssetsService.delete', () => {
     expect(softDeleteEntry?.reason).toContain('media cleanup pending');
     expect(softDeleteEntry?.reason).not.toContain('STAGED upload');
     expect(repository.recordMediaRemovalCompleted).toHaveBeenCalledTimes(1);
+  });
+
+  it('a failed compensating cleanup still surfaces honestly: 503, no completion, and the replay can retry', async () => {
+    // The soft-delete is durable but the prefix removal failed — the
+    // completion stays unrecorded so the pending state remains true, and
+    // the idempotent replay re-runs the same removal.
+    const { service, repository } = buildService({
+      repository: {
+        findByIdInternalIncludingDeleted: jest.fn(async () =>
+          assetRow({
+            deletedAt: new Date(),
+            mediaRemovedAt: null,
+            mediaWriteState: VideoMediaWriteState.SUCCEEDED,
+          }),
+        ),
+      },
+      storage: {
+        deletePrefix: jest.fn(async () => {
+          throw new VideoStorageOperationError();
+        }),
+      },
+    });
+    await expect(
+      service.delete(TENANT, 'asset-1'),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    expect(repository.recordMediaRemovalCompleted).not.toHaveBeenCalled();
   });
 
   it('re-reads a QUEUED job that raced into a claim: terminal → silent, still running → orphan audit', async () => {

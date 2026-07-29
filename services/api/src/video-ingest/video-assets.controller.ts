@@ -64,13 +64,30 @@ export class VideoAssetsController {
       '+ magic bytes), conservative size limit, filename traversal ' +
       'rejection, SHA-256 checksum. Bytes land in LOCAL/DEV storage behind ' +
       'a server-generated internal key — no public URLs, no client-supplied ' +
-      'paths, no media in the database. The asset is staged PENDING_MEDIA ' +
-      'and its frames are OCR-SCREENED BEFORE any byte reaches durable ' +
-      'storage (a frame carrying payment/credential text is a controlled ' +
-      '400 with code PRESTORE_SCREENING_REJECTED; when the screening ' +
-      'toolchain cannot run — VIDEO_FFMPEG_ENABLED / VIDEO_OCR_ENABLED — ' +
-      'the upload is refused 503 before any row or byte is accepted). ' +
-      'Only after the screen passes and the media write succeeds is the ' +
+      'paths, no media in the database. **Uploads are DISABLED by ' +
+      'default.** Phase 10 ingests CONTROLLED INTERNAL TEST MEDIA ONLY, ' +
+      'under an explicit policy gate: `VIDEO_TEST_MEDIA_INGEST_ENABLED=' +
+      'true` with `NODE_ENV` explicitly development or test (refused at ' +
+      'startup anywhere else), plus the four REQUIRED operator ' +
+      'attestations `controlledTestMedia`, `noPaymentCardsVisible`, ' +
+      '`noCustomerPII`, and `attestNoSensitiveContent` (each the literal ' +
+      '"true"; any missing/other value is a controlled 400 before any row ' +
+      'or byte). That gate — not any screening result — is what ' +
+      'authorizes storing a clip; without it the endpoint is a controlled ' +
+      '503. The asset is then staged PENDING_MEDIA and its frames are ' +
+      'text/OCR-SCREENED BEFORE any byte reaches durable storage. That ' +
+      'screen is a REJECTION LAYER, not a safety verdict: a frame in ' +
+      'which payment/credential text is DETECTED is a controlled 400 with ' +
+      'code PRESTORE_SCREENING_REJECTED, but a screen that detects ' +
+      'nothing proves nothing — recognizers miss rotated, blurred, ' +
+      'stylized, occluded and low-quality digits — so it never authorizes ' +
+      'anything on its own. The whole screen runs under one aggregate ' +
+      'wall-clock budget (`VIDEO_SCREENING_TIMEOUT_MS`, default 30 s, ' +
+      'covering decode AND recognition); an expired budget is the same ' +
+      'fail-closed audited rejection, and when the screening toolchain ' +
+      'cannot run at all (VIDEO_FFMPEG_ENABLED / VIDEO_OCR_ENABLED) the ' +
+      'upload is refused 503 before any row or byte is accepted. Only ' +
+      'once nothing was detected and the media write succeeded is the ' +
       'asset published QUARANTINED — not processable until an audited ' +
       'screening decision approves it.',
   })
@@ -243,7 +260,14 @@ export class VideoAssetsController {
     description:
       'Requires a VALIDATED asset. Artifacts are INTERNAL references ' +
       '(metadata + checksum) — no bytes, keys, paths, or URLs in the ' +
-      'response. Marks the asset READY.',
+      'response. Marks the asset READY. `idempotencyKey` is REQUIRED ' +
+      '(controlled 400 without it, before anything is read, extracted, or ' +
+      'staged): it is the identity this operation\'s artifact files are ' +
+      'staged under, so a keyless request would let a later identical one ' +
+      'rewrite the bytes an already-committed append-only artifact row ' +
+      'recorded a checksum for. Retrying with the SAME key and identical ' +
+      'parameters REPLAYS the recorded artifacts; the same key with ' +
+      'changed parameters is a controlled 409.',
   })
   @ApiCreatedResponse({ description: 'Frames extracted; artifacts returned' })
   @ApiNotFoundResponse({ description: 'Asset not found in this tenant' })
@@ -271,7 +295,11 @@ export class VideoAssetsController {
     description:
       'Timestamp must be inside the probed duration and the box inside the ' +
       'probed dimensions (controlled 400s). Reason is a closed vocabulary — ' +
-      'no free text.',
+      'no free text. `idempotencyKey` is REQUIRED here for the same reason ' +
+      'as on extract-frames (a keyless request would let a later identical ' +
+      'one rewrite a committed artifact\'s file); a same-key retry with ' +
+      'identical parameters replays the recorded artifact, and with changed ' +
+      'parameters is a controlled 409.',
   })
   @ApiCreatedResponse({ description: 'Crop extracted; artifact returned' })
   @ApiNotFoundResponse({ description: 'Asset not found in this tenant' })

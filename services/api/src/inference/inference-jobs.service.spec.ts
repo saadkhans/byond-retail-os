@@ -40,6 +40,12 @@ describe('InferenceJobsService', () => {
     result: null,
   } as unknown as InferenceJobDetail;
 
+  /** Two-phase creation, first phase: created but NOT yet published. */
+  const pendingLinkJob = {
+    ...jobDetail,
+    status: InferenceJobStatus.PENDING_LINK,
+  } as InferenceJobDetail;
+
   const succeededJob = {
     ...jobDetail,
     status: InferenceJobStatus.SUCCEEDED,
@@ -107,6 +113,7 @@ describe('InferenceJobsService', () => {
     fail: jest.Mock;
     reclaimExpired: jest.Mock;
     cancelQueued: jest.Mock;
+    publishPendingLink: jest.Mock;
   };
   let visionEvents: { ingest: jest.Mock; findById: jest.Mock };
   let platformModules: { isEnabledForTenant: jest.Mock };
@@ -162,6 +169,7 @@ describe('InferenceJobsService', () => {
         status: InferenceJobStatus.CANCELLED,
         completedAt: new Date('2026-07-26T10:03:00.000Z'),
       }),
+      publishPendingLink: jest.fn().mockResolvedValue(jobDetail),
     };
     visionEvents = {
       ingest: jest.fn().mockResolvedValue(visionEvent),
@@ -198,6 +206,53 @@ describe('InferenceJobsService', () => {
           entityId: 'job-1',
         }),
       );
+    });
+
+    it('enqueues a directly QUEUED job when the pending-link flag is absent (Phase 9 unchanged)', async () => {
+      await service.create('tenant-a', baseCreate, actor);
+      const [, input] = queue.enqueue.mock.calls[0] as [
+        string,
+        { pendingLink: boolean },
+      ];
+      expect(input.pendingLink).toBe(false);
+    });
+
+    it('creates a NON-CLAIMABLE PENDING_LINK job when the internal flag is set', async () => {
+      queue.enqueue.mockResolvedValue({
+        job: pendingLinkJob,
+        replayed: false,
+      });
+      const job = await service.create('tenant-a', baseCreate, actor, {
+        createPendingLink: true,
+      });
+      expect(job.status).toBe(InferenceJobStatus.PENDING_LINK);
+      const [, input, buildAudit] = queue.enqueue.mock.calls[0] as [
+        string,
+        { pendingLink: boolean },
+        (job: InferenceJobDetail) => AuditEntry,
+      ];
+      expect(input.pendingLink).toBe(true);
+      // Creation is still audited — as a job that is not yet claimable.
+      const entry = buildAudit(pendingLinkJob);
+      expect(entry.action).toBe(AuditAction.CREATE);
+      expect(entry.reason).toMatch(/pending link/i);
+    });
+
+    it('replays an existing job for the idempotency key WHATEVER its state (crash-window retry)', async () => {
+      // The first attempt crashed after creating the PENDING_LINK job: the
+      // retry must resolve to that same row, never a second job.
+      queue.enqueue.mockResolvedValue({
+        job: pendingLinkJob,
+        replayed: true,
+      });
+      await expect(
+        service.create(
+          'tenant-a',
+          { ...baseCreate, idempotencyKey: 'video-crop:art-1' },
+          actor,
+          { createPendingLink: true },
+        ),
+      ).resolves.toBe(pendingLinkJob);
     });
 
     it('replays the winner on an idempotency-key unique race', async () => {
@@ -468,6 +523,72 @@ describe('InferenceJobsService', () => {
     });
   });
 
+  describe('publishPendingLinkJob', () => {
+    it('publishes through the QUEUE PORT with an in-transaction audit entry, never the repository', async () => {
+      queue.publishPendingLink.mockResolvedValue(jobDetail);
+      const result = await service.publishPendingLinkJob(
+        'tenant-a',
+        'job-1',
+        actor,
+      );
+      expect(result).toEqual(
+        expect.objectContaining({ status: InferenceJobStatus.QUEUED }),
+      );
+      const [tenantId, jobId, buildAudit] = queue.publishPendingLink.mock
+        .calls[0] as [
+        string,
+        string,
+        (before: InferenceJobDetail, after: InferenceJobDetail) => AuditEntry,
+      ];
+      expect([tenantId, jobId]).toEqual(['tenant-a', 'job-1']);
+      const entry = buildAudit(pendingLinkJob, jobDetail);
+      expect(entry.action).toBe(AuditAction.UPDATE);
+      expect(entry.entityType).toBe('InferenceJob');
+      expect(entry.entityId).toBe('job-1');
+      expect(entry.actorId).toBe(actor.id);
+      expect(entry.reason).toMatch(/published to the queue/i);
+      // Publication is a queue-lifecycle mutation: it must reach the
+      // injected port (so a broker-backed queue enqueues its message too)
+      // and never bypass it into the Prisma repository.
+      for (const repositoryMethod of Object.values(repository)) {
+        expect(repositoryMethod).not.toHaveBeenCalled();
+      }
+    });
+
+    it("maps a non-PENDING_LINK job and a missing job to 'not-pending' WITHOUT throwing or writing", async () => {
+      queue.publishPendingLink.mockResolvedValueOnce('not-pending');
+      await expect(
+        service.publishPendingLinkJob('tenant-a', 'job-1'),
+      ).resolves.toBe('not-pending');
+      queue.publishPendingLink.mockResolvedValueOnce(null);
+      await expect(
+        service.publishPendingLinkJob('tenant-a', 'job-1'),
+      ).resolves.toBe('not-pending');
+    });
+  });
+
+  describe('findByIdempotencyKey', () => {
+    it('returns the tenant-scoped job WITH its status so a crash-window job can be discovered', async () => {
+      repository.findByIdempotencyKey.mockResolvedValue(pendingLinkJob);
+      const found = await service.findByIdempotencyKey(
+        'tenant-a',
+        'video-crop:art-1',
+      );
+      expect(found?.status).toBe(InferenceJobStatus.PENDING_LINK);
+      expect(repository.findByIdempotencyKey).toHaveBeenCalledWith(
+        'tenant-a',
+        'video-crop:art-1',
+      );
+    });
+
+    it('returns null (never 404s) when the tenant has no job under the key', async () => {
+      repository.findByIdempotencyKey.mockResolvedValue(null);
+      await expect(
+        service.findByIdempotencyKey('tenant-a', 'video-crop:art-1'),
+      ).resolves.toBeNull();
+    });
+  });
+
   describe('cancelOrphanedJob', () => {
     it('cancels a QUEUED job through the QUEUE PORT (audited CAS, CANCEL entry), never the repository', async () => {
       const result = await service.cancelOrphanedJob(
@@ -502,6 +623,28 @@ describe('InferenceJobsService', () => {
       for (const repositoryMethod of Object.values(repository)) {
         expect(repositoryMethod).not.toHaveBeenCalled();
       }
+    });
+
+    it('cancels an unpublished PENDING_LINK job through the same seam (crash-window cleanup)', async () => {
+      // The DELETE flow discovered the job by its idempotency key because
+      // its artifact link never committed; the port CAS covers both
+      // unclaimed states, so the service contract is unchanged.
+      queue.cancelQueued.mockResolvedValue({
+        ...pendingLinkJob,
+        status: InferenceJobStatus.CANCELLED,
+        completedAt: new Date('2026-07-26T10:03:00.000Z'),
+      });
+      await expect(
+        service.cancelOrphanedJob(
+          'tenant-a',
+          'job-1',
+          'Inference job cancelled: its source video asset was deleted',
+          actor,
+        ),
+      ).resolves.toEqual(
+        expect.objectContaining({ status: InferenceJobStatus.CANCELLED }),
+      );
+      expect(queue.cancelQueued).toHaveBeenCalledTimes(1);
     });
 
     it("maps a claimed/finished job and a missing job to 'not-cancellable' WITHOUT throwing", async () => {
@@ -953,6 +1096,16 @@ describe('InferenceJobsService', () => {
       await expect(
         service.fail('tenant-a', 'job-1', { attempt: 0, errorCode: 'X_Y' }, actor),
       ).rejects.toBeInstanceOf(ConflictException);
+    });
+
+    it('refuses an unpublished PENDING_LINK job with an accurate 409, never a write', async () => {
+      // It was never claimable, so no worker can have failed it — and the
+      // CAS would otherwise report it as "already finished".
+      repository.findById.mockResolvedValue(pendingLinkJob);
+      await expect(
+        service.fail('tenant-a', 'job-1', { attempt: 0, errorCode: 'X_Y' }, actor),
+      ).rejects.toThrow(/pending its downstream link/i);
+      expect(queue.fail).not.toHaveBeenCalled();
     });
 
     it('maps lease-superseded to a 409 naming the newer attempt', async () => {

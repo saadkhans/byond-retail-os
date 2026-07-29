@@ -1476,6 +1476,13 @@ enum InferenceJobType {
 }
 
 enum InferenceJobStatus {
+  // NON-CLAIMABLE creation state for callers that must commit a downstream
+  // link (e.g. a video crop artifact → job link) before the work may be
+  // delivered: the row exists and is discoverable/cancellable, but no
+  // claim ever returns it. The caller publishes PENDING_LINK → QUEUED once
+  // the link commits; a crash in between leaves work nothing can consume
+  // and a later delete can retire.
+  PENDING_LINK
   QUEUED
   RUNNING
   SUCCEEDED
@@ -1483,11 +1490,12 @@ enum InferenceJobStatus {
   CANCELLED
 }
 
-// A queued unit of inference work. Lifecycle QUEUED → RUNNING →
-// SUCCEEDED/FAILED (CANCELLED reserved for a future cancel path); terminal
-// statuses never transition again. The job row is the queue entry: claiming
-// is a guarded compare-and-set on status, ordered by priority DESC then
-// requestedAt ASC then id ASC (deterministic).
+// A queued unit of inference work. Lifecycle (PENDING_LINK →) QUEUED →
+// RUNNING → SUCCEEDED/FAILED, with CANCELLED reachable from PENDING_LINK
+// and QUEUED (orphan compensation); terminal statuses never transition
+// again. The job row is the queue entry: claiming is a guarded
+// compare-and-set on status, ordered by priority DESC then requestedAt ASC
+// then id ASC (deterministic). Only QUEUED rows are claimable.
 model InferenceJob {
   id       String @id @default(cuid())
   tenantId String
@@ -1661,6 +1669,21 @@ enum VideoCropReason {
   VLM_REVIEW
 }
 
+// DURABLE outcome of an upload's ONE media write (storage.put). Not a
+// lifecycle status: it records whether a put is still in flight, so the
+// DELETE cleanup can OBSERVE the drain instead of INFERRING it. PENDING is
+// claimed under the asset advisory lock immediately before the put (in the
+// same locked transaction as the pre-put liveness read, so a concurrent
+// soft-delete either sees the claim or precedes it); SUCCEEDED is written
+// the moment the put returns, FAILED when it throws. NULL means no durable
+// media write was ever attempted for this row (rejected before the put, or
+// a pre-existing row).
+enum VideoMediaWriteState {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
 // A controlled test video uploaded for the Phase 9 inference pipeline.
 // Lifecycle: UPLOADED → VALIDATED → PROCESSING → READY (or REJECTED/FAILED).
 // Soft delete: deletedAt marks the row; the local file is removed and the
@@ -1713,6 +1736,16 @@ model VideoAsset {
   // authority. Shared by the screening-rejection removal and the delete
   // cleanup (the completion audit reason distinguishes them).
   mediaRemovedAt DateTime?
+  // DURABLE media-write phase for the upload's single storage.put. The
+  // DELETE cleanup may record its exactly-once completion ONLY when this is
+  // RESOLVED (SUCCEEDED/FAILED — or NULL, meaning no put was ever
+  // attempted): while it is PENDING a put that claimed the write before the
+  // soft-delete committed can still land bytes just after the prefix was
+  // drained, so completion would be recorded over media that did not exist
+  // yet. Replaces the old inference "the row is PENDING_MEDIA / already
+  // soft-deleted, so the write must have drained", which a DELETE REPLAY
+  // could not observe at all.
+  mediaWriteState VideoMediaWriteState?
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 

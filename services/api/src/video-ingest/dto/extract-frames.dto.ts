@@ -1,4 +1,4 @@
-import { ApiPropertyOptional } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
   IsInt,
@@ -62,15 +62,26 @@ export class ExtractFramesDto {
   @Max(MAX_TIMESTAMP_MS)
   timestampMs?: number;
 
-  @ApiPropertyOptional({
+  /**
+   * REQUIRED (not optional): the key is the operation's identity, and the
+   * committed artifact files are staged under keys derived from it. Without
+   * one, every later identical keyless request would derive the SAME
+   * deterministic keys from the request fingerprint alone and re-put over
+   * files an earlier append-only artifact row already owns — that row keeps
+   * its recorded checksum while the bytes underneath it change, silently
+   * corrupting tamper-evident lineage. Requiring the key also STRENGTHENS
+   * the staged-file cleanup invariant (see stagePublishAndCleanup): a
+   * `replayed` outcome now always implies a CONSUMED idempotency key.
+   */
+  @ApiProperty({
     maxLength: 100,
     description:
-      'Tenant-scoped idempotency key: retrying a committed extraction ' +
-      'REPLAYS its artifacts (append-only rows are never duplicated).',
+      'REQUIRED tenant-scoped idempotency key: retrying a committed ' +
+      'extraction REPLAYS its artifacts (append-only rows are never ' +
+      'duplicated, and committed artifact files are never rewritten).',
   })
-  @IsOptionalNonNull()
   @IsString()
   @MinLength(1)
   @MaxLength(100)
-  idempotencyKey?: string;
+  idempotencyKey!: string;
 }

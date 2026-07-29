@@ -277,6 +277,158 @@ describe('validateEnv', () => {
     );
   });
 
+  describe('VIDEO_TEST_MEDIA_INGEST_ENABLED is NON-PRODUCTION ONLY (startup failure outside development/test)', () => {
+    const messageFor = (environment: string) =>
+      'VIDEO_TEST_MEDIA_INGEST_ENABLED is not supported when NODE_ENV is ' +
+      `${environment} because controlled test-media ingestion is ` +
+      'non-production only; it is allowed solely when NODE_ENV is ' +
+      'explicitly development or test.';
+
+    it.each(['development', 'test'])(
+      'accepts the flag as true when NODE_ENV=%s',
+      (nodeEnv) => {
+        const validated = validateEnv({
+          ...validConfig,
+          NODE_ENV: nodeEnv,
+          VIDEO_TEST_MEDIA_INGEST_ENABLED: 'true',
+        });
+        // whitelist:true strips undeclared keys — the gate must survive.
+        expect(validated.VIDEO_TEST_MEDIA_INGEST_ENABLED).toBe('true');
+      },
+    );
+
+    it('fails validation when NODE_ENV=production and the flag is true', () => {
+      expect(() =>
+        validateEnv({
+          ...validConfig,
+          NODE_ENV: 'production',
+          VIDEO_TEST_MEDIA_INGEST_ENABLED: 'true',
+        }),
+      ).toThrow(messageFor('production'));
+    });
+
+    it('fails validation when NODE_ENV is UNSET and the flag is true (the previously-fixed unset hole)', () => {
+      const { NODE_ENV: _omit, ...withoutNodeEnv } = validConfig;
+      expect(() =>
+        validateEnv({
+          ...withoutNodeEnv,
+          VIDEO_TEST_MEDIA_INGEST_ENABLED: 'true',
+        }),
+      ).toThrow(messageFor('unset'));
+    });
+
+    it.each(['staging', 'prod', 'Development'])(
+      'rejects NODE_ENV=%s with the flag true (non-enum values fail upstream)',
+      (nodeEnv) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            NODE_ENV: nodeEnv,
+            VIDEO_TEST_MEDIA_INGEST_ENABLED: 'true',
+          }),
+        ).toThrow(/NODE_ENV/);
+      },
+    );
+
+    it('rejects the flag case-insensitively outside development/test (TRUE)', () => {
+      expect(() =>
+        validateEnv({
+          ...validConfig,
+          NODE_ENV: 'production',
+          VIDEO_TEST_MEDIA_INGEST_ENABLED: 'TRUE',
+        }),
+      ).toThrow(messageFor('production'));
+    });
+
+    it.each(['development', 'test', 'production'])(
+      'accepts NODE_ENV=%s with the flag false or unset',
+      (nodeEnv) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            NODE_ENV: nodeEnv,
+            VIDEO_TEST_MEDIA_INGEST_ENABLED: 'false',
+          }),
+        ).not.toThrow();
+        expect(() =>
+          validateEnv({ ...validConfig, NODE_ENV: nodeEnv }),
+        ).not.toThrow();
+      },
+    );
+
+    it('accepts an unset NODE_ENV with the flag false or unset', () => {
+      const { NODE_ENV: _omit, ...withoutNodeEnv } = validConfig;
+      expect(() =>
+        validateEnv({
+          ...withoutNodeEnv,
+          VIDEO_TEST_MEDIA_INGEST_ENABLED: 'false',
+        }),
+      ).not.toThrow();
+      expect(() => validateEnv({ ...withoutNodeEnv })).not.toThrow();
+    });
+
+    it.each(['yes', '1', 'on'])(
+      'rejects invalid VIDEO_TEST_MEDIA_INGEST_ENABLED=%s at boot (boolean shape rule)',
+      (value) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            VIDEO_TEST_MEDIA_INGEST_ENABLED: value,
+          }),
+        ).toThrow(/VIDEO_TEST_MEDIA_INGEST_ENABLED/);
+      },
+    );
+  });
+
+  describe('VIDEO_SCREENING_TIMEOUT_MS bounds (Phase 10 upload-wide screening deadline)', () => {
+    it('accepts the default and both boundary values', () => {
+      for (const value of ['30000', '1000', '300000']) {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            VIDEO_SCREENING_TIMEOUT_MS: value,
+          }),
+        ).not.toThrow();
+      }
+    });
+
+    it.each(['999', '0', '-1000'])(
+      'rejects sub-second value %s at boot',
+      (value) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            VIDEO_SCREENING_TIMEOUT_MS: value,
+          }),
+        ).toThrow(/VIDEO_SCREENING_TIMEOUT_MS/);
+      },
+    );
+
+    it.each(['300001', '3000000'])(
+      'rejects over-cap value %s at boot (bounds the wall-clock an upload can hold)',
+      (value) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            VIDEO_SCREENING_TIMEOUT_MS: value,
+          }),
+        ).toThrow(/VIDEO_SCREENING_TIMEOUT_MS/);
+      },
+    );
+
+    it.each(['abc', '1500.5', ''])(
+      'rejects non-integer value %j at boot',
+      (value) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            VIDEO_SCREENING_TIMEOUT_MS: value,
+          }),
+        ).toThrow(/VIDEO_SCREENING_TIMEOUT_MS/);
+      },
+    );
+  });
+
   describe('placeholder secrets are rejected in EVERY environment', () => {
     const placeholderSecrets = [
       'local-dev-only-placeholder-jwt-secret-change-me', // old .env.example value

@@ -8,6 +8,7 @@ import {
   FrameCountExceededError,
   FrameExceedsBudgetError,
   FrameExtractionOptions,
+  ScreeningDeadlineExceededError,
   VideoFrameExtractorPort,
   VideoProbeResult,
 } from './video-frame-extractor.port';
@@ -64,17 +65,20 @@ export class SimulatedVideoFrameExtractor extends VideoFrameExtractorPort {
   inspectBuffer(data: Buffer): Promise<BufferInspectionSession> {
     // Trivial by design: the simulated adapter never reads real bytes
     // (readsRealBytes=false already makes the pre-storage screen refuse to
-    // treat its output as a real screen), so the session is the
-    // deterministic probe plus the EXHAUSTIVE placeholder stream — one
+    // treat its frames as a real look at the footage), so the session is
+    // the deterministic probe plus the EXHAUSTIVE placeholder stream — one
     // placeholder PNG per SOURCE frame (fps × duration, mirroring the real
-    // adapter's every-frame contract) — and a no-op close: fully
-    // in-memory, nothing ever touches disk.
+    // adapter's every-frame contract), PUSHED one at a time exactly like
+    // the streaming adapter — and a no-op close: fully in-memory, nothing
+    // ever touches disk.
     void data;
     return Promise.resolve({
       probe: () => Promise.resolve({ ...SIMULATED_PROBE }),
-      extractAllFrames: (options: {
+      streamFrames: async (options: {
         maxFrames: number;
         maxBytesPerFrame: number;
+        deadlineMs: number;
+        onFrame: (frame: Buffer, index: number) => Promise<'continue' | 'stop'>;
       }) => {
         // Same budget contract as the real adapter: a degenerate cap fits
         // no frame, and any frame over the cap is the budget verdict.
@@ -82,30 +86,43 @@ export class SimulatedVideoFrameExtractor extends VideoFrameExtractorPort {
           !Number.isInteger(options.maxBytesPerFrame) ||
           options.maxBytesPerFrame <= 0
         ) {
-          return Promise.reject(new FrameExceedsBudgetError());
+          throw new FrameExceedsBudgetError();
         }
         // Same frame-count contract too: a degenerate cap fits no frames,
         // and a stream past the cap is the controlled count verdict.
         if (!Number.isInteger(options.maxFrames) || options.maxFrames <= 0) {
-          return Promise.reject(new FrameCountExceededError());
+          throw new FrameCountExceededError();
+        }
+        // The deadline is CONTRACTUAL here, not timed: no simulated decode
+        // can overrun a wall clock, but a degenerate budget is the same
+        // controlled verdict the real adapter gives before spawning.
+        if (!Number.isInteger(options.deadlineMs) || options.deadlineMs <= 0) {
+          throw new ScreeningDeadlineExceededError();
         }
         const totalFrames = Math.ceil(
           (SIMULATED_PROBE.fps * SIMULATED_PROBE.durationMs) / 1000,
         );
         if (totalFrames > options.maxFrames) {
-          return Promise.reject(new FrameCountExceededError());
+          throw new FrameCountExceededError();
         }
-        const frames = Array.from({ length: totalFrames }, (_, index) =>
-          this.placeholderImage(
+        let framesSeen = 0;
+        for (let index = 0; index < totalFrames; index += 1) {
+          const frame = this.placeholderImage(
             SIMULATED_PROBE.width,
             SIMULATED_PROBE.height,
             Math.round((index * 1000) / SIMULATED_PROBE.fps),
-          ).data,
-        );
-        if (frames.some((frame) => frame.length > options.maxBytesPerFrame)) {
-          return Promise.reject(new FrameExceedsBudgetError());
+          ).data;
+          if (frame.length > options.maxBytesPerFrame) {
+            throw new FrameExceedsBudgetError();
+          }
+          framesSeen += 1;
+          // Push-based like the real adapter: one frame in the caller's
+          // hands at a time, and an early stop is a normal resolution.
+          if ((await options.onFrame(frame, index)) === 'stop') {
+            return { framesSeen, stoppedEarly: true };
+          }
         }
-        return Promise.resolve(frames);
+        return { framesSeen, stoppedEarly: false };
       },
       close: () => Promise.resolve(),
     });

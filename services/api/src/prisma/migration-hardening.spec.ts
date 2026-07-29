@@ -670,3 +670,95 @@ describe('video asset quarantine screening migration', () => {
     expect(sql).not.toMatch(/DO UPDATE SET[^;]*"id"\s*=/);
   });
 });
+
+describe('inference job pending-link migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260729000001_inference_job_pending_link',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('adds the PENDING_LINK lifecycle value idempotently, ahead of QUEUED', () => {
+    expect(sql).toContain(
+      `ALTER TYPE "InferenceJobStatus" ADD VALUE IF NOT EXISTS 'PENDING_LINK' BEFORE 'QUEUED'`,
+    );
+  });
+
+  it('never USES the new enum value in the same transaction (PG 12+ rule)', () => {
+    // ADD VALUE inside a transaction is legal only while the new value is
+    // unused within it: no column default flip, no UPDATE, and no CHECK
+    // constraint may NAME 'PENDING_LINK' here — the queue writes the status
+    // explicitly on the opt-in create path instead.
+    expect(sql).not.toMatch(/DEFAULT 'PENDING_LINK'/);
+    expect(sql).not.toMatch(/UPDATE\s+"InferenceJob"/i);
+    expect(sql).not.toMatch(/ADD CONSTRAINT[^;]*PENDING_LINK/);
+  });
+
+  it('keeps unclaimed jobs timestamp-free by listing the STARTED statuses instead', () => {
+    // The old guard named QUEUED, so PENDING_LINK would have escaped it;
+    // naming the complement covers the new state without using its value.
+    expect(sql).toContain(
+      'ALTER TABLE "InferenceJob" DROP CONSTRAINT "InferenceJob_queued_timestamps_check"',
+    );
+    expect(sql).toContain('InferenceJob_unclaimed_timestamps_check');
+    expect(sql).toContain(
+      `CHECK ("status" IN ('RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')`,
+    );
+    expect(sql).toContain('"startedAt" IS NULL AND "completedAt" IS NULL');
+  });
+
+  it('leaves every other InferenceJob lifecycle CHECK untouched', () => {
+    // PENDING_LINK is NON-TERMINAL and carries no error, lease, or vision
+    // link, so the remaining guards already hold for it.
+    for (const constraint of [
+      'InferenceJob_terminal_completedAt_check',
+      'InferenceJob_error_only_failed_check',
+      'InferenceJob_running_lease_check',
+      'InferenceJob_visionEvent_succeeded_check',
+    ]) {
+      expect(sql).not.toContain(constraint);
+    }
+  });
+});
+
+describe('video asset media-write state migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260729000002_video_asset_media_write_state',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('adds the media-write state enum and a NULLABLE column on VideoAsset', () => {
+    expect(sql).toContain(
+      `CREATE TYPE "VideoMediaWriteState" AS ENUM ('PENDING', 'SUCCEEDED', 'FAILED')`,
+    );
+    expect(sql).toContain(
+      'ALTER TABLE "VideoAsset" ADD COLUMN "mediaWriteState" "VideoMediaWriteState"',
+    );
+    // NULLABLE and undefaulted on purpose: NULL means "no durable media
+    // write was ever attempted", which is the honest reading for existing
+    // rows and for uploads rejected before their put.
+    expect(sql).not.toMatch(/"mediaWriteState"[^;]*NOT NULL/);
+    expect(sql).not.toMatch(/"mediaWriteState"[^;]*DEFAULT/);
+  });
+
+  it('backfills NOTHING — existing rows keep byte-identical delete behaviour', () => {
+    // Only PENDING withholds the media-removal completion, so leaving
+    // every existing row NULL cannot change what any delete records.
+    expect(sql).not.toMatch(/UPDATE\s+"VideoAsset"/i);
+  });
+});

@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { ChildProcess, execFile, spawn } from 'node:child_process';
 import { Injectable } from '@nestjs/common';
 import { LocalVideoStorageAdapter } from '../storage/local-video-storage.adapter';
 import {
@@ -13,6 +13,7 @@ import {
   FrameExceedsBudgetError,
   FrameExtractionOptions,
   FrameUnavailableError,
+  ScreeningDeadlineExceededError,
   VideoFrameExtractorPort,
   VideoProbeResult,
 } from './video-frame-extractor.port';
@@ -46,12 +47,22 @@ export const UNSTREAMABLE_CONTAINER_MESSAGE =
 export const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 const COMMAND_TIMEOUT_MS = 30_000;
 
-// Request-wide decoded-byte budget for multi-frame extraction: the
+// Request-wide decoded-byte budget for the STORAGE-KEY multi-frame batch
+// (extractFrames over already-screened, already-stored media): the
 // per-invocation maxBuffer bounds ONE frame, but a maxFrames batch retains
 // every decoded frame until the service persists the batch — without an
 // aggregate cap a valid request could hold maxFrames × MAX_OUTPUT_BYTES in
-// heap at once.
+// heap at once. It deliberately does NOT bound the screening stream
+// (streamFrames): that path retains ONE frame at a time, so an aggregate
+// clamp there would only kill ffmpeg part-way through a perfectly valid
+// clip — the exact Codex P1 defect this budget must not recreate.
 export const MAX_TOTAL_EXTRACTION_BYTES = 128 * 1024 * 1024;
+
+// The adapter's OWN ceiling on a screening decode's wall-clock budget. A
+// caller-supplied deadlineMs is clamped DOWN to it (never up), so a
+// mis-configured budget can never leave an ffmpeg child attached to a
+// synchronous upload request indefinitely.
+export const MAX_STREAMING_DEADLINE_MS = 120_000;
 
 // Probe ceilings for controlled TEST clips. ffprobe output is derived from
 // attacker-supplied container metadata: without upper bounds a tiny crafted
@@ -152,8 +163,10 @@ export function buildCropArgs(
  * stream on stdout — the in-memory inspection's only frame path. There is
  * deliberately NO fps filter: an `fps=1` sample would drop every frame
  * between one-second ticks, letting content visible only between samples
- * reach storage unscreened — the screen must see EVERY decoded source
- * frame. No file path ever appears in the vector.
+ * reach storage unlooked-at — the screen must be OFFERED EVERY decoded
+ * source frame. The stream is consumed INCREMENTALLY (see streamFrames):
+ * ffmpeg's stdout is never retained as one buffer. No file path ever
+ * appears in the vector.
  */
 export function buildAllFramesArgs(): string[] {
   return [
@@ -178,30 +191,34 @@ const PNG_SIGNATURE = Buffer.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
 ]);
 
-/**
- * Split a concatenated-PNG stdout stream into individual PNG buffers by
- * linear signature scan (no image dependencies). Bytes before the first
- * signature — none in well-formed ffmpeg output — are ignored.
- */
-export function splitConcatenatedPngStream(data: Buffer): Buffer[] {
-  const starts: number[] = [];
-  let offset = 0;
-  for (;;) {
-    const index = data.indexOf(PNG_SIGNATURE, offset);
-    if (index === -1) {
-      break;
-    }
-    starts.push(index);
-    offset = index + PNG_SIGNATURE.length;
-  }
-  return starts.map((start, i) =>
-    // subarray views the SAME allocation — each frame is copied out so a
-    // retained frame never pins the whole decoded stream in memory.
-    Buffer.from(
-      data.subarray(start, i + 1 < starts.length ? starts[i + 1] : data.length),
-    ),
-  );
+const EMPTY = Buffer.alloc(0);
+
+// Starting size of the streaming decoder's single-frame accumulator: one
+// pipe chunk. It doubles from here as a frame arrives, so a multi-MiB PNG
+// costs amortized O(bytes) to assemble instead of a fresh copy per chunk.
+const PENDING_INITIAL_CAPACITY = 64 * 1024;
+
+/** Options for one streaming screening decode of in-memory bytes. */
+export interface StreamFramesOptions {
+  maxFrames: number;
+  maxBytesPerFrame: number;
+  /** Wall-clock budget for the WHOLE decode. */
+  deadlineMs: number;
+  onFrame: (frame: Buffer, index: number) => Promise<'continue' | 'stop'>;
 }
+
+export interface StreamFramesResult {
+  framesSeen: number;
+  stoppedEarly: boolean;
+}
+
+/**
+ * Why the decode was abandoned BY US. Recorded before the signal is sent
+ * so the child's own 'close'/'error' events can never misread a kill we
+ * initiated as an infrastructure failure (that misreading is what turned a
+ * budget verdict into a retryable 503 before).
+ */
+type AbortReason = 'stop' | 'frame-bytes' | 'frame-count' | 'deadline' | 'callback';
 
 interface ProbeStream {
   width?: number;
@@ -584,11 +601,12 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
   }
 
   /**
-   * IN-MEMORY inspection for the pre-storage upload screen. The unscreened
+   * IN-MEMORY inspection for the pre-storage upload screen. The unstored
    * bytes NEVER touch any disk: ffprobe reads them from STDIN (pipe:0) and
    * the single-pass EXHAUSTIVE frame decode (every source frame — no fps
-   * filter) feeds the same buffer to ffmpeg's stdin, collecting PNG frames
-   * from stdout. A container whose probing
+   * filter) feeds the same buffer to ffmpeg's stdin, PUSHING each PNG to
+   * the caller as the stdout stream delimits it (see streamFrames — the
+   * stream is never retained whole). A container whose probing
    * requires seeking (non-faststart MP4, moov atom at the end) cannot be
    * read from a pipe — the tool exits nonzero and the inspection FAILS
    * CLOSED with a controlled unstreamable-container content error (the
@@ -597,6 +615,10 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
    * exactly as on the storage-key paths. Opening never runs tooling —
    * probe() does, memoized — and close() only releases references, so it
    * is trivially idempotent and a crash can leak nothing.
+   *
+   * The frames this session yields are a REJECTION signal only: they let
+   * the caller refuse an upload whose pixels show card or credential
+   * content. A stream that trips nothing proves NOTHING about the clip.
    */
   inspectBuffer(data: Buffer): Promise<BufferInspectionSession> {
     let bytes: Buffer | null = data;
@@ -618,80 +640,29 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
 
     return Promise.resolve({
       probe,
-      extractAllFrames: async (options: {
-        maxFrames: number;
-        maxBytesPerFrame: number;
-      }) => {
+      streamFrames: (options: StreamFramesOptions) => {
         // A degenerate per-frame budget (zero/negative/non-integer) can fit
-        // no frame at all — the budget verdict, decided before any exec.
+        // no frame at all — the budget verdict, decided before any spawn.
         if (
           !Number.isInteger(options.maxBytesPerFrame) ||
           options.maxBytesPerFrame <= 0
         ) {
-          throw new FrameExceedsBudgetError();
+          return Promise.reject(new FrameExceedsBudgetError());
         }
         // A degenerate frame cap can fit no frame COUNT at all — the frame
-        // budget verdict, also decided before any exec.
+        // budget verdict, also decided before any spawn.
         if (!Number.isInteger(options.maxFrames) || options.maxFrames <= 0) {
-          throw new FrameCountExceededError();
+          return Promise.reject(new FrameCountExceededError());
+        }
+        // A degenerate deadline leaves no time to decode anything — the
+        // time-budget verdict, decided before any spawn.
+        if (!Number.isInteger(options.deadlineMs) || options.deadlineMs <= 0) {
+          return Promise.reject(new ScreeningDeadlineExceededError());
         }
         if (bytes === null) {
-          throw new ExtractionFailedError();
+          return Promise.reject(new ExtractionFailedError());
         }
-        // The caller cap never RAISES the adapter's own per-frame ceiling.
-        const perFrameCap = Math.min(MAX_OUTPUT_BYTES, options.maxBytesPerFrame);
-        // EXHAUSTIVE decode: every source frame, no fps filter. The exec's
-        // maxBuffer is sized so an in-cap stream fits — (maxFrames+1) ×
-        // per-frame budget, clamped by the aggregate multi-frame ceiling —
-        // and a runaway stream (a hostile container decoding far past the
-        // cap) trips the buffer classification below and STOPS the child
-        // instead of buffering unbounded output. A stream that fits the
-        // buffer but still splits into more than maxFrames frames is the
-        // controlled FrameCountExceededError after the split.
-        const aggregateCap = Math.min(
-          (options.maxFrames + 1) * perFrameCap,
-          MAX_TOTAL_EXTRACTION_BYTES,
-        );
-        let stdout: Buffer;
-        try {
-          ({ stdout } = await this.runCommand(
-            FFMPEG_BINARY,
-            buildAllFramesArgs(),
-            aggregateCap,
-            bytes,
-          ));
-        } catch (error) {
-          // A BUDGET-derived cap (below the adapter's own aggregate
-          // ceiling) that overflows is the caller's budget verdict, not an
-          // infrastructure failure — same discrimination as the
-          // storage-key frame path.
-          if (
-            aggregateCap < MAX_TOTAL_EXTRACTION_BYTES &&
-            isMaxBufferOverflow(error)
-          ) {
-            throw new FrameExceedsBudgetError();
-          }
-          throw classifyCommandError(error);
-        }
-        const frames = splitConcatenatedPngStream(stdout);
-        if (frames.length === 0) {
-          // The decode SUCCEEDED but yielded nothing — no decodable frame
-          // exists, not a broken tool.
-          throw new FrameUnavailableError();
-        }
-        for (const frame of frames) {
-          if (frame.length > perFrameCap) {
-            throw new FrameExceedsBudgetError();
-          }
-        }
-        if (frames.length > options.maxFrames) {
-          // More frames than the caller can screen — fail closed with the
-          // controlled frame-count verdict (no counts echoed).
-          throw new FrameCountExceededError();
-        }
-        // FEW frames are returned AS-IS: sufficiency is the service's
-        // verdict, never grounds for an adapter throw.
-        return frames;
+        return this.streamFramesFromStdin(bytes, options);
       },
       close: () => {
         // In-memory only: release the references (idempotent by nature —
@@ -700,6 +671,364 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
         memoizedProbe = undefined;
         return Promise.resolve();
       },
+    });
+  }
+
+  /**
+   * The STREAMING screening decode: one ffmpeg child reading the unstored
+   * bytes from stdin and writing every decoded source frame to stdout as
+   * concatenated PNGs, consumed INCREMENTALLY.
+   *
+   * Why streaming rather than one buffered pass: the concatenated PNG
+   * stream of a normal multi-second 720p/1080p clip is hundreds of MiB —
+   * ANY aggregate stdout clamp is crossed long before the frame budget, so
+   * a buffered pass killed ffmpeg on perfectly valid uploads and (because
+   * the clamp equalled the adapter's own ceiling) reported it as an
+   * infrastructure failure: a 503 and a FAILED row for a clip well inside
+   * the advertised duration/frame budgets. Here stdout is parsed as it
+   * arrives, each frame is handed to onFrame the moment the NEXT PNG
+   * signature (or end of stream) delimits it, and the reference is dropped
+   * immediately after — peak memory is O(one frame), never O(stream), and
+   * MAX_TOTAL_EXTRACTION_BYTES does not apply.
+   *
+   * Backpressure: stdout is paused for the whole time a chunk is being
+   * consumed (including any awaited onFrame) and resumed after, so a slow
+   * screener throttles the decoder instead of filling the heap.
+   *
+   * Abandonment is always OUR bookkeeping first, the signal second: the
+   * abort reason is recorded before the child is killed, so a kill for a
+   * screening hit, a byte/count budget, a deadline, or a caller-callback
+   * failure can never be reclassified as an infrastructure failure by the
+   * 'close' handler. Only exits and signals we did NOT initiate go through
+   * classifyCommandError.
+   */
+  private streamFramesFromStdin(
+    bytes: Buffer,
+    options: StreamFramesOptions,
+  ): Promise<StreamFramesResult> {
+    // Caller caps never RAISE the adapter's own ceilings.
+    const perFrameCap = Math.min(MAX_OUTPUT_BYTES, options.maxBytesPerFrame);
+    const deadlineMs = Math.min(MAX_STREAMING_DEADLINE_MS, options.deadlineMs);
+    return new Promise<StreamFramesResult>((resolveResult, rejectResult) => {
+      let child: ChildProcess;
+      try {
+        child = spawn(FFMPEG_BINARY, buildAllFramesArgs(), {
+          windowsHide: true,
+          // No shell: arguments reach the binary as a vector.
+          shell: false,
+          // stderr is DISCARDED at the OS level: it is attacker-tinted text
+          // this adapter must never echo, and an undrained stderr pipe
+          // would deadlock a chatty decode.
+          stdio: ['pipe', 'pipe', 'ignore'],
+        });
+      } catch (error) {
+        rejectResult(classifyCommandError(error));
+        return;
+      }
+      const stdout = child.stdout;
+      if (stdout === null) {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // Nothing to report: the child never became usable.
+        }
+        rejectResult(new ExtractionInfrastructureError());
+        return;
+      }
+
+      let settled = false;
+      let aborted: AbortReason | null = null;
+      let framesSeen = 0;
+      // Accumulator for the CURRENT, not-yet-delimited frame ONLY: a
+      // ZERO-FILLED (never allocUnsafe — no uninitialized memory can reach
+      // a screener) buffer that GROWS BY DOUBLING and is compacted in
+      // place as frames leave, so appending a 64 KiB pipe chunk to a
+      // multi-MiB frame costs amortized O(chunk), not a fresh copy of the
+      // whole frame. `pendingLength` is the live length; everything past
+      // it is stale.
+      let pending: Buffer = EMPTY;
+      let pendingLength = 0;
+      // The first PNG signature has been seen (leading noise discarded).
+      let started = false;
+      // How far into the live bytes the signature scan already reached, so
+      // a frame arriving in many chunks is scanned once, not once per chunk.
+      let scanned = 0;
+      // Serializes chunk consumption (and therefore onFrame calls) in
+      // arrival order regardless of how the events interleave.
+      let queue: Promise<void> = Promise.resolve();
+
+      const finish = (): void => {
+        clearTimeout(timer);
+        pending = EMPTY;
+        pendingLength = 0;
+      };
+      const resolveOnce = (result: StreamFramesResult): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        finish();
+        resolveResult(result);
+      };
+      const rejectOnce = (error: unknown): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        finish();
+        rejectResult(error);
+      };
+
+      const killChild = (signal: NodeJS.Signals): void => {
+        try {
+          child.stdin?.destroy();
+        } catch {
+          // Already gone — nothing to release.
+        }
+        try {
+          stdout.destroy();
+        } catch {
+          // Already gone — nothing to release.
+        }
+        try {
+          child.kill(signal);
+        } catch {
+          // The child already exited; the abort reason still stands.
+        }
+      };
+
+      /** Abandon the decode for a reason WE own. */
+      const abort = (reason: AbortReason, cause?: unknown): void => {
+        if (settled || aborted !== null) {
+          return;
+        }
+        aborted = reason;
+        // A screening hit is a graceful stop (the decode did its job);
+        // budget/deadline/callback failures stop the child hard.
+        killChild(reason === 'stop' ? 'SIGTERM' : 'SIGKILL');
+        if (reason === 'stop') {
+          resolveOnce({ framesSeen, stoppedEarly: true });
+          return;
+        }
+        if (reason === 'frame-bytes') {
+          rejectOnce(new FrameExceedsBudgetError());
+          return;
+        }
+        if (reason === 'frame-count') {
+          rejectOnce(new FrameCountExceededError());
+          return;
+        }
+        if (reason === 'deadline') {
+          rejectOnce(new ScreeningDeadlineExceededError());
+          return;
+        }
+        // 'callback': the caller's own failure propagates UNCHANGED — the
+        // adapter never reclassifies a screener error as a decode verdict.
+        rejectOnce(cause);
+      };
+
+      const timer = setTimeout(() => abort('deadline'), deadlineMs);
+      // A decode must never keep the process alive on its own.
+      timer.unref?.();
+
+      /** Hand ONE delimited frame to the caller, then forget it. */
+      const emit = async (frame: Buffer): Promise<void> => {
+        if (settled || aborted !== null) {
+          return;
+        }
+        if (frame.length > perFrameCap) {
+          abort('frame-bytes');
+          return;
+        }
+        if (framesSeen >= options.maxFrames) {
+          // One frame past the cap: fail closed with the controlled count
+          // verdict (no counts echoed), never a silent truncation.
+          abort('frame-count');
+          return;
+        }
+        const index = framesSeen;
+        framesSeen += 1;
+        const verdict = await options.onFrame(frame, index);
+        if (verdict === 'stop') {
+          abort('stop');
+        }
+      };
+
+      /** Append a chunk, doubling the accumulator only when it must grow. */
+      const append = (chunk: Buffer): void => {
+        const needed = pendingLength + chunk.length;
+        if (needed > pending.length) {
+          // The accumulator never legitimately exceeds one frame plus the
+          // chunk that completed it — the byte cap below fires first.
+          const capacity = Math.min(
+            Math.max(pending.length * 2, needed, PENDING_INITIAL_CAPACITY),
+            Math.max(needed, perFrameCap + chunk.length),
+          );
+          const grown = Buffer.alloc(capacity);
+          pending.copy(grown, 0, 0, pendingLength);
+          pending = grown;
+        }
+        chunk.copy(pending, pendingLength);
+        pendingLength = needed;
+      };
+
+      /** Drop the first `count` bytes, compacting the rest in place. */
+      const discardFront = (count: number): void => {
+        pending.copyWithin(0, count, pendingLength);
+        pendingLength -= count;
+      };
+
+      /** Parse one stdout chunk, emitting every frame it completes. */
+      const consume = async (chunk: Buffer): Promise<void> => {
+        if (settled || aborted !== null) {
+          return;
+        }
+        append(chunk);
+        if (!started) {
+          const first = pending.subarray(0, pendingLength).indexOf(PNG_SIGNATURE);
+          if (first === -1) {
+            // Retain only what could still be the head of a signature that
+            // straddles the chunk boundary; leading noise is dropped.
+            discardFront(
+              Math.max(0, pendingLength - (PNG_SIGNATURE.length - 1)),
+            );
+            return;
+          }
+          discardFront(first);
+          started = true;
+          scanned = PNG_SIGNATURE.length;
+        }
+        for (;;) {
+          // Resume the scan a signature-length short of the last position
+          // so a signature split across chunks is still found, exactly once.
+          const from = Math.max(
+            PNG_SIGNATURE.length,
+            scanned - (PNG_SIGNATURE.length - 1),
+          );
+          const next = pending
+            .subarray(0, pendingLength)
+            .indexOf(PNG_SIGNATURE, from);
+          if (next === -1) {
+            scanned = pendingLength;
+            break;
+          }
+          // The frame is COPIED out (the accumulator is reused) and the
+          // bytes leave it BEFORE the callback runs: nothing already handed
+          // over is ever retained here.
+          const frame = Buffer.from(pending.subarray(0, next));
+          discardFront(next);
+          scanned = PNG_SIGNATURE.length;
+          await emit(frame);
+          if (settled || aborted !== null) {
+            return;
+          }
+        }
+        // Only the trailing, still-INCOMPLETE frame is bounded here — a
+        // chunk carrying several small frames is not their sum.
+        if (pendingLength > perFrameCap) {
+          abort('frame-bytes');
+        }
+      };
+
+      const fail = (error: unknown): void => {
+        // A rejection out of the consumption chain is the CALLER's (onFrame
+        // threw): abandon the decode and surface their error unchanged.
+        abort('callback', error);
+      };
+
+      stdout.on('error', () => undefined);
+      stdout.on('data', (chunk: Buffer) => {
+        if (settled || aborted !== null) {
+          return;
+        }
+        // Backpressure: read nothing more while this chunk — and any frame
+        // it hands to the screener — is outstanding.
+        stdout.pause();
+        queue = queue
+          .then(() => consume(chunk))
+          .then(() => {
+            if (!settled && aborted === null) {
+              stdout.resume();
+            }
+          })
+          .catch(fail);
+      });
+
+      child.on('error', (error: unknown) => {
+        if (settled || aborted !== null) {
+          // A kill WE initiated is never an infrastructure verdict.
+          return;
+        }
+        rejectOnce(classifyCommandError(error));
+      });
+
+      child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+        if (settled || aborted !== null) {
+          return;
+        }
+        queue = queue
+          .then(async () => {
+            if (settled || aborted !== null) {
+              return;
+            }
+            if (typeof signal === 'string' || (code !== null && code !== 0)) {
+              // An exit or signal we did NOT initiate: the standard
+              // infrastructure-vs-content classification decides.
+              rejectOnce(
+                classifyCommandError({
+                  code: typeof signal === 'string' ? null : code,
+                  signal,
+                }),
+              );
+              return;
+            }
+            // Anything buffered behind a pause() still counts as screened
+            // input — drain it before judging the stream.
+            for (;;) {
+              const rest =
+                typeof stdout.read === 'function'
+                  ? (stdout.read() as Buffer | null)
+                  : null;
+              if (rest === null || rest === undefined || rest.length === 0) {
+                break;
+              }
+              await consume(rest);
+              if (settled || aborted !== null) {
+                return;
+              }
+            }
+            // The LAST frame has no following signature: end of stream is
+            // what delimits it.
+            if (started && pendingLength > 0) {
+              const tail = Buffer.from(pending.subarray(0, pendingLength));
+              pending = EMPTY;
+              pendingLength = 0;
+              await emit(tail);
+              if (settled || aborted !== null) {
+                return;
+              }
+            }
+            if (framesSeen === 0) {
+              // The decode SUCCEEDED but yielded nothing — no decodable
+              // frame exists, not a broken tool.
+              rejectOnce(new FrameUnavailableError());
+              return;
+            }
+            // FEW frames resolve AS-IS: sufficiency is the service's
+            // verdict, never grounds for an adapter throw.
+            resolveOnce({ framesSeen, stoppedEarly: false });
+          })
+          .catch(fail);
+      });
+
+      if (child.stdin) {
+        // A child that stops reading (killed early on a screening hit, or
+        // done with the container) raises EPIPE here; swallowing it is
+        // CORRECT — the promise settles from the child's own outcome or
+        // from our recorded abort reason, never from the pipe write.
+        child.stdin.on('error', () => undefined);
+        child.stdin.end(bytes);
+      }
     });
   }
 

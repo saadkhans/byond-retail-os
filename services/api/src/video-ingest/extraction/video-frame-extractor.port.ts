@@ -128,6 +128,23 @@ export class FrameCountExceededError extends Error {
   }
 }
 
+/**
+ * Controlled failure: the streaming screening decode did not finish inside
+ * the caller-supplied wall-clock budget (streamFrames deadlineMs). The
+ * decode is ABANDONED — the child is killed — so the screen is INCOMPLETE
+ * and the caller must fail closed. Distinct from
+ * ExtractionInfrastructureError (nothing about the host is broken) and from
+ * the byte/count budget verdicts: this one says "screening this clip did
+ * not fit its time budget". The message is fixed and echoes no timings,
+ * paths, or tool output.
+ */
+export class ScreeningDeadlineExceededError extends Error {
+  constructor() {
+    super('The screening decode exceeded its time budget');
+    this.name = 'ScreeningDeadlineExceededError';
+  }
+}
+
 export interface ExtractFrameAtOptions {
   /**
    * Optional decoded-byte cap for THIS invocation, always clamped by the
@@ -161,26 +178,57 @@ export interface BufferInspectionSession {
   probe(): Promise<VideoProbeResult>;
 
   /**
-   * EXHAUSTIVE decode: emit EVERY decoded source frame (no fps filter, no
-   * sampling of any kind) in a single pass over the in-memory bytes,
-   * returning the encoded frames in decode order. Sampling would let
-   * content visible only BETWEEN samples reach storage unscreened — the
-   * exhaustive stream is the screening contract. Enforces
-   * options.maxBytesPerFrame per frame (violation →
-   * FrameExceedsBudgetError) and options.maxFrames on the total (violation
-   * → FrameCountExceededError; the adapter prefers stopping early by
-   * capping its output buffer near (maxFrames+1)×frame budget so a runaway
-   * stream trips the budget classification instead of buffering unbounded
-   * output). A successful decode yielding FEW frames returns what it
-   * yielded — SUFFICIENCY is the SERVICE's verdict (it holds the probe and
-   * the configured screening budget); only zero frames from a successful
-   * decode is FrameUnavailableError. Infrastructure failures classify
-   * exactly as on the storage-key paths.
+   * EXHAUSTIVE, STREAMING decode: every decoded source frame (no fps
+   * filter, no sampling of any kind) is handed to `onFrame` in decode
+   * order, one at a time, as soon as the stream delimits it — the frames
+   * are NEVER accumulated into a returned array. Sampling would let
+   * content visible only BETWEEN samples reach storage unlooked-at, so the
+   * exhaustive stream is the screening contract; buffering the whole
+   * stream would make a normal multi-second clip exceed any aggregate
+   * memory cap long before the frame budget, so PULL-BASED consumption is
+   * equally part of the contract. Peak memory is O(one frame).
+   *
+   * What frames are FOR: they are a REJECTION signal only. A frame that
+   * shows card/credential content lets the caller reject the upload; a
+   * pass over every frame proves NOTHING about the clip — no recognizer
+   * sees everything, so a clean stream is the ABSENCE of evidence, never
+   * evidence of safety. No implementation or caller may describe this
+   * decode as certifying, clearing, or proving a clip.
+   *
+   * Contract:
+   * - `onFrame(frame, index)` receives each frame's encoded bytes and its
+   *   zero-based index in the decode stream. The buffer is the caller's
+   *   for the duration of the promise; the implementation releases its own
+   *   reference immediately after and reads no further input until the
+   *   promise settles (backpressure).
+   * - Returning 'stop' (an early-stop on a screening hit) ends the decode
+   *   gracefully: the implementation abandons the rest of the stream and
+   *   RESOLVES `{ framesSeen, stoppedEarly: true }`. Not an error.
+   * - An `onFrame` rejection propagates UNCHANGED (the caller's recognizer
+   *   failure is the caller's error) after the decode is abandoned.
+   * - `maxBytesPerFrame` bounds each INDIVIDUAL frame; a frame over it
+   *   abandons the decode with FrameExceedsBudgetError.
+   * - `maxFrames` bounds the total; one frame past it abandons the decode
+   *   with FrameCountExceededError (never a silent truncation — a
+   *   truncated screen is no screen).
+   * - `deadlineMs` is the wall-clock budget for the WHOLE decode; overrun
+   *   abandons it with ScreeningDeadlineExceededError. Implementations may
+   *   clamp it down to their own ceiling but never up.
+   * - FEW frames resolve normally with the count seen — SUFFICIENCY is the
+   *   SERVICE's verdict (it holds the probe and the configured screening
+   *   budget); only ZERO frames from an otherwise successful decode is
+   *   FrameUnavailableError.
+   * - Infrastructure failures classify exactly as on the storage-key
+   *   paths, and an abandonment the implementation itself initiated (stop,
+   *   budget, deadline) is NEVER reported as an infrastructure failure.
    */
-  extractAllFrames(options: {
+  streamFrames(options: {
     maxFrames: number;
     maxBytesPerFrame: number;
-  }): Promise<Buffer[]>;
+    /** Wall-clock budget for the entire decode. */
+    deadlineMs: number;
+    onFrame: (frame: Buffer, index: number) => Promise<'continue' | 'stop'>;
+  }): Promise<{ framesSeen: number; stoppedEarly: boolean }>;
 
   /** Release every in-memory reference. Idempotent; MUST run in every
    *  path (success, screening hit, and failure alike). */

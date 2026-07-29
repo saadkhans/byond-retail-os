@@ -79,15 +79,23 @@ export class CreateVideoCropDto {
   @IsEnum(VideoCropReason)
   reason?: VideoCropReason;
 
-  @ApiPropertyOptional({
+  /**
+   * REQUIRED for the same reason as on ExtractFramesDto: the key is the
+   * operation's identity and the committed artifact file is staged under a
+   * key derived from it. A keyless request would derive its staging key
+   * from the request fingerprint alone, so a later identical keyless crop
+   * would re-put over the file an earlier append-only artifact row already
+   * owns while that row kept its recorded checksum.
+   */
+  @ApiProperty({
     maxLength: 100,
     description:
-      'Tenant-scoped idempotency key: retrying a committed crop REPLAYS ' +
-      'its artifact (append-only rows are never duplicated).',
+      'REQUIRED tenant-scoped idempotency key: retrying a committed crop ' +
+      'REPLAYS its artifact (append-only rows are never duplicated, and ' +
+      'the committed artifact file is never rewritten).',
   })
-  @IsOptionalNonNull()
   @IsString()
   @MinLength(1)
   @MaxLength(100)
-  idempotencyKey?: string;
+  idempotencyKey!: string;
 }
