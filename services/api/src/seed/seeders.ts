@@ -6,6 +6,10 @@ import {
   MIN_PASSWORD_LENGTH,
 } from '../auth/password-hasher';
 import { PLATFORM_MODULE_CATALOG } from '../platform-modules/platform-module.catalog';
+import {
+  PLATFORM_SANDBOX_TENANT_NAME,
+  PLATFORM_SANDBOX_TENANT_SLUG,
+} from '../tenants/platform-sandbox';
 
 /**
  * Structural client types so seeders are unit-testable with simple mocks and
@@ -323,4 +327,83 @@ export async function seedPlatformAdmin(
   });
 
   return { userId: user.id, roleId: role.id };
+}
+
+export interface PlatformSandboxSeedClient {
+  tenant: {
+    upsert(args: {
+      where: { slug: string };
+      update: { name: string; status: 'ACTIVE' };
+      create: { name: string; slug: string; status: 'ACTIVE' };
+    }): Promise<{ id: string }>;
+  };
+  platformModule: {
+    findMany(args: {
+      where: { isActive: true };
+      select: { id: true; code: true };
+    }): Promise<{ id: string; code: string }[]>;
+  };
+  tenantModule: {
+    upsert(args: {
+      where: {
+        tenantId_moduleId: { tenantId: string; moduleId: string };
+      };
+      update: Record<string, never>;
+      create: {
+        tenantId: string;
+        moduleId: string;
+        status: 'ENABLED';
+        enabledAt: Date;
+      };
+    }): Promise<unknown>;
+  };
+}
+
+/**
+ * The PLATFORM SANDBOX tenant (see ../tenants/platform-sandbox): the ONE
+ * tenant platform users resolve to on tenant-scoped routes, seeded together
+ * with the platform admin (same SEED_PLATFORM_ADMIN opt-in) so the local
+ * admin has a workspace for the Phase 10 test-video workflow.
+ *
+ * Idempotent, with the same "never overwrite operator state" stance as the
+ * admin seeder: the tenant row is upserted by its fixed slug (a reseed
+ * re-ACTIVATEs a suspended sandbox — restoring a working local setup is the
+ * point of reseeding), while module enablement rows are created only when
+ * missing — a module an operator explicitly DISABLED for the sandbox stays
+ * disabled across reseeds. Every ACTIVE catalog module is provisioned, so
+ * newly shipped modules light up for the sandbox on the next reseed.
+ */
+export async function seedPlatformSandboxTenant(
+  db: PlatformSandboxSeedClient,
+): Promise<{ tenantId: string; moduleCount: number }> {
+  const tenant = await db.tenant.upsert({
+    where: { slug: PLATFORM_SANDBOX_TENANT_SLUG },
+    update: { name: PLATFORM_SANDBOX_TENANT_NAME, status: 'ACTIVE' },
+    create: {
+      name: PLATFORM_SANDBOX_TENANT_NAME,
+      slug: PLATFORM_SANDBOX_TENANT_SLUG,
+      status: 'ACTIVE',
+    },
+  });
+
+  const modules = await db.platformModule.findMany({
+    where: { isActive: true },
+    select: { id: true, code: true },
+  });
+  for (const module of modules) {
+    await db.tenantModule.upsert({
+      where: {
+        tenantId_moduleId: { tenantId: tenant.id, moduleId: module.id },
+      },
+      update: {},
+      create: {
+        tenantId: tenant.id,
+        moduleId: module.id,
+        status: 'ENABLED',
+        enabledAt: new Date(),
+      },
+    });
+  }
+
+  return { tenantId: tenant.id, moduleCount: modules.length };
 }

@@ -6,7 +6,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { AuditAction, UserType } from '@prisma/client';
+import { AuditAction } from '@prisma/client';
 import { REQUIRED_MODULE_KEY } from '../auth/decorators/access-policy.decorators';
 import { RequestContext, RequestWithContext } from '../auth/request-context';
 import { AuditLogService } from '../common/audit/audit-log.service';
@@ -47,10 +47,12 @@ export class ModuleEnabledGuard implements CanActivate {
       throw new UnauthorizedException('Authentication required');
     }
 
-    // Module enablement is a per-tenant concept; a request without tenant
-    // context can never satisfy it. (These routes are also @TenantOnly, so
-    // platform users are already rejected upstream — this is defense in depth.)
-    if (context.userType !== UserType.TENANT || !context.tenantId) {
+    // Module enablement is a per-tenant concept; a request without a
+    // RESOLVED tenant context can never satisfy it. Tenant users always
+    // carry their own tenant; platform users carry the seeded platform
+    // sandbox tenant when it exists (resolved server-side by the auth
+    // guard) and are denied here otherwise — fail closed, never wildcard.
+    if (!context.tenantId) {
       return this.deny(
         context,
         request,

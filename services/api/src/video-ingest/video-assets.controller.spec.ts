@@ -1,10 +1,16 @@
 import 'reflect-metadata';
+import { ExecutionContext } from '@nestjs/common';
 import { GUARDS_METADATA, INTERCEPTORS_METADATA } from '@nestjs/common/constants';
+import { Reflector } from '@nestjs/core';
+import { UserType } from '@prisma/client';
 import {
   REQUIRED_MODULE_KEY,
   REQUIRED_PERMISSIONS_KEY,
   TENANT_ONLY_KEY,
 } from '../auth/decorators/access-policy.decorators';
+import { PermissionsGuard } from '../auth/guards/permissions.guard';
+import { RequestContext } from '../auth/request-context';
+import { AuditLogService } from '../common/audit/audit-log.service';
 import { TestMediaGateGuard } from './test-media-gate.guard';
 import { VideoAssetsController } from './video-assets.controller';
 import { VideoCropsController } from './video-crops.controller';
@@ -102,6 +108,110 @@ describe('VideoAssetsController access policy', () => {
         ),
       ).toBeDefined();
     }
+  });
+});
+
+/**
+ * Runs the REAL PermissionsGuard against the REAL route metadata (real
+ * Reflector — nothing faked but the request): the seeded platform admin —
+ * a PLATFORM user whose auth context resolved to the platform sandbox
+ * tenant and whose Platform Administrator role holds every permission —
+ * can reach the video-asset routes, while the fail-closed cases stay shut.
+ */
+describe('VideoAssetsController: platform admin via the sandbox tenant', () => {
+  const ALL_VIDEO_PERMISSIONS = [
+    'video-asset:read',
+    'video-asset:manage',
+    'video-asset:screen',
+    'video-asset:process',
+    'video-asset:delete',
+  ];
+
+  // What AuthGuard builds for the seeded admin once the sandbox is seeded.
+  const platformAdmin: RequestContext = {
+    userId: 'admin-1',
+    email: 'admin@byond.local',
+    userType: UserType.PLATFORM,
+    tenantId: 'sandbox-1',
+    permissions: ALL_VIDEO_PERMISSIONS,
+    requestId: 'req-1',
+  };
+
+  let auditLog: { record: jest.Mock };
+  let guard: PermissionsGuard;
+
+  function contextFor(
+    handler: keyof VideoAssetsController,
+    context: RequestContext,
+  ): ExecutionContext {
+    return {
+      switchToHttp: () => ({
+        getRequest: () => ({
+          context,
+          method: 'GET',
+          path: '/video-assets',
+        }),
+      }),
+      getHandler: () => VideoAssetsController.prototype[handler],
+      getClass: () => VideoAssetsController,
+    } as unknown as ExecutionContext;
+  }
+
+  beforeEach(() => {
+    auditLog = { record: jest.fn().mockResolvedValue(undefined) };
+    guard = new PermissionsGuard(
+      new Reflector(),
+      auditLog as unknown as AuditLogService,
+    );
+  });
+
+  it.each([['list'], ['upload'], ['findById'], ['screen'], ['delete']])(
+    'admits the platform admin to %s',
+    async (handler) => {
+      await expect(
+        guard.canActivate(
+          contextFor(handler as keyof VideoAssetsController, platformAdmin),
+        ),
+      ).resolves.toBe(true);
+    },
+  );
+
+  it('still denies a platform user with NO resolved sandbox tenant', async () => {
+    // No sandbox seeded ⇒ AuthGuard left tenantId null ⇒ tenant-only denies
+    // even though every permission is held (fail closed, as before).
+    await expect(
+      guard.canActivate(
+        contextFor('list', { ...platformAdmin, tenantId: null }),
+      ),
+    ).rejects.toThrow('Insufficient permissions');
+  });
+
+  it('still denies a user without the route permission, sandbox or not', async () => {
+    await expect(
+      guard.canActivate(
+        contextFor('list', { ...platformAdmin, permissions: ['tenant:read'] }),
+      ),
+    ).rejects.toThrow('Insufficient permissions');
+    expect(auditLog.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'ACCESS_DENIED',
+        reason: 'Missing permission(s): video-asset:read',
+      }),
+    );
+  });
+
+  it('still denies a tenant user without the route permission', async () => {
+    const tenantViewer: RequestContext = {
+      userId: 'viewer-1',
+      email: 'viewer@tenant-a.example',
+      userType: UserType.TENANT,
+      tenantId: 'tenant-a',
+      permissions: ['catalog:read'],
+      requestId: 'req-2',
+    };
+    await expect(
+      guard.canActivate(contextFor('list', tenantViewer)),
+    ).rejects.toThrow('Insufficient permissions');
   });
 });
 

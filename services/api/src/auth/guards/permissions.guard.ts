@@ -62,10 +62,12 @@ export class PermissionsGuard implements CanActivate {
       TENANT_ONLY_KEY,
       [...targets],
     );
-    if (
-      tenantOnly &&
-      (context.userType !== UserType.TENANT || !context.tenantId)
-    ) {
+    // Tenant-only means "requires a RESOLVED tenant context". Tenant users
+    // always carry their own tenant; platform users carry the seeded
+    // platform sandbox tenant when it exists (resolved server-side by the
+    // auth guard — see ../../tenants/platform-sandbox) and are denied here
+    // otherwise: a null tenant context is never a wildcard.
+    if (tenantOnly && !context.tenantId) {
       return this.deny(context, request, 'Tenant-only endpoint');
     }
 

@@ -5,6 +5,7 @@ import {
   AuditLogService,
 } from '../common/audit/audit-log.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { PLATFORM_SANDBOX_TENANT_SLUG } from '../tenants/platform-sandbox';
 import { SAFE_USER_SELECT, SafeDbUser } from '../users/users.repository';
 
 /**
@@ -54,6 +55,24 @@ export class AuthRepository {
       select: { ...SAFE_USER_SELECT, tenant: { select: { status: true } } },
     });
     return this.usableAuthUser(user);
+  }
+
+  /**
+   * Resolves the PLATFORM SANDBOX tenant — the ONE tenant platform users
+   * operate in on tenant-scoped routes (see ../tenants/platform-sandbox).
+   * Strictly server-side: a FIXED slug looked up in the database, never
+   * client input. A missing or non-ACTIVE sandbox resolves to null, which
+   * keeps every tenant-scoped guard failing closed for platform users.
+   */
+  async findPlatformSandboxTenantId(): Promise<string | null> {
+    const tenant = await this.prisma.tenant.findFirst({
+      where: {
+        slug: PLATFORM_SANDBOX_TENANT_SLUG,
+        status: TenantStatus.ACTIVE,
+      },
+      select: { id: true },
+    });
+    return tenant?.id ?? null;
   }
 
   /**

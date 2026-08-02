@@ -4,14 +4,20 @@ import {
   PLATFORM_MODULE_CATALOG,
 } from '../platform-modules/platform-module.catalog';
 import {
+  PLATFORM_SANDBOX_TENANT_NAME,
+  PLATFORM_SANDBOX_TENANT_SLUG,
+} from '../tenants/platform-sandbox';
+import {
   assertSeedAdminPasswordAllowed,
   assertSeedAllowed,
   normalizeSeedAdminEmail,
   PLATFORM_ADMIN_ROLE_NAME,
   PlatformAdminSeedClient,
+  PlatformSandboxSeedClient,
   seedPermissions,
   seedPlatformAdmin,
   seedPlatformModules,
+  seedPlatformSandboxTenant,
   shouldSeedPlatformAdmin,
 } from './seeders';
 
@@ -420,6 +426,80 @@ describe('assertSeedAdminPasswordAllowed', () => {
     expect(() => assertSeedAdminPasswordAllowed('€'.repeat(25))).toThrow(
       /72-byte/,
     );
+  });
+});
+
+describe('seedPlatformSandboxTenant', () => {
+  let db: {
+    tenant: { upsert: jest.Mock };
+    platformModule: { findMany: jest.Mock };
+    tenantModule: { upsert: jest.Mock };
+  };
+
+  beforeEach(() => {
+    db = {
+      tenant: { upsert: jest.fn().mockResolvedValue({ id: 'sandbox-1' }) },
+      platformModule: {
+        findMany: jest.fn().mockResolvedValue([
+          { id: 'm-core', code: 'core' },
+          { id: 'm-video', code: 'video-ingest' },
+        ]),
+      },
+      tenantModule: { upsert: jest.fn().mockResolvedValue({}) },
+    };
+  });
+
+  function client(): PlatformSandboxSeedClient {
+    return db as unknown as PlatformSandboxSeedClient;
+  }
+
+  it('upserts the sandbox tenant by its FIXED slug, ACTIVE on create and update', async () => {
+    const result = await seedPlatformSandboxTenant(client());
+
+    expect(db.tenant.upsert).toHaveBeenCalledWith({
+      where: { slug: PLATFORM_SANDBOX_TENANT_SLUG },
+      // A reseed re-ACTIVATEs a suspended sandbox — restoring a working
+      // local setup is the point of reseeding.
+      update: { name: PLATFORM_SANDBOX_TENANT_NAME, status: 'ACTIVE' },
+      create: {
+        name: PLATFORM_SANDBOX_TENANT_NAME,
+        slug: PLATFORM_SANDBOX_TENANT_SLUG,
+        status: 'ACTIVE',
+      },
+    });
+    expect(result).toEqual({ tenantId: 'sandbox-1', moduleCount: 2 });
+  });
+
+  it('provisions every ACTIVE catalog module as ENABLED for the sandbox', async () => {
+    await seedPlatformSandboxTenant(client());
+
+    expect(db.platformModule.findMany).toHaveBeenCalledWith({
+      where: { isActive: true },
+      select: { id: true, code: true },
+    });
+    expect(db.tenantModule.upsert).toHaveBeenCalledTimes(2);
+    expect(db.tenantModule.upsert).toHaveBeenCalledWith({
+      where: {
+        tenantId_moduleId: { tenantId: 'sandbox-1', moduleId: 'm-video' },
+      },
+      // Create-only: an operator's explicit DISABLED row survives reseeds
+      // (same "never overwrite operator state" stance as the admin seeder).
+      update: {},
+      create: expect.objectContaining({
+        tenantId: 'sandbox-1',
+        moduleId: 'm-video',
+        status: 'ENABLED',
+      }),
+    });
+  });
+
+  it('is idempotent: rerunning issues only upserts, never bare creates', async () => {
+    await seedPlatformSandboxTenant(client());
+    await seedPlatformSandboxTenant(client());
+
+    // Two runs, same shape: upserts keyed on stable unique identities.
+    expect(db.tenant.upsert).toHaveBeenCalledTimes(2);
+    expect(db.tenantModule.upsert).toHaveBeenCalledTimes(4);
   });
 });
 

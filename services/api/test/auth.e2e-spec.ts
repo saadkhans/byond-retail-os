@@ -174,6 +174,10 @@ describe('Auth & RBAC (e2e, no live database)', () => {
         ...data,
       }),
       findUnique: async () => null,
+      // Platform-sandbox lookup (AuthGuard): no sandbox tenant in these
+      // fixtures, so platform users keep a NULL tenant context and every
+      // tenant-scoped route stays 403 for them.
+      findFirst: async () => null,
     },
     platformModule: {
       // Honors the tenant-creation lookup's `{ code: { in }, isActive: true }`
