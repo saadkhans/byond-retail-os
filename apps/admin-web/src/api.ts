@@ -122,6 +122,31 @@ export async function apiUpload<T>(
   return (await response.json()) as T;
 }
 
+/**
+ * Fetch a protected binary endpoint (media/artifact images) into an object
+ * URL. The <video>/<img> tags cannot send the Bearer header themselves, so
+ * bytes travel through fetch and land in a blob URL the caller must revoke
+ * (URL.revokeObjectURL) when done. Returns null on any controlled refusal
+ * (403/404/409) — the caller hides the surface instead of erroring.
+ */
+export async function apiObjectUrl(path: string): Promise<string | null> {
+  const headers: Record<string, string> = {};
+  const token = getToken();
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, { headers });
+  } catch {
+    return null;
+  }
+  if (!response.ok) {
+    return null;
+  }
+  return URL.createObjectURL(await response.blob());
+}
+
 /** Standard paginated list envelope used by the search endpoints. */
 export interface Paginated<T> {
   items: T[];
@@ -698,4 +723,262 @@ export interface VideoArtifact {
   inferenceJobId: string | null;
   createdById: string | null;
   createdAt: string;
+}
+
+// Phase 10 validation — API-managed reference library + ground truth.
+export interface ReferenceImageView {
+  id: string;
+  productId: string;
+  originalFilename: string;
+  mimeType: string;
+  sizeBytes: number;
+  checksumSha256: string;
+  createdAt: string;
+}
+
+export interface ReferenceLibraryStatus {
+  productId: string;
+  sku: string;
+  name: string;
+  barcodes: string[];
+  referenceCount: number;
+  minRequired: number;
+  inferenceReady: boolean;
+  embeddingCount: number;
+  embeddingModelKey: string;
+  embeddingModelVersion: string;
+  images: ReferenceImageView[];
+}
+
+export interface ReferenceOverviewRow {
+  productId: string;
+  sku: string;
+  name: string;
+  referenceCount: number;
+  embeddingCount: number;
+  inferenceReady: boolean;
+}
+
+export interface ImportPreviewProduct {
+  sku: string;
+  productId: string;
+  name: string;
+  existingImages: number;
+  newImages: number;
+  duplicatesInZip: number;
+  alreadyStored: number;
+  projectedImages: number;
+  projectedInferenceReady: boolean;
+  belowMinimumAfterImport: boolean;
+  fileCount: number;
+}
+
+export interface ImportPreview {
+  matched: ImportPreviewProduct[];
+  unknownSkus: { sku: string; fileCount: number }[];
+  rejected: { path: string; reason: string }[];
+  totals: { files: number; importable: number; rejected: number };
+  minRequired: number;
+}
+
+export interface ImportReport {
+  productsImported: number;
+  imagesAccepted: number;
+  imagesRejected: number;
+  rejections: { path: string; reason: string }[];
+  productsNowInferenceReady: { sku: string; productId: string; images: number }[];
+  perProduct: {
+    sku: string;
+    productId: string;
+    accepted: number;
+    rejected: number;
+    totalImages: number;
+    inferenceReady: boolean;
+  }[];
+}
+
+export type GroundTruthEventKind = 'PICKUP' | 'RETURN' | 'NONE';
+
+export interface GroundTruthView {
+  videoAssetId: string;
+  eventKind: GroundTruthEventKind;
+  productId: string | null;
+  sku: string | null;
+  productName: string | null;
+  actualTimestampMs: number | null;
+  quantity: number;
+  note: string | null;
+  updatedAt: string;
+}
+
+export type ValidationOutcome =
+  | 'correct'
+  | 'incorrect'
+  | 'missed'
+  | 'false_pickup'
+  | 'true_negative'
+  | 'not_detected'
+  | 'unscored';
+
+export interface ValidationRow {
+  videoAssetId: string;
+  originalFilename: string;
+  reviewedAt: string;
+  actualSku: string | null;
+  actualEventKind: GroundTruthEventKind;
+  actualTimestampMs: number | null;
+  predictedSku: string | null;
+  matchScore: number | null;
+  timestampErrorMs: number | null;
+  outcome: ValidationOutcome;
+  topCandidates: { sku: string; score: number | null }[];
+  processingMs: number | null;
+  jobStatus: InferenceJobStatus | null;
+  jobErrorCode: string | null;
+  fusionTopSku: string | null;
+  fusionTopScore: number | null;
+  fusionPolicy: string | null;
+  fusionVerdict: 'correct' | 'incorrect' | 'missed' | null;
+}
+
+export interface ValidationSummary {
+  rows: ValidationRow[];
+  totals: {
+    reviewed: number;
+    correct: number;
+    incorrect: number;
+    missed: number;
+    falsePositives: number;
+    falseNegatives: number;
+    trueNegatives: number;
+    notDetected: number;
+    unscored: number;
+  };
+  confusionMatrix: {
+    minReviewed: number;
+    reviewedCount: number;
+    unlocked: boolean;
+    skus: string[];
+    matrix: number[][] | null;
+  };
+}
+
+// Phase 10 MVP — automatic product-pickup detection. Server-computed safe
+// descriptors only: numbers, enum strings, and opaque artifact ids.
+export interface PickupDetectionRecord {
+  version: 1;
+  kind: 'PRODUCT_PICKUP_DETECTION';
+  result: 'PRODUCT_MATCHED' | 'UNKNOWN_PRODUCT';
+  confidence: number;
+  eventStartMs: number;
+  eventPeakMs: number;
+  eventEndMs: number;
+  boundingBox: { x: number; y: number; width: number; height: number };
+  sourceFrameArtifactId: string | null;
+  cropArtifactId: string | null;
+  productId: string | null;
+  sku: string | null;
+  analysisFps: number;
+  modelKey: string;
+  modelVersion: string;
+  processingMs?: number;
+}
+
+export interface PickupDetectionState {
+  enabled: boolean;
+  job: {
+    id: string;
+    status: InferenceJobStatus;
+    attempts: number;
+    adapterKey: string | null;
+    errorCode: string | null;
+    errorMessage: string | null;
+    createdAt: string;
+    completedAt: string | null;
+  } | null;
+  detection:
+    | (PickupDetectionRecord & {
+        visionEventId: string;
+        visionEventStatus: VisionEventStatus;
+        productName: string | null;
+        candidates: {
+          productId: string;
+          sku: string;
+          productName: string;
+          score: number | null;
+          rank: number;
+        }[];
+        review: {
+          decision: string;
+          appliedProductId: string | null;
+          reason: string | null;
+          createdAt: string;
+        } | null;
+      })
+    | null;
+}
+
+// Local VLM readiness (pickup-fusion ops).
+export interface VlmReadiness {
+  enabled: boolean;
+  provider: string;
+  mode: string;
+  timeoutMs: number;
+  model: string | null;
+  baseUrl: string | null;
+  serverReachable: boolean;
+  modelAvailable: boolean;
+  availableModels: string[];
+  /** READY = model installed; PROVIDER_UNREACHABLE / MODEL_NOT_FOUND
+   *  name the exact readiness failure. Installed ≠ warm: first inference
+   *  may still be slow. */
+  classification: 'READY' | 'MODEL_NOT_FOUND' | 'PROVIDER_UNREACHABLE';
+  /** Outcome of the most recent verify() this API process ran — the
+   *  honest warm-up signal (null until a generation was attempted). */
+  lastInference: { status: string; latencyMs: number | null; at: string } | null;
+  ready: boolean;
+}
+
+// Customer journey skeleton (shadow mode).
+export type JourneyEventType =
+  | 'ENTRY'
+  | 'EXIT'
+  | 'SHELF_INTERACTION'
+  | 'PRODUCT_PICKUP'
+  | 'PRODUCT_RETURN'
+  | 'REVIEW_REQUIRED';
+
+export interface JourneySummary {
+  id: string;
+  locationId: string;
+  unitId: string | null;
+  status: string;
+  startedAt: string;
+  endedAt: string | null;
+  eventCount: number;
+}
+
+export interface JourneyDetail {
+  id: string;
+  locationId: string;
+  unitId: string | null;
+  status: string;
+  startedAt: string;
+  endedAt: string | null;
+  events: {
+    id: string;
+    eventType: JourneyEventType;
+    occurredAt: string;
+    productId: string | null;
+    sku: string | null;
+    productName: string | null;
+    quantity: number;
+    matchScore: number | null;
+    sourceType: string;
+    videoAssetId: string | null;
+    fusionRunId: string | null;
+    note: string | null;
+  }[];
+  basket: { productId: string | null; sku: string | null; productName: string | null; quantity: number }[];
+  issues: { kind: string; detail: string; eventId?: string }[];
 }

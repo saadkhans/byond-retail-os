@@ -11,6 +11,8 @@ import {
   VideoAsset,
 } from '../api';
 import { formatDate, Page, StatusBadge, useLoad } from '../components';
+import { FusionEvidencePanel } from './FusionEvidencePanel';
+import { PickupDetectionPanel } from './PickupDetectionPanel';
 
 const ASSET_STATUSES = [
   '',
@@ -86,6 +88,36 @@ const UPLOAD_ATTESTATIONS = [
 
 function errorMessage(err: unknown): string {
   return err instanceof ApiError ? err.message : 'Unexpected error';
+}
+
+/**
+ * Strict timestamp parse for the extraction and crop forms. Returns either
+ * the parsed integer or an error string — NEVER a fallback value: an
+ * empty, NaN, negative, or out-of-range entry must surface an error
+ * instead of silently becoming 0 (`Number('')` is 0, which is exactly the
+ * bug this guards against).
+ */
+function parseTimestampMs(
+  raw: string,
+  durationMs: number | null,
+): { value: number; error: null } | { value: null; error: string } {
+  const error =
+    durationMs !== null
+      ? `Timestamp must be between 0 and ${durationMs - 1} ms for this video.`
+      : 'Timestamp must be a non-negative integer number of milliseconds.';
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return { value: null, error };
+  }
+  const value = Number(trimmed);
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    (durationMs !== null && value >= durationMs)
+  ) {
+    return { value: null, error };
+  }
+  return { value, error: null };
 }
 
 function formatBytes(size: number): string {
@@ -348,6 +380,7 @@ export function VideoAssetDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [reload, setReload] = useState(0);
+  const [groundTruthTick, setGroundTruthTick] = useState(0);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -466,11 +499,28 @@ export function VideoAssetDetailPage() {
 
   async function extractFrames(event: FormEvent) {
     event.preventDefault();
+    // An empty single-frame field means interval SAMPLING (the form's other
+    // mode); a non-empty one is validated strictly against the probed
+    // duration BEFORE any request — invalid input never leaves the form,
+    // and is never coerced to 0.
+    const single = frameTimestampMs.trim();
+    let singleTimestampMs: number | null = null;
+    if (single) {
+      const parsed = parseTimestampMs(single, asset.data?.durationMs ?? null);
+      if (parsed.error !== null) {
+        setActionError(parsed.error);
+        return;
+      }
+      singleTimestampMs = parsed.value;
+    }
     await run(async () => {
-      const single = frameTimestampMs.trim();
-      const body = single
-        ? { timestampMs: Number(single), idempotencyKey: frameIdempotencyKey }
-        : {
+      const body =
+        singleTimestampMs !== null
+          ? {
+              timestampMs: singleTimestampMs,
+              idempotencyKey: frameIdempotencyKey,
+            }
+          : {
             ...(intervalMs.trim() ? { intervalMs: Number(intervalMs) } : {}),
             ...(maxFrames.trim() ? { maxFrames: Number(maxFrames) } : {}),
             idempotencyKey: frameIdempotencyKey,
@@ -485,6 +535,15 @@ export function VideoAssetDetailPage() {
 
   async function createCrop(event: FormEvent) {
     event.preventDefault();
+    // Strict parse — a cleared field must NOT become Number('') === 0.
+    const parsedTimestamp = parseTimestampMs(
+      cropTimestampMs,
+      asset.data?.durationMs ?? null,
+    );
+    if (parsedTimestamp.error !== null) {
+      setActionError(parsedTimestamp.error);
+      return;
+    }
     if (!cropWidth.trim() || !cropHeight.trim()) {
       setActionError('Crop width and height are required.');
       return;
@@ -493,7 +552,7 @@ export function VideoAssetDetailPage() {
       await api(`/video-assets/${id}/crops`, {
         method: 'POST',
         body: {
-          timestampMs: Number(cropTimestampMs),
+          timestampMs: parsedTimestamp.value,
           x: Number(cropX),
           y: Number(cropY),
           width: Number(cropWidth),
@@ -551,7 +610,14 @@ export function VideoAssetDetailPage() {
     data?.status === 'FAILED';
 
   return (
-    <Page title="Test video" error={asset.error} loading={asset.loading}>
+    <Page
+      title="Test video"
+      error={asset.error}
+      // Loading gates only the FIRST load: a background refetch (e.g.
+      // after saving ground truth) must not unmount the children — that
+      // would wipe transient UI state like the save-success notice.
+      loading={asset.loading && !asset.data}
+    >
       {data ? (
         <div className="detail">
           {actionError ? <div className="error">{actionError}</div> : null}
@@ -681,6 +747,24 @@ export function VideoAssetDetailPage() {
               Delete asset
             </button>
           </div>
+          {canProcess ? (
+            <>
+              <PickupDetectionPanel
+                assetId={data.id}
+                durationMs={data.durationMs}
+                onGroundTruthSaved={() => {
+                  // Refresh the asset AND the shadow comparison in place —
+                  // no page reload (the server recomputes verdicts on read).
+                  setGroundTruthTick((n) => n + 1);
+                  setReload((n) => n + 1);
+                }}
+              />
+              <FusionEvidencePanel
+                assetId={data.id}
+                refreshKey={groundTruthTick}
+              />
+            </>
+          ) : null}
           {canProcess ? (
             <form className="toolbar" onSubmit={(e) => void extractFrames(e)}>
               <input
