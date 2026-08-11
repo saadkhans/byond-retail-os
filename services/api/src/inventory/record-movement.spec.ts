@@ -170,4 +170,62 @@ describe('InventoryRepository.recordExternalMovement tenant scoping', () => {
       },
     });
   });
+
+  it('replays ONLY an identical request — a reused reference with different fields is a conflict', async () => {
+    const stored = {
+      id: 'mv-1',
+      locationId: 'store-1',
+      productId: 'prod-1',
+      movementType: 'RECEIPT',
+      quantityDelta: 5,
+      reason: 'delivery',
+    };
+    const buildRepository = () => {
+      const tx = {
+        $queryRaw: jest.fn(async (..._args: unknown[]) => []),
+        inventoryMovement: { findFirst: jest.fn(async () => stored) },
+        inventoryLevel: { findFirst: jest.fn(async () => ({ quantity: 5 })) },
+      };
+      const prisma = {
+        $transaction: jest.fn(
+          async (fn: (t: unknown) => Promise<unknown>) => fn(tx),
+        ),
+      };
+      return new InventoryRepository(
+        prisma as never,
+        { record: jest.fn(async () => undefined) } as never,
+      );
+    };
+    const identical = {
+      locationId: 'store-1',
+      productId: 'prod-1',
+      movementType: 'RECEIPT' as never,
+      quantityDelta: 5,
+      reason: 'delivery',
+      reference: 'REF-1',
+    };
+    // Same request-defining fields → the recorded movement replays.
+    const replay = await buildRepository().recordExternalMovement(
+      TENANT,
+      identical,
+      () => ({}) as never,
+    );
+    expect((replay as { replayed: boolean }).replayed).toBe(true);
+    // ANY differing field → 'reference-mismatch', never a silent success.
+    for (const mutation of [
+      { quantityDelta: 6 },
+      { productId: 'prod-OTHER' },
+      { locationId: 'store-OTHER' },
+      { movementType: 'CORRECTION_IN' as never },
+      { reason: 'different reason' },
+    ]) {
+      await expect(
+        buildRepository().recordExternalMovement(
+          TENANT,
+          { ...identical, ...mutation },
+          () => ({}) as never,
+        ),
+      ).resolves.toBe('reference-mismatch');
+    }
+  });
 });

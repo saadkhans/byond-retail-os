@@ -12,6 +12,7 @@ import {
 } from '../auth/decorators/request-context.decorators';
 import { RequestContext } from '../auth/request-context';
 import { PlatformModulesModule } from '../platform-modules/platform-modules.module';
+import { FromFusionRunDto } from './dto/from-fusion-run.dto';
 import { JourneyService } from './journey.service';
 
 /**
@@ -87,7 +88,7 @@ export class JourneyController {
   fromFusionRun(
     @CurrentTenantId() tenantId: string,
     @Param('id') id: string,
-    @Body() body: { videoAssetId: string },
+    @Body() body: FromFusionRunDto,
     @CurrentUser() actor: RequestContext,
   ) {
     return this.journeys.appendFromFusionRun(

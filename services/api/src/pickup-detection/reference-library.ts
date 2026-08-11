@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { ProductStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { LocalVideoStorageAdapter } from '../video-ingest/storage/local-video-storage.adapter';
 import { PickupAnalysisFrameDecoder } from './analysis/analysis-frames';
@@ -45,8 +46,12 @@ export class PickupReferenceLibrary {
   ) {}
 
   async load(tenantId: string): Promise<ReferenceLibraryLoad> {
+    // ACTIVE products only — the same rule bulk import enforces on entry.
+    // A DRAFT/DISCONTINUED/ARCHIVED product keeps its stored images, but
+    // they must not stay inference-ready: matching one would create a
+    // reviewable pickup event for a product that left the catalog.
     const rows = await this.prisma.productReferenceImage.findMany({
-      where: { tenantId },
+      where: { tenantId, product: { status: ProductStatus.ACTIVE } },
       select: {
         checksumSha256: true,
         storageKey: true,
@@ -119,7 +124,8 @@ export class PickupReferenceLibrary {
   ): Promise<string[]> {
     const grouped = await this.prisma.productReferenceImage.groupBy({
       by: ['productId'],
-      where: { tenantId },
+      // Same ACTIVE-only rule as load(): retired products never match.
+      where: { tenantId, product: { status: ProductStatus.ACTIVE } },
       _count: { _all: true },
     });
     let ready = grouped

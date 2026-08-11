@@ -108,6 +108,13 @@ export class InventoryService {
           'Adjustment rejected: it would take on-hand stock above the ' +
             'maximum supported quantity',
         );
+      // Unreachable through manual adjustments (only reference-keyed
+      // external movements replay); mapped defensively to a controlled 409.
+      case 'reference-mismatch':
+        throw new ConflictException(
+          'Adjustment rejected: idempotency reference reused for a ' +
+            'different movement',
+        );
       default:
         return result;
     }
@@ -185,6 +192,12 @@ export class InventoryService {
         case 'quantity-overflow':
           throw new ConflictException(
             'Movement rejected: it would exceed the maximum quantity',
+          );
+        case 'reference-mismatch':
+          throw new ConflictException(
+            'Movement rejected: this reference was already used for a ' +
+              'different movement — reuse a reference only to retry the ' +
+              'identical request',
           );
         default:
           throw new ConflictException(`Movement rejected: ${result}`);

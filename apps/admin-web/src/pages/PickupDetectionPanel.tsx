@@ -285,14 +285,21 @@ export function PickupDetectionPanel({
     [],
   );
 
-  async function run() {
+  async function run(options: { force?: boolean } = {}) {
     setBusy(true);
     setActionError(null);
     try {
-      await api(`/video-assets/${assetId}/pickup-detection/run`, {
-        method: 'POST',
-        body: {},
-      });
+      // force only on the explicit "Re-run detection" action — the plain
+      // run stays idempotent (a retry replays the successful attempt).
+      await api(
+        `/video-assets/${assetId}/pickup-detection/run${
+          options.force ? '?force=true' : ''
+        }`,
+        {
+          method: 'POST',
+          body: {},
+        },
+      );
       setTick((n) => n + 1);
     } catch (err) {
       setActionError(err instanceof ApiError ? err.message : 'Unexpected error');
@@ -373,7 +380,10 @@ export function PickupDetectionPanel({
           {jobInFlight(job.status) ? (
             <span className="muted">analyzing…</span>
           ) : null}
-          <button disabled={busy || jobInFlight(job.status)} onClick={() => void run()}>
+          <button
+            disabled={busy || jobInFlight(job.status)}
+            onClick={() => void run({ force: true })}
+          >
             Re-run detection
           </button>
         </div>

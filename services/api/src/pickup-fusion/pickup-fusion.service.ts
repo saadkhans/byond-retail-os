@@ -279,6 +279,8 @@ export interface FusionEvidence {
     reasonCodes: string[];
     contradictions: string[];
     requiresHumanReview: boolean | null;
+    /** Which reference image each candidate was shown (deterministic). */
+    references?: { sku: string; referenceImageId: string | null }[];
     modelKey: string | null;
     latencyMs: number | null;
     /** Safe short failure detail (HTTP status, parse error class). */
@@ -331,9 +333,27 @@ export class PickupFusionService {
       const value = Number(config.get<string>(key));
       return Number.isFinite(value) ? value : fallback;
     };
-    this.autoThreshold = num('PICKUP_FUSION_AUTO_THRESHOLD', 0.42);
-    this.vlmLowBand = num('PICKUP_FUSION_VLM_LOW', 0.22);
-    this.marginThreshold = num('PICKUP_FUSION_MARGIN', 0.08);
+    // Policy thresholds are BOUNDED at startup: a typo like
+    // AUTO_THRESHOLD=-1 or a negative margin would let negligible
+    // candidates auto-propose, silently bypassing the uncertainty band.
+    // Fail boot loudly instead of running with an unsafe policy.
+    const bounded = (key: string, fallback: number, min: number, max: number) => {
+      const value = num(key, fallback);
+      if (value < min || value > max) {
+        throw new Error(
+          `${key}=${value} is outside its safe range [${min}, ${max}]`,
+        );
+      }
+      return value;
+    };
+    this.autoThreshold = bounded('PICKUP_FUSION_AUTO_THRESHOLD', 0.42, 0.05, 1);
+    this.vlmLowBand = bounded('PICKUP_FUSION_VLM_LOW', 0.22, 0, 1);
+    this.marginThreshold = bounded('PICKUP_FUSION_MARGIN', 0.08, 0, 1);
+    if (this.vlmLowBand > this.autoThreshold) {
+      throw new Error(
+        'PICKUP_FUSION_VLM_LOW must not exceed PICKUP_FUSION_AUTO_THRESHOLD',
+      );
+    }
     this.vlmEnabled =
       (config.get<string>('PICKUP_VLM_ENABLED') ?? '').trim().toLowerCase() ===
       'true';
@@ -855,7 +875,7 @@ export class PickupFusionService {
           return;
         }
         const verdict = await timed('vlm', this.vlm, () =>
-          this.buildAndVerify(tenantId, evidence, crops, fused.slice(0, 3)),
+          this.buildAndVerify(tenantId, evidence, crops, bestPre, fused.slice(0, 3)),
         );
         applyVerdictToPolicy(verdict, 'routed to review');
       };
@@ -879,6 +899,30 @@ export class PickupFusionService {
       } else {
         await invokeVlm(decision.reason);
       }
+      // Inventory VALIDATES what CV proposes — as a policy gate, not
+      // display-only evidence. Whatever path produced AUTO_PROPOSE (score
+      // band or VLM confirmation), a top candidate the store does not
+      // stock — or has at zero on hand — demotes to human review.
+      const finalSku = evidence.policy.result === FusionPolicyResult.AUTO_PROPOSE
+        ? (evidence.vlm.verdict === 'MATCH' && evidence.vlm.selectedSku
+            ? evidence.vlm.selectedSku
+            : top?.sku ?? null)
+        : null;
+      if (finalSku) {
+        const validation = inventoryValidations.find(
+          (row) => row.sku === finalSku,
+        );
+        if (
+          validation &&
+          (validation.verdict === 'NOT_STOCKED' ||
+            validation.verdict === 'OUT_OF_STOCK')
+        ) {
+          evidence.policy = {
+            result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
+            reason: `inventory validation rejected ${finalSku} (${validation.verdict}) — review`,
+          };
+        }
+      }
       return this.persist(tenantId, videoAssetId, evidence, startedAt);
     } catch (error) {
       this.logger.error(
@@ -896,16 +940,27 @@ export class PickupFusionService {
     tenantId: string,
     evidence: FusionEvidence,
     crops: QualifiedCrop[],
+    bestPre: QualifiedCrop,
     top3: FusedCandidate[],
   ): Promise<VlmVerdict> {
     // One reference image per candidate, decoded from managed storage.
+    // DETERMINISTIC selection: oldest row (createdAt, then id) per
+    // product, and the chosen image id is recorded on the evidence —
+    // re-running against unchanged data must show the model the same
+    // reference photo.
     const references = await this.prisma.productReferenceImage.findMany({
       where: { tenantId, productId: { in: top3.map((candidate) => candidate.productId) } },
-      select: { productId: true, storageKey: true },
+      select: { id: true, productId: true, storageKey: true },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     });
     const referenceImages = new Map<string, RgbImage[]>();
+    evidence.vlm.references = [];
     for (const candidate of top3) {
       const row = references.find((reference) => reference.productId === candidate.productId);
+      evidence.vlm.references.push({
+        sku: candidate.sku,
+        referenceImageId: row?.id ?? null,
+      });
       if (!row) {
         referenceImages.set(candidate.productId, []);
         continue;
@@ -922,9 +977,11 @@ export class PickupFusionService {
     }
     return this.vlm.verify(
       {
-        frames: crops
-          .filter((crop) => crop.phase !== 'pre' || crop === crops.find((c) => c.phase === 'pre'))
-          .map((crop) => ({ phase: crop.phase, image: crop.image })),
+        // The SELECTED best pre-event crop (sharpest, least occluded) —
+        // the same evidence OCR and retrieval ran on — plus peak/post.
+        frames: [bestPre, ...crops.filter((crop) => crop.phase !== 'pre')].map(
+          (crop) => ({ phase: crop.phase, image: crop.image }),
+        ),
         crops,
         candidates: top3.map((candidate) => ({
           sku: candidate.sku,

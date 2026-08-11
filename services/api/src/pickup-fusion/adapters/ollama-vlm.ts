@@ -13,6 +13,26 @@ export type OllamaReadinessClass =
   | 'MODEL_NOT_FOUND'
   | 'PROVIDER_UNREACHABLE';
 
+/** True only for http(s) URLs whose host is a loopback address. */
+export function isLoopbackHttpUrl(value: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    return false;
+  }
+  const host = url.hostname.toLowerCase();
+  return (
+    host === 'localhost' ||
+    host === '::1' ||
+    host === '[::1]' ||
+    /^127(\.\d{1,3}){3}$/.test(host)
+  );
+}
+
 export interface OllamaReadiness {
   serverReachable: boolean;
   modelAvailable: boolean;
@@ -50,6 +70,7 @@ export class OllamaVlmVerifier implements VlmVerifier {
 
   private readonly logger = new Logger(OllamaVlmVerifier.name);
   private readonly baseUrl: string;
+  private readonly baseUrlLoopback: boolean;
   private readonly model: string;
   private readonly numCtx: number;
   private readonly legacyCompat: boolean;
@@ -59,6 +80,11 @@ export class OllamaVlmVerifier implements VlmVerifier {
     this.baseUrl = (
       config.get<string>('PICKUP_VLM_BASE_URL') ?? 'http://127.0.0.1:11434'
     ).replace(/\/+$/, '');
+    // MEDIA BOUNDARY: the local verifier may ONLY talk to this machine.
+    // A non-loopback base URL would ship event frames and reference
+    // images to a remote host — refuse it outright (and `redirect:
+    // 'error'` on every fetch so a redirect cannot escape either).
+    this.baseUrlLoopback = isLoopbackHttpUrl(this.baseUrl);
     this.model = config.get<string>('PICKUP_VLM_MODEL') ?? '';
     // Local-dev ONLY: map the retired {choice, confidence} shape onto the
     // strict schema (always review-flagged). Default off — rejected.
@@ -82,11 +108,15 @@ export class OllamaVlmVerifier implements VlmVerifier {
       classification: 'PROVIDER_UNREACHABLE',
       lastInference: this.lastInference,
     };
+    if (!this.baseUrlLoopback) {
+      return notReachable;
+    }
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 3000);
       const response = await fetch(`${this.baseUrl}/api/tags`, {
         signal: controller.signal,
+        redirect: 'error',
       });
       clearTimeout(timer);
       if (!response.ok) {
@@ -134,12 +164,15 @@ export class OllamaVlmVerifier implements VlmVerifier {
         latencyMs: verdict.latencyMs,
         at: new Date().toISOString(),
       };
-      // Safe fields only — endpoint/model/latency/HTTP status/error class.
+      // Safe fields only — endpoint/model/latency/HTTP status/classified
+      // error code. NEVER verdict.errorDetail: it can carry provider
+      // response previews or parser messages derived from model output
+      // (which may echo OCR/frame content), and that text must not reach
+      // durable server logs. The detail stays on the verdict/evidence row.
       this.logger.log(
         `vlm-verify endpoint=${endpoint} model=${this.model || '(unset)'} ` +
           `status=${verdict.status} http=${httpStatus ?? '-'} ` +
-          `latencyMs=${verdict.latencyMs ?? '-'} timeoutMs=${timeoutMs} ` +
-          `detail=${verdict.errorDetail ?? '-'}`,
+          `latencyMs=${verdict.latencyMs ?? '-'} timeoutMs=${timeoutMs}`,
       );
       return verdict;
     };
@@ -161,6 +194,14 @@ export class OllamaVlmVerifier implements VlmVerifier {
         httpStatus,
       );
 
+    if (!this.baseUrlLoopback) {
+      return fail(
+        'PROVIDER_UNREACHABLE',
+        'PICKUP_VLM_BASE_URL must be a loopback http(s) URL ' +
+          '(e.g. http://127.0.0.1:11434) — event frames and reference ' +
+          'images never leave this machine in local mode',
+      );
+    }
     const readiness = await this.readiness();
     if (!readiness.serverReachable) {
       return fail(
@@ -189,6 +230,7 @@ export class OllamaVlmVerifier implements VlmVerifier {
       const response = await fetch(endpoint, {
         method: 'POST',
         signal: controller.signal,
+        redirect: 'error',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           model: this.model,

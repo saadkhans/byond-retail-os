@@ -148,11 +148,26 @@ export class ReferenceImportService {
         rejected.push({ path, reason: 'INVALID_FORMAT' });
         continue;
       }
+      // Judge the DECLARED uncompressed size BEFORE inflating anything: a
+      // highly compressed entry (ZIP bomb) would otherwise be allocated
+      // and inflated in full before the per-image or aggregate limits
+      // ever ran, exhausting API memory inside one request.
+      const declaredBytes = entry.header.size;
+      if (declaredBytes > MAX_IMAGE_BYTES) {
+        rejected.push({ path, reason: 'TOO_LARGE' });
+        continue;
+      }
+      if (totalBytes + declaredBytes > MAX_TOTAL_UNCOMPRESSED_BYTES) {
+        throw new BadRequestException(
+          'The ZIP archive exceeds the total uncompressed size limit',
+        );
+      }
       const data = entry.getData();
       if (data.length === 0) {
         rejected.push({ path, reason: 'EMPTY_FILE' });
         continue;
       }
+      // Re-verify the ACTUAL inflated size — headers can lie.
       if (data.length > MAX_IMAGE_BYTES) {
         rejected.push({ path, reason: 'TOO_LARGE' });
         continue;
@@ -325,10 +340,18 @@ export class ReferenceImportService {
           entry.productId,
           (acceptedByProduct.get(entry.productId) ?? 0) + 1,
         );
-      } catch {
-        // The single-upload gate refused it (undecodable bytes behind a
-        // valid extension) — recorded per file, never fails the batch.
-        rejections.push({ path: entry.path, reason: 'UNDECODABLE' });
+      } catch (error) {
+        // ONLY the single-upload gate's own per-file refusal (undecodable
+        // bytes, or the payment-data pixel screen) becomes a per-file
+        // rejection. Operational failures — storage writes, database
+        // outages, screening tooling unavailable — PROPAGATE and fail the
+        // batch: a report that mislabels an infrastructure failure as bad
+        // image files sends operators off to discard valid inputs.
+        if (error instanceof BadRequestException) {
+          rejections.push({ path: entry.path, reason: 'UNDECODABLE' });
+        } else {
+          throw error;
+        }
       }
     }
     const perProduct: ImportReport['perProduct'] = [];

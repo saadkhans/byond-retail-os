@@ -235,6 +235,24 @@ describe('OllamaVlmVerifier', () => {
     expect(fencedInvalid.status).toBe('INVALID_SKU');
   });
 
+  it('media boundary: a non-loopback base URL is refused before any image byte is sent', async () => {
+    const remote = {
+      get: (key: string) =>
+        key === 'PICKUP_VLM_BASE_URL'
+          ? 'http://vlm.example.com:11434'
+          : key === 'PICKUP_VLM_MODEL'
+            ? 'test-vision:7b'
+            : undefined,
+    } as unknown as ConfigService;
+    const verifier = new OllamaVlmVerifier(remote);
+    const readiness = await verifier.readiness();
+    expect(readiness.serverReachable).toBe(false);
+    expect(readiness.classification).toBe('PROVIDER_UNREACHABLE');
+    const verdict = await verifier.verify(EVIDENCE, 5000);
+    expect(verdict.status).toBe('PROVIDER_UNREACHABLE');
+    expect(verdict.errorDetail).toContain('loopback');
+  });
+
   it('verify: unreachable server → PROVIDER_UNREACHABLE; missing model → MODEL_NOT_FOUND', async () => {
     const unreachable = new OllamaVlmVerifier(configFor(null));
     const verdictUnreachable = await unreachable.verify(EVIDENCE, 5000);

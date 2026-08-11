@@ -3,8 +3,12 @@ import {
   BadRequestException,
   Injectable,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { containsSensitiveFreeText } from '../video-ingest/media-safety';
+import { FrameTextRecognizerPort } from '../video-ingest/recognition/frame-text-recognizer.port';
 import { LocalVideoStorageAdapter } from '../video-ingest/storage/local-video-storage.adapter';
 import {
   EMBEDDING_MODEL_KEY,
@@ -90,7 +94,45 @@ export class ReferenceImagesService {
     private readonly prisma: PrismaService,
     private readonly storage: LocalVideoStorageAdapter,
     private readonly decoder: PickupAnalysisFrameDecoder,
+    private readonly recognizer: FrameTextRecognizerPort,
   ) {}
+
+  /**
+   * The SAME payment-data pixel screen the video-ingest pipeline applies
+   * to every frame, applied to a reference image BEFORE any byte becomes
+   * durable (AGENTS.md payments invariant). Fail-closed in every
+   * direction: a recognizer that does not read real pixels, cannot run,
+   * or cannot process the image never yields a pass.
+   */
+  private async screenReferencePixels(buffer: Buffer): Promise<void> {
+    if (
+      !this.recognizer.readsRealPixels ||
+      !(await this.recognizer.checkToolingReady())
+    ) {
+      throw new ServiceUnavailableException(
+        'Reference uploads are refused: payment-data pixel screening ' +
+          'cannot run because the configured frame-text recognizer does ' +
+          'not read the real image — configure VIDEO_OCR_ENABLED=true ' +
+          '(reference images are never stored unscreened)',
+      );
+    }
+    let text: string;
+    try {
+      text = await this.recognizer.recognize(buffer);
+    } catch {
+      // Unreadable image = incomplete screen = refusal, never a pass.
+      throw new BadRequestException(
+        'The image could not be screened for payment data — upload ' +
+          'refused (nothing was stored); PNG or JPEG screens most reliably',
+      );
+    }
+    if (containsSensitiveFreeText(text)) {
+      throw new BadRequestException(
+        'The image appears to contain payment or credential data and ' +
+          'was refused (nothing was stored)',
+      );
+    }
+  }
 
   private async requireProduct(tenantId: string, productId: string) {
     const product = await this.prisma.product.findFirst({
@@ -136,6 +178,8 @@ export class ReferenceImagesService {
       // Same bytes for the same product — idempotent, not an error.
       return duplicate;
     }
+    // Payment-data pixel screen BEFORE the bytes touch storage.
+    await this.screenReferencePixels(file.buffer);
     const extension =
       file.mimetype === 'image/png'
         ? 'png'
@@ -157,19 +201,40 @@ export class ReferenceImagesService {
         'The uploaded file could not be decoded as an image',
       );
     }
-    return this.prisma.productReferenceImage.create({
-      data: {
-        tenantId,
-        productId: product.id,
-        originalFilename: sanitizeFilename(file.originalname),
-        mimeType: file.mimetype,
-        sizeBytes: file.buffer.length,
-        checksumSha256,
-        storageKey,
-        createdById: actorId ?? null,
-      },
-      select: REFERENCE_SELECT,
-    });
+    try {
+      return await this.prisma.productReferenceImage.create({
+        data: {
+          tenantId,
+          productId: product.id,
+          originalFilename: sanitizeFilename(file.originalname),
+          mimeType: file.mimetype,
+          sizeBytes: file.buffer.length,
+          checksumSha256,
+          storageKey,
+          createdById: actorId ?? null,
+        },
+        select: REFERENCE_SELECT,
+      });
+    } catch (error) {
+      // Two byte-identical uploads racing past the preliminary duplicate
+      // query both write files, then collide on the unique constraint.
+      // The loser must clean up its orphaned bytes and REPLAY the winning
+      // row — the caller asked for exactly what now exists.
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        await this.storage.delete(storageKey).catch(() => undefined);
+        const winner = await this.prisma.productReferenceImage.findFirst({
+          where: { tenantId, productId, checksumSha256 },
+          select: REFERENCE_SELECT,
+        });
+        if (winner) {
+          return winner;
+        }
+      }
+      throw error;
+    }
   }
 
   async status(

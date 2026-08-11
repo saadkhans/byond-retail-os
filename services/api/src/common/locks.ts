@@ -213,6 +213,23 @@ export function videoAssetAdvisoryLockKey(
 }
 
 /**
+ * Serializes a customer journey's event appends against its EXIT
+ * reconciliation within a tenant. Both paths decide from a read-then-write
+ * of the journey's OPEN status: without the lock, an append that passed the
+ * open check can commit AFTER exit folded the basket and marked the journey
+ * RECONCILED, leaving a "clean" closed journey with an unaccounted event.
+ * Every JourneyService mutation (appendEvent, appendFromFusionRun via
+ * appendEvent, exit) MUST take this lock inside its transaction before the
+ * open-state check.
+ */
+export function journeyAdvisoryLockKey(
+  tenantId: string,
+  journeyId: string,
+): string {
+  return `journey:${tenantId}:${journeyId}`;
+}
+
+/**
  * Serializes provider-event ingestion per (tenant, provider, providerEventId):
  * the ingest path decides from a read-then-write ("have I seen this event?"),
  * so two concurrent deliveries of the SAME provider event must not both insert

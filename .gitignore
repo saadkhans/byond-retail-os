@@ -171,3 +171,6 @@ storage/**/*.[aA][vV][iI][fF]
 
 # Browser-automation artifacts (Playwright MCP snapshots/screenshots)
 .playwright-mcp/
+# Screenshots dropped at the repo root by browser-automation sessions; real
+# image assets always live under an app/service directory, never the root.
+/*.png

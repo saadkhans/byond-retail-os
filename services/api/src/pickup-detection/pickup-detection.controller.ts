@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, Put } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Put, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import {
   RequireModule,
@@ -58,13 +58,22 @@ export class PickupDetectionController {
     summary:
       'Run (or re-run after a failure) pickup detection for a VALIDATED ' +
       'asset. Idempotent: an in-flight attempt is returned, a SUCCEEDED ' +
-      'attempt is never silently repeated.',
+      'attempt is never silently repeated. Pass ?force=true to explicitly ' +
+      'request a fresh attempt over a SUCCEEDED one (e.g. after the ' +
+      'reference library changed).',
   })
   run(
     @CurrentTenantId() tenantId: string,
     @Param('id') id: string,
+    @Query('force') force?: string,
   ): Promise<PickupDetectionState> {
-    return this.detection.detectForAsset(tenantId, id, { force: true });
+    // Idempotent by default: the service replays a SUCCEEDED attempt and
+    // retries a FAILED/CANCELLED one, so an ordinary browser retry can
+    // never mint a duplicate attempt/VisionEvent. A rerun over success is
+    // an EXPLICIT operator request via ?force=true — never implicit.
+    return this.detection.detectForAsset(tenantId, id, {
+      force: force === 'true',
+    });
   }
 
   @Get(':id/ground-truth')

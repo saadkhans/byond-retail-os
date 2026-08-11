@@ -8,7 +8,9 @@ import {
   CustomerJourneyEventType,
   CustomerJourneyStatus,
   FusionPolicyResult,
+  Prisma,
 } from '@prisma/client';
+import { journeyAdvisoryLockKey } from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
 
 /**
@@ -151,6 +153,20 @@ export class JourneyService {
     if (!location) {
       throw new NotFoundException('Store not found in this tenant');
     }
+    if (input.unitId) {
+      // TENANT ISOLATION at the data-access boundary: the schema's unit
+      // relation is keyed by id alone, so the unit must be resolved
+      // within BOTH this tenant and this location before it is written —
+      // otherwise a known foreign unit id links a journey across tenants
+      // (or across stores of the same tenant).
+      const unit = await this.prisma.retailUnit.findFirst({
+        where: { tenantId, id: input.unitId, locationId: input.locationId },
+        select: { id: true },
+      });
+      if (!unit) {
+        throw new NotFoundException('Unit not found in this store');
+      }
+    }
     const journey = await this.prisma.customerJourney.create({
       data: {
         tenantId,
@@ -171,17 +187,37 @@ export class JourneyService {
     return this.detail(tenantId, journey.id);
   }
 
-  private async requireOpen(tenantId: string, journeyId: string) {
-    const journey = await this.prisma.customerJourney.findFirst({
-      where: { tenantId, id: journeyId },
+  /**
+   * Serialize every journey mutation behind the per-journey advisory lock
+   * and re-check OPEN inside the SAME transaction as the write. Without
+   * this, an append that passed the open check could commit after exit()
+   * folded the basket and marked the journey RECONCILED — a closed
+   * journey with an unaccounted event but a clean status.
+   */
+  private async withOpenJourney<T>(
+    tenantId: string,
+    journeyId: string,
+    work: (
+      tx: Prisma.TransactionClient,
+      journey: { id: string; locationId: string; unitId: string | null },
+    ) => Promise<T>,
+  ): Promise<T> {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${journeyAdvisoryLockKey(
+        tenantId,
+        journeyId,
+      )}))::text`;
+      const journey = await tx.customerJourney.findFirst({
+        where: { tenantId, id: journeyId },
+      });
+      if (!journey) {
+        throw new NotFoundException('Journey not found');
+      }
+      if (journey.status !== CustomerJourneyStatus.OPEN) {
+        throw new ConflictException('Journey is no longer open');
+      }
+      return work(tx, journey);
     });
-    if (!journey) {
-      throw new NotFoundException('Journey not found');
-    }
-    if (journey.status !== CustomerJourneyStatus.OPEN) {
-      throw new ConflictException('Journey is no longer open');
-    }
-    return journey;
   }
 
   async appendEvent(
@@ -200,7 +236,6 @@ export class JourneyService {
     },
     actorId?: string,
   ) {
-    await this.requireOpen(tenantId, journeyId);
     if (input.eventType === CustomerJourneyEventType.ENTRY) {
       throw new BadRequestException('ENTRY is recorded when the journey opens');
     }
@@ -211,42 +246,57 @@ export class JourneyService {
     if (!Number.isInteger(quantity) || quantity < 1 || quantity > 100) {
       throw new BadRequestException('quantity must be a whole number 1..100');
     }
-    let snapshot: { sku: string; name: string } | null = null;
-    if (input.productId) {
-      const product = await this.prisma.product.findFirst({
-        where: { tenantId, id: input.productId },
-        select: { sku: true, name: true },
-      });
-      if (!product) {
-        throw new BadRequestException('Product not found in this tenant');
+    await this.withOpenJourney(tenantId, journeyId, async (tx) => {
+      // IDEMPOTENT fusion imports: one fusion run may appear at most once
+      // per journey. Checked under the journey lock, in the same
+      // transaction as the insert, so a browser retry replays instead of
+      // doubling the provisional basket.
+      if (input.fusionRunId) {
+        const existing = await tx.customerJourneyEvent.findFirst({
+          where: { tenantId, journeyId, fusionRunId: input.fusionRunId },
+          select: { id: true },
+        });
+        if (existing) {
+          return;
+        }
       }
-      snapshot = { sku: product.sku, name: product.name };
-    } else if (
-      input.eventType === CustomerJourneyEventType.PRODUCT_PICKUP ||
-      input.eventType === CustomerJourneyEventType.PRODUCT_RETURN
-    ) {
-      throw new BadRequestException(
-        'PRODUCT_PICKUP/PRODUCT_RETURN need a product — record ' +
-          'REVIEW_REQUIRED for unidentified observations',
-      );
-    }
-    await this.prisma.customerJourneyEvent.create({
-      data: {
-        tenantId,
-        journeyId,
-        eventType: input.eventType,
-        occurredAt: input.occurredAt ? new Date(input.occurredAt) : new Date(),
-        productId: input.productId ?? null,
-        sku: snapshot?.sku ?? null,
-        productName: snapshot?.name ?? null,
-        quantity,
-        matchScore: input.matchScore ?? null,
-        sourceType: input.sourceType ?? 'MANUAL',
-        videoAssetId: input.videoAssetId ?? null,
-        fusionRunId: input.fusionRunId ?? null,
-        note: input.note?.slice(0, 500) ?? null,
-        createdById: actorId ?? null,
-      },
+      let snapshot: { sku: string; name: string } | null = null;
+      if (input.productId) {
+        const product = await tx.product.findFirst({
+          where: { tenantId, id: input.productId },
+          select: { sku: true, name: true },
+        });
+        if (!product) {
+          throw new BadRequestException('Product not found in this tenant');
+        }
+        snapshot = { sku: product.sku, name: product.name };
+      } else if (
+        input.eventType === CustomerJourneyEventType.PRODUCT_PICKUP ||
+        input.eventType === CustomerJourneyEventType.PRODUCT_RETURN
+      ) {
+        throw new BadRequestException(
+          'PRODUCT_PICKUP/PRODUCT_RETURN need a product — record ' +
+            'REVIEW_REQUIRED for unidentified observations',
+        );
+      }
+      await tx.customerJourneyEvent.create({
+        data: {
+          tenantId,
+          journeyId,
+          eventType: input.eventType,
+          occurredAt: input.occurredAt ? new Date(input.occurredAt) : new Date(),
+          productId: input.productId ?? null,
+          sku: snapshot?.sku ?? null,
+          productName: snapshot?.name ?? null,
+          quantity,
+          matchScore: input.matchScore ?? null,
+          sourceType: input.sourceType ?? 'MANUAL',
+          videoAssetId: input.videoAssetId ?? null,
+          fusionRunId: input.fusionRunId ?? null,
+          note: input.note?.slice(0, 500) ?? null,
+          createdById: actorId ?? null,
+        },
+      });
     });
     return this.detail(tenantId, journeyId);
   }
@@ -264,7 +314,35 @@ export class JourneyService {
     videoAssetId: string,
     actorId?: string,
   ) {
-    await this.requireOpen(tenantId, journeyId);
+    const journey = await this.prisma.customerJourney.findFirst({
+      where: { tenantId, id: journeyId },
+      select: { locationId: true, unitId: true },
+    });
+    if (!journey) {
+      throw new NotFoundException('Journey not found');
+    }
+    // STORE-CONTEXT MATCH: an observation captured in one store must not
+    // land in a journey opened in another. The asset must exist in this
+    // tenant AND carry the journey's location (and, when both sides pin a
+    // unit, the same unit). locationId/unitId are immutable after journey
+    // creation, so this pre-append check cannot go stale.
+    const asset = await this.prisma.videoAsset.findFirst({
+      where: { tenantId, id: videoAssetId, deletedAt: null },
+      select: { locationId: true, unitId: true },
+    });
+    if (!asset) {
+      throw new NotFoundException('Video asset not found in this tenant');
+    }
+    if (asset.locationId === null || asset.locationId !== journey.locationId) {
+      throw new ConflictException(
+        "the video's store context does not match this journey's store",
+      );
+    }
+    if (journey.unitId && asset.unitId && asset.unitId !== journey.unitId) {
+      throw new ConflictException(
+        "the video's unit does not match this journey's unit",
+      );
+    }
     const run = await this.prisma.pickupFusionRun.findFirst({
       where: { tenantId, videoAssetId },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
@@ -313,27 +391,36 @@ export class JourneyService {
   }
 
   /** EXIT + reconciliation: fold the basket, surface unresolved issues,
-   *  and settle the journey status — RECONCILED only when clean. */
+   *  and settle the journey status — RECONCILED only when clean. Runs
+   *  entirely under the per-journey lock so no append can land between
+   *  the fold and the status transition. */
   async exit(tenantId: string, journeyId: string, actorId?: string) {
-    await this.requireOpen(tenantId, journeyId);
-    await this.prisma.customerJourneyEvent.create({
-      data: {
-        tenantId,
-        journeyId,
-        eventType: CustomerJourneyEventType.EXIT,
-        occurredAt: new Date(),
-        sourceType: 'MANUAL',
-        createdById: actorId ?? null,
-      },
-    });
-    const detail = await this.detail(tenantId, journeyId);
-    const status =
-      detail.issues.length > 0
-        ? CustomerJourneyStatus.REVIEW_REQUIRED
-        : CustomerJourneyStatus.RECONCILED;
-    await this.prisma.customerJourney.update({
-      where: { id: journeyId },
-      data: { status, endedAt: new Date() },
+    await this.withOpenJourney(tenantId, journeyId, async (tx) => {
+      await tx.customerJourneyEvent.create({
+        data: {
+          tenantId,
+          journeyId,
+          eventType: CustomerJourneyEventType.EXIT,
+          occurredAt: new Date(),
+          sourceType: 'MANUAL',
+          createdById: actorId ?? null,
+        },
+      });
+      const events = await tx.customerJourneyEvent.findMany({
+        where: { tenantId, journeyId },
+        orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
+      });
+      const { issues } = foldBasket(events);
+      await tx.customerJourney.update({
+        where: { id: journeyId },
+        data: {
+          status:
+            issues.length > 0
+              ? CustomerJourneyStatus.REVIEW_REQUIRED
+              : CustomerJourneyStatus.RECONCILED,
+          endedAt: new Date(),
+        },
+      });
     });
     return this.detail(tenantId, journeyId);
   }

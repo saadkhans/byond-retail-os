@@ -1,4 +1,8 @@
-import { BadRequestException, ConflictException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  NotFoundException,
+} from '@nestjs/common';
 import {
   CustomerJourneyEventType,
   CustomerJourneyStatus,
@@ -75,6 +79,9 @@ describe('foldBasket (provisional basket = pure fold over events)', () => {
 function buildService(overrides: {
   journeyStatus?: CustomerJourneyStatus;
   fusionRun?: Record<string, unknown> | null;
+  /** The fusion-import video asset's store context (null = asset absent). */
+  asset?: { locationId: string | null; unitId: string | null } | null;
+  unit?: { id: string } | null;
 } = {}) {
   const createdEvents: Record<string, unknown>[] = [];
   const journeyRow = {
@@ -85,12 +92,25 @@ function buildService(overrides: {
     status: overrides.journeyStatus ?? CustomerJourneyStatus.OPEN,
     startedAt: new Date(),
     endedAt: null,
-    events: [] as unknown[],
+    events: [] as Record<string, unknown>[],
   };
-  const prisma = {
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  const prisma: any = {
     location: { findFirst: jest.fn(async () => ({ id: 'store-1' })) },
+    retailUnit: {
+      findFirst: jest.fn(async () =>
+        overrides.unit === undefined ? { id: 'unit-1' } : overrides.unit,
+      ),
+    },
     product: {
       findFirst: jest.fn(async () => ({ sku: 'SKU-A', name: 'Product A' })),
+    },
+    videoAsset: {
+      findFirst: jest.fn(async () =>
+        overrides.asset === undefined
+          ? { locationId: 'store-1', unitId: null }
+          : overrides.asset,
+      ),
     },
     customerJourney: {
       create: jest.fn(async () => journeyRow),
@@ -108,11 +128,27 @@ function buildService(overrides: {
         journeyRow.events.push(row);
         return row;
       }),
+      findFirst: jest.fn(
+        async (args: { where?: { fusionRunId?: string } }) =>
+          journeyRow.events.find(
+            (row) =>
+              args.where?.fusionRunId !== undefined &&
+              row.fusionRunId === args.where.fusionRunId,
+          ) ?? null,
+      ),
+      findMany: jest.fn(async () => journeyRow.events),
     },
     pickupFusionRun: {
       findFirst: jest.fn(async () => overrides.fusionRun ?? null),
     },
+    $queryRaw: jest.fn(async () => []),
   };
+  // Interactive transaction: hand the same mock back as the tx client —
+  // the service's advisory lock + open-check + writes all run through it.
+  prisma.$transaction = jest.fn(
+    async (fn: (tx: unknown) => Promise<unknown>) => fn(prisma),
+  );
+  /* eslint-enable @typescript-eslint/no-explicit-any */
   return {
     service: new JourneyService(prisma as never),
     prisma,
@@ -197,5 +233,79 @@ describe('JourneyService', () => {
       eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
       sourceType: 'FUSION_SHADOW',
     });
+  });
+
+  it('fusion-run import is IDEMPOTENT: a retry replays instead of doubling the basket', async () => {
+    const autoRun = {
+      id: 'run-1',
+      policy: 'AUTO_PROPOSE',
+      fusedTopScore: 0.51,
+      fusedTopSku: 'SKU-A',
+      evidence: {
+        detector: { events: [{ kind: 'PICKUP' }] },
+        fused: [{ productId: 'prod-a', sku: 'SKU-A', productName: 'Product A' }],
+      },
+    };
+    const { service, createdEvents } = buildService({ fusionRun: autoRun });
+    await service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    await service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    expect(
+      createdEvents.filter((row) => row.fusionRunId === 'run-1'),
+    ).toHaveLength(1);
+  });
+
+  it("fusion-run import rejects a video from a different store context", async () => {
+    const { service } = buildService({
+      fusionRun: { id: 'run-1', policy: 'AUTO_PROPOSE', evidence: {} },
+      asset: { locationId: 'store-OTHER', unitId: null },
+    });
+    await expect(
+      service.appendFromFusionRun(TENANT, 'j-1', 'asset-1'),
+    ).rejects.toBeInstanceOf(ConflictException);
+    // An asset with NO location context cannot prove it matches either.
+    const noContext = buildService({
+      fusionRun: { id: 'run-1', policy: 'AUTO_PROPOSE', evidence: {} },
+      asset: { locationId: null, unitId: null },
+    });
+    await expect(
+      noContext.service.appendFromFusionRun(TENANT, 'j-1', 'asset-1'),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('create validates a supplied unit within the tenant AND location', async () => {
+    const { service, prisma } = buildService({ unit: null });
+    await expect(
+      service.create(TENANT, { locationId: 'store-1', unitId: 'unit-foreign' }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(prisma.retailUnit.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          tenantId: TENANT,
+          id: 'unit-foreign',
+          locationId: 'store-1',
+        }),
+      }),
+    );
+  });
+
+  it('append re-checks OPEN inside the locked transaction (exit race cannot slip an event in)', async () => {
+    const { service, prisma } = buildService();
+    // The journey CLOSES between the caller's intent and the transaction:
+    // the in-tx open check must reject the append.
+    prisma.customerJourney.findFirst.mockResolvedValueOnce({
+      id: 'j-1',
+      tenantId: TENANT,
+      locationId: 'store-1',
+      unitId: null,
+      status: CustomerJourneyStatus.RECONCILED,
+      events: [],
+    });
+    await expect(
+      service.appendEvent(TENANT, 'j-1', {
+        eventType: CustomerJourneyEventType.SHELF_INTERACTION,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    // And the lock was actually taken before the check.
+    expect(prisma.$queryRaw).toHaveBeenCalled();
   });
 });

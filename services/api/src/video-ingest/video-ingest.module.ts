@@ -126,7 +126,14 @@ import { VideoCropsController } from './video-crops.controller';
   // persistence goes through VideoAssetsService's idempotent contracts
   // (never direct rows), asset reads through the repository, and analysis
   // decoding needs the CONCRETE local adapter's path capability — the same
-  // capability the ffmpeg extractor uses.
-  exports: [VideoAssetsService, VideoAssetsRepository, LocalVideoStorageAdapter],
+  // capability the ffmpeg extractor uses. The recognizer port is exported
+  // so REFERENCE-IMAGE uploads run the SAME payment-data pixel screen as
+  // video frames before any byte becomes durable.
+  exports: [
+    VideoAssetsService,
+    VideoAssetsRepository,
+    LocalVideoStorageAdapter,
+    FrameTextRecognizerPort,
+  ],
 })
 export class VideoIngestModule {}

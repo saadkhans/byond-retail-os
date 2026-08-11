@@ -46,7 +46,10 @@ export interface UpsertGroundTruthInput {
  * - false_pickup:   truth NONE, but a pickup event was produced
  * - true_negative:  truth NONE and no pickup was produced
  * - not_detected:   truth PICKUP but the attempt failed (no event at all)
- * - unscored:       truth RETURN (out of MVP scope — reported, never scored)
+ * - unscored:       truth RETURN (out of MVP scope — reported, never
+ *                   scored) — or a fusion-only row where v1 has no
+ *                   completed attempt (jobStatus null; fusion columns
+ *                   still score).
  */
 export interface ValidationRow {
   videoAssetId: string;
@@ -209,7 +212,7 @@ export class PickupValidationService {
       if (truth.videoAsset.deletedAt !== null) {
         continue;
       }
-      const job = await this.prisma.inferenceJob.findFirst({
+      const latestJob = await this.prisma.inferenceJob.findFirst({
         where: {
           tenantId,
           sourceType: EvidenceSourceType.VISION,
@@ -218,11 +221,27 @@ export class PickupValidationService {
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         include: { result: { include: { candidates: true } } },
       });
-      if (!job || job.status === InferenceJobStatus.QUEUED || job.status === InferenceJobStatus.RUNNING) {
-        // Not reviewed yet: no finished attempt to score.
+      // The v1 pipeline only counts when its attempt finished.
+      const job =
+        latestJob &&
+        latestJob.status !== InferenceJobStatus.QUEUED &&
+        latestJob.status !== InferenceJobStatus.RUNNING
+          ? latestJob
+          : null;
+      const fusionRun = await this.prisma.pickupFusionRun.findFirst({
+        where: { tenantId, videoAssetId: truth.videoAssetId },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        select: { fusedTopSku: true, fusedTopScore: true, policy: true },
+      });
+      // A ground-truth row is reviewable when EITHER pipeline has a
+      // completed result — running fusion directly (without a v1 attempt)
+      // is a supported flow, and its accuracy must not vanish from the
+      // dashboard just because v1 never ran. The unavailable pipeline's
+      // fields stay null/unscored.
+      if (!job && !fusionRun) {
         continue;
       }
-      const event = job.visionEventId
+      const event = job?.visionEventId
         ? await this.prisma.visionEvent.findFirst({
             where: { tenantId, id: job.visionEventId },
             select: { metadata: true },
@@ -240,7 +259,10 @@ export class PickupValidationService {
       const predictedSku = record?.sku ?? null;
       const detected = record !== null;
       let outcome: ValidationRow['outcome'];
-      if (truth.eventKind === GroundTruthEventKind.RETURN) {
+      if (!job) {
+        // Fusion-only row: v1 has no completed attempt to score.
+        outcome = 'unscored';
+      } else if (truth.eventKind === GroundTruthEventKind.RETURN) {
         outcome = 'unscored';
       } else if (truth.eventKind === GroundTruthEventKind.NONE) {
         outcome = detected ? 'false_pickup' : 'true_negative';
@@ -253,11 +275,6 @@ export class PickupValidationService {
       } else {
         outcome = 'incorrect';
       }
-      const fusionRun = await this.prisma.pickupFusionRun.findFirst({
-        where: { tenantId, videoAssetId: truth.videoAssetId },
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        select: { fusedTopSku: true, fusedTopScore: true, policy: true },
-      });
       const fusionVerdict =
         fusionRun && truth.eventKind === GroundTruthEventKind.PICKUP
           ? fusionRun.fusedTopSku === null
@@ -284,15 +301,15 @@ export class PickupValidationService {
             ? Math.abs(record.eventPeakMs - truth.actualTimestampMs)
             : null,
         outcome,
-        topCandidates: (job.result?.candidates ?? [])
+        topCandidates: (job?.result?.candidates ?? [])
           .slice(0, 3)
           .map((candidate) => ({
             sku: candidate.sku,
             score: candidate.score,
           })),
         processingMs: record?.processingMs ?? null,
-        jobStatus: job.status,
-        jobErrorCode: job.errorCode,
+        jobStatus: job?.status ?? null,
+        jobErrorCode: job?.errorCode ?? null,
       });
     }
 
@@ -321,8 +338,12 @@ export class PickupValidationService {
       unscored: rows.filter((r) => r.outcome === 'unscored').length,
     };
 
+    // The confusion matrix scores the v1 pipeline only — fusion-only rows
+    // (no completed v1 attempt) must not pollute its UNKNOWN column.
     const scorable = rows.filter(
-      (r) => r.actualEventKind === GroundTruthEventKind.PICKUP,
+      (r) =>
+        r.actualEventKind === GroundTruthEventKind.PICKUP &&
+        r.jobStatus !== null,
     );
     const unlocked = scorable.length >= CONFUSION_MATRIX_MIN_REVIEWED;
     let skus: string[] = [];

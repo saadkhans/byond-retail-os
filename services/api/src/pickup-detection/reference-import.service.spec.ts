@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import AdmZip from 'adm-zip';
 import { BadRequestException } from '@nestjs/common';
 import { ReferenceImportService } from './reference-import.service';
@@ -119,10 +120,7 @@ describe('ReferenceImportService.preview', () => {
 
   it('reports already-stored checksums as duplicates without re-importing', async () => {
     const bytes = pngBytes(9);
-    const checksum = require('node:crypto')
-      .createHash('sha256')
-      .update(bytes)
-      .digest('hex');
+    const checksum = createHash('sha256').update(bytes).digest('hex');
     const zip = buildZip([{ path: 'AQUAFINA-500ML/front.png', data: bytes }]);
     const { service } = buildService({
       storedChecksums: [{ productId: 'p-aqua', checksumSha256: checksum }],

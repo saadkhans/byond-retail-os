@@ -42,7 +42,8 @@ export type AdjustmentFailure =
   | 'product-not-saleable'
   | 'unit-of-measure-changed'
   | 'insufficient-stock'
-  | 'quantity-overflow';
+  | 'quantity-overflow'
+  | 'reference-mismatch';
 
 export interface AdjustmentResult {
   level: InventoryLevel;
@@ -177,6 +178,20 @@ export class InventoryRepository extends TenantScopedRepository {
           },
         });
         if (existing) {
+          // A replay is only a replay when it asks for the SAME movement.
+          // A reused reference carrying a different location, product,
+          // type, quantity, or reason must NOT return success while
+          // silently skipping the requested stock change — that is a
+          // conflict the caller has to see.
+          if (
+            existing.locationId !== data.locationId ||
+            existing.productId !== data.productId ||
+            existing.movementType !== data.movementType ||
+            existing.quantityDelta !== data.quantityDelta ||
+            existing.reason !== data.reason
+          ) {
+            throw new AdjustmentRejected('reference-mismatch');
+          }
           const level = await tx.inventoryLevel.findFirst({
             where: {
               tenantId: scopedTenantId,

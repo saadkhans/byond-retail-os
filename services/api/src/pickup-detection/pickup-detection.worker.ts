@@ -109,6 +109,15 @@ export class PickupDetectionWorker implements OnModuleInit, OnModuleDestroy {
           );
         }
       }
+    } catch (error) {
+      // A failed poll (e.g. transient DB outage) must never become an
+      // unhandled rejection from the interval callback; log and retry on
+      // the next tick.
+      this.logger.warn(
+        `Pickup-detection scan failed: ${
+          error instanceof Error ? error.message : 'unknown'
+        }`,
+      );
     } finally {
       this.scanning = false;
     }

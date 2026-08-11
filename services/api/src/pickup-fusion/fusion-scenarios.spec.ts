@@ -361,8 +361,19 @@ describe('fusion-v2 scenarios', () => {
         allowed,
       ).status,
     ).toBe('INVALID_SCHEMA');
+    // Outside the local-dev fence option the contract is a BARE JSON
+    // object: prose wrappers are rejected, not silently extracted.
+    expect(
+      verifier.parseVerdict(
+        'Answer: {"verdict":"MATCH","selectedSku":"B","visualSupport":"MEDIUM",' +
+          '"ocrSupport":"WEAK","barcodeSupport":"NONE",' +
+          '"reasonCodes":["REFERENCE_VISUAL_MATCH"],"contradictions":[],' +
+          '"requiresHumanReview":false}',
+        allowed,
+      ).status,
+    ).toBe('MALFORMED_RESPONSE');
     const valid = verifier.parseVerdict(
-      'Answer: {"verdict":"MATCH","selectedSku":"B","visualSupport":"MEDIUM",' +
+      '{"verdict":"MATCH","selectedSku":"B","visualSupport":"MEDIUM",' +
         '"ocrSupport":"WEAK","barcodeSupport":"NONE",' +
         '"reasonCodes":["REFERENCE_VISUAL_MATCH"],"contradictions":[],' +
         '"requiresHumanReview":false}',
@@ -371,6 +382,15 @@ describe('fusion-v2 scenarios', () => {
     expect(valid.status).toBe('VERDICT');
     expect(valid.result?.verdict).toBe('MATCH');
     expect(valid.result?.selectedSku).toBe('B');
+    // Omitted controlled-code arrays are INVALID_SCHEMA, never "empty".
+    expect(
+      verifier.parseVerdict(
+        '{"verdict":"MATCH","selectedSku":"B","visualSupport":"MEDIUM",' +
+          '"ocrSupport":"WEAK","barcodeSupport":"NONE",' +
+          '"requiresHumanReview":false}',
+        allowed,
+      ).status,
+    ).toBe('INVALID_SCHEMA');
   });
 
   // 12b -------------------------------------------------------------

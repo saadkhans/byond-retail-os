@@ -89,11 +89,10 @@ function parseCodeArray<T extends string>(
   vocabulary: readonly T[],
   field: string,
 ): { codes: T[] } | { error: string } {
-  if (value === undefined || value === null) {
-    return { codes: [] };
-  }
+  // A missing/null array is INVALID_SCHEMA, not "empty": a structurally
+  // incomplete MATCH must never look contradiction-free to the policy.
   if (!Array.isArray(value)) {
-    return { error: `"${field}" must be an array of controlled codes` };
+    return { error: `"${field}" must be a present array of controlled codes` };
   }
   const codes: T[] = [];
   for (const entry of value.slice(0, 8)) {
@@ -166,17 +165,33 @@ export function parseStrictVerdict(
   allowed: Set<string>,
   options: StrictParseOptions = {},
 ): StrictParseResult {
-  const source = options.stripFences ? stripCodeFences(text) : text;
-  if (source.trim().length === 0) {
+  const source = (options.stripFences ? stripCodeFences(text) : text).trim();
+  if (source.length === 0) {
     return fail('MALFORMED_RESPONSE', 'empty response text');
   }
-  const jsonMatch = source.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
-    return fail('MALFORMED_RESPONSE', 'no JSON object found in response text');
+  // The contract is EXACTLY ONE JSON object and nothing else. Brace
+  // extraction (tolerating surrounding prose) is a LOCAL-DEV cleanup that
+  // rides the same opt-in as fence stripping — the strict path parses the
+  // trimmed response verbatim and rejects any wrapper text.
+  let jsonText: string;
+  if (options.stripFences) {
+    const jsonMatch = source.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      return fail('MALFORMED_RESPONSE', 'no JSON object found in response text');
+    }
+    jsonText = jsonMatch[0];
+  } else {
+    if (!source.startsWith('{') || !source.endsWith('}')) {
+      return fail(
+        'MALFORMED_RESPONSE',
+        'response must be exactly one bare JSON object (no prose, no fences)',
+      );
+    }
+    jsonText = source;
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(jsonMatch[0]);
+    parsed = JSON.parse(jsonText);
   } catch (error) {
     return fail(
       'INVALID_JSON',
