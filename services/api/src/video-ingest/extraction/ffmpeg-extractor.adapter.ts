@@ -57,10 +57,16 @@ export const COMMAND_TIMEOUT_MS = 30_000;
 // per-invocation maxBuffer bounds ONE frame, but a maxFrames batch retains
 // every decoded frame until the service persists the batch — without an
 // aggregate cap a valid request could hold maxFrames × MAX_OUTPUT_BYTES in
-// heap at once. It deliberately does NOT bound the screening stream
-// (streamFrames): that path retains ONE frame at a time, so an aggregate
-// clamp there would only kill ffmpeg part-way through a perfectly valid
-// clip — the exact Codex P1 defect this budget must not recreate.
+// heap at once. Exhausting it MID-BATCH is a verdict on the SERVER's
+// memory allowance, never on the video: the batch resolves with the frames
+// that fit (a partial batch), because a documented 30-frame batch of a
+// perfectly valid high-res clip fills this pool around frame 10 and
+// failing there flipped the asset to FAILED — the batch-path twin of the
+// streaming defect below. It deliberately does NOT bound the screening
+// stream (streamFrames): that path retains ONE frame at a time, so an
+// aggregate clamp there would only kill ffmpeg part-way through a
+// perfectly valid clip — the exact Codex P1 defect this budget must not
+// recreate.
 export const MAX_TOTAL_EXTRACTION_BYTES = 128 * 1024 * 1024;
 
 // The adapter's OWN ceiling on a screening decode's wall-clock budget. A
@@ -751,9 +757,12 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
       // The budget is enforced BEFORE the next decode, not after: the
       // remaining allowance becomes the invocation's maxBuffer, so no
       // decode can even transiently allocate past the aggregate ceiling.
+      // An exhausted pool ends the batch with the frames already decoded
+      // (see MAX_TOTAL_EXTRACTION_BYTES) — the loop guarantees at least
+      // one frame exists whenever this fires.
       const remaining = MAX_TOTAL_EXTRACTION_BYTES - totalBytes;
       if (remaining <= 0) {
-        throw new ExtractionFailedError();
+        break;
       }
       let frame: ExtractedImage;
       try {
@@ -764,11 +773,19 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
           Math.min(MAX_OUTPUT_BYTES, remaining),
         );
       } catch (error) {
-        // The SHRINKING remainder tripped the exec cap: the batch cannot
-        // fit its aggregate budget — the same verdict as the injected-
-        // runner backstop below, never an infrastructure retry.
+        // The SHRINKING remainder tripped the exec cap: the AGGREGATE pool
+        // is exhausted — a verdict on the server's memory budget, NEVER on
+        // the video, so the batch resolves with what already fits instead
+        // of failing (an ExtractionFailedError here flipped a valid
+        // high-res asset to FAILED — the batch-path twin of the streaming
+        // Codex P1 the budget must not recreate). The remainder only drops
+        // below the per-frame ceiling after ≥64 MiB of decoded frames, so
+        // frames is never empty here; the guard is a pure backstop.
         if (error instanceof FrameExceedsBudgetError) {
-          throw new ExtractionFailedError();
+          if (frames.length === 0) {
+            throw new ExtractionFailedError();
+          }
+          break;
         }
         // Real containers report durations slightly past the last decodable
         // frame — end-of-stream mid-sampling is a NORMAL end condition, not
@@ -779,9 +796,16 @@ export class FfmpegVideoFrameExtractor extends VideoFrameExtractorPort {
         }
         throw error;
       }
-      // Backstop for injected runners that ignore maxOutputBytes.
+      // Backstop for injected runners that ignore maxOutputBytes: the
+      // over-budget frame is DROPPED and the batch ends with what fits —
+      // the same partial-batch verdict as the exec-cap path above. A FIRST
+      // frame over the ENTIRE pool still fails: nothing was decoded, so
+      // there is no partial batch to return.
       if (frame.data.length > remaining) {
-        throw new ExtractionFailedError();
+        if (frames.length === 0) {
+          throw new ExtractionFailedError();
+        }
+        break;
       }
       totalBytes += frame.data.length;
       frames.push(frame);

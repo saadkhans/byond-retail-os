@@ -48,8 +48,13 @@ export interface UpsertGroundTruthInput {
 
 /**
  * One reviewed video's validation row. `outcome` vocabulary:
- * - correct:        truth PICKUP, predicted === actual
+ * - correct:        truth PICKUP, predicted === actual AND the claimed
+ *                   quantity matches the ground-truth quantity
  * - incorrect:      truth PICKUP, predicted !== actual (a claimed wrong SKU)
+ * - quantity_mismatch: truth PICKUP, the right SKU was claimed but the
+ *                   claimed quantity differs from ground truth (v1 always
+ *                   claims quantityDelta 1, so every multi-unit truth lands
+ *                   here) — counted as incorrect in the summary totals
  * - missed:         truth PICKUP, detection said UNKNOWN_PRODUCT
  * - false_pickup:   truth NONE, but a pickup event was produced
  * - true_negative:  truth NONE and no pickup was produced
@@ -67,11 +72,17 @@ export interface ValidationRow {
   actualEventKind: GroundTruthEventKind;
   actualTimestampMs: number | null;
   predictedSku: string | null;
+  /** Reviewer-entered actual quantity (>= 1 on every ground-truth row). */
+  groundTruthQuantity: number;
+  /** Quantity the v1 attempt claimed (abs of the result's quantityDelta —
+   *  the sign belongs to the event type); null when no SKU was claimed. */
+  predictedQuantity: number | null;
   matchScore: number | null;
   timestampErrorMs: number | null;
   outcome:
     | 'correct'
     | 'incorrect'
+    | 'quantity_mismatch'
     | 'missed'
     | 'false_pickup'
     | 'true_negative'
@@ -356,6 +367,14 @@ export class PickupValidationService {
       const actualSku = truth.product?.sku ?? null;
       const predictedSku = record?.sku ?? null;
       const detected = record !== null;
+      // The claimed quantity lives on the result row, not the metadata
+      // record — abs() because the sign is carried by the event type. v1
+      // hard-codes quantityDelta 1 today; reading the persisted value keeps
+      // the scoring honest if that ever changes.
+      const predictedQuantity =
+        predictedSku !== null && job?.result
+          ? Math.abs(job.result.quantityDelta)
+          : null;
       let outcome: ValidationRow['outcome'];
       if (!job) {
         // Fusion-only row: v1 has no completed attempt to score.
@@ -369,14 +388,21 @@ export class PickupValidationService {
       } else if (predictedSku === null) {
         outcome = 'missed';
       } else if (predictedSku === actualSku) {
-        outcome = 'correct';
+        // The SKU alone is not the whole claim: a 3-unit pickup answered
+        // with quantity 1 must not score as correct.
+        outcome =
+          predictedQuantity === truth.quantity
+            ? 'correct'
+            : 'quantity_mismatch';
       } else {
         outcome = 'incorrect';
       }
       // Fusion scores every supported ground-truth kind with the same
       // semantics as the v1 outcome above: NONE clips grade the run as a
       // false pickup or true negative, RETURN stays unscored (out of MVP
-      // scope), PICKUP grades the claimed SKU.
+      // scope), PICKUP grades the claimed SKU. Fusion runs carry no
+      // quantity claim, so its verdict stays SKU-only (no
+      // quantity_mismatch).
       let fusionVerdict: ValidationRow['fusionVerdict'] = null;
       if (fusionRun) {
         if (truth.eventKind === GroundTruthEventKind.RETURN) {
@@ -403,13 +429,18 @@ export class PickupValidationService {
         actualEventKind: truth.eventKind,
         actualTimestampMs: truth.actualTimestampMs,
         predictedSku,
+        groundTruthQuantity: truth.quantity,
+        predictedQuantity,
         matchScore: record?.confidence ?? null,
         timestampErrorMs:
           record && truth.actualTimestampMs !== null
             ? Math.abs(record.eventPeakMs - truth.actualTimestampMs)
             : null,
         outcome,
-        topCandidates: (job?.result?.candidates ?? [])
+        topCandidates: [...(job?.result?.candidates ?? [])]
+          // Prisma gives no relation-order guarantee without an orderBy —
+          // sort by rank (1 = strongest) before taking the top three.
+          .sort((a, b) => a.rank - b.rank)
           .slice(0, 3)
           .map((candidate) => ({
             sku: candidate.sku,
@@ -424,7 +455,13 @@ export class PickupValidationService {
     const totals = {
       reviewed: rows.length,
       correct: rows.filter((r) => r.outcome === 'correct').length,
-      incorrect: rows.filter((r) => r.outcome === 'incorrect').length,
+      // quantity_mismatch is an incorrect claim (right SKU, wrong count),
+      // so it counts here — but NOT in falsePositives/falseNegatives below:
+      // the right product WAS claimed, only its count was off.
+      incorrect: rows.filter(
+        (r) =>
+          r.outcome === 'incorrect' || r.outcome === 'quantity_mismatch',
+      ).length,
       missed: rows.filter((r) => r.outcome === 'missed').length,
       // FALSE POSITIVE: a product was CLAIMED that should not have been —
       // a wrong SKU on a real pickup, or any pickup on a NONE clip.

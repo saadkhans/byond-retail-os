@@ -11,7 +11,15 @@ import {
 
 /** Hard caps for one archive — production-sanity bounds, not tuning. */
 const MAX_ZIP_ENTRIES = 2000;
-const MAX_TOTAL_UNCOMPRESSED_BYTES = 512 * 1024 * 1024;
+/**
+ * Aggregate INFLATED budget. Every accepted entry's bytes stay resident for
+ * the whole request ON TOP of the buffered ZIP itself (256MiB controller
+ * cap), so this bound is allocation-aware, not aspirational: 128MiB still
+ * fits 16 maximum-size (8MiB) reference photos or hundreds at typical
+ * phone-camera sizes — far beyond a legitimate import — while capping the
+ * worst-case request footprint at ~384MiB instead of ~768MiB.
+ */
+const MAX_TOTAL_UNCOMPRESSED_BYTES = 128 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
 export type RejectionReason =
@@ -20,6 +28,7 @@ export type RejectionReason =
   | 'NESTED_PATH'
   | 'UNSAFE_PATH'
   | 'TOO_LARGE'
+  | 'SIZE_MISMATCH'
   | 'EMPTY_FILE'
   | 'DUPLICATE_IN_ZIP'
   | 'ALREADY_STORED'
@@ -153,6 +162,13 @@ export class ReferenceImportService {
       // and inflated in full before the per-image or aggregate limits
       // ever ran, exhausting API memory inside one request.
       const declaredBytes = entry.header.size;
+      if (declaredBytes === 0) {
+        // A zero-byte image is never importable — and a zero declared size
+        // is the one shape adm-zip's declared-size inflation cap cannot
+        // bound (it disables the cap), so it must never reach getData().
+        rejected.push({ path, reason: 'EMPTY_FILE' });
+        continue;
+      }
       if (declaredBytes > MAX_IMAGE_BYTES) {
         rejected.push({ path, reason: 'TOO_LARGE' });
         continue;
@@ -162,12 +178,23 @@ export class ReferenceImportService {
           'The ZIP archive exceeds the total uncompressed size limit',
         );
       }
-      const data = entry.getData();
-      if (data.length === 0) {
-        rejected.push({ path, reason: 'EMPTY_FILE' });
+      let data: Buffer;
+      try {
+        // adm-zip caps inflation at the declared size, so an understated
+        // header makes zlib throw here instead of allocating the real
+        // payload; corrupt entries (bad CRC) surface the same way.
+        data = entry.getData();
+      } catch {
+        rejected.push({ path, reason: 'SIZE_MISMATCH' });
         continue;
       }
-      // Re-verify the ACTUAL inflated size — headers can lie.
+      // Headers can lie: the ACTUAL inflated length is authoritative. Any
+      // disagreement with the declared size that the pre-inflation gates
+      // trusted marks the entry hostile — reject it, never import it.
+      if (data.length !== declaredBytes) {
+        rejected.push({ path, reason: 'SIZE_MISMATCH' });
+        continue;
+      }
       if (data.length > MAX_IMAGE_BYTES) {
         rejected.push({ path, reason: 'TOO_LARGE' });
         continue;
@@ -220,21 +247,30 @@ export class ReferenceImportService {
     const unknownCounts = new Map<string, number>();
     const seenInZip = new Set<string>();
     const importable: (ParsedEntry & { productId: string })[] = [];
+    // Rejected entries survive only as classification metadata: their raw
+    // bytes are released immediately so the resident inflated set shrinks
+    // to what will actually be imported.
+    const dropData = (entry: ParsedEntry) => {
+      entry.data = Buffer.alloc(0);
+    };
     for (const entry of entries) {
       const product = productBySku.get(entry.sku);
       if (!product) {
         unknownCounts.set(entry.sku, (unknownCounts.get(entry.sku) ?? 0) + 1);
         rejected.push({ path: entry.path, reason: 'UNKNOWN_SKU' });
+        dropData(entry);
         continue;
       }
       const dedupKey = `${product.id}:${entry.checksumSha256}`;
       if (seenInZip.has(dedupKey)) {
         rejected.push({ path: entry.path, reason: 'DUPLICATE_IN_ZIP' });
+        dropData(entry);
         continue;
       }
       seenInZip.add(dedupKey);
       if (storedSet.has(dedupKey)) {
         rejected.push({ path: entry.path, reason: 'ALREADY_STORED' });
+        dropData(entry);
         continue;
       }
       importable.push({ ...entry, productId: product.id });
@@ -302,6 +338,7 @@ export class ReferenceImportService {
               rejection.reason === 'UNSAFE_PATH' ||
               rejection.reason === 'INVALID_FORMAT' ||
               rejection.reason === 'EMPTY_FILE' ||
+              rejection.reason === 'SIZE_MISMATCH' ||
               rejection.reason === 'TOO_LARGE',
           ).length,
         importable: classified.importable.length,

@@ -7,6 +7,7 @@ import {
 import {
   EvidenceSourceType,
   InferenceJobStatus,
+  TenantStatus,
   VideoAssetStatus,
 } from '@prisma/client';
 import { PlatformModulesService } from '../platform-modules/platform-modules.service';
@@ -107,18 +108,18 @@ export class PickupDetectionWorker implements OnModuleInit, OnModuleDestroy {
     try {
       const cutoff = new Date(Date.now() - AUTO_WINDOW_MS);
       this.prunePreJobFailures();
-      // Enumerating WHICH tenants have eligible assets is a platform-level
-      // operation (tenant ids only, no tenant row data); every asset/job
-      // read after this point is scoped to a single tenantId.
-      const tenants = await this.prisma.videoAsset.groupBy({
-        by: ['tenantId'],
-        where: this.eligibleAssetWhere(cutoff),
-        orderBy: { tenantId: 'asc' },
+      // Candidate tenants come from the platform-scoped Tenant table,
+      // never from a cross-tenant scan of tenant data: every VideoAsset
+      // and InferenceJob read in this worker is scoped to a single
+      // tenantId. Only ACTIVE tenants are candidates — suspended and
+      // archived tenants must not have pipelines run on their behalf.
+      const tenants = await this.prisma.tenant.findMany({
+        where: { status: TenantStatus.ACTIVE },
+        select: { id: true },
+        orderBy: { id: 'asc' },
       });
       let remaining = MAX_ASSETS_PER_SCAN;
-      const rotation = this.rotateTenants(
-        tenants.map(({ tenantId }) => tenantId),
-      );
+      const rotation = this.rotateTenants(tenants.map(({ id }) => id));
       for (const tenantId of rotation) {
         if (remaining <= 0) {
           break;
@@ -175,9 +176,11 @@ export class PickupDetectionWorker implements OnModuleInit, OnModuleDestroy {
       : [...tenantIds.slice(start), ...tenantIds.slice(0, start)];
   }
 
-  private eligibleAssetWhere(cutoff: Date, tenantId?: string) {
+  /** Required tenantId keeps every VideoAsset predicate tenant-scoped by
+   *  construction — there is deliberately no unscoped variant. */
+  private eligibleAssetWhere(cutoff: Date, tenantId: string) {
     return {
-      ...(tenantId ? { tenantId } : {}),
+      tenantId,
       deletedAt: null,
       status: {
         in: [VideoAssetStatus.VALIDATED, VideoAssetStatus.READY],
@@ -205,7 +208,18 @@ export class PickupDetectionWorker implements OnModuleInit, OnModuleDestroy {
     cutoff: Date,
     budget: number,
   ): Promise<number> {
-    // Dependency gate FIRST: while cv is disabled every attempt is
+    // Cheap tenant-scoped existence probe first: enumeration covers EVERY
+    // active tenant (not just those with eligible assets), so an idle
+    // tenant must cost one indexed lookup — not a module-gate check plus
+    // a page query — before the scan moves on.
+    const eligible = await this.prisma.videoAsset.findFirst({
+      where: this.eligibleAssetWhere(cutoff, tenantId),
+      select: { id: true },
+    });
+    if (!eligible) {
+      return 0;
+    }
+    // Dependency gate next: while cv is disabled every attempt is
     // guaranteed to fail (runJob refuses with CV_MODULE_DISABLED), so the
     // tenant is skipped WITHOUT burning any asset's automatic attempt —
     // the backlog stays unattempted and is picked up once the gate clears.

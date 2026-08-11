@@ -390,8 +390,10 @@ export class PickupDetectionService {
         jobId,
       );
       // Narrow internal metadata write — see PickupDetectionRecord docs.
+      // Tenant-scoped via the composite unique key: id alone must never
+      // address another tenant's event.
       await this.prisma.visionEvent.update({
-        where: { id: converted.visionEvent.id },
+        where: { id_tenantId: { id: converted.visionEvent.id, tenantId } },
         data: { metadata: computed.record as object },
       });
     } catch (error) {
@@ -485,8 +487,10 @@ export class PickupDetectionService {
         return;
       }
       // Narrow internal metadata write — see PickupDetectionRecord docs.
+      // Tenant-scoped via the composite unique key: id alone must never
+      // address another tenant's event.
       await this.prisma.visionEvent.update({
-        where: { id: converted.visionEvent.id },
+        where: { id_tenantId: { id: converted.visionEvent.id, tenantId } },
         data: { metadata: record as object },
       });
     } catch (error) {

@@ -575,6 +575,9 @@ model ProductReferenceImage {
   product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
   embeddings ProductReferenceEmbedding[]
 
+  // Anchor for hand-written same-tenant composite FKs
+  // (20260811110000_cv_same_tenant_fks).
+  @@unique([id, tenantId])
   @@unique([tenantId, productId, checksumSha256])
   @@index([tenantId, productId])
 }
@@ -641,6 +644,9 @@ model CustomerJourney {
   unit     RetailUnit? @relation(fields: [unitId], references: [id], onDelete: Restrict)
   events   CustomerJourneyEvent[]
 
+  // Anchor for hand-written same-tenant composite FKs
+  // (20260811110000_cv_same_tenant_fks).
+  @@unique([id, tenantId])
   @@index([tenantId, status, startedAt(sort: Desc)])
 }
 

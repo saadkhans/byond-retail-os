@@ -1,4 +1,4 @@
-import { InferenceJobStatus } from '@prisma/client';
+import { InferenceJobStatus, TenantStatus } from '@prisma/client';
 import { PickupDetectionWorker } from './pickup-detection.worker';
 import {
   CV_MODULE_DISABLED_ERROR_CODE,
@@ -7,10 +7,11 @@ import {
 
 /**
  * scanOnce loop tests with Prisma and the detection service mocked: they
- * prove the SCAN SHAPE — tenant enumeration first, then tenant-scoped
- * asset/job queries only; query-level paging past already-attempted
- * assets; the MAX_ASSETS_PER_SCAN cap; and the catch-all that keeps the
- * interval callback from ever rejecting.
+ * prove the SCAN SHAPE — tenant enumeration off the platform-scoped
+ * Tenant table first, then tenant-scoped asset/job queries ONLY (every
+ * VideoAsset query carries a tenantId); query-level paging past
+ * already-attempted assets; the MAX_ASSETS_PER_SCAN cap; and the
+ * catch-all that keeps the interval callback from ever rejecting.
  */
 
 /** Mirrors the module-private constants in pickup-detection.worker.ts. */
@@ -29,10 +30,19 @@ interface EligibleWhere {
 }
 
 function buildHarness(tenants: Record<string, FakeAsset[]>) {
-  const groupBy = jest.fn(async (_args: { by: string[]; where: EligibleWhere }) =>
-    Object.keys(tenants)
-      .sort()
-      .map((tenantId) => ({ tenantId })),
+  // Enumeration reads the Tenant table, not tenant data; the harness map
+  // holds only ACTIVE tenants, so the mock returns every key.
+  const findManyTenants = jest.fn(
+    async (_args: { where: { status: TenantStatus }; select: { id: true } }) =>
+      Object.keys(tenants)
+        .sort()
+        .map((id) => ({ id })),
+  );
+  const findFirstAsset = jest.fn(
+    async (args: { where: EligibleWhere; select: { id: true } }) => {
+      const rows = tenants[args.where.tenantId ?? ''] ?? [];
+      return rows.length > 0 ? { id: rows[0].id } : null;
+    },
   );
   const findManyAssets = jest.fn(
     async (args: {
@@ -75,7 +85,8 @@ function buildHarness(tenants: Record<string, FakeAsset[]>) {
   );
   const worker = new PickupDetectionWorker(
     {
-      videoAsset: { groupBy, findMany: findManyAssets },
+      tenant: { findMany: findManyTenants },
+      videoAsset: { findFirst: findFirstAsset, findMany: findManyAssets },
       inferenceJob: { findMany: findManyJobs },
     } as never,
     { enabled: true } as never,
@@ -85,7 +96,8 @@ function buildHarness(tenants: Record<string, FakeAsset[]>) {
   return {
     worker,
     tenants,
-    groupBy,
+    findManyTenants,
+    findFirstAsset,
     findManyAssets,
     findManyJobs,
     detectForAsset,
@@ -101,18 +113,28 @@ function assets(prefix: string, count: number, attempted: boolean): FakeAsset[] 
 }
 
 describe('PickupDetectionWorker.scanOnce', () => {
-  it('enumerates tenants first, then scopes every asset/job query to one tenantId', async () => {
+  it('enumerates ACTIVE tenants from the Tenant table, then scopes every asset/job query to one tenantId', async () => {
     const h = buildHarness({
       'tenant-a': [{ id: 'a-1', attempted: false }],
       'tenant-b': [{ id: 'b-1', attempted: false }],
     });
     await h.worker.scanOnce();
 
-    expect(h.groupBy).toHaveBeenCalledTimes(1);
-    expect(h.groupBy.mock.calls[0][0]).toMatchObject({ by: ['tenantId'] });
-    // The enumeration itself carries no tenantId (platform-level), but
-    // every subsequent data query must.
-    for (const [args] of h.findManyAssets.mock.calls) {
+    // The only cross-tenant read is against the platform-scoped Tenant
+    // table, filtered to ACTIVE tenants — never a scan of tenant data.
+    expect(h.findManyTenants).toHaveBeenCalledTimes(1);
+    expect(h.findManyTenants.mock.calls[0][0]).toMatchObject({
+      where: { status: TenantStatus.ACTIVE },
+      select: { id: true },
+    });
+    // Every VideoAsset query (existence probe and page) and every job
+    // lookup must carry a tenantId.
+    const assetWheres = [
+      ...h.findFirstAsset.mock.calls,
+      ...h.findManyAssets.mock.calls,
+    ];
+    expect(assetWheres.length).toBeGreaterThan(0);
+    for (const [args] of assetWheres) {
       expect(args.where.tenantId).toEqual(expect.any(String));
     }
     for (const [args] of h.findManyJobs.mock.calls) {
@@ -122,6 +144,23 @@ describe('PickupDetectionWorker.scanOnce', () => {
       ['tenant-a', 'a-1'],
       ['tenant-b', 'b-1'],
     ]);
+  });
+
+  it('skips a tenant with no eligible assets after one probe, without gate checks or paging', async () => {
+    // Enumeration now covers every ACTIVE tenant, so an idle tenant must
+    // cost exactly one tenant-scoped findFirst — no module-gate lookup,
+    // no page query, no budget.
+    const h = buildHarness({
+      'tenant-a': [],
+      'tenant-b': [{ id: 'b-1', attempted: false }],
+    });
+    await h.worker.scanOnce();
+
+    expect(h.isEnabledForTenant).not.toHaveBeenCalledWith('tenant-a', 'cv');
+    for (const [args] of h.findManyAssets.mock.calls) {
+      expect(args.where.tenantId).toBe('tenant-b');
+    }
+    expect(h.detectForAsset.mock.calls).toEqual([['tenant-b', 'b-1']]);
   });
 
   it('pages past a full page of already-attempted assets to reach newer ones', async () => {
@@ -229,7 +268,7 @@ describe('PickupDetectionWorker.scanOnce', () => {
     await h.worker.scanOnce();
 
     const wheres = [
-      h.groupBy.mock.calls[0][0].where,
+      h.findFirstAsset.mock.calls[0][0].where,
       h.findManyAssets.mock.calls[0][0].where,
     ];
     for (const where of wheres) {
@@ -251,7 +290,7 @@ describe('PickupDetectionWorker.scanOnce', () => {
 
   it('swallows a failed poll so the interval callback never rejects', async () => {
     const h = buildHarness({});
-    h.groupBy.mockRejectedValueOnce(new Error('db down'));
+    h.findManyTenants.mockRejectedValueOnce(new Error('db down'));
     await expect(h.worker.scanOnce()).resolves.toBeUndefined();
     expect(h.detectForAsset).not.toHaveBeenCalled();
   });
@@ -337,12 +376,12 @@ describe('PickupDetectionWorker.scanOnce', () => {
   it('refuses to overlap scans (re-entrancy guard)', async () => {
     const h = buildHarness({});
     let release!: (value: never[]) => void;
-    h.groupBy.mockImplementationOnce(
+    h.findManyTenants.mockImplementationOnce(
       () => new Promise<never[]>((resolve) => (release = resolve)),
     );
     const first = h.worker.scanOnce();
     await h.worker.scanOnce(); // returns immediately without querying
-    expect(h.groupBy).toHaveBeenCalledTimes(1);
+    expect(h.findManyTenants).toHaveBeenCalledTimes(1);
     release([]);
     await first;
   });

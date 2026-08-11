@@ -114,6 +114,15 @@ describe('InventoryService.recordMovement', () => {
       'refund to card 4111111111111111 cvv=123',
       'chargeback for 4111-1111-1111-1111',
       'password=hunter2 replay',
+      // Strict free-text screen: separator-grouped PANs and label/value
+      // pairs WITHOUT '='/':' must reject too — the weak value screen
+      // (space/dash-only PAN bridging, separator-bound credentials) let
+      // all of these into the append-only ledger.
+      'received 4111_1111_1111_1111',
+      'refund 4111.1111.1111.1111',
+      'damaged cvv 123',
+      'cvv123 on the slip',
+      'password hunter2',
     ]) {
       await expect(
         service.recordMovement(TENANT, { ...VALID, reason }, ACTOR),
@@ -123,17 +132,40 @@ describe('InventoryService.recordMovement', () => {
   });
 
   it('rejects a payment-bearing reference before any ledger write', async () => {
-    // The DTO charset ([A-Za-z0-9._-]) admits dash-grouped Luhn-valid PANs;
-    // the service screens the reference like the checkout idempotency key.
+    // The DTO charset ([A-Za-z0-9._-]) admits PANs grouped by dash, dot,
+    // or underscore; the strict free-text screen chains ALL of those
+    // separators (the weak screen only bridged space/dash, so
+    // '4111.1111.1111.1111' persisted verbatim).
     const { service, recordExternalMovement } = buildService();
-    await expect(
-      service.recordMovement(
-        TENANT,
-        { ...VALID, reference: '4111-1111-1111-1111' },
-        ACTOR,
-      ),
-    ).rejects.toBeInstanceOf(BadRequestException);
+    for (const reference of [
+      '4111-1111-1111-1111',
+      '4111.1111.1111.1111',
+      '4111_1111_1111_1111',
+    ]) {
+      await expect(
+        service.recordMovement(TENANT, { ...VALID, reference }, ACTOR),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
     expect(recordExternalMovement).not.toHaveBeenCalled();
+  });
+
+  it('redacts a PAN-valued id from the 404 message instead of echoing it', async () => {
+    // locationId/productId carry no DTO charset guard, and 404 bodies land
+    // in logs/telemetry — a PAN smuggled as an id must echo as [REDACTED].
+    for (const [failure, dirty] of [
+      ['location-not-found', { locationId: '4111111111111111' }],
+      ['product-not-found', { productId: '4111.1111.1111.1111' }],
+    ] as const) {
+      const { service } = buildService({ result: failure });
+      const rejection = service.recordMovement(
+        TENANT,
+        { ...VALID, ...dirty },
+        ACTOR,
+      );
+      await expect(rejection).rejects.toBeInstanceOf(NotFoundException);
+      await expect(rejection).rejects.toThrow('[REDACTED]');
+      await expect(rejection).rejects.not.toThrow(/4111/);
+    }
   });
 
   it('maps below-zero outcomes to a controlled 409', async () => {

@@ -460,13 +460,51 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
     expect(frames.map((f) => f.timestampMs)).toEqual([0, 5000]);
   });
 
-  it('enforces a request-wide decoded-byte budget across frames', async () => {
-    // Each mocked frame is ~half the budget; the third invocation would
-    // exceed it. The per-invocation maxBuffer cannot catch this — only the
-    // aggregate budget does.
+  it('enforces a request-wide decoded-byte budget by ending the batch, not failing it', async () => {
+    // Each mocked frame is ~half the budget; a second frame would exceed
+    // it. The per-invocation maxBuffer cannot catch this — only the
+    // aggregate budget does — and exhaustion returns the frames that fit
+    // (a server memory verdict, never a content failure of the video).
     const bigFrame = Buffer.alloc(Math.ceil(MAX_TOTAL_EXTRACTION_BYTES / 2) + 1);
     const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
       Promise.resolve({ stdout: bigFrame }),
+    );
+    const frames = await extractor.extractFrames(
+      'a/original.mp4',
+      { durationMs: 10_000, width: 100, height: 100, fps: 30 },
+      { intervalMs: 1000, maxFrames: 10, startMs: 0 },
+    );
+    // Frame 2 (over the shrunken remainder) is dropped and the batch ends.
+    expect(frames.map((f) => f.timestampMs)).toEqual([0]);
+  });
+
+  it('stops preemptively (no further decode) once the pool is exactly consumed', async () => {
+    // One frame consuming the ENTIRE pool: the next iteration's
+    // remaining-budget pre-check must end the batch BEFORE any decode.
+    const calls: number[] = [];
+    const extractor = new FfmpegVideoFrameExtractor(
+      storageStub,
+      (_binary, _args, maxOutputBytes) => {
+        calls.push(maxOutputBytes);
+        return Promise.resolve({
+          stdout: Buffer.alloc(MAX_TOTAL_EXTRACTION_BYTES),
+        });
+      },
+    );
+    const frames = await extractor.extractFrames(
+      'a/original.mp4',
+      { durationMs: 10_000, width: 100, height: 100, fps: 30 },
+      { intervalMs: 1000, maxFrames: 10, startMs: 0 },
+    );
+    expect(frames.map((f) => f.timestampMs)).toEqual([0]);
+    expect(calls.length).toBe(1);
+  });
+
+  it('still fails the batch when the FIRST frame exceeds the entire pool', async () => {
+    // Nothing decoded means no partial batch to return — the pre-existing
+    // content failure stands (backstop for runners ignoring the exec cap).
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.resolve({ stdout: Buffer.alloc(MAX_TOTAL_EXTRACTION_BYTES + 1) }),
     );
     await expect(
       extractor.extractFrames(
@@ -1612,11 +1650,12 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
     expect(runner).not.toHaveBeenCalled();
   });
 
-  it('keeps a batch whose SHRINKING budget trips the exec cap a content failure', async () => {
+  it('ends a batch whose SHRINKING budget trips the exec cap with the decoded frames', async () => {
     // Once the aggregate pool drops below the per-frame ceiling the
     // remainder becomes the exec cap; a real overflow there surfaces as
-    // FrameExceedsBudgetError inside the loop and must convert to the
-    // batch's ExtractionFailedError — never an infrastructure 503.
+    // FrameExceedsBudgetError inside the loop and must END the batch with
+    // the frames already decoded — never an infrastructure 503, and never
+    // a content failure that flips a valid asset to FAILED.
     let call = 0;
     const extractor = new FfmpegVideoFrameExtractor(storageStub, () => {
       call += 1;
@@ -1631,13 +1670,45 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
         }),
       );
     });
-    await expect(
-      extractor.extractFrames(
-        'a/original.mp4',
-        { durationMs: 20_000, width: 100, height: 100, fps: 30 },
-        { intervalMs: 1000, maxFrames: 10, startMs: 0 },
-      ),
-    ).rejects.toBeInstanceOf(ExtractionFailedError);
+    const frames = await extractor.extractFrames(
+      'a/original.mp4',
+      { durationMs: 20_000, width: 100, height: 100, fps: 30 },
+      { intervalMs: 1000, maxFrames: 10, startMs: 0 },
+    );
+    expect(frames.map((f) => f.timestampMs)).toEqual([0, 1000]);
+  });
+
+  it('returns a documented high-res batch partially instead of failing the asset', async () => {
+    // The Codex P2 scenario: a 30 s 4K clip, intervalMs=1000, maxFrames=30
+    // — ~13 MiB PNG frames exhaust the 128 MiB aggregate pool around frame
+    // 10. The runner honors its maxBuffer like the real execFile: a frame
+    // larger than the shrunken remainder overflows. The batch must resolve
+    // with the frames that fit; the caller never sees an
+    // ExtractionFailedError (which flipped VALIDATED/READY → FAILED).
+    const frameBytes = 13 * 1024 * 1024;
+    const extractor = new FfmpegVideoFrameExtractor(
+      storageStub,
+      (_binary, _args, maxOutputBytes) => {
+        if (frameBytes > maxOutputBytes) {
+          return Promise.reject(
+            Object.assign(new RangeError('stdout maxBuffer length exceeded'), {
+              code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+            }),
+          );
+        }
+        return Promise.resolve({ stdout: Buffer.alloc(frameBytes) });
+      },
+    );
+    const frames = await extractor.extractFrames(
+      'a/original.mp4',
+      { durationMs: 30_000, width: 3840, height: 2160, fps: 30 },
+      { intervalMs: 1000, maxFrames: 30, startMs: 0 },
+    );
+    // 9 × 13 MiB fit the 128 MiB pool; frame 10's 11 MiB remainder cannot
+    // hold a 13 MiB frame, so the batch ends there.
+    expect(frames.length).toBe(9);
+    expect(frames[0].timestampMs).toBe(0);
+    expect(frames[8].timestampMs).toBe(8000);
   });
 
   it('forwards the SHRINKING remaining budget once the pool drops below the per-frame cap', async () => {
@@ -1656,14 +1727,14 @@ describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
       },
     );
     // Third frame (48 MiB) exceeds its 32 MiB allowance via the runner
-    // backstop — the batch fails rather than blowing the pool.
-    await expect(
-      extractor.extractFrames(
-        'a/original.mp4',
-        { durationMs: 20_000, width: 100, height: 100, fps: 30 },
-        { intervalMs: 1000, maxFrames: 10, startMs: 0 },
-      ),
-    ).rejects.toBeInstanceOf(ExtractionFailedError);
+    // backstop — the batch ends with the two frames that fit rather than
+    // blowing the pool (or failing the asset).
+    const frames = await extractor.extractFrames(
+      'a/original.mp4',
+      { durationMs: 20_000, width: 100, height: 100, fps: 30 },
+      { intervalMs: 1000, maxFrames: 10, startMs: 0 },
+    );
+    expect(frames.map((f) => f.timestampMs)).toEqual([0, 1000]);
     expect(budgets.length).toBe(3);
     expect(budgets[2]).toBe(MAX_TOTAL_EXTRACTION_BYTES - 2 * frameBytes);
     expect(budgets[2]).toBeLessThan(budgets[0]);

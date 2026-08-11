@@ -66,6 +66,12 @@ describe('InventoryService', () => {
       'refund to card 4111111111111111 cvv=123',
       'card 4111-1111-1111-1111 chargeback',
       'api_key=sk_live_abcdefgh12345678',
+      // Strict free-text screen: dot/underscore-grouped PANs and
+      // separator-free credential labels reject too (the weak value screen
+      // only bridged space/dash and needed '='/':').
+      'card 4111_1111_1111_1111 chargeback',
+      'damaged cvv 123',
+      'password hunter2',
     ]) {
       await expect(
         service.adjustStock(
@@ -105,6 +111,31 @@ describe('InventoryService', () => {
         actor,
       ),
     ).rejects.toBeInstanceOf(errorType);
+  });
+
+  it('redacts a PAN-valued id from the 404 message instead of echoing it', async () => {
+    // The DTO puts no charset on locationId/productId, and 404 bodies land
+    // in logs/telemetry — a PAN smuggled as an id must echo as [REDACTED].
+    for (const [failure, dto] of [
+      [
+        'location-not-found',
+        { locationId: '4111111111111111', productId: 'prod-1' },
+      ],
+      [
+        'product-not-found',
+        { locationId: 'loc-1', productId: '4111.1111.1111.1111' },
+      ],
+    ] as const) {
+      repository.adjust.mockResolvedValue(failure);
+      const rejection = service.adjustStock(
+        'tenant-a',
+        { ...dto, quantityDelta: 1, reason: 'x' },
+        actor,
+      );
+      await expect(rejection).rejects.toBeInstanceOf(NotFoundException);
+      await expect(rejection).rejects.toThrow('[REDACTED]');
+      await expect(rejection).rejects.not.toThrow(/4111/);
+    }
   });
 
   it('records a STOCK_ADJUSTMENT audit entry with before/after quantities', async () => {

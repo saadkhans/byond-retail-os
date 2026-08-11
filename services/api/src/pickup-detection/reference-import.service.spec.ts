@@ -32,6 +32,32 @@ function buildZip(
   return zip.toBuffer();
 }
 
+/**
+ * Byte-patch the central-directory "uncompressed size" field for one entry —
+ * adm-zip always writes honest headers, so a lying archive (the ZIP-bomb
+ * shape the importer must survive) has to be forged at the byte level.
+ */
+function patchDeclaredSize(
+  zip: Buffer,
+  filename: string,
+  declared: number,
+): Buffer {
+  const out = Buffer.from(zip);
+  const signature = Buffer.from([0x50, 0x4b, 0x01, 0x02]);
+  let offset = out.indexOf(signature);
+  while (offset !== -1) {
+    const nameLength = out.readUInt16LE(offset + 28);
+    const name = out.toString('utf8', offset + 46, offset + 46 + nameLength);
+    if (name === filename) {
+      // Central file header: uncompressed size lives at offset 24.
+      out.writeUInt32LE(declared, offset + 24);
+      return out;
+    }
+    offset = out.indexOf(signature, offset + 4);
+  }
+  throw new Error(`No central-directory header found for ${filename}`);
+}
+
 function buildService(options: {
   existingCounts?: Record<string, number>;
   storedChecksums?: { productId: string; checksumSha256: string }[];
@@ -162,6 +188,90 @@ describe('ReferenceImportService.preview', () => {
     await expect(
       service.preview(TENANT, Buffer.from('not a zip at all')),
     ).rejects.toBeInstanceOf(BadRequestException);
+  });
+});
+
+describe('ReferenceImportService archive size hardening', () => {
+  const MEBIBYTE = 1024 * 1024;
+
+  function bigPng(seed: number, bytes: number): Buffer {
+    const data = Buffer.alloc(bytes); // zeros compress tightly — cheap fixture
+    data[0] = seed; // distinct checksum per entry (no DUPLICATE_IN_ZIP)
+    return data;
+  }
+
+  it('rejects an understated-header entry without inflating the real payload into the batch', async () => {
+    const zip = buildZip([
+      { path: 'AQUAFINA-500ML/hostile.png', data: bigPng(1, 4096) },
+      { path: 'AQUAFINA-500ML/ok.png', data: pngBytes(2) },
+    ]);
+    // Declared 16 bytes, real payload 4096: the pre-inflation gates trust
+    // the header, so only the inflation cap + mismatch gate stand between
+    // this shape and unbounded allocation.
+    const hostile = patchDeclaredSize(zip, 'AQUAFINA-500ML/hostile.png', 16);
+    const { service } = buildService();
+    const preview = await service.preview(TENANT, hostile);
+    expect(preview.rejected).toContainEqual({
+      path: 'AQUAFINA-500ML/hostile.png',
+      reason: 'SIZE_MISMATCH',
+    });
+    // The hostile entry is a per-entry rejection, never a batch failure.
+    const aqua = preview.matched.find((m) => m.sku === 'AQUAFINA-500ML')!;
+    expect(aqua.newImages).toBe(1);
+  });
+
+  it('rejects a declared-zero entry carrying payload before it ever inflates', async () => {
+    const zip = buildZip([
+      { path: 'AQUAFINA-500ML/hollow.png', data: bigPng(1, 4096) },
+      { path: 'AQUAFINA-500ML/ok.png', data: pngBytes(2) },
+    ]);
+    // Declared zero disables adm-zip's inflation cap entirely, so the
+    // importer must refuse the entry on the header alone.
+    const hostile = patchDeclaredSize(zip, 'AQUAFINA-500ML/hollow.png', 0);
+    const { service } = buildService();
+    const preview = await service.preview(TENANT, hostile);
+    expect(preview.rejected).toContainEqual({
+      path: 'AQUAFINA-500ML/hollow.png',
+      reason: 'EMPTY_FILE',
+    });
+    expect(preview.matched[0].newImages).toBe(1);
+  });
+
+  it('rejects an overstated-header entry whose actual bytes disagree', async () => {
+    const zip = buildZip([
+      { path: 'AQUAFINA-500ML/padded.png', data: pngBytes(1) },
+    ]);
+    const hostile = patchDeclaredSize(zip, 'AQUAFINA-500ML/padded.png', 5000);
+    const { service } = buildService();
+    const preview = await service.preview(TENANT, hostile);
+    expect(preview.rejected).toContainEqual({
+      path: 'AQUAFINA-500ML/padded.png',
+      reason: 'SIZE_MISMATCH',
+    });
+    expect(preview.totals.importable).toBe(0);
+  });
+
+  it('enforces the 128MiB aggregate budget against inflated bytes', async () => {
+    const { service } = buildService();
+    // 16 x 8MiB sits exactly AT the budget and must pass...
+    const atBudget = buildZip(
+      Array.from({ length: 16 }, (_, i) => ({
+        path: `AQUAFINA-500ML/big-${i}.png`,
+        data: bigPng(i, 8 * MEBIBYTE),
+      })),
+    );
+    const preview = await service.preview(TENANT, atBudget);
+    expect(preview.totals.importable).toBe(16);
+    // ...while one more max-size image breaches it and fails the archive.
+    const overBudget = buildZip(
+      Array.from({ length: 17 }, (_, i) => ({
+        path: `AQUAFINA-500ML/big-${i}.png`,
+        data: bigPng(i, 8 * MEBIBYTE),
+      })),
+    );
+    await expect(service.preview(TENANT, overBudget)).rejects.toBeInstanceOf(
+      BadRequestException,
+    );
   });
 });
 

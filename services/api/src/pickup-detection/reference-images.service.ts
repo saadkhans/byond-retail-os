@@ -2,6 +2,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import {
   BadRequestException,
   Injectable,
+  Logger,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -78,6 +79,35 @@ const REFERENCE_SELECT = {
   createdAt: true,
 } as const;
 
+/**
+ * Connection-layer Prisma codes that can surface AFTER the server received
+ * the INSERT — the statement may have committed before the link died, so
+ * these never prove the row does not exist.
+ */
+const AMBIGUOUS_CONNECTION_CODES = new Set([
+  'P1001',
+  'P1002',
+  'P1008',
+  'P1017',
+]);
+
+/**
+ * True only when the database DEFINITELY rejected the insert (the query
+ * engine answered with a request-level error, or the client refused to
+ * send at all) — the one case where the just-written bytes are provably
+ * orphaned. Anything else (dropped connection, engine panic, unknown
+ * error) is ambiguous: the INSERT may have committed server-side.
+ */
+function isDefiniteInsertFailure(error: unknown): boolean {
+  if (error instanceof Prisma.PrismaClientValidationError) {
+    return true;
+  }
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    !AMBIGUOUS_CONNECTION_CODES.has(error.code)
+  );
+}
+
 /** Basename with a conservative charset — display-only, like video uploads. */
 function sanitizeFilename(name: string): string {
   const base = name.replace(/^.*[\\/]/, '').slice(0, 120);
@@ -94,6 +124,8 @@ function sanitizeFilename(name: string): string {
  */
 @Injectable()
 export class ReferenceImagesService {
+  private readonly logger = new Logger(ReferenceImagesService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly storage: LocalVideoStorageAdapter,
@@ -243,26 +275,52 @@ export class ReferenceImagesService {
         select: REFERENCE_SELECT,
       });
     } catch (error) {
-      // ANY failed insert leaves the just-written bytes orphaned (no row
-      // will ever reference them), so cleanup is unconditional and
-      // best-effort — a cleanup error must never mask the DB failure.
-      await this.storage.delete(storageKey).catch(() => undefined);
-      // Two byte-identical uploads racing past the preliminary duplicate
-      // query both write files, then collide on the unique constraint.
-      // The loser must REPLAY the winning row — the caller asked for
-      // exactly what now exists.
-      if (
-        error instanceof Prisma.PrismaClientKnownRequestError &&
-        error.code === 'P2002'
-      ) {
-        const winner = await this.prisma.productReferenceImage.findFirst({
+      if (isDefiniteInsertFailure(error)) {
+        // The database provably rejected the insert, so the just-written
+        // bytes are orphaned (no row will ever reference them) — cleanup
+        // is best-effort; a cleanup error must never mask the DB failure.
+        await this.storage.delete(storageKey).catch(() => undefined);
+        // Two byte-identical uploads racing past the preliminary duplicate
+        // query both write files, then collide on the unique constraint.
+        // The loser must REPLAY the winning row — the caller asked for
+        // exactly what now exists.
+        if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === 'P2002'
+        ) {
+          const winner = await this.prisma.productReferenceImage.findFirst({
+            where: { tenantId, productId, checksumSha256 },
+            select: REFERENCE_SELECT,
+          });
+          if (winner) {
+            return winner;
+          }
+        }
+        throw error;
+      }
+      // AMBIGUOUS failure (connection dropped, engine panic, unknown
+      // error): the INSERT may have committed before the error surfaced.
+      // Deleting here could orphan a COMMITTED row from its bytes, so
+      // reconcile via the unique (tenantId, productId, checksumSha256)
+      // key instead — a hit means the row exists and the upload succeeded.
+      try {
+        const committed = await this.prisma.productReferenceImage.findFirst({
           where: { tenantId, productId, checksumSha256 },
           select: REFERENCE_SELECT,
         });
-        if (winner) {
-          return winner;
+        if (committed) {
+          return committed;
         }
+      } catch {
+        // Reconciliation itself failed — fall through to the safe default.
       }
+      // Unable to prove the insert did NOT commit: leave the bytes in
+      // place (an orphaned file is harmless; a committed row without
+      // bytes would 404 on serve) and surface the original failure.
+      this.logger.warn(
+        `Ambiguous insert failure for reference image ${storageKey}; ` +
+          'reconciliation found no row — keeping stored bytes in place',
+      );
       throw error;
     }
   }

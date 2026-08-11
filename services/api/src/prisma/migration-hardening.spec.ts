@@ -762,3 +762,78 @@ describe('video asset media-write state migration', () => {
     expect(sql).not.toMatch(/UPDATE\s+"VideoAsset"/i);
   });
 });
+
+describe('cv same-tenant fk migration hardening', () => {
+  // The pickup-validation, fusion-v2, and journey-skeleton migrations
+  // shipped their tables with single-column FKs only; this migration adds
+  // the composite same-tenant FKs that are the database-level
+  // tenant-isolation guarantee (AGENTS.md: tenancy).
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260811110000_cv_same_tenant_fks',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('anchors the two newly-referenced parents with UNIQUE (id, tenantId)', () => {
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "CustomerJourney_id_tenantId_key" ON "CustomerJourney"("id", "tenantId")',
+    );
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "ProductReferenceImage_id_tenantId_key" ON "ProductReferenceImage"("id", "tenantId")',
+    );
+  });
+
+  it('enforces same-tenant references with composite foreign keys on every CV table', () => {
+    for (const [constraint, columns, parent] of [
+      ['CustomerJourney_location_same_tenant_fkey', '"locationId", "tenantId"', 'Location'],
+      ['CustomerJourney_unit_same_tenant_fkey', '"unitId", "tenantId"', 'RetailUnit'],
+      ['CustomerJourneyEvent_journey_same_tenant_fkey', '"journeyId", "tenantId"', 'CustomerJourney'],
+      ['CustomerJourneyEvent_product_same_tenant_fkey', '"productId", "tenantId"', 'Product'],
+      ['ProductReferenceImage_product_same_tenant_fkey', '"productId", "tenantId"', 'Product'],
+      ['VideoGroundTruth_videoAsset_same_tenant_fkey', '"videoAssetId", "tenantId"', 'VideoAsset'],
+      ['VideoGroundTruth_product_same_tenant_fkey', '"productId", "tenantId"', 'Product'],
+      ['ProductReferenceEmbedding_product_same_tenant_fkey', '"productId", "tenantId"', 'Product'],
+      ['ProductReferenceEmbedding_referenceImage_same_tenant_fkey', '"referenceImageId", "tenantId"', 'ProductReferenceImage'],
+      ['PickupFusionRun_videoAsset_same_tenant_fkey', '"videoAssetId", "tenantId"', 'VideoAsset'],
+    ] as const) {
+      expect(sql).toContain(
+        `ADD CONSTRAINT "${constraint}" FOREIGN KEY (${columns}) REFERENCES "${parent}"("id", "tenantId")`,
+      );
+    }
+  });
+
+  it('mirrors each sibling single-column FK action — cascades ONLY with the owning lifecycle', () => {
+    // A composite RESTRICT beside a single-column CASCADE would silently
+    // veto the cascade the Prisma schema promises, so the three
+    // child-lifecycle FKs cascade and everything else restricts.
+    const cascading = [
+      'CustomerJourneyEvent_journey_same_tenant_fkey',
+      'VideoGroundTruth_videoAsset_same_tenant_fkey',
+      'ProductReferenceEmbedding_referenceImage_same_tenant_fkey',
+      'PickupFusionRun_videoAsset_same_tenant_fkey',
+    ];
+    for (const line of sql.split('\n')) {
+      if (!line.includes('ADD CONSTRAINT')) continue;
+      const expectsCascade = cascading.some((name) => line.includes(name));
+      expect(line).toContain(
+        expectsCascade
+          ? 'ON DELETE CASCADE ON UPDATE CASCADE'
+          : 'ON DELETE RESTRICT ON UPDATE CASCADE',
+      );
+    }
+  });
+
+  it('never covers User references with composite FKs (platform-sandbox exception)', () => {
+    // createdById rows written by platform admins carry (platform user,
+    // sandbox tenant) — a pair that can never exist in User(id, tenantId).
+    expect(sql).not.toMatch(/REFERENCES "User"/);
+    expect(sql).not.toMatch(/"createdById"/);
+  });
+});

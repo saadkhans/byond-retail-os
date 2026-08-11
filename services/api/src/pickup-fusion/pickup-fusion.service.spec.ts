@@ -1,7 +1,7 @@
 import { ConfigService } from '@nestjs/config';
 import { FusionPolicyResult, ProductStatus, VideoAssetStatus } from '@prisma/client';
 import { WeightedCandidateFusion } from './adapters/context-fusion-inventory';
-import { OcrExecutionStatus } from './adapters/text-signals';
+import { HogLabVisualRetriever } from './adapters/visual-signals';
 import { EMBEDDING_MODEL_KEY, EMBEDDING_MODEL_VERSION } from './primitives';
 import {
   BARCODE_VALUE_SUPPRESSED,
@@ -11,7 +11,7 @@ import {
   PickupFusionService,
   applyVlmVerdictToEvidence,
 } from './pickup-fusion.service';
-import { CandidateSignal, VlmVerdict } from './ports';
+import { CandidateSignal, OcrExecutionStatus, VlmVerdict } from './ports';
 
 /**
  * Two persistence-boundary guarantees of the fusion service:
@@ -169,6 +169,9 @@ function buildService(options: {
   ocrStatus?: OcrExecutionStatus;
   config?: Record<string, string>;
   vlmVerify?: jest.Mock;
+  /** Inventory validator port fake — defaults to PLAUSIBLE for every
+   *  requested candidate (the gate FAILS CLOSED on anything else). */
+  inventoryValidate?: jest.Mock;
 }) {
   const createdRuns: { data: { policy: FusionPolicyResult; fusedTopSku: string | null; evidence: FusionEvidence } }[] = [];
   // Behaves like the DB: honors the status filter the service sends.
@@ -220,6 +223,18 @@ function buildService(options: {
           timestampMs: index * 1000,
           rgb: Buffer.alloc(geometry.width * geometry.height * 3, 100),
         })),
+    ),
+    // Full-resolution frames arrive one seek at a time.
+    decodeFrameAt: jest.fn(
+      async (
+        _path: string,
+        timestampMs: number,
+        geometry: { width: number; height: number },
+      ) => ({
+        index: 0,
+        timestampMs,
+        rgb: Buffer.alloc(geometry.width * geometry.height * 3, 100),
+      }),
     ),
     decodeReferenceImage: jest.fn(),
   };
@@ -305,11 +320,31 @@ function buildService(options: {
     {
       adapterKey: 'stub-inventory',
       version: '1.0.0',
-      validate: jest.fn(async () => []),
+      validate:
+        options.inventoryValidate ??
+        // Default: every requested candidate validates PLAUSIBLE, so the
+        // fail-closed gate stays out of unrelated fixtures' way.
+        jest.fn(
+          async (_tenantId: string, _locationId: string | null, ids: string[]) =>
+            ids.map((productId) => {
+              const row = options.catalog.find(
+                (product) => product.id === productId,
+              );
+              return {
+                productId,
+                sku: row?.sku ?? productId,
+                stockedAtStore: true,
+                onHandQuantity: 3,
+                verdict: 'PLAUSIBLE' as const,
+              };
+            }),
+        ),
     } as never,
+    // Tx-scoped retriever factory (module-provided in production).
+    (() => ({})) as never,
     { get: (key: string) => options.config?.[key] } as unknown as ConfigService,
   );
-  return { service, productFindMany, createdRuns };
+  return { service, productFindMany, createdRuns, decoder };
 }
 
 describe('fusion catalog is constrained to ACTIVE products', () => {
@@ -571,6 +606,107 @@ describe('OCR execution failures are classified — never a silent no-text pass'
 });
 
 // --------------------------------------------------------------------
+// Full-resolution decoding stays per-timestamp (bounded ffmpeg output)
+// --------------------------------------------------------------------
+
+describe('full-resolution frames are decoded per consumed timestamp, never as a whole clip', () => {
+  const ACTIVE: CatalogFixture = {
+    id: 'p-active',
+    sku: 'WATER-1',
+    name: 'Spring Water 500ml',
+    status: ProductStatus.ACTIVE,
+    barcode: '6281000000002',
+  };
+
+  it('one whole-clip decode at the SMALL analysis geometry; full-res is one seek per instant', async () => {
+    const { service, decoder } = buildService({
+      catalog: [ACTIVE],
+      barcodeSeen: ACTIVE.barcode,
+      classicalSignals: [{ productId: ACTIVE.id, sku: ACTIVE.sku, score: 0.95 }],
+    });
+    await service.run('tenant-1', 'asset-1');
+
+    // Whole-clip decoding happens exactly ONCE — the downscaled analysis
+    // pass. A second whole-clip decode at full resolution is the overflow
+    // regression (20-30 s clips exceed the decoder's 64 MiB budget).
+    expect(decoder.decodeAnalysisFrames).toHaveBeenCalledTimes(1);
+    const smallGeometry = decoder.decodeAnalysisFrames.mock.calls[0][2] as {
+      width: number;
+    };
+    expect(smallGeometry.width).toBe(48);
+
+    // Full resolution arrives via per-timestamp seeks at the consumed
+    // instants only: quiet baseline + pre*3 + peak + post (event fixture:
+    // start 1500 / peak 2000 / end 2500, clip 6000 ms) — each decoded once.
+    const seeks = decoder.decodeFrameAt.mock.calls
+      .map((call) => call[1] as number)
+      .sort((a, b) => a - b);
+    expect(seeks).toEqual([0, 300, 900, 1300, 2000, 3100]);
+    for (const call of decoder.decodeFrameAt.mock.calls) {
+      expect((call[2] as { width: number }).width).toBe(480);
+    }
+  });
+});
+
+// --------------------------------------------------------------------
+// Inventory gate fails CLOSED (no store context / missing validation)
+// --------------------------------------------------------------------
+
+describe('AUTO_PROPOSE demotes when inventory validation cannot back the candidate', () => {
+  const ACTIVE: CatalogFixture = {
+    id: 'p-active',
+    sku: 'WATER-1',
+    name: 'Spring Water 500ml',
+    status: ProductStatus.ACTIVE,
+    barcode: '6281000000002',
+  };
+  // Barcode + strong classical signal: with a PLAUSIBLE validation this
+  // fixture reaches AUTO_PROPOSE (pinned by the ACTIVE-catalog suite).
+  const strong = {
+    catalog: [ACTIVE],
+    barcodeSeen: ACTIVE.barcode,
+    classicalSignals: [{ productId: ACTIVE.id, sku: ACTIVE.sku, score: 0.95 }],
+  };
+
+  it('a location-less asset (NO_STORE_CONTEXT) routes to review — zero inventory validation is not a pass', async () => {
+    const { service, createdRuns } = buildService({
+      ...strong,
+      inventoryValidate: jest.fn(
+        async (_tenantId: string, _locationId: string | null, ids: string[]) =>
+          ids.map((productId) => ({
+            productId,
+            sku: ACTIVE.sku,
+            stockedAtStore: false,
+            onHandQuantity: null,
+            verdict: 'NO_STORE_CONTEXT' as const,
+          })),
+      ),
+    });
+    await service.run('tenant-1', 'asset-1');
+
+    expect(createdRuns).toHaveLength(1);
+    const { data } = createdRuns[0];
+    expect(data.policy).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+    expect(data.evidence.policy.reason).toContain('NO_STORE_CONTEXT');
+  });
+
+  it('a missing validation row for the final SKU routes to review too', async () => {
+    const { service, createdRuns } = buildService({
+      ...strong,
+      inventoryValidate: jest.fn(async () => []),
+    });
+    await service.run('tenant-1', 'asset-1');
+
+    expect(createdRuns).toHaveLength(1);
+    const { data } = createdRuns[0];
+    expect(data.policy).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+    expect(data.evidence.policy.reason).toContain(
+      `no inventory validation recorded for ${ACTIVE.sku}`,
+    );
+  });
+});
+
+// --------------------------------------------------------------------
 // Atomic reference-index rebuild (delete + reconstruct in ONE transaction)
 // --------------------------------------------------------------------
 
@@ -590,12 +726,18 @@ function buildReindexService(options: {
       embeddingModelVersion: EMBEDDING_MODEL_VERSION,
       ensureIndex: jest.fn(async () => ({ indexed: 0, total: 3 })),
     };
+  const storage = { internalPathFor: (key: string) => key };
+  const decoder = options.decoder ?? { decodeReferenceImage: jest.fn() };
+  // The same factory shape the module provides: a REAL retriever adapter
+  // bound to whatever (tx) client the rebuild hands it.
+  const txRetrieverFactory = (tx: unknown) =>
+    new HogLabVisualRetriever(tx as never, storage as never, decoder as never);
   const service = new PickupFusionService(
     options.prisma as never,
     {} as never,
     {} as never,
-    { internalPathFor: (key: string) => key } as never,
-    (options.decoder ?? { decodeReferenceImage: jest.fn() }) as never,
+    storage as never,
+    decoder as never,
     {} as never,
     {} as never,
     {} as never,
@@ -607,6 +749,7 @@ function buildReindexService(options: {
     {} as never,
     { provider: 'local', verifier: {}, readiness: jest.fn() } as never,
     {} as never,
+    txRetrieverFactory as never,
     { get: () => undefined } as unknown as ConfigService,
   );
   return { service, retriever };
@@ -721,6 +864,44 @@ describe('reference-index rebuild swaps atomically (old index intact until commi
     );
     // The live (non-tx) client never deleted anything — the pre-rebuild
     // index was only ever touched inside the rolled-back transaction.
+    expect(prisma.productReferenceEmbedding.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('rebuild aborts (throws inside the tx) when any active reference cannot be reconstructed', async () => {
+    const tx = {
+      productReferenceEmbedding: {
+        deleteMany: jest.fn(async () => ({ count: 2 })),
+        create: jest.fn(async () => ({})),
+      },
+      productReferenceImage: {
+        findMany: jest.fn(async () => [
+          { id: 'img-ok', productId: 'p-1', storageKey: 'refs/ok.png', embeddings: [] },
+          { id: 'img-bad', productId: 'p-2', storageKey: 'refs/broken.png', embeddings: [] },
+        ]),
+      },
+    };
+    const prisma: ReindexPrismaFixture = {
+      $transaction: jest.fn(async (work: (tx: unknown) => Promise<unknown>) => work(tx)),
+      productReferenceEmbedding: { deleteMany: jest.fn() },
+    };
+    // One reference is temporarily unreadable — the incremental path may
+    // skip it, but a REBUILD committing without its vector would silently
+    // shrink the live index.
+    const decoder = {
+      decodeReferenceImage: jest.fn(async (path: string) => {
+        if (path.includes('broken')) {
+          throw new Error('unreadable');
+        }
+        return { width: 8, height: 8, rgb: Buffer.alloc(192, 100) };
+      }),
+    };
+    const { service } = buildReindexService({ prisma, decoder });
+
+    await expect(service.reindexReferenceIndex('tenant-1', true)).rejects.toThrow(
+      /rebuild aborted: 1 of 2/,
+    );
+    // The rejection propagates OUT of $transaction (Prisma rolls back) —
+    // the live client never deleted the old generation.
     expect(prisma.productReferenceEmbedding.deleteMany).not.toHaveBeenCalled();
   });
 });

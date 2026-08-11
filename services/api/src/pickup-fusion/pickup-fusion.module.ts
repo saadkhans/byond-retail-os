@@ -29,7 +29,23 @@ import { AnthropicVlmVerifier } from './adapters/vlm-verifier';
 import { OllamaVlmVerifier } from './adapters/ollama-vlm';
 import { ReindexReferenceIndexDto } from './dto/reindex-reference-index.dto';
 import { PickupFusionService } from './pickup-fusion.service';
+import {
+  PICKUP_BARCODE_READER,
+  PICKUP_CANDIDATE_FUSION,
+  PICKUP_CLASSICAL_MATCHER,
+  PICKUP_CONTEXT_PROVIDER,
+  PICKUP_EVENT_DETECTOR,
+  PICKUP_INVENTORY_VALIDATOR,
+  PICKUP_OBJECT_DETECTOR,
+  PICKUP_OCR_READER,
+  PICKUP_TX_RETRIEVER_FACTORY,
+  PICKUP_VISUAL_RETRIEVER,
+  TxScopedRetrieverFactory,
+} from './pickup-fusion.tokens';
 import { pickupVlmVerifierProvider } from './vlm-provider';
+import { PickupAnalysisFrameDecoder } from '../pickup-detection/analysis/analysis-frames';
+import { LocalVideoStorageAdapter } from '../video-ingest/storage/local-video-storage.adapter';
+import { PrismaService } from '../prisma/prisma.service';
 
 /** Shadow-run trigger + evidence read (both under the video-ingest gate). */
 @ApiTags('video-ingest')
@@ -132,6 +148,31 @@ export class FusionOpsController {
     // the PICKUP_VLM_VERIFIER token, never a concrete vendor.
     pickupVlmVerifierProvider,
     PrismaInventoryValidator,
+    // Every fusion stage reaches the service as a PORT bound here — the
+    // ONLY place (with vlm-provider) that names concrete adapters.
+    { provide: PICKUP_EVENT_DETECTOR, useExisting: ClassicalMotionEventDetector },
+    { provide: PICKUP_OBJECT_DETECTOR, useExisting: YoloOnnxObjectDetector },
+    { provide: PICKUP_BARCODE_READER, useExisting: ZxingBarcodeReader },
+    { provide: PICKUP_OCR_READER, useExisting: TesseractOcrReader },
+    { provide: PICKUP_VISUAL_RETRIEVER, useExisting: HogLabVisualRetriever },
+    { provide: PICKUP_CLASSICAL_MATCHER, useExisting: ClassicalHsvNccMatcher },
+    { provide: PICKUP_CONTEXT_PROVIDER, useExisting: PrismaContextSignalProvider },
+    { provide: PICKUP_CANDIDATE_FUSION, useExisting: WeightedCandidateFusion },
+    { provide: PICKUP_INVENTORY_VALIDATOR, useExisting: PrismaInventoryValidator },
+    // The atomic index rebuild reconstructs through the transaction that
+    // deleted the old generation; tx clients cannot travel through DI, so
+    // the module hands the service a factory instead of a class import.
+    {
+      provide: PICKUP_TX_RETRIEVER_FACTORY,
+      inject: [LocalVideoStorageAdapter, PickupAnalysisFrameDecoder],
+      useFactory:
+        (
+          storage: LocalVideoStorageAdapter,
+          decoder: PickupAnalysisFrameDecoder,
+        ): TxScopedRetrieverFactory =>
+        (tx: PrismaService) =>
+          new HogLabVisualRetriever(tx, storage, decoder),
+    },
     PickupFusionService,
   ],
 })

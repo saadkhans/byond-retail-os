@@ -30,30 +30,35 @@ import {
 } from '../pickup-detection/pickup-detection.service';
 import { PickupDetectionConfig } from '../pickup-detection/pickup-detection.config';
 import {
+  BarcodeReader,
+  CandidateFusion,
   CandidateSignal,
+  ClassicalMatcher,
+  ContextSignalProvider,
   FusedCandidate,
+  InventoryValidator,
+  ObjectDetector,
+  OcrExecutionStatus,
+  OcrReader,
+  PickupEventDetector,
   QualifiedCrop,
+  VisualRetriever,
   VlmStructuredResult,
   VlmVerdict,
 } from './ports';
 import {
-  ClassicalMotionEventDetector,
-  YoloOnnxObjectDetector,
-} from './adapters/event-detection';
-import {
-  OcrExecutionStatus,
-  TesseractOcrReader,
-  ZxingBarcodeReader,
-} from './adapters/text-signals';
-import {
-  ClassicalHsvNccMatcher,
-  HogLabVisualRetriever,
-} from './adapters/visual-signals';
-import {
-  PrismaContextSignalProvider,
-  PrismaInventoryValidator,
-  WeightedCandidateFusion,
-} from './adapters/context-fusion-inventory';
+  PICKUP_BARCODE_READER,
+  PICKUP_CANDIDATE_FUSION,
+  PICKUP_CLASSICAL_MATCHER,
+  PICKUP_CONTEXT_PROVIDER,
+  PICKUP_EVENT_DETECTOR,
+  PICKUP_INVENTORY_VALIDATOR,
+  PICKUP_OBJECT_DETECTOR,
+  PICKUP_OCR_READER,
+  PICKUP_TX_RETRIEVER_FACTORY,
+  PICKUP_VISUAL_RETRIEVER,
+  TxScopedRetrieverFactory,
+} from './pickup-fusion.tokens';
 import { PICKUP_VLM_VERIFIER, SelectedVlmVerifier } from './vlm-provider';
 import {
   meanBrightness,
@@ -396,19 +401,34 @@ export class PickupFusionService {
     private readonly storage: LocalVideoStorageAdapter,
     private readonly decoder: PickupAnalysisFrameDecoder,
     private readonly detectionConfig: PickupDetectionConfig,
-    private readonly detector: ClassicalMotionEventDetector,
-    private readonly yolo: YoloOnnxObjectDetector,
-    private readonly barcodeReader: ZxingBarcodeReader,
-    private readonly ocrReader: TesseractOcrReader,
-    private readonly retriever: HogLabVisualRetriever,
-    private readonly classical: ClassicalHsvNccMatcher,
-    private readonly contextProvider: PrismaContextSignalProvider,
-    private readonly fusion: WeightedCandidateFusion,
+    // Every fusion stage is a PORT injected by token (bound to concrete
+    // adapters in the module) — the service never sees a vendor class.
+    @Inject(PICKUP_EVENT_DETECTOR)
+    private readonly detector: PickupEventDetector,
+    @Inject(PICKUP_OBJECT_DETECTOR)
+    private readonly yolo: ObjectDetector,
+    @Inject(PICKUP_BARCODE_READER)
+    private readonly barcodeReader: BarcodeReader,
+    @Inject(PICKUP_OCR_READER)
+    private readonly ocrReader: OcrReader,
+    @Inject(PICKUP_VISUAL_RETRIEVER)
+    private readonly retriever: VisualRetriever,
+    @Inject(PICKUP_CLASSICAL_MATCHER)
+    private readonly classical: ClassicalMatcher,
+    @Inject(PICKUP_CONTEXT_PROVIDER)
+    private readonly contextProvider: ContextSignalProvider,
+    @Inject(PICKUP_CANDIDATE_FUSION)
+    private readonly fusion: CandidateFusion,
     // The SELECTED verifier port (vlm-provider registry, keyed by
     // PICKUP_VLM_PROVIDER) — the service never sees a concrete vendor.
     @Inject(PICKUP_VLM_VERIFIER)
     private readonly selectedVlm: SelectedVlmVerifier,
-    private readonly inventoryValidator: PrismaInventoryValidator,
+    @Inject(PICKUP_INVENTORY_VALIDATOR)
+    private readonly inventoryValidator: InventoryValidator,
+    // Module-provided factory for the tx-scoped retriever the atomic
+    // rebuild needs (tx clients cannot travel through DI).
+    @Inject(PICKUP_TX_RETRIEVER_FACTORY)
+    private readonly txRetrieverFactory: TxScopedRetrieverFactory,
     config: ConfigService,
   ) {
     const num = (key: string, fallback: number) => {
@@ -508,15 +528,27 @@ export class PickupFusionService {
     const result = rebuild
       ? await this.prisma.$transaction(
           async (tx) => {
-            const scoped = new HogLabVisualRetriever(
+            const scoped = this.txRetrieverFactory(
               tx as unknown as PrismaService,
-              this.storage,
-              this.decoder,
             );
             await tx.productReferenceEmbedding.deleteMany({
               where: { tenantId, modelKey: scoped.embeddingModelKey },
             });
-            return scoped.ensureIndex(tenantId);
+            const rebuilt = await scoped.ensureIndex(tenantId);
+            // STRICT rebuild: every active reference was just deleted, so
+            // the reconstruction must re-embed all of them. ensureIndex's
+            // lenient per-image skip (fine for incremental backfill) would
+            // otherwise COMMIT an index that silently dropped the vector
+            // of a temporarily unreadable reference — throw instead, so
+            // the rollback keeps the old index intact.
+            if (rebuilt.indexed < rebuilt.total) {
+              throw new ConflictException(
+                `rebuild aborted: ${rebuilt.total - rebuilt.indexed} of ` +
+                  `${rebuilt.total} active reference images could not be ` +
+                  'reconstructed — the previous index was kept',
+              );
+            }
+            return rebuilt;
           },
           { timeout: PickupFusionService.REINDEX_REBUILD_TX_TIMEOUT_MS },
         )
@@ -648,19 +680,13 @@ export class PickupFusionService {
             geometrySmall,
           ),
       );
+      // Full-resolution decoding happens PER TIMESTAMP (below, after the
+      // detector has chosen the instants that matter): a whole-clip decode
+      // at full resolution overflows the decoder's bounded output budget
+      // for ordinary 20-30 s clips, failing supported inputs.
       const geometryFull = analysisGeometryFor(
         { durationMs: internal.durationMs, width: source.width, height: source.height, fps: internal.fps ?? 30 },
         Math.min(source.width, 640),
-      );
-      const framesFull = await timed(
-        'decode-full',
-        { adapterKey: 'ffmpeg-rawvideo', version: '1.0.0' },
-        () =>
-          this.decoder.decodeAnalysisFrames(
-            internalPath,
-            this.detectionConfig.analysisFps,
-            geometryFull,
-          ),
       );
 
       // ---- detection + tracking ---------------------------------------
@@ -698,13 +724,27 @@ export class PickupFusionService {
       const primary = detection.events[0];
 
       // ---- multi-frame crop selection (req 4) --------------------------
-      const fullByTime = (ms: number): AnalysisFrame =>
-        framesFull.reduce((best, frame) =>
-          Math.abs(frame.timestampMs - ms) < Math.abs(best.timestampMs - ms)
-            ? frame
-            : best,
+      // Only the instants the pipeline actually consumes are decoded at
+      // full resolution — the quiet baseline plus the pre/peak/post
+      // candidates. Each is one ffmpeg seek producing one frame, so the
+      // full-res decode stays a handful of frames for any supported clip
+      // length or aspect (never the whole clip at analysis fps).
+      const durationMs = internal.durationMs;
+      const fullFrameCache = new Map<number, AnalysisFrame>();
+      const fullFrameAt = async (ms: number): Promise<AnalysisFrame> => {
+        const clamped = Math.max(0, Math.min(ms, durationMs - 1));
+        const cached = fullFrameCache.get(clamped);
+        if (cached) {
+          return cached;
+        }
+        const frame = await this.decoder.decodeFrameAt(
+          internalPath,
+          clamped,
+          geometryFull,
         );
-      const quietFull = framesFull[0].rgb;
+        fullFrameCache.set(clamped, frame);
+        return frame;
+      };
       const fullBox = scaleBoxToSource(primary.box, geometrySmall, {
         width: geometryFull.width,
         height: geometryFull.height,
@@ -716,8 +756,25 @@ export class PickupFusionService {
         { phase: 'peak', ms: primary.peakMs },
         { phase: 'post', ms: Math.min(internal.durationMs - 1, primary.endMs + 600) },
       ];
-      const crops: QualifiedCrop[] = candidateInstants.map(({ phase, ms }) => {
-        const frame = fullByTime(ms);
+      const quietFull = (
+        await timed(
+          'decode-full',
+          { adapterKey: 'ffmpeg-rawvideo', version: '1.0.0' },
+          async () => {
+            // Prefetch every consumed instant while the stage is timed.
+            for (const { ms } of candidateInstants) {
+              await fullFrameAt(ms);
+            }
+            return fullFrameAt(0);
+          },
+          'per-timestamp seeks',
+        )
+      ).rgb;
+      const cropFrames = await Promise.all(
+        candidateInstants.map(({ ms }) => fullFrameAt(ms)),
+      );
+      const crops: QualifiedCrop[] = candidateInstants.map(({ phase }, instant) => {
+        const frame = cropFrames[instant];
         const image = cropRgb(
           { width: geometryFull.width, height: geometryFull.height, rgb: frame.rgb },
           fullBox,
@@ -793,7 +850,7 @@ export class PickupFusionService {
       );
 
       // ---- barcode (req 5) --------------------------------------------
-      const peakFullFrame = fullByTime(primary.peakMs);
+      const peakFullFrame = await fullFrameAt(primary.peakMs);
       const barcodeResults = await timed('barcode', this.barcodeReader, () =>
         this.barcodeReader.read([
           { image: bestPre.image, timestampMs: bestPre.timestampMs },
@@ -1033,11 +1090,16 @@ export class PickupFusionService {
         const validation = inventoryValidations.find(
           (row) => row.sku === finalSku,
         );
-        if (
-          validation &&
-          (validation.verdict === 'NOT_STOCKED' ||
-            validation.verdict === 'OUT_OF_STOCK')
-        ) {
+        // FAIL CLOSED: only an explicit PLAUSIBLE verdict lets AUTO_PROPOSE
+        // stand. A missing validation row, or a location-less asset
+        // (NO_STORE_CONTEXT), means the proposal has ZERO inventory
+        // backing — that is a reason for human eyes, never a free pass.
+        if (!validation) {
+          evidence.policy = {
+            result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
+            reason: `no inventory validation recorded for ${finalSku} — review`,
+          };
+        } else if (validation.verdict !== 'PLAUSIBLE') {
           evidence.policy = {
             result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
             reason: `inventory validation rejected ${finalSku} (${validation.verdict}) — review`,

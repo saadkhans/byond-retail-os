@@ -152,14 +152,18 @@ describe('ReferenceImagesService.upload insert-failure cleanup', () => {
     };
   }
 
-  it('deletes the just-stored bytes and rethrows on a non-P2002 insert failure', async () => {
+  it('a DEFINITE FK failure (P2003) deletes the just-stored bytes and rethrows', async () => {
     const { service, storage, prisma } = buildService();
-    const outage = new Error('database connection lost');
-    prisma.productReferenceImage.create.mockRejectedValueOnce(outage);
+    const fkViolation = new Prisma.PrismaClientKnownRequestError(
+      'Foreign key constraint failed',
+      { code: 'P2003', clientVersion: 'test' },
+    );
+    prisma.productReferenceImage.create.mockRejectedValueOnce(fkViolation);
     await expect(
       service.upload(TENANT, PRODUCT_ID, cleanUpload()),
-    ).rejects.toBe(outage);
-    // The file written before the insert must not survive the failure.
+    ).rejects.toBe(fkViolation);
+    // The database provably rejected the row, so the file written before
+    // the insert must not survive the failure.
     expect(storage.delete).toHaveBeenCalledTimes(1);
     const [deletedKey] = storage.delete.mock.calls[0] as unknown as [string];
     const [putKey] = storage.put.mock.calls[0] as unknown as [string, Buffer];
@@ -168,13 +172,94 @@ describe('ReferenceImagesService.upload insert-failure cleanup', () => {
 
   it('a failing cleanup delete never masks the original insert error', async () => {
     const { service, storage, prisma } = buildService();
-    const outage = new Error('foreign key constraint violated');
-    prisma.productReferenceImage.create.mockRejectedValueOnce(outage);
+    const fkViolation = new Prisma.PrismaClientKnownRequestError(
+      'Foreign key constraint failed',
+      { code: 'P2003', clientVersion: 'test' },
+    );
+    prisma.productReferenceImage.create.mockRejectedValueOnce(fkViolation);
     storage.delete.mockRejectedValueOnce(new Error('disk gone too'));
     await expect(
       service.upload(TENANT, PRODUCT_ID, cleanUpload()),
-    ).rejects.toBe(outage);
+    ).rejects.toBe(fkViolation);
     expect(storage.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('an AMBIGUOUS failure with a committed row replays it and keeps the bytes', async () => {
+    const { service, storage, prisma } = buildService();
+    // Connection dropped AFTER PostgreSQL may have committed — deleting
+    // the bytes here would orphan the committed row from its file.
+    const dropped = new Prisma.PrismaClientUnknownRequestError(
+      'Connection reset by peer',
+      { clientVersion: 'test' },
+    );
+    prisma.productReferenceImage.create.mockRejectedValueOnce(dropped);
+    const committed = {
+      id: 'img-committed',
+      productId: PRODUCT_ID,
+      originalFilename: 'front.png',
+      mimeType: 'image/png',
+      sizeBytes: cleanPngBytes().length,
+      checksumSha256: 'abc',
+      createdAt: new Date(),
+    };
+    // First findFirst is the preliminary duplicate probe (miss); the
+    // second is the reconciliation lookup (hit: the insert DID commit).
+    prisma.productReferenceImage.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(committed as never);
+    await expect(
+      service.upload(TENANT, PRODUCT_ID, cleanUpload()),
+    ).resolves.toEqual(committed);
+    expect(storage.delete).not.toHaveBeenCalled();
+  });
+
+  it('an AMBIGUOUS failure with no committed row keeps the bytes and rethrows', async () => {
+    const { service, storage, prisma } = buildService();
+    const panic = new Prisma.PrismaClientRustPanicError(
+      'engine panicked',
+      'test',
+    );
+    prisma.productReferenceImage.create.mockRejectedValueOnce(panic);
+    await expect(
+      service.upload(TENANT, PRODUCT_ID, cleanUpload()),
+    ).rejects.toBe(panic);
+    // Cannot prove the insert did NOT commit — an orphaned file is
+    // harmless, a committed row without bytes would 404 on serve.
+    expect(storage.delete).not.toHaveBeenCalled();
+  });
+
+  it.each(['P1001', 'P1002', 'P1008', 'P1017'])(
+    'connection-layer known code %s is treated as ambiguous (bytes kept)',
+    async (code) => {
+      const { service, storage, prisma } = buildService();
+      const connectionError = new Prisma.PrismaClientKnownRequestError(
+        'connection-layer failure',
+        { code, clientVersion: 'test' },
+      );
+      prisma.productReferenceImage.create.mockRejectedValueOnce(
+        connectionError,
+      );
+      await expect(
+        service.upload(TENANT, PRODUCT_ID, cleanUpload()),
+      ).rejects.toBe(connectionError);
+      expect(storage.delete).not.toHaveBeenCalled();
+    },
+  );
+
+  it('a failing reconciliation lookup still keeps the bytes and rethrows the original error', async () => {
+    const { service, storage, prisma } = buildService();
+    const dropped = new Prisma.PrismaClientUnknownRequestError(
+      'Connection reset by peer',
+      { clientVersion: 'test' },
+    );
+    prisma.productReferenceImage.create.mockRejectedValueOnce(dropped);
+    prisma.productReferenceImage.findFirst
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new Error('still unreachable'));
+    await expect(
+      service.upload(TENANT, PRODUCT_ID, cleanUpload()),
+    ).rejects.toBe(dropped);
+    expect(storage.delete).not.toHaveBeenCalled();
   });
 
   it('P2002 still deletes the losing bytes and replays the winning row', async () => {

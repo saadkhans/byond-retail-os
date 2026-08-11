@@ -136,13 +136,25 @@ export class WeightedCandidateFusion implements CandidateFusion {
     ];
     const accumulator = new Map<
       string,
-      { weighted: number; signals: FusedCandidate['signals'] }
+      {
+        bestBySource: Map<keyof typeof FUSION_WEIGHTS, number>;
+        signals: FusedCandidate['signals'];
+      }
     >();
     for (const [source, signals] of bySource) {
       for (const signal of signals) {
-        const entry =
-          accumulator.get(signal.productId) ?? { weighted: 0, signals: [] };
-        entry.weighted += FUSION_WEIGHTS[source] * signal.score;
+        const entry = accumulator.get(signal.productId) ?? {
+          bestBySource: new Map<keyof typeof FUSION_WEIGHTS, number>(),
+          signals: [] as FusedCandidate['signals'],
+        };
+        // Each source counts ONCE per candidate: duplicate rows from the
+        // same source (e.g. the same barcode decoded on both crop and peak
+        // frames) keep the max score rather than stacking the weight, so no
+        // single signal class can clear the auto threshold by repetition.
+        entry.bestBySource.set(
+          source,
+          Math.max(entry.bestBySource.get(source) ?? 0, signal.score),
+        );
         entry.signals.push({
           source,
           score: signal.score,
@@ -152,13 +164,19 @@ export class WeightedCandidateFusion implements CandidateFusion {
       }
     }
     const ranked = [...accumulator.entries()]
-      .map(([productId, entry]) => ({
-        productId,
-        sku: products.get(productId)?.sku ?? productId,
-        productName: products.get(productId)?.name ?? productId,
-        fusedScore: Math.round(entry.weighted * 10_000) / 10_000,
-        signals: entry.signals,
-      }))
+      .map(([productId, entry]) => {
+        let weighted = 0;
+        for (const [source, score] of entry.bestBySource) {
+          weighted += FUSION_WEIGHTS[source] * score;
+        }
+        return {
+          productId,
+          sku: products.get(productId)?.sku ?? productId,
+          productName: products.get(productId)?.name ?? productId,
+          fusedScore: Math.round(weighted * 10_000) / 10_000,
+          signals: entry.signals,
+        };
+      })
       .sort((a, b) => b.fusedScore - a.fusedScore)
       .slice(0, 10);
     return ranked.map((candidate, index) => ({

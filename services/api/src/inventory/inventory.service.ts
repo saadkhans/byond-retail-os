@@ -13,7 +13,7 @@ import {
   AuditActor,
   SYSTEM_ACTOR_EMAIL,
 } from '../common/audit/audit-log.service';
-import { containsSensitiveValue } from '../common/sensitive-keys';
+import { containsSensitiveFreeText } from '../video-ingest/media-safety';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
 import {
   EXTERNAL_MOVEMENT_TYPES,
@@ -37,18 +37,36 @@ export interface StockLevelView extends InventoryLevelWithRefs {
  * and the reason also flows into AuditLog.reason, which audit redaction
  * does not cover. Reject credential-/payment-bearing content (a pasted PAN,
  * token, or credential URL) with a controlled 400 BEFORE any repository
- * write — AGENTS.md payments invariant; same containsSensitiveValue gate as
- * the checkout idempotency key and the order cancellation reason.
+ * write — AGENTS.md payments invariant. The screen is the STRICT free-text
+ * predicate (containsSensitiveFreeText), not the weaker
+ * containsSensitiveValue: the weak PAN detector only bridges space/dash
+ * separators and its credential detectors need '='/':' , so a dot- or
+ * underscore-grouped PAN ("4111.1111.1111.1111", "4111_1111_1111_1111")
+ * and spaced/fused credential labels ("cvv 123", "cvv123",
+ * "password hunter2") would land in the ledger forever — the same
+ * separator exemptions the media-safety Luhn-wins policy rejected.
  */
 function assertSafeLedgerText(
   field: 'reason' | 'reference',
   value: string,
 ): void {
-  if (containsSensitiveValue(value)) {
+  if (containsSensitiveFreeText(value)) {
     throw new BadRequestException(
       `${field} must not contain credential- or payment-bearing values`,
     );
   }
+}
+
+/**
+ * Caller-supplied ids reflected into error messages get the same redaction
+ * as video-assets' unresolved-id 404s: error responses land in logs and
+ * telemetry, so a PAN- or credential-valued locationId/productId (the DTO
+ * constrains them with @IsString/@MinLength only — no charset) must echo
+ * back as [REDACTED], never verbatim (AGENTS.md payments invariant).
+ * Resolved ids are server data and stay readable.
+ */
+function safeErrorEntityId(id: string): string {
+  return containsSensitiveFreeText(id) ? '[REDACTED]' : id;
 }
 
 @Injectable()
@@ -103,9 +121,13 @@ export class InventoryService {
 
     switch (result) {
       case 'location-not-found':
-        throw new NotFoundException(`Location "${dto.locationId}" not found`);
+        throw new NotFoundException(
+          `Location "${safeErrorEntityId(dto.locationId)}" not found`,
+        );
       case 'product-not-found':
-        throw new NotFoundException(`Product "${dto.productId}" not found`);
+        throw new NotFoundException(
+          `Product "${safeErrorEntityId(dto.productId)}" not found`,
+        );
       case 'product-archived':
         throw new ConflictException(
           'Stock of an ARCHIVED product cannot be adjusted',
@@ -158,8 +180,9 @@ export class InventoryService {
       throw new BadRequestException('A movement reason is required');
     }
     assertSafeLedgerText('reason', reason);
-    // The reference charset ([A-Za-z0-9._-]) still admits a dash-grouped
-    // PAN, so it gets the same screen as the reason.
+    // The reference charset ([A-Za-z0-9._-]) still admits a PAN grouped by
+    // dash, dot, OR underscore, so it gets the same strict screen as the
+    // reason (the grouping-aware detector chains all three separators).
     assertSafeLedgerText('reference', dto.reference);
     // Redundant with the DTO on purpose — ledger integrity never rests on
     // transport validation alone.
@@ -204,9 +227,13 @@ export class InventoryService {
     if (typeof result === 'string') {
       switch (result) {
         case 'location-not-found':
-          throw new NotFoundException(`Location "${dto.locationId}" not found`);
+          throw new NotFoundException(
+            `Location "${safeErrorEntityId(dto.locationId)}" not found`,
+          );
         case 'product-not-found':
-          throw new NotFoundException(`Product "${dto.productId}" not found`);
+          throw new NotFoundException(
+            `Product "${safeErrorEntityId(dto.productId)}" not found`,
+          );
         case 'product-archived':
           throw new ConflictException(
             'Stock of an ARCHIVED product cannot be moved',

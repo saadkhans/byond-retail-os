@@ -258,6 +258,11 @@ describe('PickupDetectionService.detectForAsset', () => {
     expect(completion.occurredAt).toMatch(/Z$/);
 
     expect(inferenceJobs.toVisionEvent).toHaveBeenCalledWith(TENANT, 'job-1');
+    // The metadata write is tenant-scoped via the composite unique key —
+    // id alone must never address another tenant's event.
+    expect(prisma.visionEvent.update.mock.calls[0][0].where).toEqual({
+      id_tenantId: { id: 'event-1', tenantId: TENANT },
+    });
     const metadata = prisma.visionEvent.update.mock.calls[0][0].data
       .metadata as Record<string, unknown>;
     expect(metadata.kind).toBe('PRODUCT_PICKUP_DETECTION');
@@ -497,9 +502,11 @@ describe('PickupDetectionService.detectForAsset', () => {
     expect(videoAssets.extractFrames).not.toHaveBeenCalled();
     expect(videoAssets.createCrop).not.toHaveBeenCalled();
     // ...and the record restored on the ORIGINAL event replays the
-    // persisted attempt exactly.
+    // persisted attempt exactly, under a tenant-scoped where-clause.
     const update = prisma.visionEvent.update.mock.calls[0][0];
-    expect(update.where).toEqual({ id: 'event-0' });
+    expect(update.where).toEqual({
+      id_tenantId: { id: 'event-0', tenantId: TENANT },
+    });
     const metadata = update.data.metadata as Record<string, unknown>;
     expect(metadata.kind).toBe('PRODUCT_PICKUP_DETECTION');
     expect(metadata.result).toBe('PRODUCT_MATCHED');

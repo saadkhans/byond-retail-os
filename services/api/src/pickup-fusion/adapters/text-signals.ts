@@ -8,8 +8,16 @@ import {
   MultiFormatReader,
 } from '@zxing/library';
 import { RgbImage } from '../../pickup-detection/analysis/product-matcher';
-import { BarcodeReader, BarcodeResult, OcrReader, OcrResult } from '../ports';
+import {
+  BarcodeReader,
+  BarcodeResult,
+  ClassifiedOcrResult,
+  OcrExecutionStatus,
+  OcrReader,
+} from '../ports';
 import { normalizeText } from '../primitives';
+
+export type { ClassifiedOcrResult, OcrExecutionStatus } from '../ports';
 
 // ------------------------------------------------------------ barcode
 
@@ -222,29 +230,9 @@ export function encodeRgbPng(image: RgbImage): Buffer {
   ]);
 }
 
-/**
- * Classified OCR execution status — the same pattern as the VLM verdict
- * classification: a fixed code only, NEVER raw error text (an execFile
- * error message can embed command output or filesystem paths). 'OK'
- * includes a successful pass that simply saw no text; every other value
- * means the OCR stage DID NOT complete, so its empty text must not be
- * treated as a verified "no text on the product" observation.
- * - UNAVAILABLE: tesseract (or every language pack) is missing.
- * - TIMEOUT: the process was killed at the OCR deadline.
- * - EXECUTION_FAILED: tesseract started but exited abnormally.
- */
-export type OcrExecutionStatus =
-  | 'OK'
-  | 'UNAVAILABLE'
-  | 'TIMEOUT'
-  | 'EXECUTION_FAILED';
-
-/** The port's OcrResult plus the classified execution status. */
-export interface ClassifiedOcrResult extends OcrResult {
-  status: OcrExecutionStatus;
-}
-
-/** Maps an execFile failure onto the classified vocabulary. execFile's
+/** Maps an execFile failure onto the classified vocabulary (the
+ *  OcrExecutionStatus codes now live on the port, next to the OcrReader
+ *  contract they classify). execFile's
  *  own timeout kills the child (error.killed / a kill signal); a missing
  *  binary surfaces as ENOENT. Everything else is an abnormal exit. */
 export function classifyOcrFailure(error: unknown): OcrExecutionStatus {

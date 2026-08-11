@@ -45,7 +45,10 @@ interface JobFixture {
   status: InferenceJobStatus;
   errorCode: string | null;
   visionEventId: string | null;
-  result: { candidates: { sku: string; score: number | null }[] } | null;
+  result: {
+    quantityDelta: number;
+    candidates: { rank: number; sku: string; score: number | null }[];
+  } | null;
   createdAt: Date;
 }
 
@@ -110,7 +113,8 @@ function succeededJob(
     status: InferenceJobStatus.SUCCEEDED,
     errorCode: null,
     visionEventId,
-    result: { candidates: [] },
+    // v1 always claims exactly one unit.
+    result: { quantityDelta: 1, candidates: [] },
     createdAt: new Date(createdAt),
   };
 }
@@ -417,5 +421,114 @@ describe('summary — fusion verdicts on NONE and RETURN ground truth', () => {
     const row = summary.rows[0];
     expect(row.outcome).toBe('false_pickup');
     expect(row.fusionVerdict).toBe('true_negative');
+  });
+});
+
+describe('summary — topCandidates are rank-ordered', () => {
+  it('displays the top three by rank even when the relation arrives shuffled', async () => {
+    // Prisma gives no relation-order guarantee without an orderBy, so the
+    // service must sort by rank itself before slicing.
+    const job = succeededJob('job-1', ASSET, 'event-1');
+    job.result = {
+      quantityDelta: 1,
+      candidates: [
+        { rank: 3, sku: 'SKU-C', score: 0.3 },
+        { rank: 1, sku: 'SKU-A', score: 0.9 },
+        { rank: 4, sku: 'SKU-D', score: 0.1 },
+        { rank: 2, sku: 'SKU-B', score: 0.5 },
+      ],
+    };
+    const { service } = buildService({ jobs: [job], fusionRuns: [] });
+    const summary = await service.summary(TENANT);
+    expect(summary.rows).toHaveLength(1);
+    expect(summary.rows[0].topCandidates).toEqual([
+      { sku: 'SKU-A', score: 0.9 },
+      { sku: 'SKU-B', score: 0.5 },
+      { sku: 'SKU-C', score: 0.3 },
+    ]);
+  });
+});
+
+describe('summary — quantity is part of the claim', () => {
+  it('right SKU but wrong quantity scores quantity_mismatch and counts as incorrect', async () => {
+    // v1 claims quantityDelta 1; the reviewer recorded a 3-unit pickup.
+    const { service } = buildService({
+      truths: [{ ...truth(ASSET), quantity: 3 }],
+      jobs: [succeededJob('job-1', ASSET, 'event-1')],
+      fusionRuns: [],
+    });
+    const summary = await service.summary(TENANT);
+    expect(summary.rows).toHaveLength(1);
+    const row = summary.rows[0];
+    expect(row.outcome).toBe('quantity_mismatch');
+    expect(row.groundTruthQuantity).toBe(3);
+    expect(row.predictedQuantity).toBe(1);
+    expect(summary.totals.correct).toBe(0);
+    expect(summary.totals.incorrect).toBe(1);
+    // The right product WAS claimed — a quantity mismatch is neither a
+    // false positive nor a false negative.
+    expect(summary.totals.falsePositives).toBe(0);
+    expect(summary.totals.falseNegatives).toBe(0);
+  });
+
+  it('right SKU and matching quantity scores correct (claim read from the result row)', async () => {
+    const job = succeededJob('job-1', ASSET, 'event-1');
+    job.result = { quantityDelta: 3, candidates: [] };
+    const { service } = buildService({
+      truths: [{ ...truth(ASSET), quantity: 3 }],
+      jobs: [job],
+      fusionRuns: [],
+    });
+    const summary = await service.summary(TENANT);
+    expect(summary.rows).toHaveLength(1);
+    const row = summary.rows[0];
+    expect(row.outcome).toBe('correct');
+    expect(row.predictedQuantity).toBe(3);
+    expect(summary.totals.correct).toBe(1);
+    expect(summary.totals.incorrect).toBe(0);
+  });
+
+  it('wrong SKU stays incorrect (never quantity_mismatch), and rows expose both quantities', async () => {
+    const { service } = buildService({
+      truths: [{ ...truth(ASSET), quantity: 2 }],
+      jobs: [succeededJob('job-1', ASSET, 'event-1')],
+      events: [
+        { id: 'event-1', metadata: { ...pickupRecord, sku: 'OTHER-SKU' } },
+      ],
+      fusionRuns: [],
+    });
+    const summary = await service.summary(TENANT);
+    expect(summary.rows).toHaveLength(1);
+    const row = summary.rows[0];
+    expect(row.outcome).toBe('incorrect');
+    expect(row.groundTruthQuantity).toBe(2);
+    expect(row.predictedQuantity).toBe(1);
+    // A wrong-SKU claim still counts as FP + FN, exactly as before.
+    expect(summary.totals.falsePositives).toBe(1);
+    expect(summary.totals.falseNegatives).toBe(1);
+  });
+
+  it('an UNKNOWN_PRODUCT detection has no quantity claim (predictedQuantity null)', async () => {
+    const { service } = buildService({
+      truths: [{ ...truth(ASSET), quantity: 2 }],
+      jobs: [succeededJob('job-1', ASSET, 'event-1')],
+      events: [
+        {
+          id: 'event-1',
+          metadata: {
+            ...pickupRecord,
+            result: 'UNKNOWN_PRODUCT',
+            productId: null,
+            sku: null,
+          },
+        },
+      ],
+      fusionRuns: [],
+    });
+    const summary = await service.summary(TENANT);
+    expect(summary.rows).toHaveLength(1);
+    const row = summary.rows[0];
+    expect(row.outcome).toBe('missed');
+    expect(row.predictedQuantity).toBeNull();
   });
 });

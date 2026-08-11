@@ -124,8 +124,30 @@ export interface OcrResult {
   languages: string[];
 }
 
+/**
+ * Classified OCR execution status — the same pattern as the VLM verdict
+ * classification: a fixed code only, NEVER raw error text (an execFile
+ * error message can embed command output or filesystem paths). 'OK'
+ * includes a successful pass that simply saw no text; every other value
+ * means the OCR stage DID NOT complete, so its empty text must not be
+ * treated as a verified "no text on the product" observation.
+ * - UNAVAILABLE: the OCR runtime (or every language pack) is missing.
+ * - TIMEOUT: the process was killed at the OCR deadline.
+ * - EXECUTION_FAILED: the runtime started but exited abnormally.
+ */
+export type OcrExecutionStatus =
+  | 'OK'
+  | 'UNAVAILABLE'
+  | 'TIMEOUT'
+  | 'EXECUTION_FAILED';
+
+/** OcrResult plus the classified execution status. */
+export interface ClassifiedOcrResult extends OcrResult {
+  status: OcrExecutionStatus;
+}
+
 export interface OcrReader extends VersionedAdapter {
-  recognize(image: RgbImage): Promise<OcrResult>;
+  recognize(image: RgbImage): Promise<ClassifiedOcrResult>;
 }
 
 export interface CandidateSignal {
