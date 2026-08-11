@@ -168,3 +168,6 @@ storage/**/*.[gG][iI][fF]
 storage/**/*.[hH][eE][iI][cC]
 storage/**/*.[hH][eE][iI][fF]
 storage/**/*.[aA][vV][iI][fF]
+
+# Browser-automation artifacts (Playwright MCP snapshots/screenshots)
+.playwright-mcp/

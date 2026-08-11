@@ -86,6 +86,16 @@ if ($Port -ne 3000) {
     Write-Host "NOTE: set VITE_API_BASE_URL=http://127.0.0.1:$Port in apps/admin-web/.env and restart Vite."
 }
 
+# Append the registry PATH (Machine + User) to this process's PATH: tools
+# installed AFTER the launching shell's session began (ffmpeg, tesseract)
+# are otherwise invisible to the API's screening-readiness probes, which
+# resolve their binaries from PATH and fail closed with a 503 on upload.
+# Append rather than replace, so session-only entries (node version
+# managers, pnpm shims) keep working.
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+$env:Path = "$env:Path;$machinePath;$userPath"
+
 Write-Host "Starting API on http://127.0.0.1:$Port ..."
 Set-Location $repoRoot
 pnpm --filter @byond/api start:dev
