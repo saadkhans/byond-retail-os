@@ -105,6 +105,7 @@ function assetRow(overrides: Record<string, unknown> = {}) {
 interface Harness {
   service: PickupDetectionService;
   inferenceJobs: Record<string, jest.Mock>;
+  platformModules: Record<string, jest.Mock>;
   videoAssets: Record<string, jest.Mock>;
   prisma: { visionEvent: { update: jest.Mock; findFirst: jest.Mock }; inferenceJob: { findFirst: jest.Mock; count: jest.Mock } };
 }
@@ -164,11 +165,15 @@ function buildService(overrides: {
     start: jest.fn(async () => ({ id: 'job-1', attempts: 1 })),
     complete: jest.fn(async () => ({ id: 'job-1' })),
     fail: jest.fn(async () => ({ id: 'job-1' })),
+    reclaimExpired: jest.fn(async () => ({ reclaimed: [] })),
     toVisionEvent: jest.fn(async () => ({
       job: { id: 'job-1' },
       visionEvent: { id: 'event-1' },
       replayed: false,
     })),
+  };
+  const platformModules = {
+    isEnabledForTenant: jest.fn(async () => true),
   };
   const videoAssets = {
     extractFrames: jest.fn(async () => ({
@@ -190,11 +195,18 @@ function buildService(overrides: {
     decoder as never,
     referenceLibrary as never,
     inferenceJobs as never,
+    platformModules as never,
     videoAssets as never,
     repository as never,
     storage as never,
   );
-  return { service, inferenceJobs: inferenceJobs as never, videoAssets: videoAssets as never, prisma };
+  return {
+    service,
+    inferenceJobs: inferenceJobs as never,
+    platformModules: platformModules as never,
+    videoAssets: videoAssets as never,
+    prisma,
+  };
 }
 
 describe('scaleBoxToSource', () => {
@@ -353,11 +365,193 @@ describe('PickupDetectionService.detectForAsset', () => {
     );
   });
 
-  it('never re-runs a SUCCEEDED attempt without force', async () => {
-    const { service, inferenceJobs } = buildService({
-      existingJob: { id: 'job-0', status: 'SUCCEEDED', visionEventId: null },
+  it('never re-runs a SUCCEEDED attempt with a recorded detection without force', async () => {
+    const { service, inferenceJobs, prisma } = buildService({
+      existingJob: {
+        id: 'job-0',
+        status: 'SUCCEEDED',
+        visionEventId: 'event-0',
+      },
+    });
+    prisma.visionEvent.findFirst.mockResolvedValue({
+      id: 'event-0',
+      status: 'PENDING_REVIEW',
+      metadata: { kind: 'PRODUCT_PICKUP_DETECTION', productId: null },
+      candidates: [],
+      review: null,
     });
     await service.detectForAsset(TENANT, ASSET);
+    expect(inferenceJobs.create).not.toHaveBeenCalled();
+  });
+
+  it('re-runs a SUCCEEDED attempt only when it has no replayable result at all', async () => {
+    // Invariant: SUCCEEDED implies a usable detection. A stranded success
+    // with NO InferenceResult has nothing replayable behind it (conversion
+    // requires the result, so no event can exist either) — only then does
+    // a retry run a fresh attempt instead of replaying the empty success
+    // forever.
+    const { service, inferenceJobs } = buildService({
+      existingJob: {
+        id: 'job-0',
+        status: 'SUCCEEDED',
+        visionEventId: null,
+        result: null,
+      },
+    });
+    await service.detectForAsset(TENANT, ASSET);
+    expect(inferenceJobs.create).toHaveBeenCalled();
+    expect(inferenceJobs.complete).toHaveBeenCalled();
+  });
+
+  it('repairs a SUCCEEDED attempt whose metadata write was lost instead of minting a second event', async () => {
+    // Finding: complete → toVisionEvent → metadata write is non-atomic. A
+    // transient failure on the LAST step used to make the retry fork a
+    // fresh job, which converted under a NEW reserved key and produced a
+    // second PENDING_REVIEW pickup event for the same physical pickup.
+    // With the job's InferenceResult intact the attempt must be repaired
+    // in place: idempotent conversion replay plus a metadata rewrite.
+    const { service, inferenceJobs, prisma, videoAssets } = buildService({
+      existingJob: {
+        id: 'job-0',
+        status: 'SUCCEEDED',
+        visionEventId: 'event-0',
+        result: { id: 'result-0' },
+      },
+    });
+    // The linked event exists but its metadata record never landed.
+    prisma.visionEvent.findFirst.mockResolvedValue({
+      id: 'event-0',
+      status: 'PENDING_REVIEW',
+      metadata: null,
+      candidates: [],
+      review: null,
+    });
+    inferenceJobs.toVisionEvent.mockResolvedValue({
+      job: { id: 'job-0' },
+      visionEvent: { id: 'event-0' },
+      replayed: true,
+    });
+    await service.detectForAsset(TENANT, ASSET);
+    // Never forked: conversion replays idempotently on the SAME job...
+    expect(inferenceJobs.create).not.toHaveBeenCalled();
+    expect(inferenceJobs.toVisionEvent).toHaveBeenCalledWith(TENANT, 'job-0');
+    // ...artifacts replay under the ORIGINAL job's idempotency keys...
+    expect(videoAssets.extractFrames).toHaveBeenCalledWith(
+      TENANT,
+      ASSET,
+      expect.objectContaining({ idempotencyKey: 'pickup:job-0:frame' }),
+    );
+    // ...and the record is restored on the ORIGINAL event.
+    const update = prisma.visionEvent.update.mock.calls[0][0];
+    expect(update.where).toEqual({ id: 'event-0' });
+    expect(
+      (update.data.metadata as Record<string, unknown>).kind,
+    ).toBe('PRODUCT_PICKUP_DETECTION');
+  });
+
+  it('never forks a fresh attempt while a replayable result exists, even when repair fails', async () => {
+    // A transiently failing repair (here: conversion rejected) must leave
+    // the state alone for the next retry — forking would mint a second
+    // event because job-0's result may already back an ingested event.
+    const { service, inferenceJobs } = buildService({
+      existingJob: {
+        id: 'job-0',
+        status: 'SUCCEEDED',
+        visionEventId: null,
+        result: { id: 'result-0' },
+      },
+    });
+    inferenceJobs.toVisionEvent.mockRejectedValue(new Error('transient'));
+    await service.detectForAsset(TENANT, ASSET);
+    expect(inferenceJobs.create).not.toHaveBeenCalled();
+    expect(inferenceJobs.complete).not.toHaveBeenCalled();
+  });
+
+  it('fails the job with CV_MODULE_DISABLED before it can become terminal', async () => {
+    const { service, inferenceJobs, platformModules } = buildService();
+    platformModules.isEnabledForTenant.mockResolvedValue(false);
+    await service.detectForAsset(TENANT, ASSET);
+    expect(platformModules.isEnabledForTenant).toHaveBeenCalledWith(
+      TENANT,
+      'cv',
+    );
+    expect(inferenceJobs.fail).toHaveBeenCalledWith(
+      TENANT,
+      'job-1',
+      expect.objectContaining({ errorCode: 'CV_MODULE_DISABLED' }),
+    );
+    // The dependency gate runs BEFORE the terminal transition: the job
+    // must never reach SUCCEEDED with conversion doomed to fail.
+    expect(inferenceJobs.complete).not.toHaveBeenCalled();
+    expect(inferenceJobs.toVisionEvent).not.toHaveBeenCalled();
+  });
+
+  it('fails the still-RUNNING job when completion itself is rejected', async () => {
+    const { service, inferenceJobs } = buildService();
+    inferenceJobs.complete.mockRejectedValue(new Error('db down'));
+    await service.detectForAsset(TENANT, ASSET);
+    expect(inferenceJobs.fail).toHaveBeenCalledWith(
+      TENANT,
+      'job-1',
+      expect.objectContaining({ errorCode: 'RESULT_RECORDING_FAILED' }),
+    );
+    expect(inferenceJobs.toVisionEvent).not.toHaveBeenCalled();
+  });
+
+  it('leaves a post-completion conversion failure retryable, never failing the terminal job', async () => {
+    const { service, inferenceJobs, prisma } = buildService();
+    inferenceJobs.toVisionEvent.mockRejectedValue(new Error('transient'));
+    await service.detectForAsset(TENANT, ASSET);
+    // The job is terminal — failJob would be a guaranteed conflict, so it
+    // is never attempted; no metadata lands either. Recovery is the
+    // in-place repair path proven above (SUCCEEDED with a surviving
+    // result), never a fresh attempt.
+    expect(inferenceJobs.fail).not.toHaveBeenCalled();
+    expect(prisma.visionEvent.update).not.toHaveBeenCalled();
+  });
+
+  it('sweeps expired leases and resumes a reclaimed QUEUED attempt in-process', async () => {
+    // Finding: a crash mid-run leaves the job RUNNING with an expired
+    // lease, and nothing on the pickup path ever reclaimed or resumed it —
+    // the asset was undetectable forever. The non-terminal branch must
+    // sweep (same call start() makes) and RESUME the reclaimed attempt.
+    const { service, inferenceJobs, prisma } = buildService();
+    prisma.inferenceJob.findFirst
+      .mockResolvedValueOnce({
+        id: 'job-0',
+        status: 'RUNNING',
+        visionEventId: null,
+      })
+      .mockResolvedValue({
+        id: 'job-0',
+        status: 'QUEUED',
+        visionEventId: null,
+      });
+    await service.detectForAsset(TENANT, ASSET);
+    expect(inferenceJobs.reclaimExpired).toHaveBeenCalledWith(TENANT);
+    // The SAME job is resumed (start()'s CAS makes this race-safe) —
+    // never forked into a fresh attempt.
+    expect(inferenceJobs.create).not.toHaveBeenCalled();
+    expect(inferenceJobs.start).toHaveBeenCalledWith(TENANT, 'job-0', {
+      adapterKey: 'pickup-classical-v1',
+    });
+    expect(inferenceJobs.complete).toHaveBeenCalledWith(
+      TENANT,
+      'job-0',
+      expect.anything(),
+    );
+  });
+
+  it('reports a live RUNNING attempt after the sweep without resuming or forking it', async () => {
+    // A lease still within budget means the attempt is genuinely in
+    // flight: the sweep leaves it RUNNING, and the state is reported
+    // untouched.
+    const { service, inferenceJobs } = buildService({
+      existingJob: { id: 'job-0', status: 'RUNNING', visionEventId: null },
+    });
+    await service.detectForAsset(TENANT, ASSET);
+    expect(inferenceJobs.reclaimExpired).toHaveBeenCalledWith(TENANT);
+    expect(inferenceJobs.start).not.toHaveBeenCalled();
     expect(inferenceJobs.create).not.toHaveBeenCalled();
   });
 

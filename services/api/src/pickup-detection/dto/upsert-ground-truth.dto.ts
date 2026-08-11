@@ -14,6 +14,7 @@ import {
   IsOptionalNonNull,
   toNumberRejectingBlank,
 } from '../../common/validation';
+import { MAX_TIMESTAMP_MS } from '../../video-ingest/dto/create-video-crop.dto';
 
 /**
  * Operator-entered ground truth for one controlled test video. NONE means
@@ -35,12 +36,17 @@ export class UpsertGroundTruthDto {
 
   @ApiPropertyOptional({
     minimum: 0,
+    maximum: MAX_TIMESTAMP_MS,
     description: 'Actual pickup/return instant (ms into the clip)',
   })
   @IsOptionalNonNull()
   @Transform(toNumberRejectingBlank)
   @IsInt()
   @Min(0)
+  // Same ~24h ceiling as the crop/frame DTOs — the service only checks the
+  // probed duration when it EXISTS, so an unprobed asset must still never
+  // let a value past PG int4 range reach Prisma (int overflow -> 500).
+  @Max(MAX_TIMESTAMP_MS)
   actualTimestampMs?: number;
 
   @ApiPropertyOptional({ minimum: 1, maximum: 100, default: 1 })

@@ -5,10 +5,13 @@ import {
 } from '@nestjs/common';
 import {
   EvidenceSourceType,
+  FusionPolicyResult,
   GroundTruthEventKind,
   InferenceJobStatus,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { MAX_TIMESTAMP_MS } from '../video-ingest/dto/create-video-crop.dto';
+import { containsSensitiveFreeText } from '../video-ingest/media-safety';
 import {
   PickupDetectionRecord,
   pickupSourceId,
@@ -17,6 +20,11 @@ import {
 /** Confusion matrix unlocks at this many REVIEWED videos (ground truth +
  *  finished detection attempt) — below it, per-cell counts are noise. */
 export const CONFUSION_MATRIX_MIN_REVIEWED = 50;
+
+/** Hard cap on ground-truth rows one summary() call scores — newest
+ *  reviews win. Keeps the endpoint bounded as the test library grows,
+ *  and stays comfortably above CONFUSION_MATRIX_MIN_REVIEWED. */
+export const SUMMARY_MAX_ROWS = 500;
 
 export interface GroundTruthView {
   videoAssetId: string;
@@ -73,7 +81,8 @@ export interface ValidationRow {
   processingMs: number | null;
   jobStatus: InferenceJobStatus | null;
   jobErrorCode: string | null;
-  /** Latest fusion-v2 shadow run, scored against the same ground truth. */
+  /** Latest non-FAILED fusion-v2 shadow run, scored against the same
+   *  ground truth. FAILED runs never score — they count as no run. */
   fusionTopSku: string | null;
   fusionTopScore: number | null;
   fusionPolicy: string | null;
@@ -141,6 +150,10 @@ export class PickupValidationService {
         ts === undefined ||
         !Number.isInteger(ts) ||
         ts < 0 ||
+        // Absolute ceiling mirrors the DTO's @Max: an unprobed asset has a
+        // null durationMs, and without this bound an oversized value would
+        // reach Prisma's int4 column and 500 instead of 400.
+        ts > MAX_TIMESTAMP_MS ||
         (asset.durationMs !== null && ts >= asset.durationMs)
       ) {
         throw new BadRequestException(
@@ -151,6 +164,15 @@ export class PickupValidationService {
     const quantity = input.quantity ?? 1;
     if (!Number.isInteger(quantity) || quantity < 1 || quantity > 100) {
       throw new BadRequestException('quantity must be a whole number 1..100');
+    }
+    // The note is durably stored and echoed on every groundTruth() read —
+    // screen it with the same fused free-text predicate as the screening
+    // note (video-assets) and reference-image text, so credential/payment
+    // content is rejected BEFORE anything is written.
+    if (input.note && containsSensitiveFreeText(input.note)) {
+      throw new BadRequestException(
+        'note must not contain credential- or payment-bearing content',
+      );
     }
     const data = {
       eventKind: input.eventKind,
@@ -200,54 +222,121 @@ export class PickupValidationService {
 
   async summary(tenantId: string): Promise<ValidationSummary> {
     const truths = await this.prisma.videoGroundTruth.findMany({
-      where: { tenantId },
+      // Deleted assets are excluded in the query (not post-fetch) so the
+      // row cap is spent only on rows that can actually appear.
+      where: { tenantId, videoAsset: { deletedAt: null } },
       include: {
         product: { select: { sku: true } },
         videoAsset: { select: { originalFilename: true, deletedAt: true } },
       },
-      orderBy: { updatedAt: 'desc' },
+      // `id` tiebreak keeps the capped window stable when updatedAt ties.
+      orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+      take: SUMMARY_MAX_ROWS,
     });
-    const rows: ValidationRow[] = [];
-    for (const truth of truths) {
-      if (truth.videoAsset.deletedAt !== null) {
-        continue;
+    const liveTruths = truths.filter(
+      (truth) => truth.videoAsset.deletedAt === null,
+    );
+    const assetIds = liveTruths.map((truth) => truth.videoAssetId);
+    // One batched query per dependency instead of one per ground-truth
+    // row. Both fetch every attempt/run for the capped asset window
+    // ordered newest-first, so first-seen per key IS the latest — the
+    // same row each per-asset findFirst used to return.
+    const [jobRows, fusionRows] = assetIds.length
+      ? await Promise.all([
+          this.prisma.inferenceJob.findMany({
+            where: {
+              tenantId,
+              sourceType: EvidenceSourceType.VISION,
+              sourceId: { in: assetIds.map(pickupSourceId) },
+            },
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            include: { result: { include: { candidates: true } } },
+          }),
+          // Only a non-FAILED run is a fusion RESULT — a crashed pipeline
+          // persists a FAILED row for debugging, but scoring it would
+          // present a failed experiment as missed/correct/incorrect.
+          // FAILED runs are excluded in the query itself, exactly as if
+          // they were never recorded.
+          this.prisma.pickupFusionRun.findMany({
+            where: {
+              tenantId,
+              videoAssetId: { in: assetIds },
+              policy: { not: FusionPolicyResult.FAILED },
+            },
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            select: {
+              videoAssetId: true,
+              fusedTopSku: true,
+              fusedTopScore: true,
+              policy: true,
+            },
+          }),
+        ])
+      : [[], []];
+    const latestJobBySourceId = new Map<string, (typeof jobRows)[number]>();
+    for (const jobRow of jobRows) {
+      // sourceId is nullable on the model, though the IN filter above
+      // only ever matches non-null pickup source ids.
+      if (
+        jobRow.sourceId !== null &&
+        !latestJobBySourceId.has(jobRow.sourceId)
+      ) {
+        latestJobBySourceId.set(jobRow.sourceId, jobRow);
       }
-      const latestJob = await this.prisma.inferenceJob.findFirst({
-        where: {
-          tenantId,
-          sourceType: EvidenceSourceType.VISION,
-          sourceId: pickupSourceId(truth.videoAssetId),
-        },
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        include: { result: { include: { candidates: true } } },
-      });
-      // The v1 pipeline only counts when its attempt finished.
-      const job =
-        latestJob &&
-        latestJob.status !== InferenceJobStatus.QUEUED &&
-        latestJob.status !== InferenceJobStatus.RUNNING
-          ? latestJob
-          : null;
-      const fusionRun = await this.prisma.pickupFusionRun.findFirst({
-        where: { tenantId, videoAssetId: truth.videoAssetId },
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        select: { fusedTopSku: true, fusedTopScore: true, policy: true },
-      });
+    }
+    const latestFusionByAssetId = new Map<
+      string,
+      (typeof fusionRows)[number]
+    >();
+    for (const fusionRow of fusionRows) {
+      if (!latestFusionByAssetId.has(fusionRow.videoAssetId)) {
+        latestFusionByAssetId.set(fusionRow.videoAssetId, fusionRow);
+      }
+    }
+    const scored = liveTruths
+      .map((truth) => {
+        const latestJob =
+          latestJobBySourceId.get(pickupSourceId(truth.videoAssetId)) ?? null;
+        // The v1 pipeline only counts when its attempt finished.
+        const job =
+          latestJob &&
+          latestJob.status !== InferenceJobStatus.QUEUED &&
+          latestJob.status !== InferenceJobStatus.RUNNING
+            ? latestJob
+            : null;
+        const fusionRun =
+          latestFusionByAssetId.get(truth.videoAssetId) ?? null;
+        return { truth, job, fusionRun };
+      })
       // A ground-truth row is reviewable when EITHER pipeline has a
       // completed result — running fusion directly (without a v1 attempt)
       // is a supported flow, and its accuracy must not vanish from the
       // dashboard just because v1 never ran. The unavailable pipeline's
       // fields stay null/unscored.
-      if (!job && !fusionRun) {
-        continue;
-      }
-      const event = job?.visionEventId
-        ? await this.prisma.visionEvent.findFirst({
-            where: { tenantId, id: job.visionEventId },
-            select: { metadata: true },
-          })
-        : null;
-      const rawMetadata = event?.metadata as unknown;
+      .filter((entry) => entry.job !== null || entry.fusionRun !== null);
+    const visionEventIds = [
+      ...new Set(
+        scored
+          .map((entry) => entry.job?.visionEventId)
+          .filter((id): id is string => typeof id === 'string'),
+      ),
+    ];
+    const events = visionEventIds.length
+      ? await this.prisma.visionEvent.findMany({
+          where: { tenantId, id: { in: visionEventIds } },
+          select: { id: true, metadata: true },
+        })
+      : [];
+    const metadataByEventId = new Map(
+      events.map((event) => [event.id, event.metadata]),
+    );
+    const rows: ValidationRow[] = [];
+    for (const { truth, job, fusionRun } of scored) {
+      const rawMetadata = (
+        job?.visionEventId
+          ? metadataByEventId.get(job.visionEventId)
+          : undefined
+      ) as unknown;
       const record =
         rawMetadata !== null &&
         typeof rawMetadata === 'object' &&

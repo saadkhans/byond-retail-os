@@ -1,6 +1,5 @@
 import { Body, Controller, Get, Module, Param, Post } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
-import { CustomerJourneyEventType } from '@prisma/client';
 import {
   RequireModule,
   RequirePermissions,
@@ -12,6 +11,8 @@ import {
 } from '../auth/decorators/request-context.decorators';
 import { RequestContext } from '../auth/request-context';
 import { PlatformModulesModule } from '../platform-modules/platform-modules.module';
+import { AppendJourneyEventDto } from './dto/append-journey-event.dto';
+import { CreateJourneyDto } from './dto/create-journey.dto';
 import { FromFusionRunDto } from './dto/from-fusion-run.dto';
 import { JourneyService } from './journey.service';
 
@@ -33,7 +34,7 @@ export class JourneyController {
   @ApiOperation({ summary: 'Open a journey (records the ENTRY event)' })
   create(
     @CurrentTenantId() tenantId: string,
-    @Body() body: { locationId: string; unitId?: string },
+    @Body() body: CreateJourneyDto,
     @CurrentUser() actor: RequestContext,
   ) {
     return this.journeys.create(tenantId, body, actor.userId);
@@ -65,17 +66,25 @@ export class JourneyController {
   appendEvent(
     @CurrentTenantId() tenantId: string,
     @Param('id') id: string,
-    @Body()
-    body: {
-      eventType: CustomerJourneyEventType;
-      occurredAt?: string;
-      productId?: string;
-      quantity?: number;
-      note?: string;
-    },
+    @Body() body: AppendJourneyEventDto,
     @CurrentUser() actor: RequestContext,
   ) {
-    return this.journeys.appendEvent(tenantId, id, body, actor.userId);
+    // Forward ONLY the manual-event fields. Provenance (sourceType,
+    // videoAssetId, fusionRunId, matchScore) is never caller-supplied
+    // here — the fusion-run import endpoint below sets it after
+    // resolving the asset and run within this tenant.
+    return this.journeys.appendEvent(
+      tenantId,
+      id,
+      {
+        eventType: body.eventType,
+        occurredAt: body.occurredAt,
+        productId: body.productId,
+        quantity: body.quantity,
+        note: body.note,
+      },
+      actor.userId,
+    );
   }
 
   @Post(':id/events/from-fusion-run')

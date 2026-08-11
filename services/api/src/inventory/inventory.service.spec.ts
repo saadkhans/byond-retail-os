@@ -60,6 +60,24 @@ describe('InventoryService', () => {
     expect(repository.adjust).not.toHaveBeenCalled();
   });
 
+  it('rejects a credential-/payment-bearing reason before any ledger write', async () => {
+    // The ledger is append-only, so a PAN in a reason would be permanent.
+    for (const reason of [
+      'refund to card 4111111111111111 cvv=123',
+      'card 4111-1111-1111-1111 chargeback',
+      'api_key=sk_live_abcdefgh12345678',
+    ]) {
+      await expect(
+        service.adjustStock(
+          'tenant-a',
+          { locationId: 'loc-1', productId: 'prod-1', quantityDelta: 1, reason },
+          actor,
+        ),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
+    expect(repository.adjust).not.toHaveBeenCalled();
+  });
+
   it('re-validates the non-zero integer delta independently of the DTO', async () => {
     for (const quantityDelta of [0, 1.5, Number.NaN]) {
       await expect(

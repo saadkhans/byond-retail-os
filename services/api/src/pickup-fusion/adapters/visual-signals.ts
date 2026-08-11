@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { ProductStatus } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { LocalVideoStorageAdapter } from '../../video-ingest/storage/local-video-storage.adapter';
 import { PickupAnalysisFrameDecoder } from '../../pickup-detection/analysis/analysis-frames';
@@ -45,8 +46,12 @@ export class HogLabVisualRetriever implements VisualRetriever {
   }
 
   async ensureIndex(tenantId: string): Promise<{ indexed: number; total: number }> {
+    // ACTIVE products only — the same rule the reference library enforces.
+    // A retired product keeps its stored images and vectors, but they must
+    // not stay searchable; a re-activated product is backfilled on the
+    // next index pass.
     const images = await this.prisma.productReferenceImage.findMany({
-      where: { tenantId },
+      where: { tenantId, product: { status: ProductStatus.ACTIVE } },
       select: {
         id: true,
         productId: true,
@@ -91,8 +96,16 @@ export class HogLabVisualRetriever implements VisualRetriever {
     topK: number,
   ): Promise<CandidateSignal[]> {
     const query = computeDescriptor(crop);
+    // ACTIVE products only: vectors indexed while a product was active
+    // must stop matching the moment it is retired — otherwise a
+    // DRAFT/DISCONTINUED/ARCHIVED product with reference images could
+    // accumulate retrieval score and re-enter fusion as a candidate.
     const rows = await this.prisma.productReferenceEmbedding.findMany({
-      where: { tenantId, modelKey: this.embeddingModelKey },
+      where: {
+        tenantId,
+        modelKey: this.embeddingModelKey,
+        product: { status: ProductStatus.ACTIVE },
+      },
       select: {
         productId: true,
         vector: true,

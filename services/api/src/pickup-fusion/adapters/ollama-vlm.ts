@@ -95,8 +95,18 @@ export class OllamaVlmVerifier implements VlmVerifier {
     // Ollama's default context is 4096 tokens — the multi-image evidence
     // prompt alone exceeds that (frames + reference PNGs ≈ 4600+ tokens),
     // which surfaces as HTTP 400 "exceeds the available context size".
+    // Bounded at construction like the fusion policy thresholds: below
+    // 512 no evidence prompt fits (every call fails with the same HTTP
+    // 400), and an absurdly large window would make Ollama try to
+    // reserve VRAM for it and fail or thrash. 131072 (128k) is the top
+    // of the supported range for current local vision models.
     const configured = Number(config.get<string>('PICKUP_VLM_NUM_CTX'));
-    this.numCtx = Number.isFinite(configured) && configured > 0 ? configured : 8192;
+    if (Number.isFinite(configured) && (configured < 512 || configured > 131_072)) {
+      throw new Error(
+        `PICKUP_VLM_NUM_CTX=${configured} is outside its safe range [512, 131072]`,
+      );
+    }
+    this.numCtx = Number.isFinite(configured) ? configured : 8192;
   }
 
   /** Rich readiness for the UI panel; checkReady() reduces it. */

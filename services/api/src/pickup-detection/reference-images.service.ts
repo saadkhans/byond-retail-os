@@ -7,7 +7,11 @@ import {
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { containsSensitiveFreeText } from '../video-ingest/media-safety';
+import {
+  bufferCarriesSensitiveText,
+  containsSensitiveFreeText,
+  filenameCarriesSensitiveContent,
+} from '../video-ingest/media-safety';
 import { FrameTextRecognizerPort } from '../video-ingest/recognition/frame-text-recognizer.port';
 import { LocalVideoStorageAdapter } from '../video-ingest/storage/local-video-storage.adapter';
 import {
@@ -167,6 +171,18 @@ export class ReferenceImagesService {
         `Reference images must be 1 byte to ${MAX_REFERENCE_IMAGE_BYTES} bytes`,
       );
     }
+    // The SAME filename policy the video pipeline applies: a credential-
+    // or payment-bearing name must never reach a database row. RAW and
+    // sanitized forms are both screened (the ZIP bulk-import path funnels
+    // through here too, so import paths get the identical gate).
+    if (
+      filenameCarriesSensitiveContent(file.originalname) ||
+      filenameCarriesSensitiveContent(sanitizeFilename(file.originalname))
+    ) {
+      throw new BadRequestException(
+        'Filename must not contain credential- or payment-bearing content',
+      );
+    }
     const checksumSha256 = createHash('sha256')
       .update(file.buffer)
       .digest('hex');
@@ -177,6 +193,17 @@ export class ReferenceImagesService {
     if (duplicate) {
       // Same bytes for the same product — idempotent, not an error.
       return duplicate;
+    }
+    // Raw-byte text screen BEFORE the bytes touch storage: a perfectly
+    // decodable image can still smuggle a PAN or credential through
+    // EXIF/comment metadata or bytes appended after the image terminator —
+    // regions the pixel OCR never renders. Same payload detector the
+    // video-ingest upload gate applies to every buffer.
+    if (bufferCarriesSensitiveText(file.buffer)) {
+      throw new BadRequestException(
+        'The image carries credential- or payment-bearing text and was ' +
+          'refused (nothing was stored)',
+      );
     }
     // Payment-data pixel screen BEFORE the bytes touch storage.
     await this.screenReferencePixels(file.buffer);

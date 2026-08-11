@@ -66,8 +66,6 @@ interface FusionEvidenceResponse {
       requiresHumanReview?: boolean | null;
       modelKey: string | null;
       latencyMs: number | null;
-      errorDetail?: string | null;
-      rawPreview?: string | null;
       /** Legacy rows (pre-strict-schema) only. */
       choice?: string | null;
       confidence?: number | null;
@@ -409,15 +407,6 @@ export function FusionEvidencePanel({
               {typeof evidence.vlm.confidence === 'number'
                 ? ` · confidence ${evidence.vlm.confidence.toFixed(2)}`
                 : ''}
-            </p>
-          ) : null}
-          {evidence.vlm.errorDetail ? (
-            <p className="muted">Error detail: {evidence.vlm.errorDetail}</p>
-          ) : null}
-          {evidence.vlm.rawPreview ? (
-            <p className="muted">
-              Raw response preview:{' '}
-              <code>{evidence.vlm.rawPreview}</code>
             </p>
           ) : null}
           {evidence.vlm.invoked ? (

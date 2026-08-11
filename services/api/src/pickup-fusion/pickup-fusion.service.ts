@@ -8,9 +8,11 @@ import { ConfigService } from '@nestjs/config';
 import {
   EvidenceSourceType,
   FusionPolicyResult,
+  ProductStatus,
   VideoAssetStatus,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { containsSensitiveFreeText } from '../video-ingest/media-safety';
 import { LocalVideoStorageAdapter } from '../video-ingest/storage/local-video-storage.adapter';
 import { VideoAssetsRepository } from '../video-ingest/video-assets.repository';
 import { VideoAssetsService } from '../video-ingest/video-assets.service';
@@ -58,6 +60,17 @@ import {
 } from './primitives';
 
 export const FUSION_PIPELINE_VERSION = 'pickup-fusion-v2';
+
+/**
+ * Classified markers persisted IN PLACE of frame-derived text that trips
+ * the shared sensitive-text screen (media-safety). Fusion recognizes text
+ * the pre-store screen never saw — OCR runs on a ZOOMED event-region
+ * crop, and ZXing decodes QR payloads pixel screening cannot read — so
+ * the same reject-on-write predicate gates this persistence boundary
+ * too: the recognized text itself is never stored, only the marker.
+ */
+export const OCR_TEXT_SUPPRESSED = 'SENSITIVE_TEXT_SUPPRESSED';
+export const BARCODE_VALUE_SUPPRESSED = 'UNMATCHED_SCREENED';
 
 /**
  * Shadow verdict rule, extracted for tests and shared by the run-time bake
@@ -177,6 +190,52 @@ export function policyFromVlmResult(
   };
 }
 
+/**
+ * Records a verifier verdict onto the evidence and derives the policy —
+ * extracted for tests because it is the PERSISTENCE BOUNDARY for model
+ * output. PAYMENT-SAFETY: verdict.errorDetail and verdict.rawPreview are
+ * response-derived text (HTTP body previews, parser messages, raw
+ * completion previews) that can echo OCR/frame content — potentially a
+ * PAN/CVV — so they NEVER reach the evidence or the policy reason. Only
+ * classified codes (the VlmVerdictStatus enum and the whitelist-validated
+ * structured result) are persisted.
+ */
+export function applyVlmVerdictToEvidence(
+  evidence: FusionEvidence,
+  verdict: VlmVerdict,
+  fusionDecision: 'AUTO_PROPOSE' | 'NEEDS_VLM',
+  topSku: string | null,
+  fallbackReason: string,
+): void {
+  evidence.vlm.status = verdict.status;
+  evidence.vlm.modelKey = verdict.modelKey;
+  evidence.vlm.latencyMs = verdict.latencyMs;
+  if (verdict.status !== 'VERDICT' || verdict.result === null) {
+    // Every classified failure (TIMEOUT / PROVIDER_* / INVALID_* /
+    // MALFORMED_RESPONSE / MODEL_NOT_FOUND) routes to review — never a
+    // failed store operation, never a silent pass-through. The reason is
+    // built from the classified status alone; the free-text errorDetail
+    // stays on the in-memory verdict (adapter logs safe fields only).
+    evidence.policy = {
+      result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
+      reason: `VLM ${verdict.status} — ${fallbackReason}`,
+    };
+    return;
+  }
+  const result = verdict.result;
+  evidence.vlm.verdict = result.verdict;
+  evidence.vlm.selectedSku = result.selectedSku;
+  evidence.vlm.visualSupport = result.visualSupport;
+  evidence.vlm.ocrSupport = result.ocrSupport;
+  evidence.vlm.barcodeSupport = result.barcodeSupport;
+  evidence.vlm.reasonCodes = result.reasonCodes;
+  evidence.vlm.contradictions = result.contradictions;
+  evidence.vlm.requiresHumanReview = result.requiresHumanReview;
+  // The VLM never sets policy — the pure policy rule decides from the
+  // VALIDATED result.
+  evidence.policy = policyFromVlmResult(result, fusionDecision, topSku);
+}
+
 export interface PolicyThresholds {
   autoThreshold: number;
   vlmLowBand: number;
@@ -257,8 +316,18 @@ export interface FusionEvidence {
     selected: boolean;
   }[];
   cropArtifactId: string | null;
+  /** Unmatched decode values that trip the sensitive-text screen are
+   *  replaced by BARCODE_VALUE_SUPPRESSED before persistence. */
   barcode: { results: { value: string; format: string }[]; matchedSku: string | null };
-  ocr: { rawText: string; normalizedText: string; languages: string[]; perProduct: { sku: string; score: number }[] };
+  ocr: {
+    rawText: string;
+    normalizedText: string;
+    languages: string[];
+    perProduct: { sku: string; score: number }[];
+    /** Set (with both texts emptied) when the recognized frame text
+     *  tripped the sensitive-text screen — the text is never stored. */
+    screened?: typeof OCR_TEXT_SUPPRESSED;
+  };
   retrieval: { modelKey: string; modelVersion: string; indexed: number; candidates: { sku: string; score: number }[] };
   classical: { candidates: { sku: string; score: number }[] };
   context: { candidates: { sku: string; score: number; detail?: string }[] };
@@ -283,10 +352,12 @@ export interface FusionEvidence {
     references?: { sku: string; referenceImageId: string | null }[];
     modelKey: string | null;
     latencyMs: number | null;
-    /** Safe short failure detail (HTTP status, parse error class). */
-    errorDetail: string | null;
-    /** Safe short preview of the model's raw text (base64 elided). */
-    rawPreview: string | null;
+    // PAYMENT-SAFETY: no response-derived text (rawPreview, errorDetail,
+    // parser messages, HTTP body previews) is ever persisted here — a
+    // malformed completion or provider error body can echo OCR/frame
+    // content, which may contain a PAN/CVV. Only classified codes
+    // (VlmVerdictStatus and the whitelist-validated result fields above)
+    // travel to the PickupFusionRun row.
   };
   policy: { result: FusionPolicyResult; reason: string };
   shadow: {
@@ -362,10 +433,15 @@ export class PickupFusionService {
         ? 'anthropic'
         : 'local';
     // Local default is 60 s: a 7B vision model cold-loading into VRAM can
-    // legitimately need > 30 s on its first generation.
-    this.vlmTimeoutMs = num(
+    // legitimately need > 30 s on its first generation. Bounded like the
+    // policy thresholds (1 s .. 10 min): zero/negative would abort every
+    // verification before it starts, and an extra digit would let a
+    // stalled provider pin a fusion run for hours.
+    this.vlmTimeoutMs = bounded(
       'PICKUP_VLM_TIMEOUT_MS',
       this.vlmProvider === 'local' ? 60_000 : 30_000,
+      1_000,
+      600_000,
     );
     this.vlmMode =
       config.get<string>('PICKUP_VLM_MODE') === 'VALIDATION_ALWAYS'
@@ -506,8 +582,6 @@ export class PickupFusionService {
         requiresHumanReview: null,
         modelKey: null,
         latencyMs: null,
-        errorDetail: null,
-        rawPreview: null,
       },
       policy: { result: FusionPolicyResult.FAILED, reason: 'not-run' },
       shadow: { classicalV1: null, groundTruth: null, v1Verdict: null, v2Verdict: null },
@@ -652,8 +726,13 @@ export class PickupFusionService {
       }
 
       // ---- catalog snapshot -------------------------------------------
+      // ACTIVE products only — the same rule the reference library
+      // enforces. A DRAFT/DISCONTINUED/ARCHIVED product must never become
+      // a fusion candidate (via its barcode or OCR-matched name) and be
+      // imported into a journey; the weak context prior alone is not a
+      // gate.
       const products = await this.prisma.product.findMany({
-        where: { tenantId },
+        where: { tenantId, status: ProductStatus.ACTIVE },
         select: {
           id: true,
           sku: true,
@@ -684,11 +763,13 @@ export class PickupFusionService {
         ]),
       );
       const barcodeSignals: CandidateSignal[] = [];
+      const matchedBarcodeValues = new Set<string>();
       for (const result of barcodeResults) {
         const owner = products.find((product) =>
           product.barcodes.some((barcode) => barcode.value === result.value),
         );
         if (owner) {
+          matchedBarcodeValues.add(result.value);
           barcodeSignals.push({
             productId: owner.id,
             sku: owner.sku,
@@ -698,8 +779,18 @@ export class PickupFusionService {
           evidence.barcode.matchedSku = owner.sku;
         }
       }
+      // PAYMENT-SAFETY: ZXing also decodes QR codes, whose payloads are
+      // arbitrary world-supplied free text (payment QRs, token-bearing
+      // URLs) that the pre-store pixel screen cannot read. Catalog-matched
+      // values are product identifiers and persist verbatim; an unmatched
+      // value must pass the shared sensitive-text screen or only its
+      // format plus a classified marker reaches the durable evidence row.
       evidence.barcode.results = barcodeResults.map((result) => ({
-        value: result.value,
+        value:
+          matchedBarcodeValues.has(result.value) ||
+          !containsSensitiveFreeText(result.value)
+            ? result.value
+            : BARCODE_VALUE_SUPPRESSED,
         format: result.format,
       }));
 
@@ -707,8 +798,23 @@ export class PickupFusionService {
       const ocr = await timed('ocr', this.ocrReader, () =>
         this.ocrReader.recognize(bestPre.image),
       );
-      evidence.ocr.rawText = ocr.rawText.slice(0, 500);
-      evidence.ocr.normalizedText = ocr.normalizedText.slice(0, 500);
+      // PAYMENT-SAFETY: fusion OCRs a ZOOMED event-region crop at its own
+      // timestamps, so it can recover text the pre-store full-frame screen
+      // never resolved (a card visible in the shelf crop). The recognized
+      // text is gated by the SAME predicate the pre-store screen uses
+      // before it may touch the durable evidence row — on a trip both
+      // strings stay empty and only a classified marker persists, so the
+      // (empty) evidence text is also all that ever travels to the VLM.
+      // The derived numeric perProduct scores below remain safe to keep.
+      if (
+        containsSensitiveFreeText(ocr.rawText) ||
+        containsSensitiveFreeText(ocr.normalizedText)
+      ) {
+        evidence.ocr.screened = OCR_TEXT_SUPPRESSED;
+      } else {
+        evidence.ocr.rawText = ocr.rawText.slice(0, 500);
+        evidence.ocr.normalizedText = ocr.normalizedText.slice(0, 500);
+      }
       evidence.ocr.languages = ocr.languages;
       const ocrSignals: CandidateSignal[] = [];
       if (ocr.normalizedText.length >= 3) {
@@ -823,51 +929,11 @@ export class PickupFusionService {
       evidence.vlm.provider = this.vlmProvider;
       evidence.vlm.mode = this.vlmMode;
 
-      const applyVerdictToPolicy = (
-        verdict: VlmVerdict,
-        fallbackReason: string,
-      ) => {
-        evidence.vlm.status = verdict.status;
-        evidence.vlm.modelKey = verdict.modelKey;
-        evidence.vlm.latencyMs = verdict.latencyMs;
-        evidence.vlm.errorDetail = verdict.errorDetail ?? null;
-        evidence.vlm.rawPreview = verdict.rawPreview ?? null;
-        if (verdict.status !== 'VERDICT' || verdict.result === null) {
-          // Every classified failure (TIMEOUT / PROVIDER_* / INVALID_* /
-          // MALFORMED_RESPONSE / MODEL_NOT_FOUND) routes to review —
-          // never a failed store operation, never a silent pass-through.
-          evidence.policy = {
-            result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
-            reason: `VLM ${verdict.status}${
-              verdict.errorDetail ? ` (${verdict.errorDetail})` : ''
-            } — ${fallbackReason}`,
-          };
-          return;
-        }
-        const result = verdict.result;
-        evidence.vlm.verdict = result.verdict;
-        evidence.vlm.selectedSku = result.selectedSku;
-        evidence.vlm.visualSupport = result.visualSupport;
-        evidence.vlm.ocrSupport = result.ocrSupport;
-        evidence.vlm.barcodeSupport = result.barcodeSupport;
-        evidence.vlm.reasonCodes = result.reasonCodes;
-        evidence.vlm.contradictions = result.contradictions;
-        evidence.vlm.requiresHumanReview = result.requiresHumanReview;
-        // The VLM never sets policy — the pure policy rule decides from
-        // the VALIDATED result.
-        evidence.policy = policyFromVlmResult(
-          result,
-          decision.result === 'AUTO_PROPOSE' ? 'AUTO_PROPOSE' : 'NEEDS_VLM',
-          top?.sku ?? null,
-        );
-      };
-
       const invokeVlm = async (reason: string) => {
         evidence.vlm.invoked = true;
         evidence.vlm.reason = reason;
         if (!this.vlmEnabled) {
           evidence.vlm.status = 'UNAVAILABLE';
-          evidence.vlm.errorDetail = 'PICKUP_VLM_ENABLED is not "true"';
           evidence.policy = {
             result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
             reason: 'VLM disabled (PICKUP_VLM_ENABLED) — routed to review',
@@ -877,7 +943,13 @@ export class PickupFusionService {
         const verdict = await timed('vlm', this.vlm, () =>
           this.buildAndVerify(tenantId, evidence, crops, bestPre, fused.slice(0, 3)),
         );
-        applyVerdictToPolicy(verdict, 'routed to review');
+        applyVlmVerdictToEvidence(
+          evidence,
+          verdict,
+          decision.result === 'AUTO_PROPOSE' ? 'AUTO_PROPOSE' : 'NEEDS_VLM',
+          top?.sku ?? null,
+          'routed to review',
+        );
       };
 
       if (decision.result === 'UNKNOWN_PRODUCT') {
@@ -989,8 +1061,15 @@ export class PickupFusionService {
           fusedScore: candidate.fusedScore,
           referenceImages: referenceImages.get(candidate.productId) ?? [],
         })),
+        // Screened evidence text feeds the model too: a suppressed OCR
+        // string is empty (→ null) and a suppressed decode marker is a
+        // classification, not a barcode — neither travels as text.
         ocrText: evidence.ocr.normalizedText || null,
-        barcode: evidence.barcode.results[0]?.value ?? null,
+        barcode:
+          evidence.barcode.results[0]?.value &&
+          evidence.barcode.results[0].value !== BARCODE_VALUE_SUPPRESSED
+            ? evidence.barcode.results[0].value
+            : null,
         shelfContext: evidence.detector.events[0]?.shelfZoneId ?? null,
       },
       this.vlmTimeoutMs,

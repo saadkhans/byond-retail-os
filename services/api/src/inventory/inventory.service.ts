@@ -13,6 +13,7 @@ import {
   AuditActor,
   SYSTEM_ACTOR_EMAIL,
 } from '../common/audit/audit-log.service';
+import { containsSensitiveValue } from '../common/sensitive-keys';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
 import {
   EXTERNAL_MOVEMENT_TYPES,
@@ -30,6 +31,26 @@ export interface StockLevelView extends InventoryLevelWithRefs {
   isLowStock: boolean;
 }
 
+/**
+ * Movement reasons and references are persisted verbatim into the
+ * APPEND-ONLY InventoryMovement ledger (rows are never updated or deleted),
+ * and the reason also flows into AuditLog.reason, which audit redaction
+ * does not cover. Reject credential-/payment-bearing content (a pasted PAN,
+ * token, or credential URL) with a controlled 400 BEFORE any repository
+ * write — AGENTS.md payments invariant; same containsSensitiveValue gate as
+ * the checkout idempotency key and the order cancellation reason.
+ */
+function assertSafeLedgerText(
+  field: 'reason' | 'reference',
+  value: string,
+): void {
+  if (containsSensitiveValue(value)) {
+    throw new BadRequestException(
+      `${field} must not contain credential- or payment-bearing values`,
+    );
+  }
+}
+
 @Injectable()
 export class InventoryService {
   constructor(private readonly inventoryRepository: InventoryRepository) {}
@@ -43,6 +64,7 @@ export class InventoryService {
     if (!reason) {
       throw new BadRequestException('An adjustment reason is required');
     }
+    assertSafeLedgerText('reason', reason);
     // Redundant with the DTO, deliberately: the zero/integer invariant
     // protects ledger integrity, so the service does not rely on transport
     // validation alone.
@@ -135,6 +157,10 @@ export class InventoryService {
     if (!reason) {
       throw new BadRequestException('A movement reason is required');
     }
+    assertSafeLedgerText('reason', reason);
+    // The reference charset ([A-Za-z0-9._-]) still admits a dash-grouped
+    // PAN, so it gets the same screen as the reason.
+    assertSafeLedgerText('reference', dto.reference);
     // Redundant with the DTO on purpose — ledger integrity never rests on
     // transport validation alone.
     if (!Number.isInteger(dto.quantity) || dto.quantity < 1) {

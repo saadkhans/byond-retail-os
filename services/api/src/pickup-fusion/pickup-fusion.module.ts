@@ -28,6 +28,7 @@ import {
 import { AnthropicVlmVerifier } from './adapters/vlm-verifier';
 import { OllamaVlmVerifier } from './adapters/ollama-vlm';
 import { PrismaService } from '../prisma/prisma.service';
+import { ReindexReferenceIndexDto } from './dto/reindex-reference-index.dto';
 import { PickupFusionService } from './pickup-fusion.service';
 
 /** Shadow-run trigger + evidence read (both under the video-ingest gate). */
@@ -101,7 +102,7 @@ export class FusionOpsController {
   })
   async reindex(
     @CurrentTenantId() tenantId: string,
-    @Body() body: { rebuild?: boolean },
+    @Body() body: ReindexReferenceIndexDto,
   ) {
     if (body?.rebuild === true) {
       await this.prisma.productReferenceEmbedding.deleteMany({

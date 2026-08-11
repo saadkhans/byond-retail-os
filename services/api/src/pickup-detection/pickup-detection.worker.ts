@@ -4,10 +4,16 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
-import { EvidenceSourceType, VideoAssetStatus } from '@prisma/client';
+import {
+  EvidenceSourceType,
+  InferenceJobStatus,
+  VideoAssetStatus,
+} from '@prisma/client';
+import { PlatformModulesService } from '../platform-modules/platform-modules.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { PickupDetectionConfig } from './pickup-detection.config';
 import {
+  CV_MODULE_DISABLED_ERROR_CODE,
   PickupDetectionService,
   pickupSourceId,
 } from './pickup-detection.service';
@@ -18,6 +24,13 @@ const SCAN_INTERVAL_MS = 4000;
 const MAX_ASSETS_PER_SCAN = 2;
 /** Only assets this recent are auto-picked-up; older ones stay manual. */
 const AUTO_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** Assets fetched per page while paging past already-attempted ones. */
+const SCAN_PAGE_SIZE = 25;
+/** First delay before re-trying an asset whose detect call threw before a
+ *  job row existed; doubles per consecutive failure. */
+const PRE_JOB_RETRY_BASE_MS = 60_000;
+/** Ceiling for the pre-job retry backoff. */
+const PRE_JOB_RETRY_MAX_MS = 60 * 60 * 1000;
 
 /**
  * The automatic half of the requirement "upload → inference job with no
@@ -33,11 +46,25 @@ export class PickupDetectionWorker implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(PickupDetectionWorker.name);
   private timer: NodeJS.Timeout | null = null;
   private scanning = false;
+  /**
+   * Assets whose detectForAsset call threw BEFORE a job row existed (e.g.
+   * the asset's store or unit was deleted after upload, so job creation
+   * itself is refused). Nothing marks such assets attempted, so without a
+   * backoff they would be re-selected oldest-first on EVERY scan and
+   * permanently starve the MAX_ASSETS_PER_SCAN budget. Failures that do
+   * reach a job are excluded by the attempted lookup instead. In-memory
+   * on purpose: a restart merely grants one extra retry.
+   */
+  private readonly preJobFailures = new Map<
+    string,
+    { failures: number; retryAt: number }
+  >();
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: PickupDetectionConfig,
     private readonly detection: PickupDetectionService,
+    private readonly platformModules: PlatformModulesService,
   ) {}
 
   onModuleInit(): void {
@@ -61,53 +88,29 @@ export class PickupDetectionWorker implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** One scan: newest unprocessed VALIDATED/READY assets, oldest first. */
+  /** One scan: unprocessed VALIDATED/READY assets, oldest first, per tenant. */
   async scanOnce(): Promise<void> {
     if (this.scanning) {
       return;
     }
     this.scanning = true;
     try {
-      const assets = await this.prisma.videoAsset.findMany({
-        where: {
-          deletedAt: null,
-          status: {
-            in: [VideoAssetStatus.VALIDATED, VideoAssetStatus.READY],
-          },
-          createdAt: { gte: new Date(Date.now() - AUTO_WINDOW_MS) },
-        },
-        select: { id: true, tenantId: true },
-        orderBy: { createdAt: 'asc' },
-        take: 25,
+      const cutoff = new Date(Date.now() - AUTO_WINDOW_MS);
+      this.prunePreJobFailures();
+      // Enumerating WHICH tenants have eligible assets is a platform-level
+      // operation (tenant ids only, no tenant row data); every asset/job
+      // read after this point is scoped to a single tenantId.
+      const tenants = await this.prisma.videoAsset.groupBy({
+        by: ['tenantId'],
+        where: this.eligibleAssetWhere(cutoff),
+        orderBy: { tenantId: 'asc' },
       });
-      let processed = 0;
-      for (const asset of assets) {
-        if (processed >= MAX_ASSETS_PER_SCAN) {
+      let remaining = MAX_ASSETS_PER_SCAN;
+      for (const { tenantId } of tenants) {
+        if (remaining <= 0) {
           break;
         }
-        const attempted = await this.prisma.inferenceJob.findFirst({
-          where: {
-            tenantId: asset.tenantId,
-            sourceType: EvidenceSourceType.VISION,
-            sourceId: pickupSourceId(asset.id),
-          },
-          select: { id: true },
-        });
-        if (attempted) {
-          continue;
-        }
-        processed += 1;
-        try {
-          await this.detection.detectForAsset(asset.tenantId, asset.id);
-        } catch (error) {
-          // detectForAsset records job-level failures itself; this guards
-          // the loop against pre-job refusals (e.g. a race with delete).
-          this.logger.warn(
-            `Auto pickup detection skipped asset ${asset.id}: ${
-              error instanceof Error ? error.message : 'unknown'
-            }`,
-          );
-        }
+        remaining -= await this.scanTenant(tenantId, cutoff, remaining);
       }
     } catch (error) {
       // A failed poll (e.g. transient DB outage) must never become an
@@ -121,5 +124,136 @@ export class PickupDetectionWorker implements OnModuleInit, OnModuleDestroy {
     } finally {
       this.scanning = false;
     }
+  }
+
+  /** Drop backoff entries whose asset must have aged out of the auto
+   *  window (retryAt is capped at PRE_JOB_RETRY_MAX_MS, so an entry idle
+   *  for a whole window belongs to an asset no scan will select again). */
+  private prunePreJobFailures(): void {
+    const staleBefore = Date.now() - AUTO_WINDOW_MS;
+    for (const [key, entry] of this.preJobFailures) {
+      if (entry.retryAt < staleBefore) {
+        this.preJobFailures.delete(key);
+      }
+    }
+  }
+
+  private eligibleAssetWhere(cutoff: Date, tenantId?: string) {
+    return {
+      ...(tenantId ? { tenantId } : {}),
+      deletedAt: null,
+      status: {
+        in: [VideoAssetStatus.VALIDATED, VideoAssetStatus.READY],
+      },
+      createdAt: { gte: cutoff },
+    };
+  }
+
+  /**
+   * Scan one tenant's eligible assets, oldest first, paging PAST assets
+   * that already have a pickup attempt (InferenceJob keyed by
+   * pickupSourceId) so a backlog of attempted assets can never wedge the
+   * scan short of newer unattempted ones. Returns how many assets it ran
+   * detection on (at most `budget`).
+   */
+  private async scanTenant(
+    tenantId: string,
+    cutoff: Date,
+    budget: number,
+  ): Promise<number> {
+    // Dependency gate FIRST: while cv is disabled every attempt is
+    // guaranteed to fail (runJob refuses with CV_MODULE_DISABLED), so the
+    // tenant is skipped WITHOUT burning any asset's automatic attempt —
+    // the backlog stays unattempted and is picked up once the gate clears.
+    const cvEnabled = await this.platformModules.isEnabledForTenant(
+      tenantId,
+      'cv',
+    );
+    if (!cvEnabled) {
+      return 0;
+    }
+    let processed = 0;
+    let cursor: string | null = null;
+    while (processed < budget) {
+      const page: { id: string }[] = await this.prisma.videoAsset.findMany({
+        where: this.eligibleAssetWhere(cutoff, tenantId),
+        select: { id: true },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        take: SCAN_PAGE_SIZE,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      });
+      if (page.length === 0) {
+        break;
+      }
+      cursor = page[page.length - 1].id;
+      // One batched lookup excludes the whole page's attempted assets
+      // (VideoAsset↔InferenceJob is linked only by the derived sourceId
+      // string, so the exclusion cannot live inside the asset query).
+      const attempted = await this.prisma.inferenceJob.findMany({
+        where: {
+          tenantId,
+          sourceType: EvidenceSourceType.VISION,
+          sourceId: { in: page.map((asset) => pickupSourceId(asset.id)) },
+          // A cv-gate refusal is environmental, not a verdict on the
+          // asset: attempts that failed ONLY on the gate do not count, so
+          // those assets are re-attempted once the tenant's gate clears
+          // (the gate check above keeps this from looping while closed).
+          NOT: {
+            status: InferenceJobStatus.FAILED,
+            errorCode: CV_MODULE_DISABLED_ERROR_CODE,
+          },
+        },
+        select: { sourceId: true },
+      });
+      const attemptedSourceIds = new Set(
+        attempted.map((job) => job.sourceId),
+      );
+      for (const asset of page) {
+        if (processed >= budget) {
+          break;
+        }
+        const backoffKey = `${tenantId}:${asset.id}`;
+        if (attemptedSourceIds.has(pickupSourceId(asset.id))) {
+          this.preJobFailures.delete(backoffKey);
+          continue;
+        }
+        const backoff = this.preJobFailures.get(backoffKey);
+        if (backoff && backoff.retryAt > Date.now()) {
+          // Still backing off a pre-job failure — skip WITHOUT spending
+          // budget, so a persistently refusing asset cannot starve newer
+          // ones out of the per-scan cap.
+          continue;
+        }
+        processed += 1;
+        try {
+          await this.detection.detectForAsset(tenantId, asset.id);
+          this.preJobFailures.delete(backoffKey);
+        } catch (error) {
+          // detectForAsset records job-level failures itself, so a THROW
+          // means no job row exists (a race with delete, or a store/unit
+          // removed after upload). Nothing marks the asset attempted, so
+          // back off exponentially instead of re-running it every scan.
+          const failures = (backoff?.failures ?? 0) + 1;
+          const delayMs = Math.min(
+            PRE_JOB_RETRY_BASE_MS * 2 ** (failures - 1),
+            PRE_JOB_RETRY_MAX_MS,
+          );
+          this.preJobFailures.set(backoffKey, {
+            failures,
+            retryAt: Date.now() + delayMs,
+          });
+          this.logger.warn(
+            `Auto pickup detection skipped asset ${asset.id} (next retry ` +
+              `in ~${Math.round(delayMs / 1000)}s): ${
+                error instanceof Error ? error.message : 'unknown'
+              }`,
+          );
+        }
+      }
+      if (page.length < SCAN_PAGE_SIZE) {
+        break;
+      }
+    }
+    return processed;
   }
 }

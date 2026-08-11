@@ -107,6 +107,35 @@ describe('InventoryService.recordMovement', () => {
     expect(recordExternalMovement).not.toHaveBeenCalled();
   });
 
+  it('rejects a credential-/payment-bearing reason before any ledger write', async () => {
+    // The ledger is append-only — a PAN written into a reason is permanent.
+    const { service, recordExternalMovement } = buildService();
+    for (const reason of [
+      'refund to card 4111111111111111 cvv=123',
+      'chargeback for 4111-1111-1111-1111',
+      'password=hunter2 replay',
+    ]) {
+      await expect(
+        service.recordMovement(TENANT, { ...VALID, reason }, ACTOR),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
+    expect(recordExternalMovement).not.toHaveBeenCalled();
+  });
+
+  it('rejects a payment-bearing reference before any ledger write', async () => {
+    // The DTO charset ([A-Za-z0-9._-]) admits dash-grouped Luhn-valid PANs;
+    // the service screens the reference like the checkout idempotency key.
+    const { service, recordExternalMovement } = buildService();
+    await expect(
+      service.recordMovement(
+        TENANT,
+        { ...VALID, reference: '4111-1111-1111-1111' },
+        ACTOR,
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(recordExternalMovement).not.toHaveBeenCalled();
+  });
+
   it('maps below-zero outcomes to a controlled 409', async () => {
     const { service } = buildService({ result: 'insufficient-stock' });
     await expect(

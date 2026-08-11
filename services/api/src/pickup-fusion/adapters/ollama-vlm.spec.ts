@@ -13,7 +13,7 @@ import { VlmRequestEvidence } from '../ports';
 
 function configFor(
   port: number | null,
-  options: { model?: string; legacyCompat?: boolean } = {},
+  options: { model?: string; legacyCompat?: boolean; numCtx?: string } = {},
 ): ConfigService {
   const model = options.model ?? 'test-vision:7b';
   return {
@@ -28,7 +28,9 @@ function configFor(
             ? options.legacyCompat
               ? 'true'
               : undefined
-            : undefined,
+            : key === 'PICKUP_VLM_NUM_CTX'
+              ? options.numCtx
+              : undefined,
   } as unknown as ConfigService;
 }
 
@@ -108,6 +110,32 @@ async function verifyWithContent(
 }
 
 describe('OllamaVlmVerifier', () => {
+  it('construction: PICKUP_VLM_NUM_CTX outside [512, 131072] fails boot loudly', () => {
+    // Below 512 the multi-image evidence prompt can never fit (every call
+    // would fail with the same HTTP 400); absurdly large windows make
+    // Ollama try to reserve VRAM for them. Bounded like the fusion
+    // policy thresholds: fail at construction, not per-request.
+    for (const bad of ['256', '0', '-1', '131073', '1e9']) {
+      expect(() => new OllamaVlmVerifier(configFor(null, { numCtx: bad }))).toThrow(
+        /PICKUP_VLM_NUM_CTX.*outside its safe range/,
+      );
+    }
+  });
+
+  it('construction: unset falls back to 8192; in-range values are accepted', () => {
+    const fallback = new OllamaVlmVerifier(configFor(null)) as unknown as {
+      numCtx: number;
+    };
+    expect(fallback.numCtx).toBe(8192);
+    for (const ok of ['512', '8192', '131072']) {
+      expect(
+        (new OllamaVlmVerifier(configFor(null, { numCtx: ok })) as unknown as {
+          numCtx: number;
+        }).numCtx,
+      ).toBe(Number(ok));
+    }
+  });
+
   it('readiness: unreachable server → not ready (edge-offline posture)', async () => {
     const verifier = new OllamaVlmVerifier(configFor(null));
     const readiness = await verifier.readiness();

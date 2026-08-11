@@ -129,11 +129,15 @@ function buildService(overrides: {
         return row;
       }),
       findFirst: jest.fn(
-        async (args: { where?: { fusionRunId?: string } }) =>
+        async (args: {
+          where?: { videoAssetId?: string; sourceType?: string };
+        }) =>
           journeyRow.events.find(
             (row) =>
-              args.where?.fusionRunId !== undefined &&
-              row.fusionRunId === args.where.fusionRunId,
+              args.where?.videoAssetId !== undefined &&
+              row.videoAssetId === args.where.videoAssetId &&
+              (args.where.sourceType === undefined ||
+                row.sourceType === args.where.sourceType),
           ) ?? null,
       ),
       findMany: jest.fn(async () => journeyRow.events),
@@ -164,6 +168,47 @@ describe('JourneyService', () => {
     expect(createdEvents[0]).toMatchObject({
       eventType: CustomerJourneyEventType.ENTRY,
     });
+  });
+
+  it('create writes the journey and its ENTRY event in ONE transaction (atomic open)', async () => {
+    const { service, prisma, journeyRow } = buildService();
+    // Track whether each write ran inside the $transaction callback: a
+    // journey insert that commits without its ENTRY event would leave an
+    // OPEN journey that a retry then duplicates.
+    let inTransaction = false;
+    const writes: string[] = [];
+    prisma.$transaction.mockImplementation(
+      async (fn: (tx: unknown) => Promise<unknown>) => {
+        inTransaction = true;
+        try {
+          return await fn(prisma);
+        } finally {
+          inTransaction = false;
+        }
+      },
+    );
+    prisma.customerJourney.create.mockImplementation(async () => {
+      writes.push(inTransaction ? 'journey:tx' : 'journey:outside');
+      return journeyRow;
+    });
+    prisma.customerJourneyEvent.create.mockImplementation(
+      async (args: { data: Record<string, unknown> }) => {
+        writes.push(inTransaction ? 'entry:tx' : 'entry:outside');
+        return { id: 'e-1', ...args.data };
+      },
+    );
+    await service.create(TENANT, { locationId: 'store-1' }, 'user-1');
+    expect(writes).toEqual(['journey:tx', 'entry:tx']);
+  });
+
+  it('create rejects when the ENTRY insert fails (transaction rolls both writes back)', async () => {
+    const { service, prisma } = buildService();
+    prisma.customerJourneyEvent.create.mockRejectedValueOnce(
+      new Error('ENTRY insert failed'),
+    );
+    await expect(
+      service.create(TENANT, { locationId: 'store-1' }),
+    ).rejects.toThrow('ENTRY insert failed');
   });
 
   it('append rejects on a closed journey (append-only stream stays coherent)', async () => {
@@ -252,6 +297,62 @@ describe('JourneyService', () => {
     expect(
       createdEvents.filter((row) => row.fusionRunId === 'run-1'),
     ).toHaveLength(1);
+  });
+
+  it('fusion-run dedup keys on the VIDEO, not the run id: a re-run cannot double-count', async () => {
+    const runOf = (id: string) => ({
+      id,
+      policy: 'AUTO_PROPOSE',
+      fusedTopScore: 0.51,
+      fusedTopSku: 'SKU-A',
+      evidence: {
+        detector: { events: [{ kind: 'PICKUP' }] },
+        fused: [{ productId: 'prod-a', sku: 'SKU-A', productName: 'Product A' }],
+      },
+    });
+    const { service, prisma, createdEvents } = buildService({
+      fusionRun: runOf('run-1'),
+    });
+    await service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    // Fusion is re-run on the same video (a normal admin action), so the
+    // LATEST run is now run-2: a repeated import resolves a FRESH run id
+    // that a run-id-only dedup would wave through.
+    prisma.pickupFusionRun.findFirst.mockResolvedValue(runOf('run-2'));
+    await service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    expect(
+      createdEvents.filter((row) => row.videoAssetId === 'asset-1'),
+    ).toHaveLength(1);
+  });
+
+  it('append rejects a note carrying payment- or credential-bearing content', async () => {
+    const { service, createdEvents } = buildService();
+    // A Luhn-valid PAN would otherwise persist verbatim and echo back on
+    // every journey read — the AGENTS.md payments invariant.
+    await expect(
+      service.appendEvent(TENANT, 'j-1', {
+        eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+        note: 'shopper card 4242 4242 4242 4242 cvv=123',
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    // Credential-bearing URLs reject too.
+    await expect(
+      service.appendEvent(TENANT, 'j-1', {
+        eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+        note: 'camera at rtsp://admin:hunter2@10.0.0.5/stream',
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(createdEvents).toHaveLength(0);
+  });
+
+  it('append keeps benign notes (the screen rejects secrets, not prose)', async () => {
+    const { service, createdEvents } = buildService();
+    await service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+      note: 'shopper picked up an unidentified bottle near aisle four',
+    });
+    expect(createdEvents[0]).toMatchObject({
+      note: 'shopper picked up an unidentified bottle near aisle four',
+    });
   });
 
   it("fusion-run import rejects a video from a different store context", async () => {

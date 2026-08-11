@@ -108,12 +108,58 @@ describe('upsertGroundTruth', () => {
     expect(upsert).not.toHaveBeenCalled();
   });
 
+  it('rejects a timestamp past the ~24h ceiling even when the asset is unprobed (400, no write)', async () => {
+    // durationMs is null until the probe runs, so the duration check cannot
+    // fire — the absolute ceiling must still stop int4-overflowing values
+    // from reaching Prisma (which would 500 instead of 400).
+    const { service, upsert } = buildService({
+      asset: { id: ASSET, durationMs: null },
+    });
+    await expect(
+      service.upsertGroundTruth(TENANT, ASSET, {
+        ...valid,
+        actualTimestampMs: 3_000_000_000,
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(upsert).not.toHaveBeenCalled();
+  });
+
   it('rejects a non-positive quantity (400, no write)', async () => {
     const { service, upsert } = buildService();
     await expect(
       service.upsertGroundTruth(TENANT, ASSET, { ...valid, quantity: 0 }),
     ).rejects.toBeInstanceOf(BadRequestException);
     expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it('rejects a credential-/payment-bearing note (400, no write)', async () => {
+    const { service, upsert } = buildService();
+    // Same fused free-text screen as the screening-note gate: PAN windows,
+    // spaced credential labels, and key=value fragments all reject.
+    for (const note of [
+      'card used: 4111 1111 1111 1111, PIN 1234',
+      'keypad pin1234 visible',
+      'operator note password=hunter2',
+    ]) {
+      await expect(
+        service.upsertGroundTruth(TENANT, ASSET, { ...valid, note }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
+    expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it('stores a benign note untouched', async () => {
+    const { service, upsert } = buildService();
+    await service.upsertGroundTruth(TENANT, ASSET, {
+      ...valid,
+      note: 'approved: shelf occlusion acceptable, retest cam3',
+    });
+    const args = upsert.mock.calls[0][0] as unknown as {
+      update: Record<string, unknown>;
+    };
+    expect(args.update).toMatchObject({
+      note: 'approved: shelf occlusion acceptable, retest cam3',
+    });
   });
 
   it('NONE clears the product/timestamp on the stored row', async () => {

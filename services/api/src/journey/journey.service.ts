@@ -12,6 +12,7 @@ import {
 } from '@prisma/client';
 import { journeyAdvisoryLockKey } from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
+import { containsSensitiveFreeText } from '../video-ingest/media-safety';
 
 /**
  * Customer-journey SKELETON — SHADOW MODE ONLY.
@@ -167,22 +168,29 @@ export class JourneyService {
         throw new NotFoundException('Unit not found in this store');
       }
     }
-    const journey = await this.prisma.customerJourney.create({
-      data: {
-        tenantId,
-        locationId: input.locationId,
-        unitId: input.unitId ?? null,
-      },
-    });
-    await this.prisma.customerJourneyEvent.create({
-      data: {
-        tenantId,
-        journeyId: journey.id,
-        eventType: CustomerJourneyEventType.ENTRY,
-        occurredAt: new Date(),
-        sourceType: 'MANUAL',
-        createdById: actorId ?? null,
-      },
+    // ATOMIC open: the journey row and its ENTRY event become visible
+    // together. If the ENTRY insert failed after the journey committed,
+    // an OPEN journey with no ENTRY event would remain and a retry would
+    // open a SECOND journey for the same shopper.
+    const journey = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.customerJourney.create({
+        data: {
+          tenantId,
+          locationId: input.locationId,
+          unitId: input.unitId ?? null,
+        },
+      });
+      await tx.customerJourneyEvent.create({
+        data: {
+          tenantId,
+          journeyId: created.id,
+          eventType: CustomerJourneyEventType.ENTRY,
+          occurredAt: new Date(),
+          sourceType: 'MANUAL',
+          createdById: actorId ?? null,
+        },
+      });
+      return created;
     });
     return this.detail(tenantId, journey.id);
   }
@@ -246,14 +254,38 @@ export class JourneyService {
     if (!Number.isInteger(quantity) || quantity < 1 || quantity > 100) {
       throw new BadRequestException('quantity must be a whole number 1..100');
     }
+    // The note is caller free text that persists verbatim and echoes back
+    // on every journey read — same reject-on-write screen as the video
+    // screening note (Phase 7 policy): no credential- or payment-bearing
+    // content ever touches storage. Gated at the service level so every
+    // append path is covered.
+    if (
+      input.note !== undefined &&
+      input.note !== null &&
+      containsSensitiveFreeText(input.note)
+    ) {
+      throw new BadRequestException(
+        'note must not contain credential- or payment-bearing content',
+      );
+    }
     await this.withOpenJourney(tenantId, journeyId, async (tx) => {
-      // IDEMPOTENT fusion imports: one fusion run may appear at most once
-      // per journey. Checked under the journey lock, in the same
-      // transaction as the insert, so a browser retry replays instead of
-      // doubling the provisional basket.
-      if (input.fusionRunId) {
+      // IDEMPOTENT fusion imports: one VIDEO may contribute at most one
+      // fusion observation per journey. The dedup keys on (journeyId,
+      // videoAssetId) rather than the run id because fusion runs are
+      // append-only and freely re-runnable — after a re-run, the "latest
+      // run" indirection hands a repeated import a FRESH run id that a
+      // run-id-only check would wave through, double-counting one physical
+      // observation. Checked under the journey lock, in the same
+      // transaction as the insert, so a retry replays instead of doubling
+      // the provisional basket.
+      if (input.sourceType === 'FUSION_SHADOW' && input.videoAssetId) {
         const existing = await tx.customerJourneyEvent.findFirst({
-          where: { tenantId, journeyId, fusionRunId: input.fusionRunId },
+          where: {
+            tenantId,
+            journeyId,
+            videoAssetId: input.videoAssetId,
+            sourceType: 'FUSION_SHADOW',
+          },
           select: { id: true },
         });
         if (existing) {
