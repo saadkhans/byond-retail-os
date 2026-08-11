@@ -65,7 +65,9 @@ describe('InventoryService', () => {
     for (const reason of [
       'refund to card 4111111111111111 cvv=123',
       'card 4111-1111-1111-1111 chargeback',
-      'api_key=sk_live_abcdefgh12345678',
+      // Synthetic low-entropy fixture: the screen rejects any api_key=value
+      // shape, and this one cannot trip secret scanners.
+      'api_key=aaaa1111aaaa1111',
       // Strict free-text screen: dot/underscore-grouped PANs and
       // separator-free credential labels reject too (the weak value screen
       // only bridged space/dash and needed '='/':').

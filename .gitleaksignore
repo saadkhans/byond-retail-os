@@ -20,3 +20,9 @@ a474033fff9eae0b715aeeeb3f318ef4aab11f8b:services/api/src/inference/inference-jo
 # fixtures); this entry only covers the historical commit that briefly
 # contained it. Not a real credential.
 a07518b6e7889859f2ff1a465eef7d1bb7085c62:services/api/src/video-ingest/media-safety.spec.ts:stripe-access-token:191
+#
+# Fake Stripe-shaped TEST FIXTURE (round-2 Codex-fix commit; inventory ledger
+# free-text screening spec proving such values are REJECTED before any
+# append-only write). Replaced with a safe synthetic fixture in a later
+# commit; this entry covers only the historical commit. Not a real credential.
+18d241d108c58feac03465cbeef0175a4f718cf4:services/api/src/inventory/inventory.service.spec.ts:stripe-access-token:68
