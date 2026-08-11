@@ -3724,6 +3724,64 @@ describe('VideoAssetsService crop & frame extraction', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 
+  describe('single-frame timestamp bounds on a 6000 ms video', () => {
+    // The full acceptance matrix for `0 <= timestampMs < durationMs` on a
+    // 6.0 s asset: the duration endpoint itself is EXCLUSIVE, and an
+    // invalid value is a controlled 400 that never reaches the extractor —
+    // never a silent clamp or fallback to 0.
+    const buildSixSecondService = () =>
+      buildService({
+        repository: {
+          findByIdInternal: jest.fn(async () => assetRow({ durationMs: 6000 })),
+        },
+      });
+
+    it.each([[0], [2500], [5999]])(
+      'accepts %d ms and extracts exactly that frame',
+      async (timestampMs) => {
+        const { service, extractor } = buildSixSecondService();
+        await expect(
+          service.extractFrames(TENANT, 'asset-1', {
+            timestampMs,
+            idempotencyKey: `op-ts-${timestampMs}`,
+          }),
+        ).resolves.toBeDefined();
+        expect(extractor.extractFrameAt).toHaveBeenCalledTimes(1);
+        expect(
+          (extractor.extractFrameAt as jest.Mock).mock.calls[0][2],
+        ).toBe(timestampMs);
+      },
+    );
+
+    it.each([[6000], [7000], [-1]])(
+      'rejects %d ms with a 400 and never invokes the extractor',
+      async (timestampMs) => {
+        const { service, extractor } = buildSixSecondService();
+        await expect(
+          service.extractFrames(TENANT, 'asset-1', {
+            timestampMs,
+            idempotencyKey: `op-ts-${timestampMs}`,
+          }),
+        ).rejects.toBeInstanceOf(BadRequestException);
+        expect(extractor.extractFrameAt).not.toHaveBeenCalled();
+      },
+    );
+
+    it('rejects a NaN timestamp with a 400 and never invokes the extractor', async () => {
+      // Defense in depth: the DTO transform maps blank strings to NaN and
+      // @IsInt 400s them at the pipe, but the service must hold the same
+      // line if a NaN ever reaches it — not coerce, not treat as 0.
+      const { service, extractor } = buildSixSecondService();
+      await expect(
+        service.extractFrames(TENANT, 'asset-1', {
+          timestampMs: Number.NaN,
+          idempotencyKey: 'op-ts-nan',
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(extractor.extractFrameAt).not.toHaveBeenCalled();
+    });
+  });
+
   it('rejects a crop box that exceeds the probed dimensions', async () => {
     const { service } = buildService();
     await expect(

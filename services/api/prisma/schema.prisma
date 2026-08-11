@@ -138,6 +138,13 @@ enum BarcodeFormat {
 enum InventoryMovementType {
   ADJUSTMENT
   SALE
+  // Operator-recorded external movements (pickup-lab setup workflow):
+  // stock arriving (RECEIPT) and signed count corrections. Same append-only
+  // ledger + projection invariants as ADJUSTMENT; idempotent by external
+  // reference at the service layer.
+  RECEIPT
+  CORRECTION_IN
+  CORRECTION_OUT
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +233,12 @@ model Tenant {
 
   videoAssets             VideoAsset[]
   videoArtifacts          VideoArtifact[]
+  productReferenceImages  ProductReferenceImage[]
+  videoGroundTruths       VideoGroundTruth[]
+  productReferenceEmbeddings ProductReferenceEmbedding[]
+  pickupFusionRuns        PickupFusionRun[]
+  customerJourneys        CustomerJourney[]
+  customerJourneyEvents   CustomerJourneyEvent[]
   videoExtractionRequests VideoExtractionRequest[]
 }
 
@@ -361,6 +374,7 @@ model Location {
   visionEvents       VisionEvent[]
   inferenceJobs      InferenceJob[]
   videoAssets        VideoAsset[]
+  customerJourneys   CustomerJourney[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -484,6 +498,11 @@ model Product {
   sku         String
   name        String
   description String?
+  // OCR/text-evidence catalog fields (pickup-fusion-v2): the Arabic
+  // display/label name and free-form aliases the label may carry. Optional;
+  // maintained through the same catalog ingestion path as everything else.
+  nameArabic  String?
+  aliases     String[] @default([])
   categoryId  String?
   brandId     String?
   unitOfMeasure UnitOfMeasure @default(EACH)
@@ -505,6 +524,10 @@ model Product {
   orderLines           OrderLine[]
   visionEventCandidates VisionEventCandidate[]
   visionReviewsApplied  VisionEventReview[]   @relation("VisionReviewAppliedProduct")
+  referenceImages       ProductReferenceImage[]
+  groundTruths          VideoGroundTruth[]
+  referenceEmbeddings   ProductReferenceEmbedding[]
+  journeyEvents         CustomerJourneyEvent[]
 
   @@unique([tenantId, sku])
   @@unique([id, tenantId])
@@ -529,6 +552,188 @@ model ProductBarcode {
 
   @@unique([tenantId, value])
   @@index([productId])
+}
+
+// Pickup-detection reference image for one catalog product. The row is
+// METADATA + an internal storage key — the API serves bytes only through
+// the authenticated image endpoint and never exposes the key (same rule as
+// VideoAsset/VideoArtifact). A product is INFERENCE-READY only when it has
+// at least PICKUP_MIN_REFERENCE_IMAGES (5) of these.
+model ProductReferenceImage {
+  id               String  @id @default(cuid())
+  tenantId         String
+  productId        String
+  originalFilename String
+  mimeType         String
+  sizeBytes        Int
+  checksumSha256   String
+  storageKey       String
+  createdById      String?
+  createdAt        DateTime @default(now())
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+  embeddings ProductReferenceEmbedding[]
+
+  @@unique([tenantId, productId, checksumSha256])
+  @@index([tenantId, productId])
+}
+
+// Versioned visual descriptor of ONE reference image (pickup-fusion-v2
+// retrieval index). One row per (image, modelKey) so a new embedding model
+// backfills alongside the old instead of overwriting it; deleting the
+// reference image cascades its vectors away.
+model ProductReferenceEmbedding {
+  id               String  @id @default(cuid())
+  tenantId         String
+  referenceImageId String
+  productId        String
+  modelKey         String
+  modelVersion     String
+  // L2-normalized Float array (small dimensionality) as JSON.
+  vector           Json
+  createdAt        DateTime @default(now())
+
+  tenant         Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  product        Product               @relation(fields: [productId], references: [id], onDelete: Restrict)
+  referenceImage ProductReferenceImage @relation(fields: [referenceImageId], references: [id], onDelete: Cascade)
+
+  @@unique([referenceImageId, modelKey])
+  @@index([tenantId, modelKey])
+  @@index([tenantId, productId])
+}
+
+// ---------------------------------------------------------------------------
+// Customer journey SKELETON (shadow mode): a shopper's visit as an
+// append-only event stream. The provisional basket is a FOLD over these
+// events — never a checkout-session, order, payment, or inventory write.
+// ---------------------------------------------------------------------------
+
+enum CustomerJourneyStatus {
+  OPEN
+  EXITED
+  RECONCILED
+  REVIEW_REQUIRED
+}
+
+enum CustomerJourneyEventType {
+  ENTRY
+  EXIT
+  SHELF_INTERACTION
+  PRODUCT_PICKUP
+  PRODUCT_RETURN
+  REVIEW_REQUIRED
+}
+
+model CustomerJourney {
+  id         String                @id @default(cuid())
+  tenantId   String
+  locationId String
+  unitId     String?
+  status     CustomerJourneyStatus @default(OPEN)
+  startedAt  DateTime              @default(now())
+  endedAt    DateTime?
+  createdAt  DateTime              @default(now())
+  updatedAt  DateTime              @updatedAt
+
+  tenant   Tenant      @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location Location    @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit     RetailUnit? @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  events   CustomerJourneyEvent[]
+
+  @@index([tenantId, status, startedAt(sort: Desc)])
+}
+
+// APPEND-ONLY (service discipline; no update path exists): what the CV
+// shadow pipeline OBSERVED, one row per observation. productId is the
+// canonical link; sku/productName snapshots keep rows meaningful even if
+// the catalog renames later.
+model CustomerJourneyEvent {
+  id          String                   @id @default(cuid())
+  tenantId    String
+  journeyId   String
+  eventType   CustomerJourneyEventType
+  occurredAt  DateTime
+  productId   String?
+  sku         String?
+  productName String?
+  quantity    Int                      @default(1)
+  /** Uncalibrated score carried from the producing shadow pipeline. */
+  matchScore  Float?
+  sourceType  String                   @default("MANUAL")
+  videoAssetId String?
+  fusionRunId  String?
+  note        String?
+  createdById String?
+  createdAt   DateTime                 @default(now())
+
+  tenant  Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  journey CustomerJourney @relation(fields: [journeyId], references: [id], onDelete: Cascade)
+  product Product?        @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, journeyId, occurredAt])
+}
+
+enum FusionPolicyResult {
+  AUTO_PROPOSE
+  NEEDS_VLM
+  NEEDS_HUMAN_REVIEW
+  UNKNOWN_PRODUCT
+  FAILED
+}
+
+// One pickup-fusion-v2 SHADOW run over a test video: full per-stage
+// evidence (timeline/tracks, crops + quality, barcode, OCR, retrieval,
+// classical, context, fused candidates, VLM exchange, per-stage timings)
+// as safe-descriptor JSON. Deliberately DISCONNECTED from billing,
+// checkout sessions, and vision events — CV proposes, this table records.
+model PickupFusionRun {
+  id              String             @id @default(cuid())
+  tenantId        String
+  videoAssetId    String
+  pipelineVersion String
+  policy          FusionPolicyResult
+  fusedTopSku     String?
+  fusedTopScore   Float?
+  scoreMargin     Float?
+  evidence        Json
+  processingMs    Int
+  createdAt       DateTime           @default(now())
+
+  tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  videoAsset VideoAsset @relation(fields: [videoAssetId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, videoAssetId, createdAt(sort: Desc)])
+}
+
+// What ACTUALLY happened in one controlled test video — operator-entered
+// ground truth the validation dashboard scores detections against. One row
+// per asset (upsert semantics); NONE means "no pickup occurs in this clip".
+enum GroundTruthEventKind {
+  PICKUP
+  RETURN
+  NONE
+}
+
+model VideoGroundTruth {
+  id                String               @id @default(cuid())
+  tenantId          String
+  videoAssetId      String               @unique
+  eventKind         GroundTruthEventKind
+  productId         String?
+  actualTimestampMs Int?
+  quantity          Int                  @default(1)
+  note              String?
+  createdById       String?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  videoAsset VideoAsset @relation(fields: [videoAssetId], references: [id], onDelete: Cascade)
+  product    Product?   @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@unique([tenantId, videoAssetId])
+  @@index([tenantId, productId])
 }
 
 // DERIVED stock projection — never written directly from user input. The
@@ -581,6 +786,7 @@ model RetailUnit {
   visionEvents     VisionEvent[]
   inferenceJobs    InferenceJob[]
   videoAssets      VideoAsset[]
+  customerJourneys CustomerJourney[]
 
   @@unique([tenantId, code])
   // Enables composite same-tenant FKs (devices must reference a unit of the
@@ -1757,6 +1963,8 @@ model VideoAsset {
   uploadedBy User?            @relation("VideoAssetUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
   artifacts  VideoArtifact[]
   extractionRequests VideoExtractionRequest[]
+  groundTruth VideoGroundTruth?
+  fusionRuns  PickupFusionRun[]
 
   @@unique([id, tenantId])
   @@index([tenantId, createdAt(sort: Desc), id(sort: Desc)])

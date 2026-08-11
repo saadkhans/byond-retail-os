@@ -60,7 +60,7 @@ export class BrandsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${brandAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const before = await tx.brand.findFirst({
         where: { id, tenantId: scopedTenantId },
       });
@@ -89,7 +89,7 @@ export class BrandsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${brandAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const existing = await tx.brand.findFirst({
         where: { id, tenantId: scopedTenantId },
       });

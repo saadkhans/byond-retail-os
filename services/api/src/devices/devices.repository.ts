@@ -104,7 +104,7 @@ export class DevicesRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${unitAdvisoryLockKey(
         scopedTenantId,
         data.unitId,
-      )}))`;
+      )}))::text`;
       const device = await tx.device.create({
         data: { ...data, tenantId: scopedTenantId },
         include: DEVICE_INCLUDE,
@@ -183,7 +183,7 @@ export class DevicesRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const before = await tx.device.findFirst({
         where: { id, tenantId: scopedTenantId },
         omit: DEVICE_OMIT,
@@ -248,7 +248,7 @@ export class DevicesRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const existing = await tx.device.findFirst({
         where: { id, tenantId: scopedTenantId },
         omit: DEVICE_OMIT,
@@ -284,7 +284,7 @@ export class DevicesRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const before = await tx.device.findFirst({
         where: { id, tenantId: scopedTenantId },
         omit: DEVICE_OMIT,
@@ -335,7 +335,7 @@ export class DevicesRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const before = await tx.device.findFirst({
         where: { id, tenantId: scopedTenantId },
         omit: DEVICE_OMIT,

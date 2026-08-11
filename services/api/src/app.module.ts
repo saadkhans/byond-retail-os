@@ -10,10 +10,13 @@ import { DevicesModule } from './devices/devices.module';
 import { HealthModule } from './health/health.module';
 import { InferenceModule } from './inference/inference.module';
 import { InventoryModule } from './inventory/inventory.module';
+import { JourneyModule } from './journey/journey.module';
 import { LocationsModule } from './locations/locations.module';
 import { OrdersModule } from './orders/orders.module';
 import { PaymentsModule } from './payments/payments.module';
 import { PlatformModulesModule } from './platform-modules/platform-modules.module';
+import { PickupDetectionModule } from './pickup-detection/pickup-detection.module';
+import { PickupFusionModule } from './pickup-fusion/pickup-fusion.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { TenantsModule } from './tenants/tenants.module';
 import { UnitsModule } from './units/units.module';
@@ -42,6 +45,9 @@ import { VisionModule } from './vision/vision.module';
     VisionModule,
     InferenceModule,
     VideoIngestModule,
+    PickupDetectionModule,
+    PickupFusionModule,
+    JourneyModule,
   ],
 })
 export class AppModule implements NestModule {

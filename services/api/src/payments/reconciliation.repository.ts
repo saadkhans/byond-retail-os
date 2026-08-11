@@ -105,7 +105,7 @@ export class ReconciliationRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${reconciliationAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const before = await tx.paymentReconciliationRecord.findFirst({
         where: { id, tenantId: scopedTenantId },
       });

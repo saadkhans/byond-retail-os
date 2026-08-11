@@ -58,6 +58,9 @@ export interface AdjustmentResult {
  * callers of `applyMovement()` (checkout completion) catch it to roll back
  * their own enclosing transaction.
  */
+/** referenceType stamped on operator-recorded external movements. */
+export const EXTERNAL_MOVEMENT_REFERENCE_TYPE = 'EXTERNAL';
+
 export class AdjustmentRejected extends Error {
   constructor(readonly reason: AdjustmentFailure) {
     super(reason);
@@ -135,6 +138,80 @@ export class InventoryRepository extends TenantScopedRepository {
     return this.runAdjustment(scopedTenantId, data, buildAuditEntry);
   }
 
+  /**
+   * Operator-recorded EXTERNAL movement (RECEIPT / CORRECTION_IN /
+   * CORRECTION_OUT), IDEMPOTENT BY REFERENCE: the transaction takes an
+   * advisory lock on the (tenant, reference) pair, then either returns the
+   * movement that reference already produced (replayed — a browser retry
+   * can never double-stock) or appends exactly one new ledger movement via
+   * the same applyMovement invariants as every other write.
+   */
+  recordExternalMovement(
+    tenantId: string,
+    data: {
+      locationId: string;
+      productId: string;
+      movementType: InventoryMovementType;
+      quantityDelta: number;
+      reason: string;
+      reference: string;
+      createdById?: string;
+    },
+    buildAuditEntry: (
+      movement: InventoryMovement,
+      level: InventoryLevel,
+    ) => AuditEntry,
+  ): Promise<
+    | (AdjustmentResult & { replayed: boolean })
+    | AdjustmentFailure
+  > {
+    const scopedTenantId = this.requireTenantId(tenantId);
+    return this.prisma
+      .$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`inventory-ref:${scopedTenantId}:${data.reference}`}))::text`;
+        const existing = await tx.inventoryMovement.findFirst({
+          where: {
+            tenantId: scopedTenantId,
+            referenceType: EXTERNAL_MOVEMENT_REFERENCE_TYPE,
+            referenceId: data.reference,
+          },
+        });
+        if (existing) {
+          const level = await tx.inventoryLevel.findFirst({
+            where: {
+              tenantId: scopedTenantId,
+              locationId: existing.locationId,
+              productId: existing.productId,
+            },
+          });
+          return {
+            movement: existing,
+            level: level as InventoryLevel,
+            replayed: true,
+          };
+        }
+        const { movement, level } = await this.applyMovement(tx, {
+          tenantId: scopedTenantId,
+          locationId: data.locationId,
+          productId: data.productId,
+          quantityDelta: data.quantityDelta,
+          movementType: data.movementType,
+          reason: data.reason,
+          referenceType: EXTERNAL_MOVEMENT_REFERENCE_TYPE,
+          referenceId: data.reference,
+          createdById: data.createdById,
+        });
+        await this.auditLog.record(buildAuditEntry(movement, level), tx);
+        return { movement, level, replayed: false };
+      })
+      .catch((error) => {
+        if (error instanceof AdjustmentRejected) {
+          return error.reason;
+        }
+        throw error;
+      });
+  }
+
   private async runAdjustment(
     scopedTenantId: string,
     data: {
@@ -200,7 +277,7 @@ export class InventoryRepository extends TenantScopedRepository {
     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
       scopedTenantId,
       input.productId,
-    )}))`;
+    )}))::text`;
 
     // Scoped existence checks: ids from other tenants are simply not
     // found. Every rejection THROWS so the transaction rolls back —

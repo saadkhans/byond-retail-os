@@ -221,13 +221,13 @@ export class VideoAssetsRepository extends TenantScopedRepository {
         await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${unitAdvisoryLockKey(
           scopedTenantId,
           lockUnitId,
-        )}))`;
+        )}))::text`;
       }
       if (data.deviceId) {
         await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceAdvisoryLockKey(
           scopedTenantId,
           data.deviceId,
-        )}))`;
+        )}))::text`;
       }
       if (data.locationId) {
         const location = await tx.location.findFirst({
@@ -406,7 +406,7 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${videoAssetAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const row = await tx.videoAsset.findFirst({
         where: { id, tenantId: scopedTenantId },
         select: { deletedAt: true },
@@ -534,7 +534,7 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${videoAssetAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const before = await tx.videoAsset.findFirst({
         where: { id, tenantId: scopedTenantId, deletedAt: null },
         select: VIDEO_ASSET_SELECT,
@@ -610,7 +610,7 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${videoAssetAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const current = await tx.videoAsset.findFirst({
         where: { id, tenantId: scopedTenantId, deletedAt: null },
         select: { status: true },
@@ -756,7 +756,7 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${videoAssetAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const row = await tx.videoAsset.findFirst({
         where: { id, tenantId: scopedTenantId, deletedAt: null },
         // The safe select PLUS the removal marker and the durable
@@ -985,7 +985,7 @@ export class VideoAssetsRepository extends TenantScopedRepository {
           scopedTenantId,
           videoAssetId,
           operationHash,
-        )}))`;
+        )}))::text`;
         // WHY A PUBLICATION COULD NOT PROCEED — 'parent-deleted' ONLY when
         // the row is PROVABLY soft-deleted, otherwise the fail-closed null.
         // The distinction is what lets the caller REMOVE the files it just
@@ -1136,6 +1136,14 @@ export class VideoAssetsRepository extends TenantScopedRepository {
     });
   }
 
+  /** Internal: full artifact row INCLUDING storageKey — image-serving only,
+   *  same never-surfaced rule as findByIdInternal. */
+  findArtifactByIdInternal(tenantId: string, id: string) {
+    return this.prisma.videoArtifact.findFirst({
+      where: this.scope(tenantId, { id, videoAsset: { deletedAt: null } }),
+    });
+  }
+
   async listArtifacts(
     tenantId: string,
     videoAssetId: string,
@@ -1189,7 +1197,7 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${videoAssetAdvisoryLockKey(
         scopedTenantId,
         videoAssetId,
-      )}))`;
+      )}))::text`;
       const before = await tx.videoArtifact.findFirst({
         // Deleted-parent scoping here too: a deleted asset's crop can
         // neither link nor replay a job.

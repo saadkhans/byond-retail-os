@@ -6,11 +6,13 @@ import {
   Param,
   Post,
   Query,
+  Res,
   UploadedFile,
   UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import { Response } from 'express';
 import {
   ApiBadRequestResponse,
   ApiBearerAuth,
@@ -226,6 +228,56 @@ export class VideoAssetsController {
     @Param('id') id: string,
   ): Promise<VideoArtifactView[]> {
     return this.assetsService.listArtifacts(tenantId, id);
+  }
+
+  @Get(':id/media')
+  @RequirePermissions('video-asset:screen')
+  @ApiOperation({
+    summary: 'Serve the stored media bytes for the in-app review player',
+    description:
+      'DELIBERATE Phase 10 policy change for the pickup-detection MVP: ' +
+      'reviewing an automatic detection requires watching the clip, so the ' +
+      'bytes are served to `video-asset:screen` holders — the permission ' +
+      'that already authorizes viewing footage during quarantine ' +
+      'screening. QUARANTINED/PENDING_MEDIA media is never served here, ' +
+      'and no storage key, path, or URL appears anywhere in the response.',
+  })
+  @ApiNotFoundResponse({ description: 'Asset or media not found' })
+  async serveMedia(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Res() response: Response,
+  ): Promise<void> {
+    const media = await this.assetsService.getMediaBytes(tenantId, id);
+    response
+      .status(200)
+      .setHeader('Content-Type', media.mimeType)
+      .setHeader('Cache-Control', 'private, max-age=60')
+      .send(media.data);
+  }
+
+  @Get(':id/artifacts/:artifactId/image')
+  @RequirePermissions('video-asset:read')
+  @ApiOperation({
+    summary: 'Serve one FRAME/CROP artifact image (detection thumbnails)',
+  })
+  @ApiNotFoundResponse({ description: 'Artifact not found in this tenant' })
+  async serveArtifactImage(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Param('artifactId') artifactId: string,
+    @Res() response: Response,
+  ): Promise<void> {
+    const image = await this.assetsService.getArtifactImageBytes(
+      tenantId,
+      id,
+      artifactId,
+    );
+    response
+      .status(200)
+      .setHeader('Content-Type', image.mimeType)
+      .setHeader('Cache-Control', 'private, max-age=3600')
+      .send(image.data);
   }
 
   @Post(':id/screening-preview')

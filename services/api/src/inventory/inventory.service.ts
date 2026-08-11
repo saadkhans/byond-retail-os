@@ -4,12 +4,20 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { AuditAction, InventoryMovement } from '@prisma/client';
+import {
+  AuditAction,
+  InventoryMovement,
+  InventoryMovementType,
+} from '@prisma/client';
 import {
   AuditActor,
   SYSTEM_ACTOR_EMAIL,
 } from '../common/audit/audit-log.service';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
+import {
+  EXTERNAL_MOVEMENT_TYPES,
+  RecordMovementDto,
+} from './dto/record-movement.dto';
 import { QueryLevelsDto, QueryMovementsDto } from './dto/query-inventory.dto';
 import {
   AdjustmentResult,
@@ -103,6 +111,86 @@ export class InventoryService {
       default:
         return result;
     }
+  }
+
+  /**
+   * Operator-recorded external movement (RECEIPT / CORRECTION_IN /
+   * CORRECTION_OUT). NEVER an overwrite: the ledger appends and the level
+   * is projected atomically, exactly like every other movement. Idempotent
+   * by `reference` — a browser retry replays the recorded movement.
+   */
+  async recordMovement(
+    tenantId: string,
+    dto: RecordMovementDto,
+    actor: AuditActor,
+  ): Promise<AdjustmentResult & { replayed: boolean }> {
+    const reason = dto.reason.trim();
+    if (!reason) {
+      throw new BadRequestException('A movement reason is required');
+    }
+    // Redundant with the DTO on purpose — ledger integrity never rests on
+    // transport validation alone.
+    if (!Number.isInteger(dto.quantity) || dto.quantity < 1) {
+      throw new BadRequestException('quantity must be a whole number >= 1');
+    }
+    if (!EXTERNAL_MOVEMENT_TYPES.includes(dto.movementType)) {
+      throw new BadRequestException('Unsupported movement type');
+    }
+    const quantityDelta =
+      dto.movementType === 'CORRECTION_OUT' ? -dto.quantity : dto.quantity;
+    const result = await this.inventoryRepository.recordExternalMovement(
+      tenantId,
+      {
+        locationId: dto.locationId,
+        productId: dto.productId,
+        movementType: dto.movementType as InventoryMovementType,
+        quantityDelta,
+        reason,
+        reference: dto.reference,
+        createdById: actor.id,
+      },
+      (movement, level) => ({
+        tenantId,
+        actorId: actor.id,
+        actorEmail: actor.email || SYSTEM_ACTOR_EMAIL,
+        action: AuditAction.STOCK_ADJUSTMENT,
+        entityType: 'InventoryMovement',
+        entityId: movement.id,
+        before: { quantity: level.quantity - movement.quantityDelta },
+        after: {
+          quantity: level.quantity,
+          quantityDelta: movement.quantityDelta,
+          movementType: movement.movementType,
+          locationId: movement.locationId,
+          productId: movement.productId,
+          reference: dto.reference,
+        },
+        reason,
+      }),
+    );
+    if (typeof result === 'string') {
+      switch (result) {
+        case 'location-not-found':
+          throw new NotFoundException(`Location "${dto.locationId}" not found`);
+        case 'product-not-found':
+          throw new NotFoundException(`Product "${dto.productId}" not found`);
+        case 'product-archived':
+          throw new ConflictException(
+            'Stock of an ARCHIVED product cannot be moved',
+          );
+        case 'insufficient-stock':
+          throw new ConflictException(
+            'Movement rejected: it would take on-hand stock below zero',
+          );
+        case 'quantity-overflow':
+          throw new ConflictException(
+            'Movement rejected: it would exceed the maximum quantity',
+          );
+        default:
+          throw new ConflictException(`Movement rejected: ${result}`);
+      }
+    }
+    return result;
   }
 
   async getLevels(

@@ -3565,6 +3565,16 @@ export class VideoAssetsService {
   }
 
   private assertTimestampInRange(timestampMs: number, durationMs: number): void {
+    // Defense in depth behind the DTO layer: a timestamp that is not a
+    // non-negative integer can never address a frame, so it gets a
+    // controlled 400 HERE too — never a fallback, never a silent clamp to
+    // zero, and never a pass-through to an extractor argv.
+    if (!Number.isInteger(timestampMs) || timestampMs < 0) {
+      throw new BadRequestException(
+        `timestampMs must be an integer between 0 and ${durationMs - 1} ms ` +
+          '(inclusive) for this video',
+      );
+    }
     // Duration is an EXCLUSIVE endpoint: no frame exists AT durationMs, and
     // accepting it would make the same request succeed on the simulated
     // adapter and fail on a real one. Strictly-less only.
@@ -4052,5 +4062,74 @@ export class VideoAssetsService {
       return new ConflictException('Frame/crop extraction failed');
     }
     return error instanceof Error ? error : new Error('Extraction failed');
+  }
+
+  /**
+   * Serve the stored media bytes for the in-app review player.
+   *
+   * DELIBERATE POLICY CHANGE (Phase 10 pickup-detection MVP): the original
+   * Phase 10 contract exposed no media bytes at all. Reviewing an automatic
+   * pickup detection requires WATCHING the clip, so this endpoint serves
+   * the bytes to callers holding `video-asset:screen` — the same permission
+   * that already authorizes viewing the footage via the quarantine preview.
+   * Boundaries that remain: QUARANTINED/PENDING_MEDIA media is NEVER served
+   * here (screening owns that surface), storage keys and paths still never
+   * leave the server, and soft-deleted assets 404.
+   */
+  async getMediaBytes(
+    tenantId: string,
+    id: string,
+  ): Promise<{ data: Buffer; mimeType: string }> {
+    assertPlainId('id', id);
+    const internal = await this.repository.findByIdInternal(tenantId, id);
+    if (!internal || internal.deletedAt !== null) {
+      throw new NotFoundException('Video asset not found');
+    }
+    if (
+      internal.status === VideoAssetStatus.PENDING_MEDIA ||
+      internal.status === VideoAssetStatus.QUARANTINED
+    ) {
+      throw new ConflictException(
+        'Media is not viewable before the screening decision releases it',
+      );
+    }
+    if (internal.mediaRemovedAt !== null) {
+      throw new NotFoundException('The stored media was removed');
+    }
+    let data: Buffer;
+    try {
+      data = await this.storage.read(internal.storageKey);
+    } catch {
+      throw new NotFoundException('The stored media is unavailable');
+    }
+    return { data, mimeType: internal.mimeType };
+  }
+
+  /**
+   * Serve one artifact's image bytes (FRAME or CROP) — thumbnails for the
+   * detection result UI. Same boundary notes as getMediaBytes; artifacts
+   * only exist for post-screening assets by construction.
+   */
+  async getArtifactImageBytes(
+    tenantId: string,
+    videoAssetId: string,
+    artifactId: string,
+  ): Promise<{ data: Buffer; mimeType: string }> {
+    assertPlainId('id', videoAssetId);
+    assertPlainId('artifactId', artifactId);
+    const artifact = await this.repository.findArtifactByIdInternal(
+      tenantId,
+      artifactId,
+    );
+    if (!artifact || artifact.videoAssetId !== videoAssetId) {
+      throw new NotFoundException('Artifact not found');
+    }
+    let data: Buffer;
+    try {
+      data = await this.storage.read(artifact.storageKey);
+    } catch {
+      throw new NotFoundException('The stored artifact is unavailable');
+    }
+    return { data, mimeType: artifact.mimeType };
   }
 }

@@ -188,7 +188,7 @@ export class UnitsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${unitAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const before = await tx.retailUnit.findFirst({
         where: { id, tenantId: scopedTenantId },
       });
@@ -259,7 +259,7 @@ export class UnitsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${unitAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const existing = await tx.retailUnit.findFirst({
         where: { id, tenantId: scopedTenantId },
       });

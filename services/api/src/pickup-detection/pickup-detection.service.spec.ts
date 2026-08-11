@@ -1,0 +1,367 @@
+import {
+  PickupDetectionService,
+  pickupSourceId,
+  scaleBoxToSource,
+} from './pickup-detection.service';
+import { MATCHER_MODEL_KEY, ReferenceImage } from './analysis/product-matcher';
+import { AnalysisFrame } from './analysis/pickup-analyzer';
+
+/**
+ * Pipeline-logic tests with every seam mocked: the decoder yields a
+ * deterministic synthetic pickup scene (the same shape as the analyzer
+ * spec), so these tests prove the ORCHESTRATION — job lifecycle calls,
+ * artifact idempotency keys, threshold behavior (UNKNOWN_PRODUCT), and
+ * the failure codes — without any media tooling.
+ */
+
+const TENANT = 'tenant-1';
+const ASSET = 'asset-1';
+const GEOMETRY = { width: 40, height: 30 };
+const PRODUCT_BOX = { x: 10, y: 8, width: 10, height: 10 };
+const RED: [number, number, number] = [200, 30, 30];
+const BLUE: [number, number, number] = [30, 60, 200];
+
+function solid(gray: number): Buffer {
+  return Buffer.alloc(GEOMETRY.width * GEOMETRY.height * 3, gray);
+}
+
+function paint(
+  frame: Buffer,
+  rect: { x: number; y: number; width: number; height: number },
+  rgb: [number, number, number],
+): void {
+  for (let y = rect.y; y < rect.y + rect.height; y += 1) {
+    for (let x = rect.x; x < rect.x + rect.width; x += 1) {
+      const offset = (y * GEOMETRY.width + x) * 3;
+      frame[offset] = rgb[0];
+      frame[offset + 1] = rgb[1];
+      frame[offset + 2] = rgb[2];
+    }
+  }
+}
+
+function scene(productPresent: boolean, handX: number | null): Buffer {
+  const frame = solid(120);
+  if (productPresent) {
+    paint(frame, PRODUCT_BOX, RED);
+  }
+  if (handX !== null) {
+    paint(frame, { x: handX, y: 6, width: 6, height: 14 }, [250, 240, 230]);
+  }
+  return frame;
+}
+
+function pickupFrames(): AnalysisFrame[] {
+  const buffers: Buffer[] = [];
+  for (let i = 0; i <= 5; i += 1) buffers.push(scene(true, null));
+  buffers.push(scene(true, 30));
+  buffers.push(scene(true, 18));
+  buffers.push(scene(false, 12));
+  buffers.push(scene(false, 28));
+  for (let i = 10; i <= 15; i += 1) buffers.push(scene(false, null));
+  return buffers.map((rgb, index) => ({ index, timestampMs: index * 500, rgb }));
+}
+
+function stillFrames(): AnalysisFrame[] {
+  return Array.from({ length: 16 }, (_, index) => ({
+    index,
+    timestampMs: index * 500,
+    rgb: scene(true, null),
+  }));
+}
+
+function referenceImage(rgb: [number, number, number]): ReferenceImage['image'] {
+  const edge = 48;
+  const buffer = Buffer.alloc(edge * edge * 3);
+  for (let i = 0; i < edge * edge; i += 1) {
+    buffer[i * 3] = rgb[0];
+    buffer[i * 3 + 1] = rgb[1];
+    buffer[i * 3 + 2] = rgb[2];
+  }
+  return { width: edge, height: edge, rgb: buffer };
+}
+
+function assetRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: ASSET,
+    tenantId: TENANT,
+    status: 'VALIDATED',
+    storageKey: `${TENANT}/uuid/original.mp4`,
+    durationMs: 8000,
+    width: 640,
+    height: 480,
+    fps: 15,
+    locationId: 'loc-1',
+    unitId: 'unit-1',
+    deviceId: null,
+    sessionId: null,
+    deletedAt: null,
+    mediaRemovedAt: null,
+    createdAt: new Date('2026-08-03T10:00:00.000Z'),
+    ...overrides,
+  };
+}
+
+interface Harness {
+  service: PickupDetectionService;
+  inferenceJobs: Record<string, jest.Mock>;
+  videoAssets: Record<string, jest.Mock>;
+  prisma: { visionEvent: { update: jest.Mock; findFirst: jest.Mock }; inferenceJob: { findFirst: jest.Mock; count: jest.Mock } };
+}
+
+function buildService(overrides: {
+  frames?: AnalysisFrame[];
+  references?: ReferenceImage[];
+  asset?: Record<string, unknown>;
+  threshold?: number;
+  existingJob?: Record<string, unknown> | null;
+  libraryLoad?: { references: ReferenceImage[]; productsWithImages: number; readyProducts: number };
+  readyProductIds?: string[];
+} = {}): Harness {
+  const frames = overrides.frames ?? pickupFrames();
+  const references =
+    overrides.references ??
+    ([
+      { productId: 'p-red', sku: 'SKU-RED', image: referenceImage(RED) },
+      { productId: 'p-blue', sku: 'SKU-BLUE', image: referenceImage(BLUE) },
+    ] as ReferenceImage[]);
+  const prisma = {
+    visionEvent: {
+      update: jest.fn(async () => ({})),
+      findFirst: jest.fn(async () => null),
+    },
+    inferenceJob: {
+      findFirst: jest.fn(async () => overrides.existingJob ?? null),
+      count: jest.fn(async () => 0),
+    },
+  };
+  const config = {
+    enabled: true,
+    analysisFps: 2,
+    analysisWidth: GEOMETRY.width,
+    confidenceThreshold: overrides.threshold ?? 0.62,
+    referenceDir: '/unused',
+  };
+  const decoder = {
+    decodeAnalysisFrames: jest.fn(async () => frames),
+    decodeReferenceImage: jest.fn(),
+  };
+  const referenceLibrary = {
+    load: jest.fn(async () =>
+      overrides.libraryLoad ?? {
+        references,
+        productsWithImages: references.length > 0 ? 2 : 0,
+        readyProducts: references.length > 0 ? 2 : 0,
+      },
+    ),
+    readyProductIds: jest.fn(async () =>
+      overrides.readyProductIds ??
+      [...new Set(references.map((reference) => reference.productId))],
+    ),
+  };
+  const inferenceJobs = {
+    create: jest.fn(async () => ({ id: 'job-1', attempts: 0 })),
+    start: jest.fn(async () => ({ id: 'job-1', attempts: 1 })),
+    complete: jest.fn(async () => ({ id: 'job-1' })),
+    fail: jest.fn(async () => ({ id: 'job-1' })),
+    toVisionEvent: jest.fn(async () => ({
+      job: { id: 'job-1' },
+      visionEvent: { id: 'event-1' },
+      replayed: false,
+    })),
+  };
+  const videoAssets = {
+    extractFrames: jest.fn(async () => ({
+      artifacts: [{ id: 'frame-artifact-1' }],
+      replayed: false,
+    })),
+    createCrop: jest.fn(async () => ({
+      artifact: { id: 'crop-artifact-1' },
+      replayed: false,
+    })),
+  };
+  const repository = {
+    findByIdInternal: jest.fn(async () => assetRow(overrides.asset)),
+  };
+  const storage = { internalPathFor: jest.fn(() => '/root/x') };
+  const service = new PickupDetectionService(
+    prisma as never,
+    config as never,
+    decoder as never,
+    referenceLibrary as never,
+    inferenceJobs as never,
+    videoAssets as never,
+    repository as never,
+    storage as never,
+  );
+  return { service, inferenceJobs: inferenceJobs as never, videoAssets: videoAssets as never, prisma };
+}
+
+describe('scaleBoxToSource', () => {
+  it('scales analysis coordinates to source pixels and clamps to bounds', () => {
+    const box = scaleBoxToSource(
+      { x: 10, y: 8, width: 10, height: 10 },
+      { width: 40, height: 30 },
+      { width: 640, height: 480 },
+    );
+    expect(box).toEqual({ x: 160, y: 128, width: 160, height: 160 });
+    const clamped = scaleBoxToSource(
+      { x: 39, y: 29, width: 10, height: 10 },
+      { width: 40, height: 30 },
+      { width: 640, height: 480 },
+    );
+    expect(clamped.x + clamped.width).toBeLessThanOrEqual(640);
+    expect(clamped.y + clamped.height).toBeLessThanOrEqual(480);
+  });
+});
+
+describe('PickupDetectionService.detectForAsset', () => {
+  it('completes the job with pixel-derived candidates and records PRODUCT_MATCHED', async () => {
+    const { service, inferenceJobs, prisma } = buildService();
+    await service.detectForAsset(TENANT, ASSET);
+
+    expect(inferenceJobs.start).toHaveBeenCalledWith(TENANT, 'job-1', {
+      adapterKey: 'pickup-classical-v1',
+    });
+    const completion = inferenceJobs.complete.mock.calls[0][2];
+    expect(completion.eventType).toBe('PRODUCT_PICKUP');
+    expect(completion.quantityDelta).toBe(1);
+    expect(completion.modelKey).toBe(MATCHER_MODEL_KEY);
+    expect(completion.detections[0].sku).toBe('SKU-RED');
+    expect(completion.detections[0].confidence).toBeGreaterThan(0.62);
+    // occurredAt = asset.createdAt + peak offset, timezone-aware.
+    expect(completion.occurredAt).toMatch(/Z$/);
+
+    expect(inferenceJobs.toVisionEvent).toHaveBeenCalledWith(TENANT, 'job-1');
+    const metadata = prisma.visionEvent.update.mock.calls[0][0].data
+      .metadata as Record<string, unknown>;
+    expect(metadata.kind).toBe('PRODUCT_PICKUP_DETECTION');
+    expect(metadata.result).toBe('PRODUCT_MATCHED');
+    expect(metadata.productId).toBe('p-red');
+    expect(metadata.sku).toBe('SKU-RED');
+    expect(metadata.sourceFrameArtifactId).toBe('frame-artifact-1');
+    expect(metadata.cropArtifactId).toBe('crop-artifact-1');
+    expect(metadata.eventStartMs).toBeLessThanOrEqual(
+      metadata.eventPeakMs as number,
+    );
+    expect(metadata.eventPeakMs).toBeLessThanOrEqual(
+      metadata.eventEndMs as number,
+    );
+    expect(inferenceJobs.fail).not.toHaveBeenCalled();
+  });
+
+  it('records UNKNOWN_PRODUCT with productId null below the threshold', async () => {
+    // Threshold above any achievable score for this scene.
+    const { service, inferenceJobs, prisma } = buildService({ threshold: 0.999 });
+    await service.detectForAsset(TENANT, ASSET);
+
+    // Candidates are still recorded (they are suggestions, not claims)...
+    expect(inferenceJobs.complete).toHaveBeenCalled();
+    // ...but the persisted verdict claims nothing.
+    const metadata = prisma.visionEvent.update.mock.calls[0][0].data
+      .metadata as Record<string, unknown>;
+    expect(metadata.result).toBe('UNKNOWN_PRODUCT');
+    expect(metadata.productId).toBeNull();
+    expect(metadata.sku).toBeNull();
+  });
+
+  it('fails the job with NO_MOTION_EVENT on a motionless clip', async () => {
+    const { service, inferenceJobs } = buildService({ frames: stillFrames() });
+    await service.detectForAsset(TENANT, ASSET);
+    expect(inferenceJobs.fail).toHaveBeenCalledWith(
+      TENANT,
+      'job-1',
+      expect.objectContaining({ errorCode: 'NO_MOTION_EVENT' }),
+    );
+    expect(inferenceJobs.complete).not.toHaveBeenCalled();
+  });
+
+  it('fails the job with MISSING_LOCATION_CONTEXT when the asset has no store/unit', async () => {
+    const { service, inferenceJobs } = buildService({
+      asset: { locationId: null, unitId: null },
+    });
+    await service.detectForAsset(TENANT, ASSET);
+    expect(inferenceJobs.fail).toHaveBeenCalledWith(
+      TENANT,
+      'job-1',
+      expect.objectContaining({ errorCode: 'MISSING_LOCATION_CONTEXT' }),
+    );
+  });
+
+  it('fails the job with REFERENCE_LIBRARY_EMPTY when no references exist', async () => {
+    const { service, inferenceJobs } = buildService({ references: [] });
+    await service.detectForAsset(TENANT, ASSET);
+    expect(inferenceJobs.fail).toHaveBeenCalledWith(
+      TENANT,
+      'job-1',
+      expect.objectContaining({ errorCode: 'REFERENCE_LIBRARY_EMPTY' }),
+    );
+  });
+
+  it('fails with NO_INFERENCE_READY_SKUS when images exist but no product reaches the 5-image floor', async () => {
+    const { service, inferenceJobs } = buildService({
+      libraryLoad: { references: [], productsWithImages: 3, readyProducts: 0 },
+    });
+    await service.detectForAsset(TENANT, ASSET);
+    expect(inferenceJobs.fail).toHaveBeenCalledWith(
+      TENANT,
+      'job-1',
+      expect.objectContaining({ errorCode: 'NO_INFERENCE_READY_SKUS' }),
+    );
+    expect(inferenceJobs.complete).not.toHaveBeenCalled();
+  });
+
+  it('fails with NO_INFERENCE_READY_SKUS when the store stocks no ready SKUs', async () => {
+    const { service, inferenceJobs } = buildService({ readyProductIds: [] });
+    await service.detectForAsset(TENANT, ASSET);
+    expect(inferenceJobs.fail).toHaveBeenCalledWith(
+      TENANT,
+      'job-1',
+      expect.objectContaining({
+        errorCode: 'NO_INFERENCE_READY_SKUS',
+        errorMessage: expect.stringContaining('store'),
+      }),
+    );
+  });
+
+  it('records processingMs and up to 10 ranked candidates', async () => {
+    const { service, inferenceJobs, prisma } = buildService();
+    await service.detectForAsset(TENANT, ASSET);
+    const completion = inferenceJobs.complete.mock.calls[0][2];
+    expect(completion.detections.length).toBeLessThanOrEqual(10);
+    const metadata = prisma.visionEvent.update.mock.calls[0][0].data
+      .metadata as Record<string, unknown>;
+    expect(typeof metadata.processingMs).toBe('number');
+    expect(metadata.processingMs as number).toBeGreaterThanOrEqual(0);
+  });
+
+  it('persists artifacts under job-scoped idempotency keys', async () => {
+    const { service, videoAssets } = buildService();
+    await service.detectForAsset(TENANT, ASSET);
+    expect(videoAssets.extractFrames).toHaveBeenCalledWith(
+      TENANT,
+      ASSET,
+      expect.objectContaining({ idempotencyKey: 'pickup:job-1:frame' }),
+    );
+    expect(videoAssets.createCrop).toHaveBeenCalledWith(
+      TENANT,
+      ASSET,
+      expect.objectContaining({
+        idempotencyKey: 'pickup:job-1:crop',
+        reason: 'PRODUCT_PICKUP',
+      }),
+    );
+  });
+
+  it('never re-runs a SUCCEEDED attempt without force', async () => {
+    const { service, inferenceJobs } = buildService({
+      existingJob: { id: 'job-0', status: 'SUCCEEDED', visionEventId: null },
+    });
+    await service.detectForAsset(TENANT, ASSET);
+    expect(inferenceJobs.create).not.toHaveBeenCalled();
+  });
+
+  it('derives the shared source id from the asset id', () => {
+    expect(pickupSourceId('abc')).toBe('pickup:abc');
+  });
+});

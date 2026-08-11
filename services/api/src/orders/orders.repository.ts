@@ -138,7 +138,7 @@ export class OrdersRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${orderPaymentAdvisoryLockKey(
         scopedTenantId,
         before.id,
-      )}))`;
+      )}))::text`;
       const locked = await tx.order.findFirst({
         where: { id, tenantId: scopedTenantId },
       });

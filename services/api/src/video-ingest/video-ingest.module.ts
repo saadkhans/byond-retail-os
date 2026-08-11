@@ -122,5 +122,11 @@ import { VideoCropsController } from './video-crops.controller';
           : simulated,
     },
   ],
+  // Exported for the Phase 10 pickup-detection module: artifact
+  // persistence goes through VideoAssetsService's idempotent contracts
+  // (never direct rows), asset reads through the repository, and analysis
+  // decoding needs the CONCRETE local adapter's path capability — the same
+  // capability the ffmpeg extractor uses.
+  exports: [VideoAssetsService, VideoAssetsRepository, LocalVideoStorageAdapter],
 })
 export class VideoIngestModule {}

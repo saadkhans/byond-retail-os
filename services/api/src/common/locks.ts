@@ -1,6 +1,15 @@
 /**
  * Advisory-lock keys used to serialize operations that a single database row
  * lock cannot cover on its own.
+ *
+ * Every call site invokes the lock as
+ * `tx.$queryRaw\`SELECT pg_advisory_xact_lock(hashtext(<key>))::text\``.
+ * The `::text` cast is load-bearing: `pg_advisory_xact_lock` returns the
+ * Postgres `void` type, which Prisma's `$queryRaw` refuses to deserialize
+ * ("Failed to deserialize column of type 'void'"), turning every locked
+ * transaction into a 500. Casting to text keeps the statement a no-result
+ * side effect while staying on `$queryRaw` (which the repository specs
+ * assert on).
  */
 
 /**

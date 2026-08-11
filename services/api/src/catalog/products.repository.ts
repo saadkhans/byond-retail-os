@@ -182,7 +182,7 @@ export class ProductsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const before = await tx.product.findFirst({
         where: { id, tenantId: scopedTenantId },
       });
@@ -251,7 +251,7 @@ export class ProductsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
 
       // Load the product WITH its barcodes so the delete audit captures the
       // scan identifiers being removed. Without this the barcodes would
@@ -290,7 +290,7 @@ export class ProductsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
         scopedTenantId,
         productId,
-      )}))`;
+      )}))::text`;
       const product = await tx.product.findFirst({
         where: { id: productId, tenantId: scopedTenantId },
       });
@@ -318,7 +318,7 @@ export class ProductsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
         scopedTenantId,
         productId,
-      )}))`;
+      )}))::text`;
       const existing = await tx.productBarcode.findFirst({
         where: { id: barcodeId, productId, tenantId: scopedTenantId },
       });

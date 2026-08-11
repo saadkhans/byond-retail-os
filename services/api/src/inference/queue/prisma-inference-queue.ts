@@ -121,7 +121,7 @@ export class PrismaInferenceQueue
         await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${unitAdvisoryLockKey(
           scopedTenantId,
           input.unitId,
-        )}))`;
+        )}))::text`;
         const unit = await tx.retailUnit.findFirst({
           where: { id: input.unitId, tenantId: scopedTenantId },
           select: { id: true, locationId: true },
@@ -141,7 +141,7 @@ export class PrismaInferenceQueue
         await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceAdvisoryLockKey(
           scopedTenantId,
           input.deviceId,
-        )}))`;
+        )}))::text`;
         const device = await tx.device.findFirst({
           where: { id: input.deviceId, tenantId: scopedTenantId },
           select: { id: true, unitId: true },
