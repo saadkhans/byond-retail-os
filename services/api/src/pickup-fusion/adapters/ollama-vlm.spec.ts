@@ -66,10 +66,18 @@ function stubOllama(handlers: {
   chat?: () => unknown;
   chatStatus?: number;
   stall?: boolean;
+  stallBody?: boolean;
 }): Promise<{ server: Server; port: number }> {
   const server = createServer((request, response) => {
     if (handlers.stall) {
       return; // never respond
+    }
+    if (handlers.stallBody) {
+      // Headers plus a partial JSON body, then silence: response.json()
+      // hangs until the client-side abort timer fires.
+      response.setHeader('content-type', 'application/json');
+      response.write('{"models": [');
+      return;
     }
     if (request.url === '/api/tags') {
       response.setHeader('content-type', 'application/json');
@@ -327,6 +335,22 @@ describe('OllamaVlmVerifier', () => {
     server.close();
     expect(verdict.status).toBe('TIMEOUT');
     expect(verdict.errorDetail).toContain('300 ms');
+  }, 10_000);
+
+  it('readiness: a hanging /api/tags BODY still times out (abort timer covers body parsing)', async () => {
+    // Regression: the timer used to be cleared as soon as headers arrived,
+    // so a stalling/trickling body hung readiness() — and verify()'s
+    // preliminary check — forever. Both must now settle via the 3s abort.
+    const { server, port } = await stubOllama({ stallBody: true });
+    const verifier = new OllamaVlmVerifier(configFor(port));
+    const [readiness, verdict] = await Promise.all([
+      verifier.readiness(),
+      verifier.verify(EVIDENCE, 5000),
+    ]);
+    server.close();
+    expect(readiness.serverReachable).toBe(false);
+    expect(readiness.classification).toBe('PROVIDER_UNREACHABLE');
+    expect(verdict.status).toBe('PROVIDER_UNREACHABLE');
   }, 10_000);
 
   it('readiness: reports classification and remembers the last inference outcome', async () => {

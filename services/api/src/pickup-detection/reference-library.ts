@@ -4,6 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { LocalVideoStorageAdapter } from '../video-ingest/storage/local-video-storage.adapter';
 import { PickupAnalysisFrameDecoder } from './analysis/analysis-frames';
 import { ReferenceImage, RgbImage } from './analysis/product-matcher';
+import { PickupDetectionConfig } from './pickup-detection.config';
 import { PICKUP_MIN_REFERENCE_IMAGES } from './reference-images.service';
 
 /** Decoded-image cache cap — 200 x (96x96x3 bytes) ≈ 5.5 MiB. */
@@ -43,6 +44,7 @@ export class PickupReferenceLibrary {
     private readonly prisma: PrismaService,
     private readonly storage: LocalVideoStorageAdapter,
     private readonly decoder: PickupAnalysisFrameDecoder,
+    private readonly config: PickupDetectionConfig,
   ) {}
 
   async load(tenantId: string): Promise<ReferenceLibraryLoad> {
@@ -113,10 +115,14 @@ export class PickupReferenceLibrary {
   }
 
   /**
-   * Inference-ready product ids, optionally scoped to a store: when the
-   * store stocks ANY products, readiness intersects with the stocked SKUs
-   * (a store cannot claim a pickup of a product it does not carry); a
-   * store with no stock rows at all (lab/dev) falls back to tenant-wide.
+   * Inference-ready product ids, optionally scoped to a store: readiness
+   * intersects with the store's stocked SKUs (a store cannot claim a
+   * pickup of a product it does not carry). A store with NO inventory
+   * rows at all matches NOTHING by default — an empty/new production
+   * store must never produce a matched pickup, mirroring how the fusion
+   * path treats the same absence as NOT_STOCKED. The historical
+   * tenant-wide fallback survives ONLY behind the explicit PICKUP_LAB_MODE
+   * flag (lab/dev rigs without seeded inventory).
    */
   async readyProductIds(
     tenantId: string,
@@ -128,19 +134,20 @@ export class PickupReferenceLibrary {
       where: { tenantId, product: { status: ProductStatus.ACTIVE } },
       _count: { _all: true },
     });
-    let ready = grouped
+    const ready = grouped
       .filter((g) => g._count._all >= PICKUP_MIN_REFERENCE_IMAGES)
       .map((g) => g.productId);
-    if (locationId && ready.length > 0) {
-      const stocked = await this.prisma.inventoryLevel.findMany({
-        where: { tenantId, locationId },
-        select: { productId: true },
-      });
-      if (stocked.length > 0) {
-        const stockedIds = new Set(stocked.map((s) => s.productId));
-        ready = ready.filter((id) => stockedIds.has(id));
-      }
+    if (!locationId || ready.length === 0) {
+      return ready;
     }
-    return ready;
+    const stocked = await this.prisma.inventoryLevel.findMany({
+      where: { tenantId, locationId },
+      select: { productId: true },
+    });
+    if (stocked.length === 0) {
+      return this.config.labMode ? ready : [];
+    }
+    const stockedIds = new Set(stocked.map((s) => s.productId));
+    return ready.filter((id) => stockedIds.has(id));
   }
 }

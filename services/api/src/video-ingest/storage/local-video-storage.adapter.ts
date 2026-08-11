@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { createReadStream as fsCreateReadStream } from 'node:fs';
 import {
   chmod,
   mkdir,
@@ -10,6 +11,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { isAbsolute, resolve, sep } from 'node:path';
+import { PassThrough, Readable } from 'node:stream';
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -134,6 +136,36 @@ export class LocalVideoStorageAdapter extends VideoStoragePort {
   async read(storageKey: string): Promise<Buffer> {
     const target = this.resolveWithinRoot(storageKey);
     return this.guarded(() => readFile(target));
+  }
+
+  async createReadStream(
+    storageKey: string,
+    range?: { start: number; end: number },
+  ): Promise<Readable> {
+    const target = this.resolveWithinRoot(storageKey);
+    return this.guarded(async () => {
+      // Probe existence HERE so a missing object fails as the controlled,
+      // path-free error — fs.createReadStream opens lazily, which would
+      // otherwise surface the raw ENOENT (absolute path embedded) on the
+      // LIVE stream after the caller already committed response headers.
+      await stat(target);
+      const source = fsCreateReadStream(target, {
+        start: range?.start,
+        end: range?.end,
+      });
+      // Raw fs stream errors embed the absolute path, so the consumer gets
+      // a PassThrough that re-raises the controlled error instead; a
+      // consumer teardown (client disconnect) releases the file handle.
+      const sanitized = new PassThrough();
+      source.once('error', () => {
+        sanitized.destroy(new VideoStorageOperationError());
+      });
+      sanitized.once('close', () => {
+        source.destroy();
+      });
+      source.pipe(sanitized);
+      return sanitized;
+    });
   }
 
   async delete(storageKey: string): Promise<void> {

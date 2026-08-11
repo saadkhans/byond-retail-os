@@ -45,6 +45,16 @@ export function useLoad<T>(
   return { data, error, loading };
 }
 
+/** Shared hook: debounce a fast-changing value (e.g. a search input). */
+export function useDebounced<T>(value: T, delayMs = 300): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(timer);
+  }, [value, delayMs]);
+  return debounced;
+}
+
 export function StatusBadge({ status }: { status: string }) {
   const tone =
     status === 'ACTIVE' || status === 'ONLINE' || status === 'OPEN' || status === 'COMPLETED' || status === 'CONFIRMED' || status === 'APPROVED' || status === 'SUCCEEDED'

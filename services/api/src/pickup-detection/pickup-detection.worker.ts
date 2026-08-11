@@ -22,7 +22,8 @@ import {
 const SCAN_INTERVAL_MS = 4000;
 /** Per-scan ceiling so one burst of uploads cannot starve the event loop. */
 const MAX_ASSETS_PER_SCAN = 2;
-/** Only assets this recent are auto-picked-up; older ones stay manual. */
+/** Only assets validated this recently are auto-picked-up; older ones stay
+ *  manual (see eligibleAssetWhere for why updatedAt carries the window). */
 const AUTO_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** Assets fetched per page while paging past already-attempted ones. */
 const SCAN_PAGE_SIZE = 25;
@@ -59,6 +60,15 @@ export class PickupDetectionWorker implements OnModuleInit, OnModuleDestroy {
     string,
     { failures: number; retryAt: number }
   >();
+  /**
+   * Tenant that received the LAST unit of scan budget. Each scan resumes
+   * with the next tenant id after this one (wrapping), because the tenant
+   * enumeration sorts identically every poll — without a cursor the first
+   * tenant's backlog would consume the whole MAX_ASSETS_PER_SCAN budget on
+   * every scan and starve later tenants forever. In-memory on purpose: a
+   * restart merely restarts the rotation at the first tenant.
+   */
+  private lastTenantServed: string | null = null;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -106,11 +116,21 @@ export class PickupDetectionWorker implements OnModuleInit, OnModuleDestroy {
         orderBy: { tenantId: 'asc' },
       });
       let remaining = MAX_ASSETS_PER_SCAN;
-      for (const { tenantId } of tenants) {
+      const rotation = this.rotateTenants(
+        tenants.map(({ tenantId }) => tenantId),
+      );
+      for (const tenantId of rotation) {
         if (remaining <= 0) {
           break;
         }
-        remaining -= await this.scanTenant(tenantId, cutoff, remaining);
+        const processed = await this.scanTenant(tenantId, cutoff, remaining);
+        if (processed > 0) {
+          // Only budget spent advances the cursor: a tenant skipped for a
+          // closed cv gate or a fully-attempted backlog costs nothing, so
+          // it must not push the rotation past tenants that DID have work.
+          this.lastTenantServed = tenantId;
+        }
+        remaining -= processed;
       }
     } catch (error) {
       // A failed poll (e.g. transient DB outage) must never become an
@@ -138,6 +158,23 @@ export class PickupDetectionWorker implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** Rotate the ascending tenant list so scanning resumes AFTER the tenant
+   *  that last received budget. Comparing ids (rather than indexOf) keeps
+   *  the rotation stable when that tenant has since dropped out of the
+   *  list; a single-tenant list always comes back unchanged. */
+  private rotateTenants(tenantIds: string[]): string[] {
+    if (this.lastTenantServed === null) {
+      return tenantIds;
+    }
+    const cursor = this.lastTenantServed;
+    const start = tenantIds.findIndex((id) => id > cursor);
+    // start === 0: every id already sorts after the cursor; start === -1:
+    // none do, so wrap to the beginning. Either way: no rotation needed.
+    return start <= 0
+      ? tenantIds
+      : [...tenantIds.slice(start), ...tenantIds.slice(0, start)];
+  }
+
   private eligibleAssetWhere(cutoff: Date, tenantId?: string) {
     return {
       ...(tenantId ? { tenantId } : {}),
@@ -145,7 +182,14 @@ export class PickupDetectionWorker implements OnModuleInit, OnModuleDestroy {
       status: {
         in: [VideoAssetStatus.VALIDATED, VideoAssetStatus.READY],
       },
-      createdAt: { gte: cutoff },
+      // The auto window starts when validation COMPLETES, not at upload:
+      // an asset can sit QUARANTINED past the window and only then be
+      // approved, and it must still get its automatic attempt. VideoAsset
+      // has no dedicated validatedAt column, but the status transition
+      // into VALIDATED/READY bumps @updatedAt and rows in these statuses
+      // see no routine later writes — so updatedAt is always >= the
+      // transition time and never strands a freshly validated asset.
+      updatedAt: { gte: cutoff },
     };
   }
 

@@ -1,3 +1,5 @@
+import type { Readable } from 'node:stream';
+
 /**
  * Controlled, PATH-FREE storage failure. Raw filesystem/provider errors
  * carry absolute paths (and a deployment root can carry credential-bearing
@@ -27,6 +29,20 @@ export abstract class VideoStoragePort {
 
   /** Read bytes back (extraction adapters only — never served to clients). */
   abstract read(storageKey: string): Promise<Buffer>;
+
+  /**
+   * Open a read STREAM over one object, optionally narrowed to an
+   * INCLUSIVE byte window — the media-serving path (Codex P2): a clip is
+   * piped to the review player chunk by chunk, so per-request memory stays
+   * bounded instead of buffering up to the whole file like `read`.
+   * Adapters must fail path-free like every other operation, including
+   * errors the underlying stream raises AFTER this promise resolved — a
+   * raw provider/fs error must never reach the stream's consumer.
+   */
+  abstract createReadStream(
+    storageKey: string,
+    range?: { start: number; end: number },
+  ): Promise<Readable>;
 
   /** Remove one object; missing objects are a no-op (idempotent delete). */
   abstract delete(storageKey: string): Promise<void>;

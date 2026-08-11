@@ -2,6 +2,7 @@ import { plainToInstance } from 'class-transformer';
 import {
   IsEnum,
   IsInt,
+  IsNumber,
   IsOptional,
   IsString,
   Matches,
@@ -202,6 +203,143 @@ class EnvironmentVariables {
   @Min(1000)
   @Max(300_000)
   VIDEO_SCREENING_TIMEOUT_MS?: number;
+
+  // ── Pickup detection / fusion (Phase 10 CV) ─────────────────────────
+  // Every PICKUP_* key read through ConfigService is declared here so the
+  // env contract is explicit and a deployment typo fails at boot. Note
+  // ConfigService.get() falls back to process.env for keys absent from
+  // the validated object, so whitelist-stripping alone never blanked
+  // these — but declared keys are validated (and bounded) instead of
+  // silently passing whatever string the environment carried.
+
+  // Master switch for the automatic pickup-detection worker AND the
+  // manual run endpoint. Same strict boolean idiom as the VIDEO_* flags.
+  @IsOptional()
+  @Matches(/^(true|false)$/i, {
+    message: 'PICKUP_DETECTION_ENABLED must be true or false',
+  })
+  PICKUP_DETECTION_ENABLED?: string;
+
+  // LAB/DEV ONLY: when the selected store has ZERO inventory rows, allow
+  // matching against the tenant-wide inference-ready catalog instead of
+  // matching nothing. Off by default — an empty/new production store must
+  // never produce a matched pickup for a product it does not stock (the
+  // fusion path treats the same absence as NOT_STOCKED).
+  @IsOptional()
+  @Matches(/^(true|false)$/i, {
+    message: 'PICKUP_LAB_MODE must be true or false',
+  })
+  PICKUP_LAB_MODE?: string;
+
+  // Analysis sampling rate (frames per second of source time). Fractional
+  // rates are legitimate (e.g. 2.5); bounds mirror the consumer's.
+  @IsOptional()
+  @IsNumber()
+  @Min(1)
+  @Max(15)
+  PICKUP_ANALYSIS_FPS?: number;
+
+  // Recognition confidence floor below which a match claims NOTHING
+  // (UNKNOWN_PRODUCT, productId null).
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(1)
+  PICKUP_CONFIDENCE_THRESHOLD?: number;
+
+  // Fusion v2 policy thresholds — bounds mirror the constructor checks in
+  // PickupFusionService so a typo fails at env validation, not later.
+  @IsOptional()
+  @IsNumber()
+  @Min(0.05)
+  @Max(1)
+  PICKUP_FUSION_AUTO_THRESHOLD?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(1)
+  PICKUP_FUSION_VLM_LOW?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(1)
+  PICKUP_FUSION_MARGIN?: number;
+
+  // Opt-in switch for the fusion VLM verification stage.
+  @IsOptional()
+  @Matches(/^(true|false)$/i, {
+    message: 'PICKUP_VLM_ENABLED must be true or false',
+  })
+  PICKUP_VLM_ENABLED?: string;
+
+  // Which verifier adapter serves VLM verification. Default local (Ollama
+  // on the operator's own box) — never a paid API implicitly.
+  @IsOptional()
+  @Matches(/^(local|anthropic)$/, {
+    message: 'PICKUP_VLM_PROVIDER must be local or anthropic',
+  })
+  PICKUP_VLM_PROVIDER?: string;
+
+  // UNCERTAIN_ONLY (default) verifies only the uncertainty band;
+  // VALIDATION_ALWAYS verifies every candidate (lab evaluation).
+  @IsOptional()
+  @Matches(/^(UNCERTAIN_ONLY|VALIDATION_ALWAYS)$/, {
+    message: 'PICKUP_VLM_MODE must be UNCERTAIN_ONLY or VALIDATION_ALWAYS',
+  })
+  PICKUP_VLM_MODE?: string;
+
+  // Per-verification deadline — bounds mirror the fusion constructor
+  // (1 s .. 10 min; a local 7B vision model cold-load needs > 30 s).
+  @IsOptional()
+  @IsInt()
+  @Min(1000)
+  @Max(600_000)
+  PICKUP_VLM_TIMEOUT_MS?: number;
+
+  // Local (Ollama) verifier endpoint — the adapter itself refuses any
+  // non-loopback URL, so no host validation is duplicated here.
+  @IsOptional()
+  @IsString()
+  PICKUP_VLM_BASE_URL?: string;
+
+  // Remote (anthropic-provider) verifier endpoint override.
+  @IsOptional()
+  @IsString()
+  PICKUP_VLM_ENDPOINT?: string;
+
+  @IsOptional()
+  @IsString()
+  PICKUP_VLM_MODEL?: string;
+
+  // Secret — value is never echoed (validation errors report property
+  // names only).
+  @IsOptional()
+  @IsString()
+  PICKUP_VLM_API_KEY?: string;
+
+  // Ollama context window — bounds mirror the adapter's construction
+  // check (512 .. 131072).
+  @IsOptional()
+  @IsInt()
+  @Min(512)
+  @Max(131_072)
+  PICKUP_VLM_NUM_CTX?: number;
+
+  // Local-dev ONLY: map the retired {choice, confidence} VLM response
+  // shape onto the strict schema (always review-flagged). Default off.
+  @IsOptional()
+  @Matches(/^(true|false)$/i, {
+    message: 'PICKUP_VLM_LEGACY_COMPAT must be true or false',
+  })
+  PICKUP_VLM_LEGACY_COMPAT?: string;
+
+  // Optional local YOLO ONNX model path for the fusion event detector;
+  // absent/empty means the classical motion detector runs alone.
+  @IsOptional()
+  @IsString()
+  PICKUP_YOLO_MODEL_PATH?: string;
 }
 
 // Placeholder markers — banned in EVERY environment (staging and preview

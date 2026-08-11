@@ -223,6 +223,50 @@ export function encodeRgbPng(image: RgbImage): Buffer {
 }
 
 /**
+ * Classified OCR execution status — the same pattern as the VLM verdict
+ * classification: a fixed code only, NEVER raw error text (an execFile
+ * error message can embed command output or filesystem paths). 'OK'
+ * includes a successful pass that simply saw no text; every other value
+ * means the OCR stage DID NOT complete, so its empty text must not be
+ * treated as a verified "no text on the product" observation.
+ * - UNAVAILABLE: tesseract (or every language pack) is missing.
+ * - TIMEOUT: the process was killed at the OCR deadline.
+ * - EXECUTION_FAILED: tesseract started but exited abnormally.
+ */
+export type OcrExecutionStatus =
+  | 'OK'
+  | 'UNAVAILABLE'
+  | 'TIMEOUT'
+  | 'EXECUTION_FAILED';
+
+/** The port's OcrResult plus the classified execution status. */
+export interface ClassifiedOcrResult extends OcrResult {
+  status: OcrExecutionStatus;
+}
+
+/** Maps an execFile failure onto the classified vocabulary. execFile's
+ *  own timeout kills the child (error.killed / a kill signal); a missing
+ *  binary surfaces as ENOENT. Everything else is an abnormal exit. */
+export function classifyOcrFailure(error: unknown): OcrExecutionStatus {
+  const failure = error as {
+    killed?: boolean;
+    signal?: string | null;
+    code?: string | number | null;
+  } | null;
+  if (
+    failure?.killed === true ||
+    failure?.signal === 'SIGTERM' ||
+    failure?.signal === 'SIGKILL'
+  ) {
+    return 'TIMEOUT';
+  }
+  if (failure?.code === 'ENOENT') {
+    return 'UNAVAILABLE';
+  }
+  return 'EXECUTION_FAILED';
+}
+
+/**
  * Local OCR through the SAME system tesseract the screening pipeline
  * already requires. Languages: English always; Arabic joins automatically
  * when the `ara` traineddata is installed (checked once per process).
@@ -259,10 +303,12 @@ export class TesseractOcrReader implements OcrReader {
     return langs;
   }
 
-  async recognize(image: RgbImage): Promise<OcrResult> {
+  async recognize(image: RgbImage): Promise<ClassifiedOcrResult> {
     const languages = await this.languages();
     if (languages.length === 0) {
-      return { rawText: '', normalizedText: '', languages: [] };
+      // No tesseract / no language packs: the stage is UNAVAILABLE — a
+      // classified state, not a successful "no text" pass.
+      return { rawText: '', normalizedText: '', languages: [], status: 'UNAVAILABLE' };
     }
     try {
       const rawText = await runTesseract(
@@ -273,9 +319,18 @@ export class TesseractOcrReader implements OcrReader {
         rawText: rawText.trim(),
         normalizedText: normalizeText(rawText),
         languages,
+        status: 'OK',
       };
-    } catch {
-      return { rawText: '', normalizedText: '', languages };
+    } catch (error) {
+      // Timeout/crash must stay distinguishable from a no-text pass —
+      // fusion demotes AUTO_PROPOSE when this advertised stage never ran.
+      // Classified code only; the raw error text is never propagated.
+      return {
+        rawText: '',
+        normalizedText: '',
+        languages,
+        status: classifyOcrFailure(error),
+      };
     }
   }
 }

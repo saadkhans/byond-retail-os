@@ -8,6 +8,7 @@ import {
   EvidenceQuality,
   EvidenceSourceType,
   InferenceJobStatus,
+  Prisma,
   VideoAssetStatus,
   VisionEventType,
 } from '@prisma/client';
@@ -115,6 +116,12 @@ function round4(value: number): number {
   return Math.round(value * 10_000) / 10_000;
 }
 
+/** Latest-attempt job row with its immutable result payload riding along
+ *  (the shape latestJob loads; what the repair path replays from). */
+type PickupJobWithResult = Prisma.InferenceJobGetPayload<{
+  include: { result: { include: { candidates: true } } };
+}>;
+
 /** Scale an analysis-space box to source pixels, clamped and floored to a
  *  sane minimum so the crop endpoint's own validation always passes. */
 export function scaleBoxToSource(
@@ -170,7 +177,11 @@ export class PickupDetectionService {
         sourceId: pickupSourceId(videoAssetId),
       },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      include: { result: true },
+      // Candidates ride along so a repair can replay the attempt's own
+      // persisted output instead of recomputing anything.
+      include: {
+        result: { include: { candidates: { orderBy: { rank: 'asc' } } } },
+      },
     });
   }
 
@@ -234,7 +245,7 @@ export class PickupDetectionService {
         // result at all (nothing replayable, so no event can exist) is
         // treated like a failed attempt and re-run fresh below.
         if (existing.result) {
-          await this.repairAttempt(tenantId, existing.id, videoAssetId, internal);
+          await this.repairAttempt(tenantId, existing, videoAssetId, internal);
           return this.getState(tenantId, videoAssetId);
         }
       }
@@ -433,17 +444,20 @@ export class PickupDetectionService {
    * Repair a SUCCEEDED attempt stranded between its terminal transition
    * and the conversion/metadata write. toVisionEvent is idempotent (the
    * reserved `inference:{jobId}` key plus the already-linked replay), so
-   * repairing can only re-surface the ORIGINAL event; the analysis is
-   * then recomputed under the SAME job id to restore the metadata record
-   * (artifacts replay under their original keys). Best-effort: any
-   * failure just leaves the state for the next retry — a FRESH attempt is
-   * never the fallback while a replayable result exists, because it would
-   * convert under a new reserved key and mint a second pending event for
-   * the same physical pickup.
+   * repairing can only re-surface the ORIGINAL event; the metadata record
+   * is then rebuilt EXCLUSIVELY from the attempt's own persisted output.
+   * Detection is never recomputed here: the reference library is mutable,
+   * so a rerun could disagree with the append-only InferenceResult and
+   * the converted event's candidates — or repair NOTHING if the library
+   * emptied since the attempt ran. Best-effort: any failure just leaves
+   * the state for the next retry — a FRESH attempt is never the fallback
+   * while a replayable result exists, because it would convert under a
+   * new reserved key and mint a second pending event for the same
+   * physical pickup.
    */
   private async repairAttempt(
     tenantId: string,
-    jobId: string,
+    job: PickupJobWithResult,
     videoAssetId: string,
     internal: NonNullable<
       Awaited<ReturnType<VideoAssetsRepository['findByIdInternal']>>
@@ -452,43 +466,152 @@ export class PickupDetectionService {
     try {
       const converted = await this.inferenceJobs.toVisionEvent(
         tenantId,
-        jobId,
+        job.id,
       );
-      if (
-        internal.durationMs === null ||
-        internal.width === null ||
-        internal.height === null
-      ) {
-        // The event is converted; without probed metadata the record
-        // cannot be rebuilt — never a reason to fork a fresh attempt.
-        return;
-      }
-      const computed = await this.computeDetection(
+      const record = await this.rebuildRecordFromResult(
         tenantId,
-        jobId,
-        videoAssetId,
+        job,
         internal,
+        converted.visionEvent.id,
       );
-      if (!computed.ok) {
+      if (!record) {
+        // The event is converted; with no persisted crop box and no
+        // probed frame size the record cannot be rebuilt — never a
+        // reason to fork a fresh attempt.
         this.logger.warn(
-          `Pickup metadata for asset ${videoAssetId} could not be ` +
-            `recomputed (${computed.errorCode}); the converted event stands`,
+          `Pickup metadata for asset ${videoAssetId} could not be rebuilt ` +
+            `from the persisted result; the converted event stands`,
         );
         return;
       }
       // Narrow internal metadata write — see PickupDetectionRecord docs.
       await this.prisma.visionEvent.update({
         where: { id: converted.visionEvent.id },
-        data: { metadata: computed.record as object },
+        data: { metadata: record as object },
       });
     } catch (error) {
       this.logger.error(
-        `Repairing pickup attempt ${jobId} for asset ${videoAssetId} ` +
+        `Repairing pickup attempt ${job.id} for asset ${videoAssetId} ` +
           `failed (it stays repairable): ${
             error instanceof Error ? error.message : 'unknown'
           }`,
       );
     }
+  }
+
+  /**
+   * Rebuild the metadata record from what the original attempt persisted —
+   * no decode, no matching, no reference-library dependency. Sources, all
+   * immutable or attempt-scoped:
+   * - the append-only InferenceResult: verdict quality (runJob maps
+   *   matched → HIGH/MEDIUM, unmatched → LOW), ranked candidates, model
+   *   provenance, and occurredAt (asset.createdAt + peak offset, inverted
+   *   here);
+   * - the converted event's candidates: the catalog productId the top SKU
+   *   resolved to at conversion;
+   * - the extraction requests under the job-derived idempotency keys: the
+   *   original frame/crop artifact ids, and the crop row's source box.
+   * The analysis window and processing time were never persisted, so the
+   * window collapses to the persisted peak and processingMs reads 0 — the
+   * repaired record claims only what the attempt proved (downstream
+   * consumers read eventPeakMs alone). Returns null only when no bounding
+   * box can be restored (no crop artifact AND no probed frame size).
+   */
+  private async rebuildRecordFromResult(
+    tenantId: string,
+    job: PickupJobWithResult,
+    internal: NonNullable<
+      Awaited<ReturnType<VideoAssetsRepository['findByIdInternal']>>
+    >,
+    visionEventId: string,
+  ): Promise<PickupDetectionRecord | null> {
+    const result = job.result;
+    if (!result) {
+      return null;
+    }
+    const candidates = [...result.candidates].sort((a, b) => a.rank - b.rank);
+    const top = candidates[0];
+    const matchedTop =
+      result.evidenceQuality === EvidenceQuality.HIGH ||
+      result.evidenceQuality === EvidenceQuality.MEDIUM
+        ? (top ?? null)
+        : null;
+    const eventPeakMs = Math.max(
+      0,
+      result.occurredAt.getTime() - internal.createdAt.getTime(),
+    );
+
+    // Artifact ids replay from the recorded extraction requests — the
+    // same tenant-scoped rows that make extractFrames/createCrop
+    // idempotent under `pickup:{jobId}:frame|crop`.
+    const artifactIdFor = async (kind: 'frame' | 'crop') => {
+      const request = await this.prisma.videoExtractionRequest.findFirst({
+        where: { tenantId, idempotencyKey: `pickup:${job.id}:${kind}` },
+      });
+      const ids = request?.artifactIds;
+      const first = Array.isArray(ids) ? ids[0] : null;
+      return typeof first === 'string' ? first : null;
+    };
+    const sourceFrameArtifactId = await artifactIdFor('frame');
+    const cropArtifactId = await artifactIdFor('crop');
+    const cropArtifact = cropArtifactId
+      ? await this.prisma.videoArtifact.findFirst({
+          where: { tenantId, id: cropArtifactId },
+        })
+      : null;
+    const boundingBox =
+      cropArtifact &&
+      cropArtifact.cropX !== null &&
+      cropArtifact.cropY !== null &&
+      cropArtifact.cropWidth !== null &&
+      cropArtifact.cropHeight !== null
+        ? {
+            x: cropArtifact.cropX,
+            y: cropArtifact.cropY,
+            width: cropArtifact.cropWidth,
+            height: cropArtifact.cropHeight,
+          }
+        : internal.width !== null && internal.height !== null
+          ? { x: 0, y: 0, width: internal.width, height: internal.height }
+          : null;
+    if (!boundingBox) {
+      return null;
+    }
+
+    let productId: string | null = null;
+    if (matchedTop) {
+      const event = await this.prisma.visionEvent.findFirst({
+        where: { tenantId, id: visionEventId },
+        include: { candidates: { orderBy: { rank: 'asc' } } },
+      });
+      productId =
+        event?.candidates.find(
+          (candidate) => candidate.sku === matchedTop.sku,
+        )?.productId ?? null;
+    }
+
+    const descriptor = job.inputDescriptor as { analysisFps?: unknown } | null;
+    return {
+      version: 1,
+      kind: 'PRODUCT_PICKUP_DETECTION',
+      result: matchedTop ? 'PRODUCT_MATCHED' : 'UNKNOWN_PRODUCT',
+      confidence: round4(top?.score ?? 0),
+      eventStartMs: eventPeakMs,
+      eventPeakMs,
+      eventEndMs: eventPeakMs,
+      boundingBox,
+      sourceFrameArtifactId,
+      cropArtifactId,
+      productId: matchedTop ? productId : null,
+      sku: matchedTop ? matchedTop.sku : null,
+      analysisFps:
+        typeof descriptor?.analysisFps === 'number'
+          ? descriptor.analysisFps
+          : this.config.analysisFps,
+      modelKey: result.modelKey ?? MATCHER_MODEL_KEY,
+      modelVersion: result.modelVersion ?? MATCHER_MODEL_VERSION,
+      processingMs: 0,
+    };
   }
 
   /**

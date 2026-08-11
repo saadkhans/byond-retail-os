@@ -82,11 +82,20 @@ export interface ValidationRow {
   jobStatus: InferenceJobStatus | null;
   jobErrorCode: string | null;
   /** Latest non-FAILED fusion-v2 shadow run, scored against the same
-   *  ground truth. FAILED runs never score — they count as no run. */
+   *  ground truth with the same vocabulary as the v1 `outcome` (NONE
+   *  clips score false_pickup/true_negative; RETURN stays unscored).
+   *  FAILED runs never score — they count as no run. */
   fusionTopSku: string | null;
   fusionTopScore: number | null;
   fusionPolicy: string | null;
-  fusionVerdict: 'correct' | 'incorrect' | 'missed' | null;
+  fusionVerdict:
+    | 'correct'
+    | 'incorrect'
+    | 'missed'
+    | 'false_pickup'
+    | 'true_negative'
+    | 'unscored'
+    | null;
 }
 
 export interface ValidationSummary {
@@ -364,14 +373,24 @@ export class PickupValidationService {
       } else {
         outcome = 'incorrect';
       }
-      const fusionVerdict =
-        fusionRun && truth.eventKind === GroundTruthEventKind.PICKUP
-          ? fusionRun.fusedTopSku === null
-            ? ('missed' as const)
-            : fusionRun.fusedTopSku === actualSku
-              ? ('correct' as const)
-              : ('incorrect' as const)
-          : null;
+      // Fusion scores every supported ground-truth kind with the same
+      // semantics as the v1 outcome above: NONE clips grade the run as a
+      // false pickup or true negative, RETURN stays unscored (out of MVP
+      // scope), PICKUP grades the claimed SKU.
+      let fusionVerdict: ValidationRow['fusionVerdict'] = null;
+      if (fusionRun) {
+        if (truth.eventKind === GroundTruthEventKind.RETURN) {
+          fusionVerdict = 'unscored';
+        } else if (truth.eventKind === GroundTruthEventKind.NONE) {
+          fusionVerdict =
+            fusionRun.fusedTopSku === null ? 'true_negative' : 'false_pickup';
+        } else if (fusionRun.fusedTopSku === null) {
+          fusionVerdict = 'missed';
+        } else {
+          fusionVerdict =
+            fusionRun.fusedTopSku === actualSku ? 'correct' : 'incorrect';
+        }
+      }
       rows.push({
         fusionTopSku: fusionRun?.fusedTopSku ?? null,
         fusionTopScore: fusionRun?.fusedTopScore ?? null,

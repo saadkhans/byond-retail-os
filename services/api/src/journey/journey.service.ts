@@ -360,7 +360,7 @@ export class JourneyService {
     // creation, so this pre-append check cannot go stale.
     const asset = await this.prisma.videoAsset.findFirst({
       where: { tenantId, id: videoAssetId, deletedAt: null },
-      select: { locationId: true, unitId: true },
+      select: { locationId: true, unitId: true, createdAt: true },
     });
     if (!asset) {
       throw new NotFoundException('Video asset not found in this tenant');
@@ -383,10 +383,23 @@ export class JourneyService {
       throw new NotFoundException('No fusion run exists for that video');
     }
     const evidence = run.evidence as {
-      detector?: { events?: { kind?: string }[] };
+      detector?: { events?: { kind?: string; peakMs?: number }[] };
       fused?: { productId: string; sku: string; productName: string }[];
     };
     const detectedKind = evidence.detector?.events?.[0]?.kind;
+    // SOURCE TIME, not import time: the v1 pipeline stamps its event at
+    // asset.createdAt + eventPeakMs, and the ordered basket fold trusts
+    // occurredAt — a late or out-of-order clip import stamped "now" would
+    // fabricate chronology (e.g. a spurious RETURN_WITHOUT_PICKUP when the
+    // return clip imports before the pickup clip). Missing/garbage peakMs
+    // falls back to append-time stamping, the pre-existing behavior.
+    const peakMs = evidence.detector?.events?.[0]?.peakMs;
+    const occurredAt =
+      typeof peakMs === 'number' && Number.isFinite(peakMs)
+        ? new Date(
+            asset.createdAt.getTime() + Math.max(0, Math.round(peakMs)),
+          ).toISOString()
+        : undefined;
     const top = evidence.fused?.[0];
     if (run.policy === FusionPolicyResult.AUTO_PROPOSE && top) {
       return this.appendEvent(
@@ -397,6 +410,7 @@ export class JourneyService {
             detectedKind === 'RETURN'
               ? CustomerJourneyEventType.PRODUCT_RETURN
               : CustomerJourneyEventType.PRODUCT_PICKUP,
+          occurredAt,
           productId: top.productId,
           matchScore: run.fusedTopScore,
           sourceType: 'FUSION_SHADOW',
@@ -412,6 +426,7 @@ export class JourneyService {
       journeyId,
       {
         eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+        occurredAt,
         sourceType: 'FUSION_SHADOW',
         videoAssetId,
         fusionRunId: run.id,

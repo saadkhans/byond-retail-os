@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
+import { Readable } from 'node:stream';
 import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  HttpException,
   NotFoundException,
   PayloadTooLargeException,
   ServiceUnavailableException,
@@ -378,6 +380,9 @@ function buildService(overrides: {
   const storage = {
     put: jest.fn(async () => undefined),
     read: jest.fn(async () => Buffer.alloc(0)),
+    // Streaming media read (the review-player path) — a fresh empty
+    // stream per call; media-serving tests override with real bytes.
+    createReadStream: jest.fn(async () => Readable.from(Buffer.alloc(0))),
     delete: jest.fn(async () => undefined),
     // Mirrors the port contract: reports whether anything existed under
     // the prefix (true = this call removed something).
@@ -6873,5 +6878,200 @@ describe('response safety', () => {
     });
     const asset = await service.findById(TENANT, 'asset-1');
     expect('storageKey' in asset).toBe(false);
+  });
+});
+
+describe('VideoAssetsService.getMediaStream', () => {
+  async function collect(stream: NodeJS.ReadableStream): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) {
+      chunks.push(Buffer.from(chunk as Buffer));
+    }
+    return Buffer.concat(chunks);
+  }
+
+  it('refuses a REJECTED asset whose failed cleanup left media behind (allowlist, not blocklist)', async () => {
+    // The Codex P1 scenario: screening REJECT committed the status, then
+    // the media delete failed — mediaRemovedAt is still null and the bytes
+    // still exist. The old status BLOCKLIST (PENDING_MEDIA/QUARANTINED
+    // only) served them; the allowlist must 404 without touching storage.
+    const { service, storage } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () =>
+          assetRow({
+            status: VideoAssetStatus.REJECTED,
+            mediaRemovedAt: null,
+          }),
+        ),
+      },
+    });
+    await expect(
+      service.getMediaStream(TENANT, 'asset-1'),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(storage.createReadStream).not.toHaveBeenCalled();
+    expect(storage.read).not.toHaveBeenCalled();
+  });
+
+  it('refuses a FAILED asset (any non-released status is denied by default)', async () => {
+    const { service, storage } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () =>
+          assetRow({ status: VideoAssetStatus.FAILED }),
+        ),
+      },
+    });
+    await expect(
+      service.getMediaStream(TENANT, 'asset-1'),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(storage.createReadStream).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [VideoAssetStatus.PENDING_MEDIA],
+    [VideoAssetStatus.QUARANTINED],
+  ])('keeps the truthful 409 for the pre-release state %s', async (status) => {
+    const { service, storage } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () => assetRow({ status })),
+      },
+    });
+    await expect(
+      service.getMediaStream(TENANT, 'asset-1'),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(storage.createReadStream).not.toHaveBeenCalled();
+  });
+
+  it('404s a released status once the media-removal marker is recorded', async () => {
+    const { service, storage } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () =>
+          assetRow({
+            status: VideoAssetStatus.READY,
+            mediaRemovedAt: new Date(),
+          }),
+        ),
+      },
+    });
+    await expect(
+      service.getMediaStream(TENANT, 'asset-1'),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(storage.createReadStream).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [VideoAssetStatus.UPLOADED],
+    [VideoAssetStatus.VALIDATED],
+    [VideoAssetStatus.PROCESSING],
+    [VideoAssetStatus.READY],
+  ])('streams a released %s asset without a whole-clip buffered read', async (status) => {
+    const { service, storage } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () => assetRow({ status })),
+      },
+      storage: {
+        createReadStream: jest.fn(async () =>
+          Readable.from(Buffer.from('media-bytes')),
+        ),
+      },
+    });
+    const media = await service.getMediaStream(TENANT, 'asset-1');
+    expect(media.mimeType).toBe('video/mp4');
+    expect(media.totalSizeBytes).toBe(100);
+    expect(media.range).toBeNull();
+    expect((await collect(media.stream)).toString('utf8')).toBe('media-bytes');
+    expect(storage.createReadStream).toHaveBeenCalledWith(
+      `${TENANT}/uuid-1/original.mp4`,
+      undefined,
+    );
+    // The buffering read must be OUT of the media-serving path entirely.
+    expect(storage.read).not.toHaveBeenCalled();
+  });
+
+  it('narrows the storage read to a satisfiable range and reports the 206 window', async () => {
+    const { service, storage } = buildService();
+    const media = await service.getMediaStream(TENANT, 'asset-1', 'bytes=10-19');
+    expect(media.range).toEqual({ start: 10, end: 19 });
+    expect(media.totalSizeBytes).toBe(100);
+    expect(storage.createReadStream).toHaveBeenCalledWith(
+      `${TENANT}/uuid-1/original.mp4`,
+      { start: 10, end: 19 },
+    );
+  });
+
+  it.each([
+    // Open-ended: from an offset to the last byte (sizeBytes is 100).
+    ['bytes=90-', { start: 90, end: 99 }],
+    // Suffix: the final N bytes.
+    ['bytes=-10', { start: 90, end: 99 }],
+    // An over-long end clamps to the last byte instead of erroring.
+    ['bytes=0-100000', { start: 0, end: 99 }],
+    // A suffix longer than the clip clamps to the whole clip.
+    ['bytes=-100000', { start: 0, end: 99 }],
+  ])('resolves range %p to %p', async (header, expected) => {
+    const { service, storage } = buildService();
+    const media = await service.getMediaStream(TENANT, 'asset-1', header);
+    expect(media.range).toEqual(expected);
+    expect(storage.createReadStream).toHaveBeenCalledWith(
+      `${TENANT}/uuid-1/original.mp4`,
+      expected,
+    );
+  });
+
+  it.each([
+    // Multi-range and non-byte units are unsupported shapes → full 200.
+    ['bytes=0-1,5-9'],
+    ['items=0-5'],
+    ['garbage'],
+    ['bytes=-'],
+    // Syntactically INVALID per the RFC grammar (end before start).
+    ['bytes=5-2'],
+  ])('ignores unsupported Range shape %p and serves the full clip', async (header) => {
+    const { service, storage } = buildService();
+    const media = await service.getMediaStream(TENANT, 'asset-1', header);
+    expect(media.range).toBeNull();
+    expect(storage.createReadStream).toHaveBeenCalledWith(
+      `${TENANT}/uuid-1/original.mp4`,
+      undefined,
+    );
+  });
+
+  it('416s a syntactically valid but unsatisfiable range (start past the end)', async () => {
+    const { service, storage } = buildService();
+    let caught: unknown;
+    try {
+      await service.getMediaStream(TENANT, 'asset-1', 'bytes=100-');
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(HttpException);
+    expect((caught as HttpException).getStatus()).toBe(416);
+    expect(storage.createReadStream).not.toHaveBeenCalled();
+  });
+
+  it('maps a storage open failure to a controlled 404', async () => {
+    const { service } = buildService({
+      storage: {
+        createReadStream: jest.fn(async () => {
+          throw new VideoStorageOperationError();
+        }),
+      },
+    });
+    await expect(
+      service.getMediaStream(TENANT, 'asset-1'),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('404s a soft-deleted asset', async () => {
+    const { service, storage } = buildService({
+      repository: {
+        findByIdInternal: jest.fn(async () =>
+          assetRow({ deletedAt: new Date() }),
+        ),
+      },
+    });
+    await expect(
+      service.getMediaStream(TENANT, 'asset-1'),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(storage.createReadStream).not.toHaveBeenCalled();
   });
 });

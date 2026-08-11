@@ -1,8 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
+import type { Readable } from 'node:stream';
 import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  HttpException,
+  HttpStatus,
   Injectable,
   NotFoundException,
   PayloadTooLargeException,
@@ -242,6 +245,101 @@ export interface UploadedVideoFile {
   mimetype: string;
   size: number;
   buffer: Buffer;
+}
+
+/**
+ * ALLOWLIST of the statuses whose media the review player may serve
+ * (Codex P1). A status EXCLUSION list served rejected clips: a screening
+ * REJECT commits REJECTED BEFORE its media delete, so a delete that fails
+ * leaves the row REJECTED with `mediaRemovedAt` still null — and a
+ * blocklist of only PENDING_MEDIA/QUARANTINED kept serving those bytes.
+ * Only explicitly RELEASED states qualify: UPLOADED (the audited screening
+ * decision approved it) plus VALIDATED/PROCESSING/READY, which are all
+ * downstream of that approval. Everything else — REJECTED, FAILED, both
+ * pre-release states, and any status a later phase adds — is refused by
+ * default. QUARANTINED review deliberately stays out: screening owns that
+ * surface (in-memory preview frames only, never the container).
+ */
+export const MEDIA_SERVABLE_STATUSES: ReadonlySet<VideoAssetStatus> =
+  new Set([
+    VideoAssetStatus.UPLOADED,
+    VideoAssetStatus.VALIDATED,
+    VideoAssetStatus.PROCESSING,
+    VideoAssetStatus.READY,
+  ]);
+
+/**
+ * What the media route streams: a bounded byte stream plus the header
+ * facts the HTTP layer needs. `range` non-null means the stream carries
+ * exactly that INCLUSIVE byte window (respond 206 Partial Content with the
+ * matching Content-Range); null means the whole clip (plain 200).
+ */
+export interface VideoAssetMediaStream {
+  stream: Readable;
+  mimeType: string;
+  totalSizeBytes: number;
+  range: { start: number; end: number } | null;
+}
+
+/** Single-range `bytes=` header shape — the only form players emit. */
+const BYTE_RANGE_HEADER = /^bytes=(\d*)-(\d*)$/;
+
+/**
+ * Parse a `Range` request header against the stored media size into the
+ * INCLUSIVE byte window to stream, or null to serve the full clip (no
+ * header, or a shape this endpoint does not support — RFC 9110 §14.2 lets
+ * a server ignore a Range it cannot honor, and a full 200 is always a
+ * correct response). The one case that must NOT degrade to a full serve is
+ * a syntactically valid but UNSATISFIABLE range (first byte past the end):
+ * RFC 9110 §15.5.17 requires 416 there, and silently returning the whole
+ * clip would desync a seeking player.
+ */
+function parseRequestedByteRange(
+  header: string | undefined,
+  totalSizeBytes: number,
+): { start: number; end: number } | null {
+  if (header === undefined) {
+    return null;
+  }
+  const match = BYTE_RANGE_HEADER.exec(header.trim());
+  if (!match) {
+    return null;
+  }
+  const [, startRaw, endRaw] = match;
+  if (startRaw === '' && endRaw === '') {
+    return null;
+  }
+  const lastByte = totalSizeBytes - 1;
+  if (startRaw === '') {
+    // Suffix form `bytes=-N`: the final N bytes of the clip.
+    const suffixLength = Number(endRaw);
+    if (suffixLength === 0 || totalSizeBytes === 0) {
+      throw rangeNotSatisfiable();
+    }
+    return {
+      start: Math.max(0, totalSizeBytes - suffixLength),
+      end: lastByte,
+    };
+  }
+  const start = Number(startRaw);
+  if (start > lastByte) {
+    throw rangeNotSatisfiable();
+  }
+  const end = endRaw === '' ? lastByte : Math.min(Number(endRaw), lastByte);
+  if (end < start) {
+    // `bytes=5-2` is SYNTACTICALLY invalid per the RFC grammar — ignored
+    // like any other unsupported shape, not a 416.
+    return null;
+  }
+  return { start, end };
+}
+
+function rangeNotSatisfiable(): HttpException {
+  // @nestjs/common ships no dedicated 416 exception class.
+  return new HttpException(
+    'Requested range not satisfiable',
+    HttpStatus.REQUESTED_RANGE_NOT_SATISFIABLE,
+  );
 }
 
 function prismaErrorCode(error: unknown): string | undefined {
@@ -4065,21 +4163,28 @@ export class VideoAssetsService {
   }
 
   /**
-   * Serve the stored media bytes for the in-app review player.
+   * Serve the stored media for the in-app review player — as a bounded,
+   * optionally range-narrowed STREAM (Codex P2): the clip is piped from
+   * storage chunk by chunk, so a request never buffers the whole file into
+   * process memory, and a seeking player's `Range` header narrows the read
+   * to exactly the requested window (the caller responds 206).
    *
    * DELIBERATE POLICY CHANGE (Phase 10 pickup-detection MVP): the original
    * Phase 10 contract exposed no media bytes at all. Reviewing an automatic
    * pickup detection requires WATCHING the clip, so this endpoint serves
    * the bytes to callers holding `video-asset:screen` — the same permission
    * that already authorizes viewing the footage via the quarantine preview.
-   * Boundaries that remain: QUARANTINED/PENDING_MEDIA media is NEVER served
-   * here (screening owns that surface), storage keys and paths still never
-   * leave the server, and soft-deleted assets 404.
+   * Boundaries that remain: media is served ONLY for the explicitly
+   * released MEDIA_SERVABLE_STATUSES allowlist (so REJECTED assets whose
+   * cleanup delete failed are 404s, never downloads — Codex P1), storage
+   * keys and paths still never leave the server, and soft-deleted assets
+   * 404.
    */
-  async getMediaBytes(
+  async getMediaStream(
     tenantId: string,
     id: string,
-  ): Promise<{ data: Buffer; mimeType: string }> {
+    rangeHeader?: string,
+  ): Promise<VideoAssetMediaStream> {
     assertPlainId('id', id);
     const internal = await this.repository.findByIdInternal(tenantId, id);
     if (!internal || internal.deletedAt !== null) {
@@ -4089,26 +4194,42 @@ export class VideoAssetsService {
       internal.status === VideoAssetStatus.PENDING_MEDIA ||
       internal.status === VideoAssetStatus.QUARANTINED
     ) {
+      // The pre-release states keep their truthful 409: the media may
+      // exist, but no screening decision has released it (screening owns
+      // that surface via the frames-only preview).
       throw new ConflictException(
         'Media is not viewable before the screening decision releases it',
       );
     }
+    if (!MEDIA_SERVABLE_STATUSES.has(internal.status)) {
+      // REJECTED/FAILED (and any state a later phase adds): the media is
+      // gone or was never released — 404 even when a failed cleanup left
+      // bytes behind (`mediaRemovedAt` still null). The rejection is the
+      // decision; the delete is only its cleanup.
+      throw new NotFoundException('The stored media was removed');
+    }
     if (internal.mediaRemovedAt !== null) {
       throw new NotFoundException('The stored media was removed');
     }
-    let data: Buffer;
+    const totalSizeBytes = internal.sizeBytes;
+    const range = parseRequestedByteRange(rangeHeader, totalSizeBytes);
+    let stream: Readable;
     try {
-      data = await this.storage.read(internal.storageKey);
+      stream = await this.storage.createReadStream(
+        internal.storageKey,
+        range ?? undefined,
+      );
     } catch {
       throw new NotFoundException('The stored media is unavailable');
     }
-    return { data, mimeType: internal.mimeType };
+    return { stream, mimeType: internal.mimeType, totalSizeBytes, range };
   }
 
   /**
    * Serve one artifact's image bytes (FRAME or CROP) — thumbnails for the
-   * detection result UI. Same boundary notes as getMediaBytes; artifacts
-   * only exist for post-screening assets by construction.
+   * detection result UI. Same boundary notes as getMediaStream; artifacts
+   * only exist for post-screening assets by construction, and stay small
+   * enough (bounded extraction budgets) that a buffered read is fine here.
    */
   async getArtifactImageBytes(
     tenantId: string,

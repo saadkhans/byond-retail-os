@@ -654,6 +654,110 @@ describe('validateEnv', () => {
       validateEnv({ ...validConfig, LOGIN_THROTTLE_IP_LIMIT: '0' }),
     ).toThrow(/LOGIN_THROTTLE_IP_LIMIT/);
   });
+
+  describe('PICKUP_* settings (pickup detection / fusion)', () => {
+    // Declared so the env contract is explicit — whitelist:true validation
+    // must never strip them, and a deployment typo fails at boot instead
+    // of a consumer silently falling back to its default.
+    it.each([
+      'PICKUP_DETECTION_ENABLED',
+      'PICKUP_LAB_MODE',
+      'PICKUP_VLM_ENABLED',
+      'PICKUP_VLM_LEGACY_COMPAT',
+    ])('preserves boolean flag %s through validation', (key) => {
+      const validated = validateEnv({ ...validConfig, [key]: 'true' });
+      expect(
+        (validated as unknown as Record<string, unknown>)[key],
+      ).toBe('true');
+    });
+
+    it.each(['yes', '1', 'enabled', 'on'])(
+      'rejects invalid PICKUP_DETECTION_ENABLED=%s at boot',
+      (value) => {
+        expect(() =>
+          validateEnv({ ...validConfig, PICKUP_DETECTION_ENABLED: value }),
+        ).toThrow(/PICKUP_DETECTION_ENABLED/);
+      },
+    );
+
+    it.each(['yes', 'on', 'production'])(
+      'rejects invalid PICKUP_LAB_MODE=%s at boot',
+      (value) => {
+        expect(() =>
+          validateEnv({ ...validConfig, PICKUP_LAB_MODE: value }),
+        ).toThrow(/PICKUP_LAB_MODE/);
+      },
+    );
+
+    it('preserves the numeric knobs (implicit string→number conversion)', () => {
+      const validated = validateEnv({
+        ...validConfig,
+        PICKUP_ANALYSIS_FPS: '2.5',
+        PICKUP_CONFIDENCE_THRESHOLD: '0.62',
+        PICKUP_FUSION_AUTO_THRESHOLD: '0.42',
+        PICKUP_FUSION_VLM_LOW: '0.22',
+        PICKUP_FUSION_MARGIN: '0.08',
+        PICKUP_VLM_TIMEOUT_MS: '60000',
+        PICKUP_VLM_NUM_CTX: '8192',
+      });
+      expect(validated.PICKUP_ANALYSIS_FPS).toBe(2.5);
+      expect(validated.PICKUP_CONFIDENCE_THRESHOLD).toBe(0.62);
+      expect(validated.PICKUP_FUSION_AUTO_THRESHOLD).toBe(0.42);
+      expect(validated.PICKUP_FUSION_VLM_LOW).toBe(0.22);
+      expect(validated.PICKUP_FUSION_MARGIN).toBe(0.08);
+      expect(validated.PICKUP_VLM_TIMEOUT_MS).toBe(60_000);
+      expect(validated.PICKUP_VLM_NUM_CTX).toBe(8192);
+    });
+
+    it('rejects out-of-range numeric knobs at boot', () => {
+      expect(() =>
+        validateEnv({ ...validConfig, PICKUP_ANALYSIS_FPS: '30' }),
+      ).toThrow(/PICKUP_ANALYSIS_FPS/);
+      expect(() =>
+        validateEnv({ ...validConfig, PICKUP_CONFIDENCE_THRESHOLD: '1.5' }),
+      ).toThrow(/PICKUP_CONFIDENCE_THRESHOLD/);
+      expect(() =>
+        validateEnv({ ...validConfig, PICKUP_VLM_TIMEOUT_MS: '600001' }),
+      ).toThrow(/PICKUP_VLM_TIMEOUT_MS/);
+      expect(() =>
+        validateEnv({ ...validConfig, PICKUP_VLM_NUM_CTX: '256' }),
+      ).toThrow(/PICKUP_VLM_NUM_CTX/);
+    });
+
+    it('constrains provider and mode to their supported values', () => {
+      expect(() =>
+        validateEnv({ ...validConfig, PICKUP_VLM_PROVIDER: 'local' }),
+      ).not.toThrow();
+      expect(() =>
+        validateEnv({ ...validConfig, PICKUP_VLM_PROVIDER: 'anthropic' }),
+      ).not.toThrow();
+      expect(() =>
+        validateEnv({ ...validConfig, PICKUP_VLM_PROVIDER: 'ollama' }),
+      ).toThrow(/PICKUP_VLM_PROVIDER/);
+      expect(() =>
+        validateEnv({ ...validConfig, PICKUP_VLM_MODE: 'VALIDATION_ALWAYS' }),
+      ).not.toThrow();
+      expect(() =>
+        validateEnv({ ...validConfig, PICKUP_VLM_MODE: 'ALWAYS' }),
+      ).toThrow(/PICKUP_VLM_MODE/);
+    });
+
+    it('preserves the string settings through validation', () => {
+      const validated = validateEnv({
+        ...validConfig,
+        PICKUP_VLM_BASE_URL: 'http://127.0.0.1:11434',
+        PICKUP_VLM_ENDPOINT: 'https://api.example.test/v1/messages',
+        PICKUP_VLM_MODEL: 'qwen2.5vl:7b',
+        PICKUP_YOLO_MODEL_PATH: 'models/yolo.onnx',
+      });
+      expect(validated.PICKUP_VLM_BASE_URL).toBe('http://127.0.0.1:11434');
+      expect(validated.PICKUP_VLM_ENDPOINT).toBe(
+        'https://api.example.test/v1/messages',
+      );
+      expect(validated.PICKUP_VLM_MODEL).toBe('qwen2.5vl:7b');
+      expect(validated.PICKUP_YOLO_MODEL_PATH).toBe('models/yolo.onnx');
+    });
+  });
 });
 
 describe('isEnvFlagEnabled (single source of truth for Phase 10 boolean flags)', () => {

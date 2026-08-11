@@ -11,6 +11,10 @@ import { JourneyService, foldBasket } from './journey.service';
 
 const TENANT = 'tenant-1';
 
+/** Fixed capture baseline for the mock video asset — fusion imports derive
+ *  occurredAt from createdAt + evidence peakMs (v1 pipeline rule). */
+const ASSET_CREATED_AT = new Date('2026-08-01T10:00:00.000Z');
+
 type EventRow = {
   id: string;
   eventType: CustomerJourneyEventType;
@@ -80,7 +84,11 @@ function buildService(overrides: {
   journeyStatus?: CustomerJourneyStatus;
   fusionRun?: Record<string, unknown> | null;
   /** The fusion-import video asset's store context (null = asset absent). */
-  asset?: { locationId: string | null; unitId: string | null } | null;
+  asset?: {
+    locationId: string | null;
+    unitId: string | null;
+    createdAt?: Date;
+  } | null;
   unit?: { id: string } | null;
 } = {}) {
   const createdEvents: Record<string, unknown>[] = [];
@@ -108,7 +116,7 @@ function buildService(overrides: {
     videoAsset: {
       findFirst: jest.fn(async () =>
         overrides.asset === undefined
-          ? { locationId: 'store-1', unitId: null }
+          ? { locationId: 'store-1', unitId: null, createdAt: ASSET_CREATED_AT }
           : overrides.asset,
       ),
     },
@@ -278,6 +286,54 @@ describe('JourneyService', () => {
       eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
       sourceType: 'FUSION_SHADOW',
     });
+  });
+
+  it('fusion-run import stamps the SOURCE occurrence time (asset createdAt + evidence peakMs)', async () => {
+    const autoRun = {
+      id: 'run-1',
+      policy: 'AUTO_PROPOSE',
+      fusedTopScore: 0.51,
+      fusedTopSku: 'SKU-A',
+      evidence: {
+        detector: { events: [{ kind: 'PICKUP', peakMs: 4500 }] },
+        fused: [{ productId: 'prod-a', sku: 'SKU-A', productName: 'Product A' }],
+      },
+    };
+    const { service, createdEvents } = buildService({ fusionRun: autoRun });
+    await service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    // Stamped at capture time, NOT import time — a clip imported hours
+    // later must not fabricate chronology in the ordered basket fold.
+    expect(createdEvents[0].occurredAt).toEqual(
+      new Date(ASSET_CREATED_AT.getTime() + 4500),
+    );
+    // Review-path imports carry the same source timestamp.
+    const review = buildService({
+      fusionRun: { ...autoRun, policy: 'NEEDS_HUMAN_REVIEW' },
+    });
+    await review.service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    expect(review.createdEvents[0].occurredAt).toEqual(
+      new Date(ASSET_CREATED_AT.getTime() + 4500),
+    );
+  });
+
+  it('fusion-run import falls back to append-time stamping when peakMs is missing', async () => {
+    const before = Date.now();
+    const { service, createdEvents } = buildService({
+      fusionRun: {
+        id: 'run-1',
+        policy: 'AUTO_PROPOSE',
+        fusedTopScore: 0.51,
+        fusedTopSku: 'SKU-A',
+        evidence: {
+          detector: { events: [{ kind: 'PICKUP' }] },
+          fused: [{ productId: 'prod-a', sku: 'SKU-A', productName: 'Product A' }],
+        },
+      },
+    });
+    await service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    const occurredAt = createdEvents[0].occurredAt as Date;
+    expect(occurredAt.getTime()).toBeGreaterThanOrEqual(before);
+    expect(occurredAt.getTime()).toBeLessThanOrEqual(Date.now());
   });
 
   it('fusion-run import is IDEMPOTENT: a retry replays instead of doubling the basket', async () => {

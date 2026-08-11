@@ -1,4 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { ReferenceImagesService } from './reference-images.service';
 
 /**
@@ -140,4 +141,66 @@ describe('ReferenceImagesService.upload payment-data screens', () => {
       expect(prisma.productReferenceImage.create).not.toHaveBeenCalled();
     },
   );
+});
+
+describe('ReferenceImagesService.upload insert-failure cleanup', () => {
+  function cleanUpload() {
+    return {
+      buffer: cleanPngBytes(),
+      mimetype: 'image/png' as const,
+      originalname: 'front.png',
+    };
+  }
+
+  it('deletes the just-stored bytes and rethrows on a non-P2002 insert failure', async () => {
+    const { service, storage, prisma } = buildService();
+    const outage = new Error('database connection lost');
+    prisma.productReferenceImage.create.mockRejectedValueOnce(outage);
+    await expect(
+      service.upload(TENANT, PRODUCT_ID, cleanUpload()),
+    ).rejects.toBe(outage);
+    // The file written before the insert must not survive the failure.
+    expect(storage.delete).toHaveBeenCalledTimes(1);
+    const [deletedKey] = storage.delete.mock.calls[0] as unknown as [string];
+    const [putKey] = storage.put.mock.calls[0] as unknown as [string, Buffer];
+    expect(deletedKey).toBe(putKey);
+  });
+
+  it('a failing cleanup delete never masks the original insert error', async () => {
+    const { service, storage, prisma } = buildService();
+    const outage = new Error('foreign key constraint violated');
+    prisma.productReferenceImage.create.mockRejectedValueOnce(outage);
+    storage.delete.mockRejectedValueOnce(new Error('disk gone too'));
+    await expect(
+      service.upload(TENANT, PRODUCT_ID, cleanUpload()),
+    ).rejects.toBe(outage);
+    expect(storage.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('P2002 still deletes the losing bytes and replays the winning row', async () => {
+    const { service, storage, prisma } = buildService();
+    const collision = new Prisma.PrismaClientKnownRequestError(
+      'Unique constraint failed',
+      { code: 'P2002', clientVersion: 'test' },
+    );
+    prisma.productReferenceImage.create.mockRejectedValueOnce(collision);
+    const winner = {
+      id: 'img-winner',
+      productId: PRODUCT_ID,
+      originalFilename: 'front.png',
+      mimeType: 'image/png',
+      sizeBytes: cleanPngBytes().length,
+      checksumSha256: 'abc',
+      createdAt: new Date(),
+    };
+    // First findFirst is the preliminary duplicate probe (miss); the
+    // second is the post-collision replay lookup (hit).
+    prisma.productReferenceImage.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(winner as never);
+    await expect(
+      service.upload(TENANT, PRODUCT_ID, cleanUpload()),
+    ).resolves.toEqual(winner);
+    expect(storage.delete).toHaveBeenCalledTimes(1);
+  });
 });

@@ -99,6 +99,49 @@ describe('LocalVideoStorageAdapter', () => {
     expect(caught?.message).not.toContain('missing.mp4');
   });
 
+  it('createReadStream streams the object, honoring an inclusive byte range', async () => {
+    const key = 'tenant-1/asset-1/original.mp4';
+    await adapter.put(key, Buffer.from('0123456789'));
+
+    async function collect(stream: NodeJS.ReadableStream): Promise<string> {
+      const chunks: Buffer[] = [];
+      for await (const chunk of stream) {
+        chunks.push(Buffer.from(chunk as Buffer));
+      }
+      return Buffer.concat(chunks).toString('utf8');
+    }
+
+    // Full read without a range…
+    await expect(
+      adapter.createReadStream(key).then(collect),
+    ).resolves.toBe('0123456789');
+    // …and a narrowed read carries EXACTLY the inclusive window.
+    await expect(
+      adapter.createReadStream(key, { start: 2, end: 5 }).then(collect),
+    ).resolves.toBe('2345');
+  });
+
+  it('createReadStream fails path-free for a missing object', async () => {
+    // The lazy fs stream would otherwise surface the raw ENOENT (absolute
+    // path embedded) only once the consumer starts reading — the adapter
+    // must refuse at OPEN time with the controlled error instead.
+    let caught: Error | undefined;
+    try {
+      await adapter.createReadStream('tenant-1/asset-1/missing.mp4');
+    } catch (error) {
+      caught = error as Error;
+    }
+    expect(caught).toBeInstanceOf(VideoStorageOperationError);
+    expect(caught?.message).not.toContain(root);
+    expect(caught?.message).not.toContain('missing.mp4');
+  });
+
+  it('createReadStream rejects escaping keys before any filesystem call', async () => {
+    await expect(
+      adapter.createReadStream('../escape.mp4'),
+    ).rejects.toBeInstanceOf(InvalidStorageKeyError);
+  });
+
   it('deletePrefix removes an asset directory but refuses the root itself', async () => {
     await adapter.put('tenant-1/asset-1/original.mp4', Buffer.alloc(4));
     await adapter.put('tenant-1/asset-1/artifacts/a.png', Buffer.alloc(4));

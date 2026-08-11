@@ -29,6 +29,14 @@ export class PickupDetectionConfig {
   /** Master switch for the automatic worker AND the manual run endpoint. */
   readonly enabled: boolean;
 
+  /**
+   * LAB/DEV ONLY (PICKUP_LAB_MODE): a store with ZERO inventory rows may
+   * fall back to the tenant-wide inference-ready catalog. Off by default —
+   * an empty/new production store must never claim a pickup of a product
+   * it does not stock (fusion treats the same absence as NOT_STOCKED).
+   */
+  readonly labMode: boolean;
+
   /** Analysis sampling rate (frames per second of source time). */
   readonly analysisFps: number;
 
@@ -46,6 +54,7 @@ export class PickupDetectionConfig {
     this.enabled = isEnvFlagEnabled(
       config.get<string>('PICKUP_DETECTION_ENABLED'),
     );
+    this.labMode = isEnvFlagEnabled(config.get<string>('PICKUP_LAB_MODE'));
     this.analysisFps = boundedNumber(
       config.get<string>('PICKUP_ANALYSIS_FPS'),
       DEFAULT_ANALYSIS_FPS,

@@ -243,15 +243,18 @@ export class ReferenceImagesService {
         select: REFERENCE_SELECT,
       });
     } catch (error) {
+      // ANY failed insert leaves the just-written bytes orphaned (no row
+      // will ever reference them), so cleanup is unconditional and
+      // best-effort — a cleanup error must never mask the DB failure.
+      await this.storage.delete(storageKey).catch(() => undefined);
       // Two byte-identical uploads racing past the preliminary duplicate
       // query both write files, then collide on the unique constraint.
-      // The loser must clean up its orphaned bytes and REPLAY the winning
-      // row — the caller asked for exactly what now exists.
+      // The loser must REPLAY the winning row — the caller asked for
+      // exactly what now exists.
       if (
         error instanceof Prisma.PrismaClientKnownRequestError &&
         error.code === 'P2002'
       ) {
-        await this.storage.delete(storageKey).catch(() => undefined);
         const winner = await this.prisma.productReferenceImage.findFirst({
           where: { tenantId, productId, checksumSha256 },
           select: REFERENCE_SELECT,

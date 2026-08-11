@@ -52,15 +52,31 @@ interface JobFixture {
 function truth(videoAssetId: string, updatedAt = '2026-08-10T00:00:00Z') {
   return {
     videoAssetId,
-    eventKind: GroundTruthEventKind.PICKUP,
-    productId: 'prod-1',
-    actualTimestampMs: 1600,
+    eventKind: GroundTruthEventKind.PICKUP as GroundTruthEventKind,
+    productId: 'prod-1' as string | null,
+    actualTimestampMs: 1600 as number | null,
     quantity: 1,
     note: null,
     updatedAt: new Date(updatedAt),
-    product: { sku: SKU },
+    product: { sku: SKU } as { sku: string } | null,
     videoAsset: { originalFilename: `${videoAssetId}.mp4`, deletedAt: null },
   };
+}
+
+/** A NONE clip: no product, no actual timestamp. */
+function noneTruth(videoAssetId: string) {
+  return {
+    ...truth(videoAssetId),
+    eventKind: GroundTruthEventKind.NONE,
+    productId: null,
+    actualTimestampMs: null,
+    product: null,
+  };
+}
+
+/** A RETURN clip: has a product but is out of MVP scoring scope. */
+function returnTruth(videoAssetId: string) {
+  return { ...truth(videoAssetId), eventKind: GroundTruthEventKind.RETURN };
 }
 
 const pickupRecord = {
@@ -168,6 +184,18 @@ function failedRun(id: string, createdAt: string): FusionRunFixture {
     fusedTopSku: null,
     fusedTopScore: null,
     createdAt: new Date(createdAt),
+  };
+}
+
+function completedRun(fusedTopSku: string | null): FusionRunFixture {
+  return {
+    id: 'run-1',
+    tenantId: TENANT,
+    videoAssetId: ASSET,
+    policy: FusionPolicyResult.AUTO_PROPOSE,
+    fusedTopSku,
+    fusedTopScore: fusedTopSku === null ? null : 0.8,
+    createdAt: new Date('2026-08-10T01:00:00Z'),
   };
 }
 
@@ -334,5 +362,60 @@ describe('summary — bounded and batched queries', () => {
     expect(summary.rows).toHaveLength(1);
     expect(summary.rows[0].outcome).toBe('not_detected');
     expect(visionEventFindMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('summary — fusion verdicts on NONE and RETURN ground truth', () => {
+  it('NONE truth + fusion claimed a SKU => false_pickup', async () => {
+    const { service } = buildService({
+      truths: [noneTruth(ASSET)],
+      fusionRuns: [completedRun(SKU)],
+      jobs: [],
+    });
+    const summary = await service.summary(TENANT);
+    expect(summary.rows).toHaveLength(1);
+    const row = summary.rows[0];
+    expect(row.fusionVerdict).toBe('false_pickup');
+    // Fusion-only row: v1 stays unscored per the either-pipeline rule.
+    expect(row.outcome).toBe('unscored');
+  });
+
+  it('NONE truth + fusion claimed nothing => true_negative', async () => {
+    const { service } = buildService({
+      truths: [noneTruth(ASSET)],
+      fusionRuns: [completedRun(null)],
+      jobs: [],
+    });
+    const summary = await service.summary(TENANT);
+    expect(summary.rows).toHaveLength(1);
+    expect(summary.rows[0].fusionVerdict).toBe('true_negative');
+  });
+
+  it('RETURN truth + fusion run => unscored, mirroring v1', async () => {
+    const { service } = buildService({
+      truths: [returnTruth(ASSET)],
+      fusionRuns: [completedRun(SKU)],
+      jobs: [succeededJob('job-1', ASSET, 'event-1')],
+    });
+    const summary = await service.summary(TENANT);
+    expect(summary.rows).toHaveLength(1);
+    const row = summary.rows[0];
+    // Both pipelines report RETURN as out of MVP scoring scope.
+    expect(row.fusionVerdict).toBe('unscored');
+    expect(row.outcome).toBe('unscored');
+  });
+
+  it('NONE truth scores BOTH pipelines when v1 also completed', async () => {
+    const { service } = buildService({
+      truths: [noneTruth(ASSET)],
+      fusionRuns: [completedRun(null)],
+      // v1 produced a pickup event on a NONE clip: a v1 false pickup.
+      jobs: [succeededJob('job-1', ASSET, 'event-1')],
+    });
+    const summary = await service.summary(TENANT);
+    expect(summary.rows).toHaveLength(1);
+    const row = summary.rows[0];
+    expect(row.outcome).toBe('false_pickup');
+    expect(row.fusionVerdict).toBe('true_negative');
   });
 });

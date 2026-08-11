@@ -121,14 +121,18 @@ export class OllamaVlmVerifier implements VlmVerifier {
     if (!this.baseUrlLoopback) {
       return notReachable;
     }
+    // The abort timer must stay armed through BODY PARSING, not just until
+    // headers arrive: a stalling/trickling /api/tags body would otherwise
+    // hang readiness() — and verify()'s preliminary check — indefinitely.
+    // The inner finally clears it on every exit path; an abort mid-body
+    // rejects response.json() and lands in the outer catch.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 3000);
       const response = await fetch(`${this.baseUrl}/api/tags`, {
         signal: controller.signal,
         redirect: 'error',
       });
-      clearTimeout(timer);
       if (!response.ok) {
         return notReachable;
       }
@@ -150,6 +154,8 @@ export class OllamaVlmVerifier implements VlmVerifier {
       };
     } catch {
       return notReachable;
+    } finally {
+      clearTimeout(timer);
     }
   }
 

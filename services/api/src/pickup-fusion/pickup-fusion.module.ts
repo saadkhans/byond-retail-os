@@ -27,9 +27,9 @@ import {
 } from './adapters/visual-signals';
 import { AnthropicVlmVerifier } from './adapters/vlm-verifier';
 import { OllamaVlmVerifier } from './adapters/ollama-vlm';
-import { PrismaService } from '../prisma/prisma.service';
 import { ReindexReferenceIndexDto } from './dto/reindex-reference-index.dto';
 import { PickupFusionService } from './pickup-fusion.service';
+import { pickupVlmVerifierProvider } from './vlm-provider';
 
 /** Shadow-run trigger + evidence read (both under the video-ingest gate). */
 @ApiTags('video-ingest')
@@ -76,11 +76,7 @@ export class PickupFusionController {
 @RequireModule('video-ingest')
 @Controller('pickup-fusion')
 export class FusionOpsController {
-  constructor(
-    private readonly fusion: PickupFusionService,
-    private readonly retriever: HogLabVisualRetriever,
-    private readonly prisma: PrismaService,
-  ) {}
+  constructor(private readonly fusion: PickupFusionService) {}
 
   @Get('vlm-readiness')
   @RequirePermissions('video-asset:read')
@@ -97,25 +93,16 @@ export class FusionOpsController {
   @RequirePermissions('catalog:manage')
   @ApiOperation({
     summary:
-      'Ensure (or with {"rebuild":true} fully rebuild) the visual ' +
-      'reference-embedding index for the current embedding model.',
+      'Ensure (or with {"rebuild":true} atomically rebuild) the visual ' +
+      'reference-embedding index for the current embedding model. A ' +
+      'rebuild swaps in one transaction — readers keep the old index ' +
+      'until commit, and a failure leaves it intact.',
   })
-  async reindex(
+  reindex(
     @CurrentTenantId() tenantId: string,
     @Body() body: ReindexReferenceIndexDto,
   ) {
-    if (body?.rebuild === true) {
-      await this.prisma.productReferenceEmbedding.deleteMany({
-        where: { tenantId, modelKey: this.retriever.embeddingModelKey },
-      });
-    }
-    const result = await this.retriever.ensureIndex(tenantId);
-    return {
-      modelKey: this.retriever.embeddingModelKey,
-      modelVersion: this.retriever.embeddingModelVersion,
-      rebuilt: body?.rebuild === true,
-      ...result,
-    };
+    return this.fusion.reindexReferenceIndex(tenantId, body?.rebuild === true);
   }
 }
 
@@ -141,6 +128,9 @@ export class FusionOpsController {
     WeightedCandidateFusion,
     AnthropicVlmVerifier,
     OllamaVlmVerifier,
+    // Keyed port selection (PICKUP_VLM_PROVIDER) — the service injects
+    // the PICKUP_VLM_VERIFIER token, never a concrete vendor.
+    pickupVlmVerifierProvider,
     PrismaInventoryValidator,
     PickupFusionService,
   ],

@@ -107,7 +107,13 @@ interface Harness {
   inferenceJobs: Record<string, jest.Mock>;
   platformModules: Record<string, jest.Mock>;
   videoAssets: Record<string, jest.Mock>;
-  prisma: { visionEvent: { update: jest.Mock; findFirst: jest.Mock }; inferenceJob: { findFirst: jest.Mock; count: jest.Mock } };
+  referenceLibrary: Record<string, jest.Mock>;
+  prisma: {
+    visionEvent: { update: jest.Mock; findFirst: jest.Mock };
+    inferenceJob: { findFirst: jest.Mock; count: jest.Mock };
+    videoExtractionRequest: { findFirst: jest.Mock };
+    videoArtifact: { findFirst: jest.Mock };
+  };
 }
 
 function buildService(overrides: {
@@ -134,6 +140,12 @@ function buildService(overrides: {
     inferenceJob: {
       findFirst: jest.fn(async () => overrides.existingJob ?? null),
       count: jest.fn(async () => 0),
+    },
+    videoExtractionRequest: {
+      findFirst: jest.fn(async () => null),
+    },
+    videoArtifact: {
+      findFirst: jest.fn(async () => null),
     },
   };
   const config = {
@@ -205,6 +217,7 @@ function buildService(overrides: {
     inferenceJobs: inferenceJobs as never,
     platformModules: platformModules as never,
     videoAssets: videoAssets as never,
+    referenceLibrary: referenceLibrary as never,
     prisma,
   };
 }
@@ -409,16 +422,132 @@ describe('PickupDetectionService.detectForAsset', () => {
     // fresh job, which converted under a NEW reserved key and produced a
     // second PENDING_REVIEW pickup event for the same physical pickup.
     // With the job's InferenceResult intact the attempt must be repaired
-    // in place: idempotent conversion replay plus a metadata rewrite.
-    const { service, inferenceJobs, prisma, videoAssets } = buildService({
+    // in place: idempotent conversion replay plus a metadata rewrite
+    // rebuilt from the attempt's own PERSISTED output (immutable result,
+    // the converted event's candidates, and the recorded artifacts) —
+    // never from a rerun against the mutable reference library.
+    const { service, inferenceJobs, prisma, videoAssets, referenceLibrary } =
+      buildService({
+        existingJob: {
+          id: 'job-0',
+          status: 'SUCCEEDED',
+          visionEventId: 'event-0',
+          inputDescriptor: {
+            artifactType: 'VIDEO_ASSET',
+            videoAssetId: ASSET,
+            analysisFps: 4,
+          },
+          result: {
+            id: 'result-0',
+            // asset.createdAt + 3000 ms peak offset.
+            occurredAt: new Date('2026-08-03T10:00:03.000Z'),
+            evidenceQuality: 'HIGH',
+            modelKey: 'model-k',
+            modelVersion: 'model-v',
+            candidates: [
+              { rank: 2, sku: 'SKU-BLUE', score: 0.4, label: null },
+              { rank: 1, sku: 'SKU-RED', score: 0.91, label: null },
+            ],
+          },
+        },
+      });
+    // The linked event exists but its metadata record never landed; its
+    // candidates carry the catalog productId resolved at conversion.
+    prisma.visionEvent.findFirst.mockResolvedValue({
+      id: 'event-0',
+      status: 'PENDING_REVIEW',
+      metadata: null,
+      candidates: [
+        {
+          productId: 'p-red',
+          sku: 'SKU-RED',
+          productName: 'Red',
+          score: 0.91,
+          rank: 1,
+        },
+      ],
+      review: null,
+    });
+    // The original attempt's artifacts, recorded under the job-derived
+    // idempotency keys.
+    prisma.videoExtractionRequest.findFirst.mockImplementation(
+      async (args: { where: { idempotencyKey: string } }) =>
+        args.where.idempotencyKey === 'pickup:job-0:crop'
+          ? { artifactIds: ['crop-artifact-0'] }
+          : { artifactIds: ['frame-artifact-0'] },
+    );
+    prisma.videoArtifact.findFirst.mockResolvedValue({
+      id: 'crop-artifact-0',
+      cropX: 160,
+      cropY: 128,
+      cropWidth: 160,
+      cropHeight: 160,
+    });
+    inferenceJobs.toVisionEvent.mockResolvedValue({
+      job: { id: 'job-0' },
+      visionEvent: { id: 'event-0' },
+      replayed: true,
+    });
+    await service.detectForAsset(TENANT, ASSET);
+    // Never forked: conversion replays idempotently on the SAME job...
+    expect(inferenceJobs.create).not.toHaveBeenCalled();
+    expect(inferenceJobs.toVisionEvent).toHaveBeenCalledWith(TENANT, 'job-0');
+    // ...detection is never recomputed (no library read, no re-extract)...
+    expect(referenceLibrary.load).not.toHaveBeenCalled();
+    expect(videoAssets.extractFrames).not.toHaveBeenCalled();
+    expect(videoAssets.createCrop).not.toHaveBeenCalled();
+    // ...and the record restored on the ORIGINAL event replays the
+    // persisted attempt exactly.
+    const update = prisma.visionEvent.update.mock.calls[0][0];
+    expect(update.where).toEqual({ id: 'event-0' });
+    const metadata = update.data.metadata as Record<string, unknown>;
+    expect(metadata.kind).toBe('PRODUCT_PICKUP_DETECTION');
+    expect(metadata.result).toBe('PRODUCT_MATCHED');
+    expect(metadata.sku).toBe('SKU-RED'); // rank-1 of the immutable result
+    expect(metadata.productId).toBe('p-red'); // via the event's candidates
+    expect(metadata.confidence).toBe(0.91);
+    expect(metadata.eventPeakMs).toBe(3000); // occurredAt − asset.createdAt
+    // Window bounds were never persisted: they collapse to the peak.
+    expect(metadata.eventStartMs).toBe(3000);
+    expect(metadata.eventEndMs).toBe(3000);
+    expect(metadata.boundingBox).toEqual({
+      x: 160,
+      y: 128,
+      width: 160,
+      height: 160,
+    });
+    expect(metadata.sourceFrameArtifactId).toBe('frame-artifact-0');
+    expect(metadata.cropArtifactId).toBe('crop-artifact-0');
+    expect(metadata.analysisFps).toBe(4); // from the job's input descriptor
+    expect(metadata.modelKey).toBe('model-k');
+    expect(metadata.modelVersion).toBe('model-v');
+    expect(metadata.processingMs).toBe(0);
+  });
+
+  it('repairs from the persisted result even when the reference library has since been emptied', async () => {
+    // The reference library is mutable; the InferenceResult is not. With
+    // every reference image deleted since the original attempt, the old
+    // recompute-based repair failed with REFERENCE_LIBRARY_EMPTY and
+    // stranded the converted event without its record forever — the
+    // repair must not depend on the library at all.
+    const { service, inferenceJobs, prisma } = buildService({
+      references: [],
       existingJob: {
         id: 'job-0',
         status: 'SUCCEEDED',
         visionEventId: 'event-0',
-        result: { id: 'result-0' },
+        result: {
+          id: 'result-0',
+          occurredAt: new Date('2026-08-03T10:00:03.000Z'),
+          evidenceQuality: 'LOW',
+          modelKey: null,
+          modelVersion: null,
+          candidates: [
+            { rank: 1, sku: 'SKU-RED', score: 0.31, label: null },
+          ],
+        },
       },
     });
-    // The linked event exists but its metadata record never landed.
     prisma.visionEvent.findFirst.mockResolvedValue({
       id: 'event-0',
       status: 'PENDING_REVIEW',
@@ -432,21 +561,27 @@ describe('PickupDetectionService.detectForAsset', () => {
       replayed: true,
     });
     await service.detectForAsset(TENANT, ASSET);
-    // Never forked: conversion replays idempotently on the SAME job...
     expect(inferenceJobs.create).not.toHaveBeenCalled();
-    expect(inferenceJobs.toVisionEvent).toHaveBeenCalledWith(TENANT, 'job-0');
-    // ...artifacts replay under the ORIGINAL job's idempotency keys...
-    expect(videoAssets.extractFrames).toHaveBeenCalledWith(
-      TENANT,
-      ASSET,
-      expect.objectContaining({ idempotencyKey: 'pickup:job-0:frame' }),
-    );
-    // ...and the record is restored on the ORIGINAL event.
-    const update = prisma.visionEvent.update.mock.calls[0][0];
-    expect(update.where).toEqual({ id: 'event-0' });
-    expect(
-      (update.data.metadata as Record<string, unknown>).kind,
-    ).toBe('PRODUCT_PICKUP_DETECTION');
+    expect(inferenceJobs.fail).not.toHaveBeenCalled();
+    const metadata = prisma.visionEvent.update.mock.calls[0][0].data
+      .metadata as Record<string, unknown>;
+    // LOW evidence quality replays the original UNKNOWN_PRODUCT verdict.
+    expect(metadata.result).toBe('UNKNOWN_PRODUCT');
+    expect(metadata.productId).toBeNull();
+    expect(metadata.sku).toBeNull();
+    // No artifacts were recorded for the attempt: ids stay null and the
+    // box falls back to the full probed frame.
+    expect(metadata.sourceFrameArtifactId).toBeNull();
+    expect(metadata.cropArtifactId).toBeNull();
+    expect(metadata.boundingBox).toEqual({
+      x: 0,
+      y: 0,
+      width: 640,
+      height: 480,
+    });
+    // Provenance falls back to the matcher constants when the result
+    // carried none.
+    expect(metadata.modelKey).toBe(MATCHER_MODEL_KEY);
   });
 
   it('never forks a fresh attempt while a replayable result exists, even when repair fails', async () => {

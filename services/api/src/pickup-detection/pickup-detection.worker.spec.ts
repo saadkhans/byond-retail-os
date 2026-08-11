@@ -22,15 +22,21 @@ interface FakeAsset {
   attempted: boolean;
 }
 
+interface EligibleWhere {
+  tenantId?: string;
+  createdAt?: unknown;
+  updatedAt?: unknown;
+}
+
 function buildHarness(tenants: Record<string, FakeAsset[]>) {
-  const groupBy = jest.fn(async (_args: { by: string[] }) =>
+  const groupBy = jest.fn(async (_args: { by: string[]; where: EligibleWhere }) =>
     Object.keys(tenants)
       .sort()
       .map((tenantId) => ({ tenantId })),
   );
   const findManyAssets = jest.fn(
     async (args: {
-      where: { tenantId?: string };
+      where: EligibleWhere;
       take: number;
       cursor?: { id: string };
       skip?: number;
@@ -78,6 +84,7 @@ function buildHarness(tenants: Record<string, FakeAsset[]>) {
   );
   return {
     worker,
+    tenants,
     groupBy,
     findManyAssets,
     findManyJobs,
@@ -146,6 +153,89 @@ describe('PickupDetectionWorker.scanOnce', () => {
       ['tenant-a', 'a-001'],
       ['tenant-a', 'a-002'],
     ]);
+  });
+
+  it('rotates the tenant scan across polls instead of restarting at the first tenant', async () => {
+    // tenant-a alone could fill the budget every poll; the rotating cursor
+    // must hand the NEXT poll to tenant-b instead of starving it forever.
+    const h = buildHarness({
+      'tenant-a': assets('a', 5, false),
+      'tenant-b': assets('b', 5, false),
+    });
+    await h.worker.scanOnce();
+    expect(h.detectForAsset.mock.calls).toEqual([
+      ['tenant-a', 'a-001'],
+      ['tenant-a', 'a-002'],
+    ]);
+
+    // Second poll resumes AFTER the tenant that consumed the last budget…
+    h.detectForAsset.mockClear();
+    await h.worker.scanOnce();
+    expect(h.detectForAsset.mock.calls).toEqual([
+      ['tenant-b', 'b-001'],
+      ['tenant-b', 'b-002'],
+    ]);
+
+    // …and the rotation wraps back around to the first tenant.
+    h.detectForAsset.mockClear();
+    await h.worker.scanOnce();
+    expect(h.detectForAsset.mock.calls).toEqual([
+      ['tenant-a', 'a-001'],
+      ['tenant-a', 'a-002'],
+    ]);
+  });
+
+  it('keeps single-tenant behavior unchanged under rotation', async () => {
+    const h = buildHarness({ 'tenant-a': assets('a', 5, false) });
+    await h.worker.scanOnce();
+    h.detectForAsset.mockClear();
+    await h.worker.scanOnce();
+    // Rotating a one-tenant list is a no-op: same tenant, oldest first.
+    expect(h.detectForAsset.mock.calls).toEqual([
+      ['tenant-a', 'a-001'],
+      ['tenant-a', 'a-002'],
+    ]);
+  });
+
+  it('resumes the rotation past a served tenant that has since dropped out', async () => {
+    // Serve tenant-b, then remove it from the eligible set entirely: the
+    // cursor compares ids instead of positions, so the next poll starts at
+    // the first tenant sorting after "tenant-b" (tenant-c), not back at
+    // tenant-a.
+    const h = buildHarness({ 'tenant-b': assets('b', 5, false) });
+    await h.worker.scanOnce();
+    expect(h.detectForAsset.mock.calls).toEqual([
+      ['tenant-b', 'b-001'],
+      ['tenant-b', 'b-002'],
+    ]);
+
+    delete h.tenants['tenant-b'];
+    h.tenants['tenant-a'] = assets('x', 5, false);
+    h.tenants['tenant-c'] = assets('z', 5, false);
+    h.detectForAsset.mockClear();
+    await h.worker.scanOnce();
+    expect(h.detectForAsset.mock.calls).toEqual([
+      ['tenant-c', 'z-001'],
+      ['tenant-c', 'z-002'],
+    ]);
+  });
+
+  it('windows eligibility on updatedAt (validation transition), not createdAt', async () => {
+    // An upload can sit QUARANTINED past the 24h window and only then be
+    // VALIDATED; keying the cutoff on createdAt would deny such assets
+    // their automatic attempt forever. updatedAt is bumped by the status
+    // transition itself, so it carries the window instead.
+    const h = buildHarness({ 'tenant-a': [{ id: 'a-1', attempted: false }] });
+    await h.worker.scanOnce();
+
+    const wheres = [
+      h.groupBy.mock.calls[0][0].where,
+      h.findManyAssets.mock.calls[0][0].where,
+    ];
+    for (const where of wheres) {
+      expect(where.updatedAt).toEqual({ gte: expect.any(Date) });
+      expect(where.createdAt).toBeUndefined();
+    }
   });
 
   it('counts a failed detectForAsset against the cap and keeps scanning', async () => {

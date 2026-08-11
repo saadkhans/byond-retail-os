@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
   Param,
   Post,
   Query,
@@ -239,21 +240,44 @@ export class VideoAssetsController {
       'reviewing an automatic detection requires watching the clip, so the ' +
       'bytes are served to `video-asset:screen` holders — the permission ' +
       'that already authorizes viewing footage during quarantine ' +
-      'screening. QUARANTINED/PENDING_MEDIA media is never served here, ' +
-      'and no storage key, path, or URL appears anywhere in the response.',
+      'screening. Media is served ONLY for explicitly released statuses ' +
+      '(UPLOADED/VALIDATED/PROCESSING/READY — an allowlist, so REJECTED ' +
+      'clips are 404s even if their cleanup delete is still retrying), it ' +
+      'is STREAMED (single-range `Range` requests answered 206, so a ' +
+      'request never buffers the whole clip in memory), and no storage ' +
+      'key, path, or URL appears anywhere in the response.',
   })
   @ApiNotFoundResponse({ description: 'Asset or media not found' })
   async serveMedia(
     @CurrentTenantId() tenantId: string,
     @Param('id') id: string,
+    @Headers('range') range: string | undefined,
     @Res() response: Response,
   ): Promise<void> {
-    const media = await this.assetsService.getMediaBytes(tenantId, id);
+    const media = await this.assetsService.getMediaStream(tenantId, id, range);
     response
-      .status(200)
       .setHeader('Content-Type', media.mimeType)
       .setHeader('Cache-Control', 'private, max-age=60')
-      .send(media.data);
+      .setHeader('Accept-Ranges', 'bytes');
+    if (media.range === null) {
+      response
+        .status(200)
+        .setHeader('Content-Length', String(media.totalSizeBytes));
+    } else {
+      const { start, end } = media.range;
+      response
+        .status(206)
+        .setHeader(
+          'Content-Range',
+          `bytes ${start}-${end}/${media.totalSizeBytes}`,
+        )
+        .setHeader('Content-Length', String(end - start + 1));
+    }
+    // A storage failure after the headers are committed can no longer
+    // become a JSON error body — tear the connection down instead of
+    // leaving the player hanging on a stalled response.
+    media.stream.once('error', () => response.destroy());
+    media.stream.pipe(response);
   }
 
   @Get(':id/artifacts/:artifactId/image')

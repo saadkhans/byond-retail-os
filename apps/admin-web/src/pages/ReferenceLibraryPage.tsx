@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   ApiError,
   ImportPreview,
@@ -11,26 +11,46 @@ import {
   apiObjectUrl,
   apiUpload,
 } from '../api';
-import { Page, useLoad } from '../components';
+import { Page, useDebounced, useLoad } from '../components';
 
 function errorMessage(err: unknown): string {
   return err instanceof ApiError ? err.message : 'Unexpected error';
 }
 
-/** name / SKU / barcode search, case-insensitive, client-side. */
-export function filterProducts(products: Product[], query: string): Product[] {
-  const needle = query.trim().toLowerCase();
-  if (!needle) {
-    return products;
+/**
+ * Server-side product search paths for one query: name/SKU substring match
+ * via `search`, plus exact `barcode` (the API has no substring barcode
+ * filter). Fetched in parallel and merged so catalogs beyond one page stay
+ * fully searchable. Lengths mirror QueryProductsDto (search ≤200, barcode
+ * ≤64) so neither request is rejected by validation.
+ */
+export function productSearchPaths(query: string, take = 100): string[] {
+  const trimmed = query.trim();
+  const base = `/catalog/products?take=${take}`;
+  if (!trimmed) {
+    return [base];
   }
-  return products.filter(
-    (product) =>
-      product.name.toLowerCase().includes(needle) ||
-      product.sku.toLowerCase().includes(needle) ||
-      (product.barcodes ?? []).some((barcode) =>
-        barcode.value.toLowerCase().includes(needle),
-      ),
-  );
+  const encoded = encodeURIComponent(trimmed.slice(0, 200));
+  const paths = [`${base}&search=${encoded}`];
+  if (trimmed.length <= 64) {
+    paths.push(`${base}&barcode=${encodeURIComponent(trimmed)}`);
+  }
+  return paths;
+}
+
+/** Merge pages from the parallel searches, de-duplicated by product id. */
+export function mergeProducts(pages: Paginated<Product>[]): Product[] {
+  const seen = new Set<string>();
+  const merged: Product[] = [];
+  for (const page of pages) {
+    for (const product of page.items) {
+      if (!seen.has(product.id)) {
+        seen.add(product.id);
+        merged.push(product);
+      }
+    }
+  }
+  return merged;
 }
 
 /**
@@ -321,14 +341,21 @@ export function ReferenceLibraryPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const products = useLoad<Paginated<Product>>(
-    () => api<Paginated<Product>>('/catalog/products?take=100'),
-    [],
+  // Debounced server-side search: the catalog can exceed one page, so the
+  // selector must query the API rather than filter a local 100-row subset.
+  const debouncedSearch = useDebounced(search);
+  const products = useLoad<Product[]>(
+    async () =>
+      mergeProducts(
+        await Promise.all(
+          productSearchPaths(debouncedSearch).map((path) =>
+            api<Paginated<Product>>(path),
+          ),
+        ),
+      ),
+    [debouncedSearch],
   );
-  const visibleProducts = useMemo(
-    () => filterProducts(products.data?.items ?? [], search),
-    [products.data, search],
-  );
+  const visibleProducts = products.data ?? [];
   const overview = useLoad<ReferenceOverviewRow[]>(
     () => api<ReferenceOverviewRow[]>('/catalog/products/reference-images/overview'),
     [reload],
@@ -412,7 +439,13 @@ export function ReferenceLibraryPage() {
   const data = status.data;
 
   return (
-    <Page title="Reference library" error={products.error} loading={products.loading}>
+    <Page
+      title="Reference library"
+      error={products.error}
+      // Full-page spinner only before the first load; search refetches keep
+      // the page (and the input focus) in place.
+      loading={products.loading && products.data === undefined}
+    >
       <p className="muted">
         Upload 8–15 reference photos per product (PNG/JPEG/WEBP — different angles, lighting, and distances). A product becomes INFERENCE-READY at {data?.minRequired ?? 5} images; below that it never participates in pickup matching.
       </p>
@@ -426,9 +459,11 @@ export function ReferenceLibraryPage() {
         />
         <select value={productId} onChange={(e) => setProductId(e.target.value)}>
           <option value="">
-            {visibleProducts.length === 0
-              ? 'No products match the search'
-              : `Select a product… (${visibleProducts.length})`}
+            {products.loading
+              ? 'Searching…'
+              : visibleProducts.length === 0
+                ? 'No products match the search'
+                : `Select a product… (${visibleProducts.length})`}
           </option>
           {visibleProducts.map((product) => (
             <option key={product.id} value={product.id}>

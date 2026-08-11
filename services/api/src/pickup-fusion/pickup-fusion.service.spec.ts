@@ -1,6 +1,8 @@
 import { ConfigService } from '@nestjs/config';
 import { FusionPolicyResult, ProductStatus, VideoAssetStatus } from '@prisma/client';
 import { WeightedCandidateFusion } from './adapters/context-fusion-inventory';
+import { OcrExecutionStatus } from './adapters/text-signals';
+import { EMBEDDING_MODEL_KEY, EMBEDDING_MODEL_VERSION } from './primitives';
 import {
   BARCODE_VALUE_SUPPRESSED,
   FUSION_PIPELINE_VERSION,
@@ -44,7 +46,7 @@ function emptyEvidence(): FusionEvidence {
     crops: [],
     cropArtifactId: null,
     barcode: { results: [], matchedSku: null },
-    ocr: { rawText: '', normalizedText: '', languages: [], perProduct: [] },
+    ocr: { rawText: '', normalizedText: '', languages: [], perProduct: [], status: 'NOT_RUN' },
     retrieval: { modelKey: 'stub', modelVersion: '1', indexed: 0, candidates: [] },
     classical: { candidates: [] },
     context: { candidates: [] },
@@ -163,6 +165,8 @@ function buildService(options: {
   classicalSignals: CandidateSignal[];
   barcodeFormat?: string;
   ocrSeen?: { rawText: string; normalizedText: string };
+  /** Classified OCR execution status the stub adapter reports (default OK). */
+  ocrStatus?: OcrExecutionStatus;
   config?: Record<string, string>;
   vlmVerify?: jest.Mock;
 }) {
@@ -265,6 +269,7 @@ function buildService(options: {
         rawText: options.ocrSeen?.rawText ?? '',
         normalizedText: options.ocrSeen?.normalizedText ?? '',
         languages: options.ocrSeen ? ['eng'] : [],
+        status: options.ocrStatus ?? 'OK',
       })),
     } as never,
     {
@@ -286,13 +291,16 @@ function buildService(options: {
       contextFor: jest.fn(async () => []),
     } as never,
     new WeightedCandidateFusion(),
-    {} as never,
-    // Local (Ollama) verifier slot — the provider the service selects by
-    // default when a test enables PICKUP_VLM_ENABLED.
+    // The SELECTED verifier port (PICKUP_VLM_VERIFIER token) — fakes are
+    // injected through the port; the service never sees a concrete vendor.
     {
-      adapterKey: 'stub-vlm',
-      version: '1.0.0',
-      verify: options.vlmVerify ?? jest.fn(),
+      provider: 'local',
+      verifier: {
+        adapterKey: 'stub-vlm',
+        version: '1.0.0',
+        verify: options.vlmVerify ?? jest.fn(),
+      },
+      readiness: jest.fn(),
     } as never,
     {
       adapterKey: 'stub-inventory',
@@ -510,5 +518,209 @@ describe('PICKUP_VLM_TIMEOUT_MS is bounded at construction like the policy thres
         buildService({ ...base, config: { PICKUP_VLM_TIMEOUT_MS: ok } }),
       ).not.toThrow();
     }
+  });
+});
+
+// --------------------------------------------------------------------
+// A failed OCR stage is classified and demotes AUTO_PROPOSE
+// --------------------------------------------------------------------
+
+describe('OCR execution failures are classified — never a silent no-text pass', () => {
+  const ACTIVE: CatalogFixture = {
+    id: 'p-active',
+    sku: 'WATER-1',
+    name: 'Spring Water 500ml',
+    status: ProductStatus.ACTIVE,
+    barcode: '6281000000002',
+  };
+  // Barcode + strong classical signal: without the OCR gate this fixture
+  // reaches AUTO_PROPOSE (pinned by the ACTIVE-catalog suite above).
+  const strong = {
+    catalog: [ACTIVE],
+    barcodeSeen: ACTIVE.barcode,
+    classicalSignals: [{ productId: ACTIVE.id, sku: ACTIVE.sku, score: 0.95 }],
+  };
+
+  it.each(['EXECUTION_FAILED', 'TIMEOUT', 'UNAVAILABLE'] as const)(
+    'OCR %s: a would-be AUTO_PROPOSE demotes to review and the classified marker persists',
+    async (ocrStatus) => {
+      const { service, createdRuns } = buildService({ ...strong, ocrStatus });
+      await service.run('tenant-1', 'asset-1');
+
+      expect(createdRuns).toHaveLength(1);
+      const { data } = createdRuns[0];
+      // The advertised OCR verification stage did not run — review, not
+      // auto-propose past a dead stage.
+      expect(data.policy).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+      expect(data.evidence.policy.reason).toContain(`OCR stage ${ocrStatus}`);
+      // Classified code only in the durable evidence — no longer
+      // indistinguishable from a no-text pass, and never raw error text.
+      expect(data.evidence.ocr.status).toBe(ocrStatus);
+      expect(data.evidence.ocr.rawText).toBe('');
+    },
+  );
+
+  it('a successful pass records status OK and auto-proposes as before', async () => {
+    const { service, createdRuns } = buildService(strong);
+    await service.run('tenant-1', 'asset-1');
+
+    const { data } = createdRuns[0];
+    expect(data.policy).toBe(FusionPolicyResult.AUTO_PROPOSE);
+    expect(data.evidence.ocr.status).toBe('OK');
+  });
+});
+
+// --------------------------------------------------------------------
+// Atomic reference-index rebuild (delete + reconstruct in ONE transaction)
+// --------------------------------------------------------------------
+
+interface ReindexPrismaFixture {
+  $transaction: jest.Mock;
+  productReferenceEmbedding: { deleteMany: jest.Mock };
+}
+
+function buildReindexService(options: {
+  prisma: ReindexPrismaFixture;
+  decoder?: { decodeReferenceImage: jest.Mock };
+  retriever?: { embeddingModelKey: string; embeddingModelVersion: string; ensureIndex: jest.Mock };
+}) {
+  const retriever =
+    options.retriever ?? {
+      embeddingModelKey: EMBEDDING_MODEL_KEY,
+      embeddingModelVersion: EMBEDDING_MODEL_VERSION,
+      ensureIndex: jest.fn(async () => ({ indexed: 0, total: 3 })),
+    };
+  const service = new PickupFusionService(
+    options.prisma as never,
+    {} as never,
+    {} as never,
+    { internalPathFor: (key: string) => key } as never,
+    (options.decoder ?? { decodeReferenceImage: jest.fn() }) as never,
+    {} as never,
+    {} as never,
+    {} as never,
+    {} as never,
+    {} as never,
+    retriever as never,
+    {} as never,
+    {} as never,
+    {} as never,
+    { provider: 'local', verifier: {}, readiness: jest.fn() } as never,
+    {} as never,
+    { get: () => undefined } as unknown as ConfigService,
+  );
+  return { service, retriever };
+}
+
+describe('reference-index rebuild swaps atomically (old index intact until commit)', () => {
+  it('rebuild=false only backfills through the injected retriever — no delete, no transaction', async () => {
+    const prisma: ReindexPrismaFixture = {
+      $transaction: jest.fn(),
+      productReferenceEmbedding: { deleteMany: jest.fn() },
+    };
+    const { service, retriever } = buildReindexService({ prisma });
+
+    const result = await service.reindexReferenceIndex('tenant-1', false);
+
+    expect(retriever.ensureIndex).toHaveBeenCalledWith('tenant-1');
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(prisma.productReferenceEmbedding.deleteMany).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      modelKey: EMBEDDING_MODEL_KEY,
+      modelVersion: EMBEDDING_MODEL_VERSION,
+      rebuilt: false,
+      indexed: 0,
+      total: 3,
+    });
+  });
+
+  it('rebuild=true deletes AND reconstructs on the SAME transaction client, inside one bounded transaction', async () => {
+    const tx = {
+      productReferenceEmbedding: {
+        deleteMany: jest.fn(async () => ({ count: 1 })),
+        create: jest.fn(async () => ({})),
+      },
+      productReferenceImage: {
+        findMany: jest.fn(async () => [
+          { id: 'img-1', productId: 'p-1', storageKey: 'refs/img-1.png', embeddings: [] },
+        ]),
+      },
+    };
+    const prisma: ReindexPrismaFixture = {
+      $transaction: jest.fn(async (work: (tx: unknown) => Promise<unknown>) => work(tx)),
+      productReferenceEmbedding: { deleteMany: jest.fn() },
+    };
+    const decoder = {
+      decodeReferenceImage: jest.fn(async () => ({
+        width: 8,
+        height: 8,
+        rgb: Buffer.alloc(192, 100),
+      })),
+    };
+    const { service, retriever } = buildReindexService({ prisma, decoder });
+
+    const result = await service.reindexReferenceIndex('tenant-1', true);
+
+    // One interactive transaction with a BOUNDED budget.
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      timeout: 120_000,
+    });
+    // The delete runs on the TX client (never the live connection) and
+    // strictly before the rebuild reads — so a rollback restores it all.
+    expect(tx.productReferenceEmbedding.deleteMany).toHaveBeenCalledWith({
+      where: { tenantId: 'tenant-1', modelKey: EMBEDDING_MODEL_KEY },
+    });
+    expect(prisma.productReferenceEmbedding.deleteMany).not.toHaveBeenCalled();
+    expect(
+      tx.productReferenceEmbedding.deleteMany.mock.invocationCallOrder[0],
+    ).toBeLessThan(tx.productReferenceImage.findMany.mock.invocationCallOrder[0]);
+    // Reconstruction wrote through the tx client too, under the same key.
+    expect(tx.productReferenceEmbedding.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          tenantId: 'tenant-1',
+          referenceImageId: 'img-1',
+          modelKey: EMBEDDING_MODEL_KEY,
+        }),
+      }),
+    );
+    // The injected (live-connection) retriever is bypassed entirely.
+    expect(retriever.ensureIndex).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      modelKey: EMBEDDING_MODEL_KEY,
+      modelVersion: EMBEDDING_MODEL_VERSION,
+      rebuilt: true,
+      indexed: 1,
+      total: 1,
+    });
+  });
+
+  it('a mid-rebuild failure rejects out of the transaction — rollback leaves the old index intact', async () => {
+    const tx = {
+      productReferenceEmbedding: {
+        deleteMany: jest.fn(async () => ({ count: 1 })),
+        create: jest.fn(),
+      },
+      productReferenceImage: {
+        findMany: jest.fn(async () => {
+          throw new Error('connection lost');
+        }),
+      },
+    };
+    // A faithful $transaction: a rejection from the callback propagates
+    // (Prisma rolls back), it never resolves with partial work.
+    const prisma: ReindexPrismaFixture = {
+      $transaction: jest.fn(async (work: (tx: unknown) => Promise<unknown>) => work(tx)),
+      productReferenceEmbedding: { deleteMany: jest.fn() },
+    };
+    const { service } = buildReindexService({ prisma });
+
+    await expect(service.reindexReferenceIndex('tenant-1', true)).rejects.toThrow(
+      'connection lost',
+    );
+    // The live (non-tx) client never deleted anything — the pre-rebuild
+    // index was only ever touched inside the rolled-back transaction.
+    expect(prisma.productReferenceEmbedding.deleteMany).not.toHaveBeenCalled();
   });
 });

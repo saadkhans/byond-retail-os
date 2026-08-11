@@ -1,5 +1,6 @@
 import {
   ConflictException,
+  Inject,
   Injectable,
   Logger,
   NotFoundException,
@@ -39,7 +40,11 @@ import {
   ClassicalMotionEventDetector,
   YoloOnnxObjectDetector,
 } from './adapters/event-detection';
-import { TesseractOcrReader, ZxingBarcodeReader } from './adapters/text-signals';
+import {
+  OcrExecutionStatus,
+  TesseractOcrReader,
+  ZxingBarcodeReader,
+} from './adapters/text-signals';
 import {
   ClassicalHsvNccMatcher,
   HogLabVisualRetriever,
@@ -49,8 +54,7 @@ import {
   PrismaInventoryValidator,
   WeightedCandidateFusion,
 } from './adapters/context-fusion-inventory';
-import { AnthropicVlmVerifier } from './adapters/vlm-verifier';
-import { OllamaVlmVerifier } from './adapters/ollama-vlm';
+import { PICKUP_VLM_VERIFIER, SelectedVlmVerifier } from './vlm-provider';
 import {
   meanBrightness,
   occlusionFraction,
@@ -324,6 +328,11 @@ export interface FusionEvidence {
     normalizedText: string;
     languages: string[];
     perProduct: { sku: string; score: number }[];
+    /** Classified execution marker (adapters/text-signals): anything but
+     *  'OK' means the OCR stage did not complete, so empty text is NOT a
+     *  verified no-text pass — AUTO_PROPOSE demotes to review. 'NOT_RUN'
+     *  is the pre-stage placeholder (early exits before OCR). */
+    status: OcrExecutionStatus | 'NOT_RUN';
     /** Set (with both texts emptied) when the recognized frame text
      *  tripped the sensitive-text screen — the text is never stored. */
     screened?: typeof OCR_TEXT_SUPPRESSED;
@@ -395,8 +404,10 @@ export class PickupFusionService {
     private readonly classical: ClassicalHsvNccMatcher,
     private readonly contextProvider: PrismaContextSignalProvider,
     private readonly fusion: WeightedCandidateFusion,
-    private readonly anthropicVlm: AnthropicVlmVerifier,
-    private readonly ollamaVlm: OllamaVlmVerifier,
+    // The SELECTED verifier port (vlm-provider registry, keyed by
+    // PICKUP_VLM_PROVIDER) — the service never sees a concrete vendor.
+    @Inject(PICKUP_VLM_VERIFIER)
+    private readonly selectedVlm: SelectedVlmVerifier,
     private readonly inventoryValidator: PrismaInventoryValidator,
     config: ConfigService,
   ) {
@@ -428,10 +439,9 @@ export class PickupFusionService {
     this.vlmEnabled =
       (config.get<string>('PICKUP_VLM_ENABLED') ?? '').trim().toLowerCase() ===
       'true';
-    this.vlmProvider =
-      (config.get<string>('PICKUP_VLM_PROVIDER') ?? 'local') === 'anthropic'
-        ? 'anthropic'
-        : 'local';
+    // Provider identity comes from the registry that selected the port —
+    // one source of truth for the PICKUP_VLM_PROVIDER decision.
+    this.vlmProvider = this.selectedVlm.provider;
     // Local default is 60 s: a 7B vision model cold-loading into VRAM can
     // legitimately need > 30 s on its first generation. Bounded like the
     // policy thresholds (1 s .. 10 min): zero/negative would abort every
@@ -449,50 +459,79 @@ export class PickupFusionService {
         : 'UNCERTAIN_ONLY';
   }
 
-  /** The configured verifier — LOCAL (Ollama) by default; no paid API in
-   *  local mode and no API key requirement. */
+  /** The configured verifier PORT — LOCAL (Ollama) by default; no paid
+   *  API in local mode and no API key requirement. Selection lives in
+   *  the vlm-provider registry, never here. */
   private get vlm() {
-    return this.vlmProvider === 'anthropic' ? this.anthropicVlm : this.ollamaVlm;
+    return this.selectedVlm.verifier;
   }
 
-  /** Readiness surface for the UI panel. */
+  /** Readiness surface for the UI panel — provider-neutral shape mapped
+   *  by the registry. */
   async vlmReadiness() {
-    const base = {
+    const readiness = await this.selectedVlm.readiness();
+    return {
       enabled: this.vlmEnabled,
       provider: this.vlmProvider,
       mode: this.vlmMode,
       timeoutMs: this.vlmTimeoutMs,
-    };
-    if (this.vlmProvider === 'local') {
-      const readiness = await this.ollamaVlm.readiness();
-      return {
-        ...base,
-        model: this.ollamaVlm['model'] as string,
-        baseUrl: this.ollamaVlm['baseUrl'] as string,
-        serverReachable: readiness.serverReachable,
-        modelAvailable: readiness.modelAvailable,
-        availableModels: readiness.availableModels,
-        // MODEL INSTALLED ≠ inference-ready: READY here means the model is
-        // present; the first generation may still be slow (cold VRAM load).
-        // lastInference is the honest warm-up signal.
-        classification: readiness.classification,
-        lastInference: readiness.lastInference,
-        ready: this.vlmEnabled && readiness.serverReachable && readiness.modelAvailable,
-      };
-    }
-    const ready = await this.anthropicVlm.checkReady();
-    return {
-      ...base,
-      model: null,
-      baseUrl: null,
-      serverReachable: ready,
-      modelAvailable: ready,
-      availableModels: [],
-      classification: ready ? ('READY' as const) : ('PROVIDER_UNREACHABLE' as const),
-      lastInference: null,
-      ready: this.vlmEnabled && ready,
+      model: readiness.model,
+      baseUrl: readiness.baseUrl,
+      serverReachable: readiness.serverReachable,
+      modelAvailable: readiness.modelAvailable,
+      availableModels: readiness.availableModels,
+      // MODEL INSTALLED ≠ inference-ready: READY here means the model is
+      // present; the first generation may still be slow (cold VRAM load).
+      // lastInference is the honest warm-up signal.
+      classification: readiness.classification,
+      lastInference: readiness.lastInference,
+      ready:
+        this.vlmEnabled && readiness.serverReachable && readiness.modelAvailable,
     };
   }
+
+  /**
+   * Ensure (or fully rebuild) the reference-embedding index for the
+   * current embedding model.
+   *
+   * A rebuild is delete + reconstruct in ONE interactive transaction, so
+   * the swap is atomic: a concurrent fusion run keeps reading the OLD
+   * generation until commit, and any failure rolls back with the old
+   * index intact — never a partial/empty live index. The adapter must
+   * observe the transaction's deletes, so a tx-scoped instance of the
+   * SAME retriever adapter does the reconstruction (Prisma tx clients
+   * cannot travel through DI). Volume note: reference libraries are
+   * catalog-scale (the same assumption exact in-process NN retrieval
+   * already makes), so the decode work fits the bounded tx budget.
+   */
+  async reindexReferenceIndex(tenantId: string, rebuild: boolean) {
+    const result = rebuild
+      ? await this.prisma.$transaction(
+          async (tx) => {
+            const scoped = new HogLabVisualRetriever(
+              tx as unknown as PrismaService,
+              this.storage,
+              this.decoder,
+            );
+            await tx.productReferenceEmbedding.deleteMany({
+              where: { tenantId, modelKey: scoped.embeddingModelKey },
+            });
+            return scoped.ensureIndex(tenantId);
+          },
+          { timeout: PickupFusionService.REINDEX_REBUILD_TX_TIMEOUT_MS },
+        )
+      : await this.retriever.ensureIndex(tenantId);
+    return {
+      modelKey: this.retriever.embeddingModelKey,
+      modelVersion: this.retriever.embeddingModelVersion,
+      rebuilt: rebuild,
+      ...result,
+    };
+  }
+
+  /** Rebuild decodes every reference image inside the swap transaction —
+   *  generous but bounded, so a wedged decode cannot pin a tx forever. */
+  private static readonly REINDEX_REBUILD_TX_TIMEOUT_MS = 120_000;
 
   /**
    * One SHADOW run of pickup-fusion-v2 over a validated test video.
@@ -555,7 +594,13 @@ export class PickupFusionService {
       crops: [],
       cropArtifactId: null,
       barcode: { results: [], matchedSku: null },
-      ocr: { rawText: '', normalizedText: '', languages: [], perProduct: [] },
+      ocr: {
+        rawText: '',
+        normalizedText: '',
+        languages: [],
+        perProduct: [],
+        status: 'NOT_RUN',
+      },
       retrieval: {
         modelKey: this.retriever.embeddingModelKey,
         modelVersion: this.retriever.embeddingModelVersion,
@@ -798,6 +843,10 @@ export class PickupFusionService {
       const ocr = await timed('ocr', this.ocrReader, () =>
         this.ocrReader.recognize(bestPre.image),
       );
+      // The classified execution marker persists as-is (code only, never
+      // raw error text): a timeout/crash must stay distinguishable from a
+      // successful no-text pass in the durable evidence.
+      evidence.ocr.status = ocr.status;
       // PAYMENT-SAFETY: fusion OCRs a ZOOMED event-region crop at its own
       // timestamps, so it can recover text the pre-store full-frame screen
       // never resolved (a card visible in the shelf crop). The recognized
@@ -994,6 +1043,19 @@ export class PickupFusionService {
             reason: `inventory validation rejected ${finalSku} (${validation.verdict}) — review`,
           };
         }
+      }
+      // OCR is an ADVERTISED verification stage: when it did not complete
+      // (UNAVAILABLE / TIMEOUT / EXECUTION_FAILED), its empty text is not
+      // a verified "no text" observation, so an AUTO_PROPOSE that skipped
+      // the stage demotes to human review — same posture as a failed VLM.
+      if (
+        evidence.policy.result === FusionPolicyResult.AUTO_PROPOSE &&
+        evidence.ocr.status !== 'OK'
+      ) {
+        evidence.policy = {
+          result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
+          reason: `OCR stage ${evidence.ocr.status} — verification stage did not run, routed to review`,
+        };
       }
       return this.persist(tenantId, videoAssetId, evidence, startedAt);
     } catch (error) {
