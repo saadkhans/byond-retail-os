@@ -1,4 +1,4 @@
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { ReferenceImagesService } from './reference-images.service';
 
@@ -32,6 +32,7 @@ function buildService() {
     },
     productReferenceImage: {
       findFirst: jest.fn(async () => null),
+      delete: jest.fn(async () => undefined),
       create: jest.fn(
         async ({ data }: { data: Record<string, unknown> }) => ({
           id: 'img-1',
@@ -287,5 +288,34 @@ describe('ReferenceImagesService.upload insert-failure cleanup', () => {
       service.upload(TENANT, PRODUCT_ID, cleanUpload()),
     ).resolves.toEqual(winner);
     expect(storage.delete).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ReferenceImagesService.remove tenant scoping', () => {
+  it('deletes the row through the id_tenantId composite key, then the bytes', async () => {
+    const { service, storage, prisma } = buildService();
+    const row = {
+      id: 'img-1',
+      productId: PRODUCT_ID,
+      storageKey: `references/${TENANT}/${PRODUCT_ID}/img-1.png`,
+    };
+    prisma.productReferenceImage.findFirst.mockResolvedValueOnce(row as never);
+    await service.remove(TENANT, PRODUCT_ID, 'img-1');
+    // The destructive write must carry tenantId itself (AGENTS.md tenancy
+    // invariant) — never rely on the preceding lookup to have scoped it.
+    expect(prisma.productReferenceImage.delete).toHaveBeenCalledWith({
+      where: { id_tenantId: { id: 'img-1', tenantId: TENANT } },
+    });
+    expect(storage.delete).toHaveBeenCalledWith(row.storageKey);
+  });
+
+  it('404s without issuing any delete when the row is outside the tenant', async () => {
+    const { service, storage, prisma } = buildService();
+    prisma.productReferenceImage.findFirst.mockResolvedValueOnce(null);
+    await expect(
+      service.remove(TENANT, PRODUCT_ID, 'img-other-tenant'),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(prisma.productReferenceImage.delete).not.toHaveBeenCalled();
+    expect(storage.delete).not.toHaveBeenCalled();
   });
 });

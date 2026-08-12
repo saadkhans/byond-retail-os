@@ -697,6 +697,10 @@ export class PickupDetectionService {
         this.storage.internalPathFor(internal.storageKey),
         this.config.analysisFps,
         geometry,
+        // Probed duration lets the decoder downsample fps instead of
+        // failing when the sampled total would exceed its aggregate
+        // memory budget (long clips at high analysis fps).
+        internal.durationMs!,
       );
     } catch {
       return {

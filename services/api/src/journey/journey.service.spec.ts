@@ -249,6 +249,18 @@ describe('JourneyService', () => {
     expect(journeyRow.status).toBe(CustomerJourneyStatus.RECONCILED);
   });
 
+  it('exit scopes the status update by the id_tenantId composite key (tenant isolation at the write)', async () => {
+    const { service, prisma } = buildService();
+    await service.exit(TENANT, 'j-1');
+    // The update must carry the composite unique key — id alone would let
+    // a caller-supplied journey id address another tenant's row.
+    expect(prisma.customerJourney.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id_tenantId: { id: 'j-1', tenantId: TENANT } },
+      }),
+    );
+  });
+
   it('exit routes journeys with unresolved issues to REVIEW_REQUIRED', async () => {
     const { service, journeyRow } = buildService();
     await service.appendEvent(TENANT, 'j-1', {

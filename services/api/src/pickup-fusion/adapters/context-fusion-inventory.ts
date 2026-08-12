@@ -40,14 +40,27 @@ export class PrismaContextSignalProvider implements ContextSignalProvider {
       where: { tenantId, id: { in: productIds } },
       select: { id: true, sku: true, categoryId: true, status: true },
     });
-    const stock = context.locationId
-      ? await this.prisma.inventoryLevel.findMany({
-          where: { tenantId, locationId: context.locationId },
-          select: { productId: true, quantity: true },
-        })
-      : [];
+    // Two cheap reads instead of loading the whole store: an existence
+    // probe decides lab mode (any inventory row at all), and an IN-filtered
+    // read fetches quantities for the candidates only.
+    const [storeProbe, stock] = context.locationId
+      ? await Promise.all([
+          this.prisma.inventoryLevel.findFirst({
+            where: { tenantId, locationId: context.locationId },
+            select: { id: true },
+          }),
+          this.prisma.inventoryLevel.findMany({
+            where: {
+              tenantId,
+              locationId: context.locationId,
+              productId: { in: productIds },
+            },
+            select: { productId: true, quantity: true },
+          }),
+        ])
+      : ([null, []] as const);
     const stockByProduct = new Map(stock.map((row) => [row.productId, row.quantity]));
-    const storeHasInventory = stock.length > 0;
+    const storeHasInventory = storeProbe !== null;
     return products.map((product) => {
       let score = 0.5; // neutral prior
       const details: string[] = [];

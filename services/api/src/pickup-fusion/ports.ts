@@ -31,6 +31,40 @@ export interface VersionedAdapter {
   checkReady(): Promise<boolean>;
 }
 
+// ---------------------------------------------------------------- decode
+
+/**
+ * Repository-owned media decode port — STORAGE-KEY-based pixel access for
+ * the fusion pipeline. The orchestration service hands the adapter the
+ * managed storage key it read from the asset/reference row; resolving the
+ * key to a local filesystem path (internalPathFor) — or, for a future
+ * object-store adapter, to a download — happens inside the adapter alone.
+ * No path, storage vendor, or decode binary ever reaches the service.
+ * `durationMs` (from the asset's probed metadata) lets the whole-clip
+ * decode enforce its aggregate memory budget by downsampling fps instead
+ * of failing a valid asset.
+ */
+export interface PickupMediaDecoder extends VersionedAdapter {
+  /** Whole-clip downscaled analysis frames at `fps` (or the highest
+   *  budget-fitting cadence below it — timestamps carry the truth). */
+  decodeAnalysisFrames(
+    storageKey: string,
+    fps: number,
+    geometry: AnalysisGeometry,
+    durationMs: number,
+  ): Promise<AnalysisFrame[]>;
+  /** ONE frame at (or, on a tail-of-clip fallback, just before)
+   *  `timestampMs` — the returned frame's timestampMs is the instant that
+   *  ACTUALLY decoded, which callers must carry into evidence. */
+  decodeFrameAt(
+    storageKey: string,
+    timestampMs: number,
+    geometry: AnalysisGeometry,
+  ): Promise<AnalysisFrame>;
+  /** ONE stored reference image at the matcher's working size. */
+  decodeReferenceImage(storageKey: string): Promise<RgbImage>;
+}
+
 // ---------------------------------------------------------------- events
 
 export type PickupEventKind = 'PICKUP' | 'RETURN';

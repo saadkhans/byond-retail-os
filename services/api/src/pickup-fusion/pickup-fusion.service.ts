@@ -14,13 +14,9 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { containsSensitiveFreeText } from '../video-ingest/media-safety';
-import { LocalVideoStorageAdapter } from '../video-ingest/storage/local-video-storage.adapter';
 import { VideoAssetsRepository } from '../video-ingest/video-assets.repository';
 import { VideoAssetsService } from '../video-ingest/video-assets.service';
-import {
-  PickupAnalysisFrameDecoder,
-  analysisGeometryFor,
-} from '../pickup-detection/analysis/analysis-frames';
+import { analysisGeometryFor } from '../pickup-detection/analysis/analysis-frames';
 import { AnalysisFrame, BoundingBox } from '../pickup-detection/analysis/pickup-analyzer';
 import { RgbImage, cropRgb } from '../pickup-detection/analysis/product-matcher';
 import {
@@ -41,6 +37,7 @@ import {
   OcrExecutionStatus,
   OcrReader,
   PickupEventDetector,
+  PickupMediaDecoder,
   QualifiedCrop,
   VisualRetriever,
   VlmStructuredResult,
@@ -53,6 +50,7 @@ import {
   PICKUP_CONTEXT_PROVIDER,
   PICKUP_EVENT_DETECTOR,
   PICKUP_INVENTORY_VALIDATOR,
+  PICKUP_MEDIA_DECODER,
   PICKUP_OBJECT_DETECTOR,
   PICKUP_OCR_READER,
   PICKUP_TX_RETRIEVER_FACTORY,
@@ -398,11 +396,13 @@ export class PickupFusionService {
     private readonly prisma: PrismaService,
     private readonly repository: VideoAssetsRepository,
     private readonly videoAssets: VideoAssetsService,
-    private readonly storage: LocalVideoStorageAdapter,
-    private readonly decoder: PickupAnalysisFrameDecoder,
     private readonly detectionConfig: PickupDetectionConfig,
     // Every fusion stage is a PORT injected by token (bound to concrete
     // adapters in the module) — the service never sees a vendor class.
+    // Media decoding included: the service passes STORAGE KEYS; only the
+    // adapter knows how a key becomes local pixels.
+    @Inject(PICKUP_MEDIA_DECODER)
+    private readonly media: PickupMediaDecoder,
     @Inject(PICKUP_EVENT_DETECTOR)
     private readonly detector: PickupEventDetector,
     @Inject(PICKUP_OBJECT_DETECTOR)
@@ -611,7 +611,9 @@ export class PickupFusionService {
       throw new ConflictException('Asset metadata is incomplete');
     }
     const source = { width: internal.width, height: internal.height };
-    const internalPath = this.storage.internalPathFor(internal.storageKey);
+    // Narrowed ONCE after the metadata guard: property narrowing does not
+    // survive into the decode closures below.
+    const durationMs = internal.durationMs;
 
     const evidence: FusionEvidence = {
       pipelineVersion: FUSION_PIPELINE_VERSION,
@@ -672,12 +674,13 @@ export class PickupFusionService {
       );
       const framesSmall = await timed(
         'decode-analysis',
-        { adapterKey: 'ffmpeg-rawvideo', version: '1.0.0' },
+        this.media,
         () =>
-          this.decoder.decodeAnalysisFrames(
-            internalPath,
+          this.media.decodeAnalysisFrames(
+            internal.storageKey,
             this.detectionConfig.analysisFps,
             geometrySmall,
+            durationMs,
           ),
       );
       // Full-resolution decoding happens PER TIMESTAMP (below, after the
@@ -729,7 +732,6 @@ export class PickupFusionService {
       // candidates. Each is one ffmpeg seek producing one frame, so the
       // full-res decode stays a handful of frames for any supported clip
       // length or aspect (never the whole clip at analysis fps).
-      const durationMs = internal.durationMs;
       const fullFrameCache = new Map<number, AnalysisFrame>();
       const fullFrameAt = async (ms: number): Promise<AnalysisFrame> => {
         const clamped = Math.max(0, Math.min(ms, durationMs - 1));
@@ -737,8 +739,11 @@ export class PickupFusionService {
         if (cached) {
           return cached;
         }
-        const frame = await this.decoder.decodeFrameAt(
-          internalPath,
+        // The returned frame's timestampMs is the instant that ACTUALLY
+        // decoded — a tail-of-clip fallback reports the earlier seek, and
+        // the evidence below carries that true timestamp.
+        const frame = await this.media.decodeFrameAt(
+          internal.storageKey,
           clamped,
           geometryFull,
         );
@@ -759,7 +764,7 @@ export class PickupFusionService {
       const quietFull = (
         await timed(
           'decode-full',
-          { adapterKey: 'ffmpeg-rawvideo', version: '1.0.0' },
+          this.media,
           async () => {
             // Prefetch every consumed instant while the stage is timed.
             for (const { ms } of candidateInstants) {
@@ -1163,9 +1168,7 @@ export class PickupFusionService {
       }
       try {
         referenceImages.set(candidate.productId, [
-          await this.decoder.decodeReferenceImage(
-            this.storage.internalPathFor(row.storageKey),
-          ),
+          await this.media.decodeReferenceImage(row.storageKey),
         ]);
       } catch {
         referenceImages.set(candidate.productId, []);

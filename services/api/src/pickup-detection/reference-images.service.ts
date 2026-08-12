@@ -432,7 +432,11 @@ export class ReferenceImagesService {
     }
     // Row first (authorization boundary), bytes second: an orphaned file
     // is harmless and unreachable; a row without bytes would 404 on serve.
-    await this.prisma.productReferenceImage.delete({ where: { id: row.id } });
+    // The destructive write carries tenantId itself via the id_tenantId
+    // composite key — never trust the lookup above to have scoped it.
+    await this.prisma.productReferenceImage.delete({
+      where: { id_tenantId: { id: row.id, tenantId } },
+    });
     await this.storage.delete(row.storageKey).catch(() => undefined);
   }
 }

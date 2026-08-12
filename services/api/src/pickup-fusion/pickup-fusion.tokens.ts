@@ -10,6 +10,7 @@ import { VisualRetriever } from './ports';
  * the module — the service never changes and never imports a vendor.
  */
 
+export const PICKUP_MEDIA_DECODER = 'PICKUP_MEDIA_DECODER';
 export const PICKUP_EVENT_DETECTOR = 'PICKUP_EVENT_DETECTOR';
 export const PICKUP_OBJECT_DETECTOR = 'PICKUP_OBJECT_DETECTOR';
 export const PICKUP_BARCODE_READER = 'PICKUP_BARCODE_READER';

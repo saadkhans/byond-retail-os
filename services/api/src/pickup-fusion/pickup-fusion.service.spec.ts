@@ -214,10 +214,20 @@ function buildService(options: {
     unitId: null,
     deviceId: null,
   };
+  // The MEDIA PORT fake (PICKUP_MEDIA_DECODER) — storage-key based; the
+  // service never sees a path or a concrete storage/decoder class.
   const decoder = {
+    adapterKey: 'stub-media',
+    version: '1.0.0',
+    checkReady: jest.fn(async () => true),
     // Frames sized to whatever geometry the service asks for; flat gray.
     decodeAnalysisFrames: jest.fn(
-      async (_path: string, _fps: number, geometry: { width: number; height: number }) =>
+      async (
+        _storageKey: string,
+        _fps: number,
+        geometry: { width: number; height: number },
+        _durationMs: number,
+      ) =>
         Array.from({ length: 5 }, (_unused, index) => ({
           index,
           timestampMs: index * 1000,
@@ -227,7 +237,7 @@ function buildService(options: {
     // Full-resolution frames arrive one seek at a time.
     decodeFrameAt: jest.fn(
       async (
-        _path: string,
+        _storageKey: string,
         timestampMs: number,
         geometry: { width: number; height: number },
       ) => ({
@@ -261,9 +271,8 @@ function buildService(options: {
     prisma as never,
     { findByIdInternal: jest.fn(async () => asset) } as never,
     { createCrop: jest.fn(async () => ({ artifact: { id: 'crop-1' } })) } as never,
-    { internalPathFor: (key: string) => key } as never,
-    decoder as never,
     { analysisWidth: 48, analysisFps: 2 } as never,
+    decoder as never,
     detector as never,
     { checkReady: jest.fn(async () => false) } as never,
     {
@@ -630,6 +639,11 @@ describe('full-resolution frames are decoded per consumed timestamp, never as a 
     // pass. A second whole-clip decode at full resolution is the overflow
     // regression (20-30 s clips exceed the decoder's 64 MiB budget).
     expect(decoder.decodeAnalysisFrames).toHaveBeenCalledTimes(1);
+    // The PORT contract: the service hands over the STORAGE KEY (never a
+    // filesystem path) plus the probed duration the decoder's aggregate
+    // memory budget needs.
+    expect(decoder.decodeAnalysisFrames.mock.calls[0][0]).toBe('assets/clip.mp4');
+    expect(decoder.decodeAnalysisFrames.mock.calls[0][3]).toBe(6000);
     const smallGeometry = decoder.decodeAnalysisFrames.mock.calls[0][2] as {
       width: number;
     };
@@ -645,6 +659,38 @@ describe('full-resolution frames are decoded per consumed timestamp, never as a 
     for (const call of decoder.decodeFrameAt.mock.calls) {
       expect((call[2] as { width: number }).width).toBe(480);
     }
+  });
+
+  it('a tail-of-clip fallback decode persists the ACTUAL decoded instant into crop evidence', async () => {
+    const { service, decoder, createdRuns } = buildService({
+      catalog: [ACTIVE],
+      barcodeSeen: ACTIVE.barcode,
+      classicalSignals: [{ productId: ACTIVE.id, sku: ACTIVE.sku, score: 0.95 }],
+    });
+    // The post instant (3100 ms) seeks past the container's last frame —
+    // the decoder falls back 1 s and reports the instant that actually
+    // produced pixels (pinned in analysis-frames.spec.ts).
+    decoder.decodeFrameAt.mockImplementation(
+      async (
+        _storageKey: string,
+        timestampMs: number,
+        geometry: { width: number; height: number },
+      ) => ({
+        index: 0,
+        timestampMs: timestampMs >= 3100 ? timestampMs - 1000 : timestampMs,
+        rgb: Buffer.alloc(geometry.width * geometry.height * 3, 100),
+      }),
+    );
+    await service.run('tenant-1', 'asset-1');
+
+    expect(createdRuns).toHaveLength(1);
+    const { data } = createdRuns[0];
+    const post = data.evidence.crops.find((crop) => crop.phase === 'post');
+    // Evidence carries the TRUE decoded timestamp (2100), never the
+    // requested one (3100) — a near-clip-end event must not label a frame
+    // up to 1 s earlier as if it showed the requested instant.
+    expect(post?.timestampMs).toBe(2100);
+    expect(data.evidence.crops.map((crop) => crop.timestampMs)).not.toContain(3100);
   });
 });
 
@@ -736,9 +782,8 @@ function buildReindexService(options: {
     options.prisma as never,
     {} as never,
     {} as never,
-    storage as never,
-    decoder as never,
     {} as never,
+    decoder as never,
     {} as never,
     {} as never,
     {} as never,

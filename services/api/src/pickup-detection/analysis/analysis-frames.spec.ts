@@ -25,6 +25,8 @@ describe('PickupAnalysisFrameDecoder.decodeAnalysisFrames', () => {
   const FRAME_BYTES = GEOMETRY.width * GEOMETRY.height * 3;
   const MAX_DECODE_BYTES = 64 * 1024 * 1024;
   const FRAMES_PER_CHUNK = Math.floor(MAX_DECODE_BYTES / FRAME_BYTES);
+  const MAX_AGGREGATE_DECODE_BYTES = 192 * 1024 * 1024;
+  const MAX_TOTAL_FRAMES = Math.floor(MAX_AGGREGATE_DECODE_BYTES / FRAME_BYTES);
 
   function decoderWith(
     responses: Buffer[],
@@ -53,7 +55,7 @@ describe('PickupAnalysisFrameDecoder.decodeAnalysisFrames', () => {
     stdout[3 * FRAME_BYTES] = 42;
     const { decoder, calls } = decoderWith([stdout]);
 
-    const frames = await decoder.decodeAnalysisFrames('/videos/clip.mp4', FPS, GEOMETRY);
+    const frames = await decoder.decodeAnalysisFrames('/videos/clip.mp4', FPS, GEOMETRY, 334);
 
     expect(calls).toHaveLength(1);
     expect(calls[0].args[calls[0].args.indexOf('-ss') + 1]).toBe('0.000');
@@ -61,6 +63,20 @@ describe('PickupAnalysisFrameDecoder.decodeAnalysisFrames', () => {
     expect(frames.map((frame) => frame.timestampMs)).toEqual([0, 67, 133, 200, 267]);
     expect(frames[3].rgb[0]).toBe(42);
     expect(frames[3].rgb.length).toBe(FRAME_BYTES);
+  });
+
+  it('COPIES each frame out of the chunk pipe — no frame pins the chunk stdout buffer via a subarray view', async () => {
+    const stdout = Buffer.alloc(5 * FRAME_BYTES);
+    const { decoder } = decoderWith([stdout]);
+
+    const frames = await decoder.decodeAnalysisFrames('/videos/clip.mp4', FPS, GEOMETRY, 334);
+
+    for (const frame of frames) {
+      // A subarray view would share stdout's ArrayBuffer, keeping the
+      // whole <= 64 MiB chunk alive for as long as any frame is retained.
+      expect(frame.rgb.buffer).not.toBe(stdout.buffer);
+      expect(frame.rgb.length).toBe(FRAME_BYTES);
+    }
   });
 
   it('splits a clip whose sampled total exceeds 64 MiB into budget-fitting chunks (portrait @ fps 15 regression)', async () => {
@@ -74,7 +90,7 @@ describe('PickupAnalysisFrameDecoder.decodeAnalysisFrames', () => {
     chunk2[0] = 9;
     const { decoder, calls } = decoderWith([chunk1, chunk2]);
 
-    const frames = await decoder.decodeAnalysisFrames('/videos/clip.mp4', FPS, GEOMETRY);
+    const frames = await decoder.decodeAnalysisFrames('/videos/clip.mp4', FPS, GEOMETRY, 30_000);
 
     expect(calls).toHaveLength(2);
     for (const { args, maxOutputBytes } of calls) {
@@ -106,17 +122,70 @@ describe('PickupAnalysisFrameDecoder.decodeAnalysisFrames', () => {
       Buffer.alloc(0), // seek landed past the last frame — clip is done
     ]);
 
-    const frames = await decoder.decodeAnalysisFrames('/videos/clip.mp4', FPS, GEOMETRY);
+    const frames = await decoder.decodeAnalysisFrames('/videos/clip.mp4', FPS, GEOMETRY, 22_800);
 
     expect(calls).toHaveLength(2);
     expect(frames).toHaveLength(FRAMES_PER_CHUNK);
+  });
+
+  it('DOWNSAMPLES fps (never fails) when duration x fps would exceed the aggregate retained-bytes budget', async () => {
+    // 300 s portrait at 15 fps would retain 4500 frames = ~840 MiB. The
+    // budget admits 1028 frames, so the cadence drops to the highest
+    // millifps whose sampled total fits: floor(1028 * 1000 / 300) / 1000.
+    const durationMs = 300_000;
+    expect(Math.ceil((durationMs / 1000) * FPS)).toBeGreaterThan(MAX_TOTAL_FRAMES);
+    const effectiveFps =
+      Math.floor((MAX_TOTAL_FRAMES * 1000) / (durationMs / 1000)) / 1000;
+    // A short first chunk terminates the decode — the cadence and caps
+    // are what this test pins, not the clip length.
+    const { decoder, calls } = decoderWith([Buffer.alloc(2 * FRAME_BYTES)]);
+
+    const frames = await decoder.decodeAnalysisFrames(
+      '/videos/clip.mp4',
+      FPS,
+      GEOMETRY,
+      durationMs,
+    );
+
+    // The exec samples at the DOWNSAMPLED cadence, not the requested one.
+    expect(calls[0].args).toContain(
+      `fps=${effectiveFps},scale=${GEOMETRY.width}:${GEOMETRY.height}`,
+    );
+    // The downsampled total provably fits the aggregate budget.
+    expect(Math.ceil((durationMs / 1000) * effectiveFps)).toBeLessThanOrEqual(
+      MAX_TOTAL_FRAMES,
+    );
+    // Timestamps carry the truth: the i / fps cadence at the EFFECTIVE fps.
+    expect(frames.map((frame) => frame.timestampMs)).toEqual([
+      0,
+      Math.round(1000 / effectiveFps),
+    ]);
+  });
+
+  it('hard-caps aggregate retained frames even when metadata lied and ffmpeg keeps producing output', async () => {
+    // durationMs claims a 1 s clip, but every chunk comes back full — the
+    // loop must stop at the aggregate ceiling instead of decoding forever.
+    const fullChunk = Buffer.alloc(FRAMES_PER_CHUNK * FRAME_BYTES);
+    const { decoder, calls } = decoderWith([fullChunk]);
+
+    const frames = await decoder.decodeAnalysisFrames('/videos/clip.mp4', FPS, GEOMETRY, 1000);
+
+    expect(frames).toHaveLength(MAX_TOTAL_FRAMES);
+    expect(frames.length * FRAME_BYTES).toBeLessThanOrEqual(MAX_AGGREGATE_DECODE_BYTES);
+    // The FINAL chunk's -frames:v cap shrank to the budget remainder — the
+    // decoder never even asks ffmpeg for frames it cannot retain.
+    const lastArgs = calls[calls.length - 1].args;
+    expect(Number(lastArgs[lastArgs.indexOf('-frames:v') + 1])).toBe(
+      MAX_TOTAL_FRAMES - (calls.length - 1) * FRAMES_PER_CHUNK,
+    );
+    expect(calls).toHaveLength(Math.ceil(MAX_TOTAL_FRAMES / FRAMES_PER_CHUNK));
   });
 
   it('fails CONTROLLED (ExtractionFailedError) when the clip decodes no frames at all', async () => {
     const { decoder } = decoderWith([Buffer.alloc(0)]);
 
     await expect(
-      decoder.decodeAnalysisFrames('/videos/clip.mp4', FPS, GEOMETRY),
+      decoder.decodeAnalysisFrames('/videos/clip.mp4', FPS, GEOMETRY, 1000),
     ).rejects.toBeInstanceOf(ExtractionFailedError);
   });
 
@@ -132,7 +201,7 @@ describe('PickupAnalysisFrameDecoder.decodeAnalysisFrames', () => {
     });
 
     await expect(
-      decoder.decodeAnalysisFrames('/videos/clip.mp4', FPS, GEOMETRY),
+      decoder.decodeAnalysisFrames('/videos/clip.mp4', FPS, GEOMETRY, 1000),
     ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
   });
 });
@@ -189,7 +258,7 @@ describe('PickupAnalysisFrameDecoder.decodeFrameAt', () => {
     expect(portraitFrameBudget).toBeLessThan((64 * 1024 * 1024) / 10);
   });
 
-  it('a tail-of-clip seek past the last frame retries once from 1 s earlier', async () => {
+  it('a tail-of-clip seek past the last frame retries once from 1 s earlier and reports the ACTUAL decoded instant', async () => {
     const { decoder, calls } = decoderWith([
       Buffer.alloc(0), // seek landed past the final frame — no output
       Buffer.alloc(FRAME_BYTES, 9),
@@ -201,6 +270,10 @@ describe('PickupAnalysisFrameDecoder.decodeFrameAt', () => {
     expect(calls).toHaveLength(2);
     expect(calls[0].args[calls[0].args.indexOf('-ss') + 1]).toBe('29.950');
     expect(calls[1].args[calls[1].args.indexOf('-ss') + 1]).toBe('28.950');
+    // The frame is labelled with the FALLBACK seek that produced pixels,
+    // never the requested timestamp — evidence must not claim an instant
+    // 1 s later than the pixels it shows.
+    expect(frame.timestampMs).toBe(28_950);
   });
 
   it('fails CONTROLLED (ExtractionFailedError) when no frame decodes at all', async () => {

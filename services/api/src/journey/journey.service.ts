@@ -458,8 +458,11 @@ export class JourneyService {
         orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
       });
       const { issues } = foldBasket(events);
+      // Tenant-scoped via the composite unique key: id alone must never
+      // address another tenant's journey, even after withOpenJourney's
+      // scoped lookup (the write itself enforces isolation).
       await tx.customerJourney.update({
-        where: { id: journeyId },
+        where: { id_tenantId: { id: journeyId, tenantId } },
         data: {
           status:
             issues.length > 0

@@ -27,6 +27,7 @@ import {
 } from './adapters/visual-signals';
 import { AnthropicVlmVerifier } from './adapters/vlm-verifier';
 import { OllamaVlmVerifier } from './adapters/ollama-vlm';
+import { LocalStorageMediaDecoder } from './adapters/storage-media-decoder';
 import { ReindexReferenceIndexDto } from './dto/reindex-reference-index.dto';
 import { PickupFusionService } from './pickup-fusion.service';
 import {
@@ -36,6 +37,7 @@ import {
   PICKUP_CONTEXT_PROVIDER,
   PICKUP_EVENT_DETECTOR,
   PICKUP_INVENTORY_VALIDATOR,
+  PICKUP_MEDIA_DECODER,
   PICKUP_OBJECT_DETECTOR,
   PICKUP_OCR_READER,
   PICKUP_TX_RETRIEVER_FACTORY,
@@ -148,8 +150,12 @@ export class FusionOpsController {
     // the PICKUP_VLM_VERIFIER token, never a concrete vendor.
     pickupVlmVerifierProvider,
     PrismaInventoryValidator,
+    LocalStorageMediaDecoder,
     // Every fusion stage reaches the service as a PORT bound here — the
-    // ONLY place (with vlm-provider) that names concrete adapters.
+    // ONLY place (with vlm-provider) that names concrete adapters. Media
+    // decoding included: the storage-key port keeps the local-only
+    // internalPathFor confined to its adapter.
+    { provide: PICKUP_MEDIA_DECODER, useExisting: LocalStorageMediaDecoder },
     { provide: PICKUP_EVENT_DETECTOR, useExisting: ClassicalMotionEventDetector },
     { provide: PICKUP_OBJECT_DETECTOR, useExisting: YoloOnnxObjectDetector },
     { provide: PICKUP_BARCODE_READER, useExisting: ZxingBarcodeReader },
