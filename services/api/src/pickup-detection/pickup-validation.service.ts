@@ -208,8 +208,10 @@ export class PickupValidationService {
       note: input.note?.slice(0, 500) ?? null,
       createdById: actorId ?? null,
     };
+    // The composite selector makes the write itself enforce the tenant
+    // boundary rather than relying on the asset lookup above.
     await this.prisma.videoGroundTruth.upsert({
-      where: { videoAssetId },
+      where: { tenantId_videoAssetId: { tenantId, videoAssetId } },
       create: { tenantId, videoAssetId, ...data },
       update: data,
     });

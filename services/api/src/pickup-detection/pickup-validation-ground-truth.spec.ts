@@ -67,14 +67,16 @@ describe('upsertGroundTruth', () => {
     await service.upsertGroundTruth(TENANT, ASSET, valid, 'user-1');
     expect(upsert).toHaveBeenCalledTimes(1);
     const args = upsert.mock.calls[0][0] as unknown as {
-      where: { videoAssetId: string };
+      where: { tenantId_videoAssetId: { tenantId: string; videoAssetId: string } };
       create: Record<string, unknown>;
       update: Record<string, unknown>;
     };
-    // Duplicate prevention: the WHERE is the unique per-video key, and the
-    // update branch carries the same data as create — a second save can
-    // only modify the existing record.
-    expect(args.where).toEqual({ videoAssetId: ASSET });
+    // Duplicate prevention AND tenant isolation: the WHERE is the composite
+    // tenant-scoped per-video key, so the write itself enforces the tenant
+    // boundary and a second save can only modify the existing record.
+    expect(args.where).toEqual({
+      tenantId_videoAssetId: { tenantId: TENANT, videoAssetId: ASSET },
+    });
     expect(args.create).toMatchObject({ tenantId: TENANT, videoAssetId: ASSET, productId: 'prod-1', actualTimestampMs: 1600 });
     expect(args.update).toMatchObject({ productId: 'prod-1', actualTimestampMs: 1600, quantity: 1 });
   });
