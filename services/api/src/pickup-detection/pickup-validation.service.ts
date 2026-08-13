@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  CvTestScenario,
   EvidenceSourceType,
   FusionPolicyResult,
   GroundTruthEventKind,
@@ -29,6 +30,7 @@ export const SUMMARY_MAX_ROWS = 500;
 export interface GroundTruthView {
   videoAssetId: string;
   eventKind: GroundTruthEventKind;
+  testType: CvTestScenario | null;
   productId: string | null;
   sku: string | null;
   productName: string | null;
@@ -40,6 +42,7 @@ export interface GroundTruthView {
 
 export interface UpsertGroundTruthInput {
   eventKind: GroundTruthEventKind;
+  testType?: CvTestScenario | null;
   productId?: string | null;
   actualTimestampMs?: number | null;
   quantity?: number;
@@ -196,6 +199,7 @@ export class PickupValidationService {
     }
     const data = {
       eventKind: input.eventKind,
+      testType: input.testType ?? null,
       productId:
         input.eventKind === GroundTruthEventKind.NONE
           ? null
@@ -232,6 +236,7 @@ export class PickupValidationService {
     return {
       videoAssetId: row.videoAssetId,
       eventKind: row.eventKind,
+      testType: row.testType,
       productId: row.productId,
       sku: row.product?.sku ?? null,
       productName: row.product?.name ?? null,

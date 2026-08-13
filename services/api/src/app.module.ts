@@ -5,6 +5,7 @@ import { AuthModule } from './auth/auth.module';
 import { CatalogModule } from './catalog/catalog.module';
 import { CheckoutModule } from './checkout/checkout.module';
 import { RequestIdMiddleware } from './common/request-id.middleware';
+import { CvEvaluationModule } from './cv-evaluation/cv-evaluation.module';
 import { validateEnv } from './config/env.validation';
 import { DevicesModule } from './devices/devices.module';
 import { HealthModule } from './health/health.module';
@@ -47,6 +48,7 @@ import { VisionModule } from './vision/vision.module';
     VideoIngestModule,
     PickupDetectionModule,
     PickupFusionModule,
+    CvEvaluationModule,
     JourneyModule,
   ],
 })

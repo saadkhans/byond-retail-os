@@ -107,6 +107,7 @@ export class PickupDetectionController {
       id,
       {
         eventKind: dto.eventKind,
+        testType: dto.testType ?? null,
         productId: dto.productId ?? null,
         actualTimestampMs: dto.actualTimestampMs ?? null,
         quantity: dto.quantity,

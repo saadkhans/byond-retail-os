@@ -335,6 +335,19 @@ class EnvironmentVariables {
   })
   PICKUP_VLM_LEGACY_COMPAT?: string;
 
+  // SHADOW/TEST-ONLY fault-injection drill for the Phase 11 controlled
+  // test-run workflow — NEVER a production setting. UNAVAILABLE makes the
+  // selected verifier report PROVIDER_UNREACHABLE without any network
+  // call; INVALID_SKU synthesizes an invented-SKU completion and pushes
+  // it through the REAL strict parser so the genuine rejection path
+  // (INVALID_SKU → NEEDS_HUMAN_REVIEW) is exercised end-to-end. Default
+  // NONE (no injection, real provider untouched).
+  @IsOptional()
+  @Matches(/^(NONE|UNAVAILABLE|INVALID_SKU)$/, {
+    message: 'PICKUP_VLM_FAULT must be NONE, UNAVAILABLE, or INVALID_SKU',
+  })
+  PICKUP_VLM_FAULT?: string;
+
   // Optional local YOLO ONNX model path for the fusion event detector;
   // absent/empty means the classical motion detector runs alone.
   @IsOptional()

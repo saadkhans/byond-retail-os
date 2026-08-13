@@ -6,6 +6,7 @@ import { formatMs } from '../pickup-detection-utils';
 const OUTCOME_LABEL: Record<string, { label: string; tone: string }> = {
   correct: { label: 'ACCEPTED', tone: 'ok' },
   incorrect: { label: 'INCORRECT', tone: 'down' },
+  quantity_mismatch: { label: 'QUANTITY MISMATCH', tone: 'warn' },
   missed: { label: 'REJECTED (unknown)', tone: 'warn' },
   false_pickup: { label: 'FALSE PICKUP', tone: 'down' },
   true_negative: { label: 'TRUE NEGATIVE', tone: 'ok' },

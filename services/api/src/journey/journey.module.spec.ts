@@ -1,6 +1,10 @@
-import { CustomerJourneyEventType } from '@prisma/client';
+import {
+  CustomerJourneyEventType,
+  JourneyEventReviewDecision,
+} from '@prisma/client';
 import { RequestContext } from '../auth/request-context';
 import { AppendJourneyEventDto } from './dto/append-journey-event.dto';
+import { ReviewJourneyEventDto } from './dto/review-journey-event.dto';
 import { JourneyController } from './journey.module';
 import { JourneyService } from './journey.service';
 
@@ -45,5 +49,55 @@ describe('JourneyController.appendEvent', () => {
     expect(forwarded).not.toHaveProperty('videoAssetId');
     expect(forwarded).not.toHaveProperty('fusionRunId');
     expect(forwarded).not.toHaveProperty('matchScore');
+  });
+});
+
+/**
+ * Same defense-in-depth for the review endpoint: the handler forwards
+ * ONLY the declared review fields — caller-supplied snapshots
+ * (correctedSku / correctedProductName) or attribution (reviewedById)
+ * can never reach the service, which resolves the product within this
+ * tenant and snapshots sku/name itself.
+ */
+describe('JourneyController.reviewEvent', () => {
+  it('forwards only the whitelisted review fields to the service', async () => {
+    const reviewEvent = jest.fn(async (..._args: unknown[]) => ({}));
+    const controller = new JourneyController(
+      { reviewEvent } as unknown as JourneyService,
+    );
+    const body = {
+      decision: JourneyEventReviewDecision.CORRECT,
+      correctedEventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      correctedProductId: 'prod-a',
+      correctedQuantity: 2,
+      reason: 'mislabeled',
+      // Forged snapshot/attribution a caller might try to smuggle in.
+      correctedSku: 'FORGED-SKU',
+      correctedProductName: 'Forged Product',
+      reviewedById: 'someone-else',
+      tenantId: 'tenant-B',
+    } as ReviewJourneyEventDto;
+    await controller.reviewEvent('tenant-1', 'j-1', 'e-1', body, {
+      userId: 'user-1',
+      email: 'reviewer@example.com',
+    } as RequestContext);
+    expect(reviewEvent).toHaveBeenCalledWith(
+      'tenant-1',
+      'j-1',
+      'e-1',
+      {
+        decision: JourneyEventReviewDecision.CORRECT,
+        reason: 'mislabeled',
+        correctedEventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+        correctedProductId: 'prod-a',
+        correctedQuantity: 2,
+      },
+      { id: 'user-1', email: 'reviewer@example.com' },
+    );
+    const forwarded = reviewEvent.mock.calls[0][3] as Record<string, unknown>;
+    expect(forwarded).not.toHaveProperty('correctedSku');
+    expect(forwarded).not.toHaveProperty('correctedProductName');
+    expect(forwarded).not.toHaveProperty('reviewedById');
+    expect(forwarded).not.toHaveProperty('tenantId');
   });
 });

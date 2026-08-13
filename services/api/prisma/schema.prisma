@@ -244,6 +244,7 @@ model Tenant {
   pickupFusionRuns        PickupFusionRun[]
   customerJourneys        CustomerJourney[]
   customerJourneyEvents   CustomerJourneyEvent[]
+  customerJourneyEventReviews CustomerJourneyEventReview[]
   videoExtractionRequests VideoExtractionRequest[]
 }
 
@@ -533,6 +534,7 @@ model Product {
   groundTruths          VideoGroundTruth[]
   referenceEmbeddings   ProductReferenceEmbedding[]
   journeyEvents         CustomerJourneyEvent[]
+  journeyEventReviews   CustomerJourneyEventReview[] @relation("JourneyReviewCorrectedProduct")
 
   @@unique([tenantId, sku])
   @@unique([id, tenantId])
@@ -633,12 +635,36 @@ enum CustomerJourneyEventType {
   REVIEW_REQUIRED
 }
 
+// Phase 11 — the final SHADOW decision of an exited journey. "SETTLE" is
+// deliberately suffixed _SHADOW: no settlement exists; the decision is a
+// recorded conclusion, never a trigger for checkout/order/payment writes.
+enum CustomerJourneyDecision {
+  READY_TO_SETTLE_SHADOW
+  NEEDS_EVENT_REVIEW
+  NEEDS_JOURNEY_REVIEW
+  FAILED
+}
+
+// Phase 11 — reviewer decision over ONE journey event. CORRECT replaces
+// the event's contribution to the fold (product/quantity/kind) without
+// ever rewriting the observation row itself.
+enum JourneyEventReviewDecision {
+  APPROVE
+  REJECT
+  CORRECT
+}
+
 model CustomerJourney {
   id         String                @id @default(cuid())
   tenantId   String
   locationId String
   unitId     String?
   status     CustomerJourneyStatus @default(OPEN)
+  // Phase 11 — final shadow decision, set at exit reconciliation and
+  // recomputed after each event review. Null while the journey is OPEN.
+  decision       CustomerJourneyDecision?
+  decisionReason String?
+  decidedAt      DateTime?
   startedAt  DateTime              @default(now())
   endedAt    DateTime?
   createdAt  DateTime              @default(now())
@@ -648,6 +674,7 @@ model CustomerJourney {
   location Location    @relation(fields: [locationId], references: [id], onDelete: Restrict)
   unit     RetailUnit? @relation(fields: [unitId], references: [id], onDelete: Restrict)
   events   CustomerJourneyEvent[]
+  eventReviews CustomerJourneyEventReview[]
 
   // Anchor for hand-written same-tenant composite FKs
   // (20260811110000_cv_same_tenant_fks).
@@ -681,8 +708,47 @@ model CustomerJourneyEvent {
   tenant  Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   journey CustomerJourney @relation(fields: [journeyId], references: [id], onDelete: Cascade)
   product Product?        @relation(fields: [productId], references: [id], onDelete: Restrict)
+  reviews CustomerJourneyEventReview[]
 
+  // Anchor for the review table's same-tenant composite FK (Phase 11).
+  @@unique([id, tenantId])
   @@index([tenantId, journeyId, occurredAt])
+}
+
+// Phase 11 — APPEND-ONLY (DB triggers reject UPDATE/DELETE, same
+// hardening as VisionEventReview): what a human reviewer decided about
+// one journey observation. The observation row is never rewritten — the
+// basket fold applies the LATEST review per event on read. Every write
+// lands with an AuditLog row in the same transaction. No review path
+// touches checkout, order, payment, or inventory tables.
+model CustomerJourneyEventReview {
+  id        String                     @id @default(cuid())
+  tenantId  String
+  journeyId String
+  eventId   String
+  decision  JourneyEventReviewDecision
+  // CORRECT payload: what the fold should count instead. Snapshots keep
+  // the correction meaningful if the catalog renames later. CHECK
+  // constraints in migration SQL: CORRECT requires product + quantity;
+  // APPROVE/REJECT must carry none; correctedEventType is restricted to
+  // PRODUCT_PICKUP / PRODUCT_RETURN.
+  correctedEventType   CustomerJourneyEventType?
+  correctedProductId   String?
+  correctedSku         String?
+  correctedProductName String?
+  correctedQuantity    Int?
+  reason               String?
+  reviewedById         String?
+  createdAt            DateTime @default(now())
+
+  tenant           Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  journey          CustomerJourney      @relation(fields: [journeyId], references: [id], onDelete: Restrict)
+  event            CustomerJourneyEvent @relation(fields: [eventId], references: [id], onDelete: Restrict)
+  correctedProduct Product?             @relation("JourneyReviewCorrectedProduct", fields: [correctedProductId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@index([tenantId, journeyId, createdAt])
+  @@index([tenantId, eventId, createdAt])
 }
 
 enum FusionPolicyResult {
@@ -726,11 +792,26 @@ enum GroundTruthEventKind {
   NONE
 }
 
+// Phase 11 — which CONTROLLED test scenario a ground-truthed clip
+// exercises, so the evaluation dashboard can break accuracy down per
+// test type. The two VLM_* scenarios are fault-injection drills (via
+// PICKUP_VLM_FAULT) proving the pipeline degrades safely.
+enum CvTestScenario {
+  PICKUP_SINGLE
+  RETURN_SINGLE
+  FALSE_TOUCH
+  TWO_SIMILAR_PICK_ONE
+  TWO_VISIBLE_PICK_ONE
+  VLM_UNAVAILABLE
+  VLM_INVALID_SKU
+}
+
 model VideoGroundTruth {
   id                String               @id @default(cuid())
   tenantId          String
   videoAssetId      String               @unique
   eventKind         GroundTruthEventKind
+  testType          CvTestScenario?
   productId         String?
   actualTimestampMs Int?
   quantity          Int                  @default(1)

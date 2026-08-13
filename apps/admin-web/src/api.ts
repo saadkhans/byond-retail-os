@@ -799,9 +799,21 @@ export interface ImportReport {
 
 export type GroundTruthEventKind = 'PICKUP' | 'RETURN' | 'NONE';
 
+// Phase 11 — which controlled test scenario a ground-truthed clip
+// exercises (the evaluation dashboard breaks accuracy down per scenario).
+export type CvTestScenario =
+  | 'PICKUP_SINGLE'
+  | 'RETURN_SINGLE'
+  | 'FALSE_TOUCH'
+  | 'TWO_SIMILAR_PICK_ONE'
+  | 'TWO_VISIBLE_PICK_ONE'
+  | 'VLM_UNAVAILABLE'
+  | 'VLM_INVALID_SKU';
+
 export interface GroundTruthView {
   videoAssetId: string;
   eventKind: GroundTruthEventKind;
+  testType: CvTestScenario | null;
   productId: string | null;
   sku: string | null;
   productName: string | null;
@@ -814,6 +826,7 @@ export interface GroundTruthView {
 export type ValidationOutcome =
   | 'correct'
   | 'incorrect'
+  | 'quantity_mismatch'
   | 'missed'
   | 'false_pickup'
   | 'true_negative'
@@ -828,6 +841,8 @@ export interface ValidationRow {
   actualEventKind: GroundTruthEventKind;
   actualTimestampMs: number | null;
   predictedSku: string | null;
+  groundTruthQuantity: number;
+  predictedQuantity: number | null;
   matchScore: number | null;
   timestampErrorMs: number | null;
   outcome: ValidationOutcome;
@@ -838,7 +853,14 @@ export interface ValidationRow {
   fusionTopSku: string | null;
   fusionTopScore: number | null;
   fusionPolicy: string | null;
-  fusionVerdict: 'correct' | 'incorrect' | 'missed' | null;
+  fusionVerdict:
+    | 'correct'
+    | 'incorrect'
+    | 'missed'
+    | 'false_pickup'
+    | 'true_negative'
+    | 'unscored'
+    | null;
 }
 
 export interface ValidationSummary {
@@ -948,11 +970,57 @@ export type JourneyEventType =
   | 'PRODUCT_RETURN'
   | 'REVIEW_REQUIRED';
 
+// Phase 11 — final SHADOW decision of an exited journey (recorded
+// conclusion only; never triggers checkout/order/payment writes).
+export type JourneyDecision =
+  | 'READY_TO_SETTLE_SHADOW'
+  | 'NEEDS_EVENT_REVIEW'
+  | 'NEEDS_JOURNEY_REVIEW'
+  | 'FAILED';
+
+export type JourneyReviewDecision = 'APPROVE' | 'REJECT' | 'CORRECT';
+
+/** One append-only reviewer decision over one journey observation. */
+export interface JourneyEventReview {
+  id: string;
+  decision: JourneyReviewDecision;
+  correctedEventType: JourneyEventType | null;
+  correctedProductId: string | null;
+  correctedSku: string | null;
+  correctedProductName: string | null;
+  correctedQuantity: number | null;
+  reason: string | null;
+  reviewedById: string | null;
+  createdAt: string;
+}
+
+/** Safe summary of an imported fusion run (descriptor fields only). */
+export interface JourneyFusionRunSummary {
+  runId: string;
+  videoAssetId: string;
+  pipelineVersion: string;
+  policy: string;
+  fusedTopSku: string | null;
+  /** Uncalibrated ranking score, not a probability. */
+  fusedTopScore: number | null;
+  createdAt: string;
+  vlm: {
+    invoked: boolean;
+    status: string | null;
+    verdict: string | null;
+    selectedSku: string | null;
+    requiresHumanReview: boolean;
+    reasonCodes: string[];
+    contradictions: string[];
+  } | null;
+}
+
 export interface JourneySummary {
   id: string;
   locationId: string;
   unitId: string | null;
   status: string;
+  decision: JourneyDecision | null;
   startedAt: string;
   endedAt: string | null;
   eventCount: number;
@@ -963,6 +1031,9 @@ export interface JourneyDetail {
   locationId: string;
   unitId: string | null;
   status: string;
+  decision: JourneyDecision | null;
+  decisionReason: string | null;
+  decidedAt: string | null;
   startedAt: string;
   endedAt: string | null;
   events: {
@@ -978,7 +1049,85 @@ export interface JourneyDetail {
     videoAssetId: string | null;
     fusionRunId: string | null;
     note: string | null;
+    reviews: JourneyEventReview[];
   }[];
   basket: { productId: string | null; sku: string | null; productName: string | null; quantity: number }[];
   issues: { kind: string; detail: string; eventId?: string }[];
+  fusionRuns: JourneyFusionRunSummary[];
+}
+
+// Phase 11 — CV evaluation dashboard (read-only; only ground-truthed
+// clips are scored, and fused scores are uncalibrated ranking scores).
+export interface RateMetric {
+  numerator: number;
+  denominator: number;
+  rate: number | null;
+}
+
+export interface EvaluationSummary {
+  totals: {
+    groundTruthedClips: number;
+    clipsWithRun: number;
+    clipsWithoutRun: number;
+  };
+  pickupAccuracy: RateMetric;
+  returnAccuracy: RateMetric;
+  falseTouchRejection: RateMetric;
+  skuTop1Accuracy: RateMetric;
+  skuTop3Accuracy: RateMetric;
+  vlmAgreement: {
+    agree: number;
+    disagree: number;
+    abstain: number;
+    denominator: number;
+    rate: number | null;
+  };
+  humanReviewRate: RateMetric;
+  basketExactMatchRate: RateMetric;
+  latency: { stage: string; medianMs: number; samples: number }[];
+  perSku: {
+    sku: string;
+    clips: number;
+    top1Correct: number;
+    top1Rate: number | null;
+  }[];
+  perTestType: {
+    testType: CvTestScenario | 'UNLABELED';
+    clips: number;
+    passed: number;
+    passRate: number | null;
+  }[];
+  scoreNote: string;
+}
+
+export interface EvaluationTestRunRow {
+  videoAssetId: string;
+  originalFilename: string;
+  testType: CvTestScenario | null;
+  groundTruth: {
+    eventKind: GroundTruthEventKind;
+    sku: string | null;
+    quantity: number;
+  };
+  run: {
+    runId: string;
+    createdAt: string;
+    policy: string;
+    predictedKind: 'PICKUP' | 'RETURN' | null;
+    predictedSku: string | null;
+    fusedTopScore: number | null;
+    vlmStatus: string | null;
+    requiresHumanReview: boolean | null;
+  } | null;
+  evaluation: {
+    /** null = unlabeled clip (excluded from pass rates). */
+    pass: boolean | null;
+    expected: string;
+    actual: string;
+  };
+}
+
+export interface EvaluationTestRuns {
+  rows: EvaluationTestRunRow[];
+  scoreNote: string;
 }

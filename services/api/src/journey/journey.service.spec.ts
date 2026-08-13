@@ -4,10 +4,17 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  CustomerJourneyDecision,
   CustomerJourneyEventType,
   CustomerJourneyStatus,
+  JourneyEventReviewDecision,
 } from '@prisma/client';
-import { JourneyService, foldBasket } from './journey.service';
+import {
+  FoldReview,
+  JourneyService,
+  decideJourney,
+  foldBasket,
+} from './journey.service';
 
 const TENANT = 'tenant-1';
 
@@ -36,6 +43,27 @@ function event(
     sku: productId ? `SKU-${productId}` : null,
     productName: productId ? `Product ${productId}` : null,
     quantity,
+  };
+}
+
+let reviewSeq = 0;
+function review(
+  eventId: string,
+  decision: JourneyEventReviewDecision,
+  overrides: Partial<FoldReview> = {},
+): FoldReview {
+  reviewSeq += 1;
+  return {
+    id: `r-${reviewSeq}`,
+    eventId,
+    decision,
+    correctedEventType: null,
+    correctedProductId: null,
+    correctedSku: null,
+    correctedProductName: null,
+    correctedQuantity: null,
+    createdAt: new Date(2026, 0, 1, 0, 0, reviewSeq),
+    ...overrides,
   };
 }
 
@@ -75,6 +103,122 @@ describe('foldBasket (provisional basket = pure fold over events)', () => {
   });
 });
 
+describe('foldBasket with reviews (append-only corrections)', () => {
+  it('REJECT removes the event contribution and raises no issue', () => {
+    const pickup = event(CustomerJourneyEventType.PRODUCT_PICKUP, 'a', 2);
+    const { basket, issues } = foldBasket(
+      [pickup],
+      [review(pickup.id, JourneyEventReviewDecision.REJECT)],
+    );
+    expect(basket).toHaveLength(0);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('APPROVE resolves a REVIEW_REQUIRED observation as a non-event', () => {
+    const flagged = event(CustomerJourneyEventType.REVIEW_REQUIRED);
+    const { basket, issues } = foldBasket(
+      [flagged],
+      [review(flagged.id, JourneyEventReviewDecision.APPROVE)],
+    );
+    expect(basket).toHaveLength(0);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('APPROVE keeps a product event counting as-is', () => {
+    const pickup = event(CustomerJourneyEventType.PRODUCT_PICKUP, 'a', 2);
+    const { basket } = foldBasket(
+      [pickup],
+      [review(pickup.id, JourneyEventReviewDecision.APPROVE)],
+    );
+    expect(basket).toEqual([
+      expect.objectContaining({ productId: 'a', quantity: 2 }),
+    ]);
+  });
+
+  it('CORRECT replaces product, quantity, and kind in the fold', () => {
+    const flagged = event(CustomerJourneyEventType.REVIEW_REQUIRED);
+    const { basket, issues } = foldBasket(
+      [flagged],
+      [
+        review(flagged.id, JourneyEventReviewDecision.CORRECT, {
+          correctedEventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+          correctedProductId: 'b',
+          correctedSku: 'SKU-b',
+          correctedProductName: 'Product b',
+          correctedQuantity: 3,
+        }),
+      ],
+    );
+    expect(basket).toEqual([
+      expect.objectContaining({ productId: 'b', sku: 'SKU-b', quantity: 3 }),
+    ]);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('the LATEST review per event wins (append-only history, last decision rules)', () => {
+    const pickup = event(CustomerJourneyEventType.PRODUCT_PICKUP, 'a', 1);
+    const { basket } = foldBasket(
+      [pickup],
+      [
+        review(pickup.id, JourneyEventReviewDecision.REJECT),
+        review(pickup.id, JourneyEventReviewDecision.APPROVE),
+      ],
+    );
+    expect(basket).toEqual([
+      expect.objectContaining({ productId: 'a', quantity: 1 }),
+    ]);
+  });
+
+  it('corrected events still surface fold-arithmetic issues (a correction fixes the observation, not the journey)', () => {
+    const flagged = event(CustomerJourneyEventType.REVIEW_REQUIRED);
+    const { issues } = foldBasket(
+      [flagged],
+      [
+        review(flagged.id, JourneyEventReviewDecision.CORRECT, {
+          correctedEventType: CustomerJourneyEventType.PRODUCT_RETURN,
+          correctedProductId: 'b',
+          correctedSku: 'SKU-b',
+          correctedProductName: 'Product b',
+          correctedQuantity: 1,
+        }),
+      ],
+    );
+    const kinds = issues.map((issue) => issue.kind).sort();
+    expect(kinds).toEqual(['NEGATIVE_QUANTITY', 'RETURN_WITHOUT_PICKUP']);
+  });
+});
+
+describe('decideJourney (final shadow decision)', () => {
+  it('clean journeys are READY_TO_SETTLE_SHADOW', () => {
+    const { decision } = decideJourney([]);
+    expect(decision).toBe(CustomerJourneyDecision.READY_TO_SETTLE_SHADOW);
+  });
+
+  it('unresolved event issues need event review', () => {
+    const { decision } = decideJourney([
+      { kind: 'REVIEW_EVENT', detail: 'x' },
+      { kind: 'UNKNOWN_PRODUCT_EVENT', detail: 'y' },
+    ]);
+    expect(decision).toBe(CustomerJourneyDecision.NEEDS_EVENT_REVIEW);
+  });
+
+  it('journey-level inconsistencies outrank event issues', () => {
+    const { decision, reason } = decideJourney([
+      { kind: 'REVIEW_EVENT', detail: 'x' },
+      { kind: 'RETURN_WITHOUT_PICKUP', detail: 'y' },
+    ]);
+    expect(decision).toBe(CustomerJourneyDecision.NEEDS_JOURNEY_REVIEW);
+    expect(reason).toContain('1');
+  });
+
+  it('NEGATIVE_QUANTITY is journey-level', () => {
+    const { decision } = decideJourney([
+      { kind: 'NEGATIVE_QUANTITY', detail: 'x' },
+    ]);
+    expect(decision).toBe(CustomerJourneyDecision.NEEDS_JOURNEY_REVIEW);
+  });
+});
+
 /**
  * The prisma mock exposes ONLY journey tables + read-only product/location
  * lookups — any attempt by the service to touch checkout sessions, orders,
@@ -92,12 +236,16 @@ function buildService(overrides: {
   unit?: { id: string } | null;
 } = {}) {
   const createdEvents: Record<string, unknown>[] = [];
+  const createdReviews: Record<string, unknown>[] = [];
   const journeyRow = {
     id: 'j-1',
     tenantId: TENANT,
     locationId: 'store-1',
     unitId: null,
     status: overrides.journeyStatus ?? CustomerJourneyStatus.OPEN,
+    decision: null as unknown,
+    decisionReason: null as unknown,
+    decidedAt: null as unknown,
     startedAt: new Date(),
     endedAt: null,
     events: [] as Record<string, unknown>[],
@@ -138,20 +286,41 @@ function buildService(overrides: {
       }),
       findFirst: jest.fn(
         async (args: {
-          where?: { videoAssetId?: string; sourceType?: string };
-        }) =>
-          journeyRow.events.find(
-            (row) =>
-              args.where?.videoAssetId !== undefined &&
-              row.videoAssetId === args.where.videoAssetId &&
-              (args.where.sourceType === undefined ||
-                row.sourceType === args.where.sourceType),
-          ) ?? null,
+          where?: { id?: string; videoAssetId?: string; sourceType?: string };
+        }) => {
+          if (args.where?.id !== undefined) {
+            return (
+              journeyRow.events.find((row) => row.id === args.where?.id) ?? null
+            );
+          }
+          return (
+            journeyRow.events.find(
+              (row) =>
+                args.where?.videoAssetId !== undefined &&
+                row.videoAssetId === args.where.videoAssetId &&
+                (args.where.sourceType === undefined ||
+                  row.sourceType === args.where.sourceType),
+            ) ?? null
+          );
+        },
       ),
       findMany: jest.fn(async () => journeyRow.events),
     },
+    customerJourneyEventReview: {
+      create: jest.fn(async (args: { data: Record<string, unknown> }) => {
+        const row = {
+          id: `r-${createdReviews.length + 1}`,
+          createdAt: new Date(2026, 0, 2, 0, 0, createdReviews.length),
+          ...args.data,
+        };
+        createdReviews.push(row);
+        return row;
+      }),
+      findMany: jest.fn(async () => createdReviews),
+    },
     pickupFusionRun: {
       findFirst: jest.fn(async () => overrides.fusionRun ?? null),
+      findMany: jest.fn(async () => []),
     },
     $queryRaw: jest.fn(async () => []),
   };
@@ -160,11 +329,14 @@ function buildService(overrides: {
   prisma.$transaction = jest.fn(
     async (fn: (tx: unknown) => Promise<unknown>) => fn(prisma),
   );
+  const audit = { record: jest.fn(async () => undefined) };
   /* eslint-enable @typescript-eslint/no-explicit-any */
   return {
-    service: new JourneyService(prisma as never),
+    service: new JourneyService(prisma as never, audit as never),
     prisma,
+    audit,
     createdEvents,
+    createdReviews,
     journeyRow,
   };
 }
@@ -476,5 +648,271 @@ describe('JourneyService', () => {
     ).rejects.toBeInstanceOf(ConflictException);
     // And the lock was actually taken before the check.
     expect(prisma.$queryRaw).toHaveBeenCalled();
+  });
+
+  it('exit persists the final SHADOW decision with its reason', async () => {
+    const { service, journeyRow } = buildService();
+    await service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+    });
+    await service.exit(TENANT, 'j-1');
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.RECONCILED);
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+    expect(journeyRow.decisionReason).toEqual(expect.any(String));
+    expect(journeyRow.decidedAt).toBeInstanceOf(Date);
+  });
+
+  it('exit decides NEEDS_EVENT_REVIEW for unresolved observations', async () => {
+    const { service, journeyRow } = buildService();
+    await service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+    });
+    await service.exit(TENANT, 'j-1');
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.REVIEW_REQUIRED);
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+  });
+
+  it('exit decides NEEDS_JOURNEY_REVIEW for journey-level inconsistencies', async () => {
+    const { service, journeyRow } = buildService();
+    await service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_RETURN,
+      productId: 'prod-a',
+    });
+    await service.exit(TENANT, 'j-1');
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.REVIEW_REQUIRED);
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_JOURNEY_REVIEW,
+    );
+  });
+
+  it('exit persists FAILED when reconciliation itself throws', async () => {
+    const { service, prisma, journeyRow } = buildService();
+    // The post-EXIT fold read blows up — the journey must not present a
+    // half-computed basket as settled.
+    prisma.customerJourneyEventReview.findMany.mockRejectedValueOnce(
+      new Error('storage failure'),
+    );
+    await service.exit(TENANT, 'j-1');
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.REVIEW_REQUIRED);
+    expect(journeyRow.decision).toBe(CustomerJourneyDecision.FAILED);
+  });
+});
+
+describe('JourneyService.reviewEvent', () => {
+  const ACTOR = { id: 'user-1', email: 'reviewer@example.com' };
+
+  async function withPickupEvent(
+    overrides: Parameters<typeof buildService>[0] = {},
+  ) {
+    const built = buildService(overrides);
+    // Seed the observation directly so the journey status override applies
+    // to the review, not the append.
+    built.journeyRow.events.push({
+      id: 'e-1',
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+      sku: 'SKU-A',
+      productName: 'Product A',
+      quantity: 1,
+    });
+    return built;
+  }
+
+  it('rejects reviews on non-reviewable event types', async () => {
+    const built = buildService();
+    built.journeyRow.events.push({
+      id: 'e-1',
+      eventType: CustomerJourneyEventType.SHELF_INTERACTION,
+      productId: null,
+      sku: null,
+      productName: null,
+      quantity: 1,
+    });
+    await expect(
+      built.service.reviewEvent(
+        TENANT,
+        'j-1',
+        'e-1',
+        { decision: JourneyEventReviewDecision.APPROVE },
+        ACTOR,
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('404s an event id that does not resolve within this tenant + journey', async () => {
+    const built = await withPickupEvent();
+    await expect(
+      built.service.reviewEvent(
+        TENANT,
+        'j-1',
+        'e-foreign',
+        { decision: JourneyEventReviewDecision.APPROVE },
+        ACTOR,
+      ),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(built.createdReviews).toHaveLength(0);
+  });
+
+  it('CORRECT requires a product and an in-range quantity', async () => {
+    const built = await withPickupEvent();
+    await expect(
+      built.service.reviewEvent(
+        TENANT,
+        'j-1',
+        'e-1',
+        { decision: JourneyEventReviewDecision.CORRECT },
+        ACTOR,
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    await expect(
+      built.service.reviewEvent(
+        TENANT,
+        'j-1',
+        'e-1',
+        {
+          decision: JourneyEventReviewDecision.CORRECT,
+          correctedProductId: 'prod-a',
+          correctedQuantity: 0,
+        },
+        ACTOR,
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('APPROVE/REJECT must not smuggle corrected fields', async () => {
+    const built = await withPickupEvent();
+    await expect(
+      built.service.reviewEvent(
+        TENANT,
+        'j-1',
+        'e-1',
+        {
+          decision: JourneyEventReviewDecision.APPROVE,
+          correctedProductId: 'prod-b',
+        },
+        ACTOR,
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('rejects a reason carrying payment-bearing content', async () => {
+    const built = await withPickupEvent();
+    await expect(
+      built.service.reviewEvent(
+        TENANT,
+        'j-1',
+        'e-1',
+        {
+          decision: JourneyEventReviewDecision.REJECT,
+          reason: 'shopper card 4242 4242 4242 4242',
+        },
+        ACTOR,
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(built.createdReviews).toHaveLength(0);
+  });
+
+  it('CORRECT on a REVIEW_REQUIRED observation requires the corrected kind', async () => {
+    const built = buildService();
+    built.journeyRow.events.push({
+      id: 'e-1',
+      eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+      productId: null,
+      sku: null,
+      productName: null,
+      quantity: 1,
+    });
+    await expect(
+      built.service.reviewEvent(
+        TENANT,
+        'j-1',
+        'e-1',
+        {
+          decision: JourneyEventReviewDecision.CORRECT,
+          correctedProductId: 'prod-a',
+          correctedQuantity: 1,
+        },
+        ACTOR,
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('writes the review AND its audit row in the SAME transaction, with the product snapshot', async () => {
+    const built = await withPickupEvent();
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-1',
+      {
+        decision: JourneyEventReviewDecision.CORRECT,
+        correctedProductId: 'prod-a',
+        correctedQuantity: 2,
+        reason: 'shopper took two',
+      },
+      ACTOR,
+    );
+    expect(built.createdReviews[0]).toMatchObject({
+      decision: JourneyEventReviewDecision.CORRECT,
+      correctedEventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      correctedProductId: 'prod-a',
+      correctedSku: 'SKU-A',
+      correctedProductName: 'Product A',
+      correctedQuantity: 2,
+      reviewedById: ACTOR.id,
+    });
+    // The audit entry is handed the SAME transaction client the review
+    // used — commit or roll back together (fail closed).
+    expect(built.audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'OVERRIDE',
+        entityType: 'CustomerJourneyEvent',
+        entityId: 'e-1',
+        actorEmail: ACTOR.email,
+      }),
+      built.prisma,
+    );
+  });
+
+  it('a review on a CLOSED journey re-settles the final decision in the same transaction', async () => {
+    const built = buildService({
+      journeyStatus: CustomerJourneyStatus.REVIEW_REQUIRED,
+    });
+    built.journeyRow.events.push({
+      id: 'e-1',
+      eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+      productId: null,
+      sku: null,
+      productName: null,
+      quantity: 1,
+    });
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-1',
+      { decision: JourneyEventReviewDecision.APPROVE },
+      ACTOR,
+    );
+    expect(built.journeyRow.status).toBe(CustomerJourneyStatus.RECONCILED);
+    expect(built.journeyRow.decision).toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+  });
+
+  it('a review on an OPEN journey records the decision for exit-time reconciliation only', async () => {
+    const built = await withPickupEvent();
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-1',
+      { decision: JourneyEventReviewDecision.APPROVE },
+      ACTOR,
+    );
+    expect(built.createdReviews).toHaveLength(1);
+    expect(built.journeyRow.decision).toBeNull();
   });
 });
