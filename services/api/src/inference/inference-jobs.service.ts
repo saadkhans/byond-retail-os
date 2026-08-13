@@ -254,10 +254,24 @@ export class InferenceJobsService {
     private readonly platformModulesService: PlatformModulesService,
   ) {}
 
+  /**
+   * Creates (or idempotently replays) an inference job.
+   *
+   * `options.createPendingLink` is an INTERNAL, service-only opt-in — it is
+   * deliberately NOT part of CreateInferenceJobDto, so no HTTP client can
+   * mint non-claimable jobs. Callers that must commit a downstream link
+   * before the work may be delivered (video-ingest's crop artifact → job
+   * link) create the job PENDING_LINK, commit their link, and then call
+   * publishPendingLinkJob(). A crash between the two leaves a job NO worker
+   * can claim, still discoverable by its idempotency key
+   * (findByIdempotencyKey) and cancellable (cancelOrphanedJob). Absent or
+   * false, creation is byte-identical to Phase 9: a directly QUEUED job.
+   */
   async create(
     tenantId: string,
     dto: CreateInferenceJobDto,
     actor?: AuditActor,
+    options?: { createPendingLink?: boolean },
   ): Promise<InferenceJobDetail> {
     assertOpaque('sourceId', dto.sourceId);
     assertOpaque('idempotencyKey', dto.idempotencyKey);
@@ -281,6 +295,7 @@ export class InferenceJobsService {
             | undefined,
           idempotencyKey: dto.idempotencyKey,
           createdById: actor?.id,
+          pendingLink: options?.createPendingLink === true,
         },
         (job) =>
           this.auditEntry(tenantId, actor, {
@@ -288,7 +303,11 @@ export class InferenceJobsService {
             entityType: 'InferenceJob',
             entityId: job.id,
             after: job,
-            reason: `Inference job queued (${job.jobType})`,
+            reason:
+              options?.createPendingLink === true
+                ? `Inference job created pending link (${job.jobType}); it ` +
+                  'is not claimable until published'
+                : `Inference job queued (${job.jobType})`,
           }),
       );
     } catch (error) {
@@ -350,6 +369,104 @@ export class InferenceJobsService {
       );
     }
     return result.job;
+  }
+
+  /**
+   * INTERNAL service-only seam (no controller route): the SECOND phase of
+   * two-phase creation. Publishes a job created with
+   * `{ createPendingLink: true }` once the caller's downstream link has
+   * COMMITTED — PENDING_LINK → QUEUED as an audited compare-and-set, which
+   * is the moment the work becomes claimable. Routed through the QUEUE
+   * PORT (never the repository): publication is a queue-lifecycle mutation,
+   * and a broker-backed implementation enqueues its message here.
+   *
+   * Returns the published job, or the controlled rejection 'not-pending'
+   * when the row is not PENDING_LINK — already published (a replayed
+   * publish), cancelled by a concurrent asset delete, or missing in this
+   * tenant. Like cancelOrphanedJob this NEVER throws HTTP errors: the
+   * caller decides whether a lost publish is a retry, a 409, or a no-op.
+   */
+  async publishPendingLinkJob(
+    tenantId: string,
+    jobId: string,
+    actor?: AuditActor,
+  ): Promise<InferenceJobDetail | 'not-pending'> {
+    const result = await this.queue.publishPendingLink(
+      tenantId,
+      jobId,
+      (before, after) =>
+        this.auditEntry(tenantId, actor, {
+          action: AuditAction.UPDATE,
+          entityType: 'InferenceJob',
+          entityId: after.id,
+          before,
+          after,
+          reason:
+            'Inference job published to the queue: its downstream link ' +
+            'committed, so the job is now claimable',
+        }),
+    );
+    return result === null || result === 'not-pending' ? 'not-pending' : result;
+  }
+
+  /**
+   * INTERNAL service-only seam (no controller route): tenant-scoped
+   * discovery by the caller's DETERMINISTIC idempotency key — how a
+   * crash-window job is found when the link that would have made it
+   * reachable never committed (video-ingest's key is
+   * `video-crop:<artifactId>`). Returns the job WITH its status (so the
+   * caller can decide between publishing and cancelling it) or null when
+   * this tenant has no job under that key. Never throws NotFound: absence
+   * is the normal answer.
+   */
+  findByIdempotencyKey(
+    tenantId: string,
+    idempotencyKey: string,
+  ): Promise<InferenceJobDetail | null> {
+    return this.jobsRepository.findByIdempotencyKey(tenantId, idempotencyKey);
+  }
+
+  /**
+   * INTERNAL service-only seam (no controller route): compensation for a
+   * caller whose downstream linkage to a just-created job failed
+   * permanently — e.g. video-ingest's crop → job link losing the race with
+   * the source asset's deletion — leaving the job as orphan work nothing
+   * will ever consume. Transitions PENDING_LINK/QUEUED → CANCELLED, as an
+   * audited (CANCEL) compare-and-set: a job whose link never committed
+   * (still PENDING_LINK after a crash) retires exactly like a published
+   * one, which is what lets a later DELETE clean the crash window. A job
+   * already claimed (RUNNING) or finished
+   * returns 'not-cancellable' so the caller records the orphan condition
+   * instead — this path never throws HTTP errors, because it runs while a
+   * different controlled error is already being surfaced. `reason` is
+   * composed by the internal caller (never end-user input) and lands in
+   * the audit trail verbatim. The cancellation goes through the QUEUE
+   * PORT (never the repository directly): withdrawing queued work is a
+   * queue-lifecycle mutation, and a broker-backed port implementation
+   * must learn about it to drop the message.
+   */
+  async cancelOrphanedJob(
+    tenantId: string,
+    jobId: string,
+    reason: string,
+    actor?: AuditActor,
+  ): Promise<InferenceJobDetail | 'not-cancellable'> {
+    const result = await this.queue.cancelQueued(
+      tenantId,
+      jobId,
+      (before, after) =>
+        this.auditEntry(tenantId, actor, {
+          action: AuditAction.CANCEL,
+          entityType: 'InferenceJob',
+          entityId: after.id,
+          before,
+          after,
+          reason,
+        }),
+    );
+    return result === null || result === 'not-queued'
+      ? 'not-cancellable'
+      : result;
   }
 
   async search(
@@ -431,7 +548,9 @@ export class InferenceJobsService {
       result === 'lease-superseded'
     ) {
       throw new ConflictException(
-        'Only a QUEUED job can be started; this job is already running',
+        'Only a QUEUED job can be started; this job is already running, or ' +
+          'is still pending its downstream link and has not been published ' +
+          'to the queue yet',
       );
     }
     return result;
@@ -469,7 +588,10 @@ export class InferenceJobsService {
     const job = await this.findById(tenantId, jobId);
     if (job.status !== InferenceJobStatus.RUNNING) {
       throw new ConflictException(
-        job.status === InferenceJobStatus.QUEUED
+        // PENDING_LINK is non-terminal too (it has not even been published
+        // to the queue yet), so it must not be reported as "finished".
+        job.status === InferenceJobStatus.QUEUED ||
+        job.status === InferenceJobStatus.PENDING_LINK
           ? 'Only a RUNNING job can be completed; start it first'
           : 'This job has already finished (succeeded, failed, or ' +
             'cancelled); terminal jobs never transition again',
@@ -563,7 +685,17 @@ export class InferenceJobsService {
     // dto.attempt (never this fresh read) — a stale worker whose lease was
     // reclaimed and re-claimed must not fail the attempt that superseded
     // its own.
-    await this.findById(tenantId, jobId);
+    const existing = await this.findById(tenantId, jobId);
+    // A job still awaiting its downstream link was never published to the
+    // queue, so no worker can have run (or failed) it: reporting a failure
+    // against it is a controlled 409, not a silent 'terminal' rejection
+    // from the CAS. Retiring such a job is cancelOrphanedJob's business.
+    if (existing.status === InferenceJobStatus.PENDING_LINK) {
+      throw new ConflictException(
+        'This job is still pending its downstream link and was never ' +
+          'published to the queue, so it cannot be failed; cancel it instead',
+      );
+    }
     const result = await this.queue.fail(
       tenantId,
       jobId,

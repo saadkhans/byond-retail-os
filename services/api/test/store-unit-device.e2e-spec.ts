@@ -313,6 +313,10 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
         tenantStatuses[String(where.id)]
           ? { status: tenantStatuses[String(where.id)] }
           : null,
+      // Platform-sandbox lookup (AuthGuard): no sandbox tenant in these
+      // fixtures, so platform users keep a NULL tenant context and every
+      // tenant-scoped route stays 403 for them.
+      findFirst: async () => null,
     },
     platformModule: {
       findUnique: async ({ where }: { where: Where }) =>

@@ -657,6 +657,12 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
       },
     },
     auditLog: { create: auditCreateSpy },
+    tenant: {
+      // Platform-sandbox lookup (AuthGuard): no sandbox tenant in these
+      // fixtures, so platform users keep a NULL tenant context and every
+      // tenant-scoped route stays 403 for them.
+      findFirst: async () => null,
+    },
     evidenceBundle: {
       findFirst: async ({ where }: { where: Where }) =>
         evidenceBundles.find(

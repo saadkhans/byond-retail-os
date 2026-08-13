@@ -48,4 +48,9 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   { code: 'inference:manage', module: 'inference', description: 'Create inference jobs and drive their lifecycle (start, fail)' },
   { code: 'inference:simulate', module: 'inference', description: 'Complete jobs with simulated adapter output (no real model execution)' },
   { code: 'inference:apply', module: 'inference', description: 'Convert a successful inference result into a Phase 7 vision event' },
+  { code: 'video-asset:read', module: 'video-ingest', description: 'View video assets and their frame/crop artifacts' },
+  { code: 'video-asset:manage', module: 'video-ingest', description: 'Upload controlled test videos and manage their metadata' },
+  { code: 'video-asset:screen', module: 'video-ingest', description: 'Record the audited frame-content screening decision that releases (QUARANTINED to UPLOADED) or rejects (media removed) a quarantined upload' },
+  { code: 'video-asset:process', module: 'video-ingest', description: 'Validate videos, extract frames/crops, and create inference jobs from crops' },
+  { code: 'video-asset:delete', module: 'video-ingest', description: 'Delete video assets (removes the local file, keeps audited metadata)' },
 ];

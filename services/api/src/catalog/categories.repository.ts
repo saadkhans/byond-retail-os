@@ -86,7 +86,7 @@ export class CategoriesRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${categoryAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
 
       // Serialize every category-tree MOVE within a tenant. Without this, two
       // concurrent reparents can each validate against the old tree and commit
@@ -96,7 +96,7 @@ export class CategoriesRepository extends TenantScopedRepository {
       // against the first's committed change. Only taken when a parent is
       // actually being set (parentId is a non-null string).
       if (typeof data.parentId === 'string') {
-        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`category-tree:${scopedTenantId}`}))`;
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`category-tree:${scopedTenantId}`}))::text`;
       }
 
       const before = await tx.productCategory.findFirst({
@@ -148,7 +148,7 @@ export class CategoriesRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${categoryAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const existing = await tx.productCategory.findFirst({
         where: { id, tenantId: scopedTenantId },
       });

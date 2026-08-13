@@ -1,0 +1,2093 @@
+import { spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { PassThrough } from 'node:stream';
+import { LocalVideoStorageAdapter } from '../storage/local-video-storage.adapter';
+import {
+  buildAllFramesArgs,
+  buildCapabilityProbeArgs,
+  buildCropArgs,
+  buildFrameArgs,
+  buildProbeArgs,
+  buildVersionArgs,
+  classifyCommandError,
+  COMMAND_TIMEOUT_MS,
+  FfmpegVideoFrameExtractor,
+  MAX_OUTPUT_BYTES,
+  MAX_PROBE_DIMENSION,
+  MAX_PROBE_DURATION_MS,
+  MAX_TOTAL_EXTRACTION_BYTES,
+  parseProbeOutput,
+  TIMEOUT_ATTRIBUTION_TOLERANCE_MS,
+  TOOLING_READY_TIMEOUT_MS,
+  TOOLING_READY_TTL_MS,
+  UNSTREAMABLE_CONTAINER_MESSAGE,
+} from './ffmpeg-extractor.adapter';
+
+// The screening decode SPAWNS ffmpeg and consumes its stdout incrementally,
+// so the child-process module is mocked wholesale: no test ever starts a
+// real process, and the specs drive a fake stdout stream chunk by chunk.
+// (execFile is only reached by the default injected runner, which no test
+// uses — every command-runner test injects its own.)
+jest.mock('node:child_process', () => ({
+  execFile: jest.fn(),
+  spawn: jest.fn(),
+}));
+
+// The adapter must NEVER touch the filesystem — the buffer-inspection path
+// is in-memory only (stdin/pipes, no scratch files). The fs layer stays
+// mocked wholesale (the storage adapter import shares the module) so the
+// specs can ASSERT that no fs call is ever made by the inspection path.
+jest.mock('node:fs/promises', () => ({
+  chmod: jest.fn(async () => undefined),
+  mkdir: jest.fn(async () => undefined),
+  mkdtemp: jest.fn(async (prefix: string) => `${prefix}abc123`),
+  readdir: jest.fn(async () => []),
+  readFile: jest.fn(async () => Buffer.alloc(0)),
+  rename: jest.fn(async () => undefined),
+  rm: jest.fn(async () => undefined),
+  stat: jest.fn(async () => ({})),
+  unlink: jest.fn(async () => undefined),
+  writeFile: jest.fn(async () => undefined),
+}));
+import {
+  ExtractionFailedError,
+  ExtractionInfrastructureError,
+  ExtractorUnavailableError,
+  FrameCountExceededError,
+  FrameExceedsBudgetError,
+  FrameUnavailableError,
+  ScreeningDeadlineExceededError,
+} from './video-frame-extractor.port';
+
+const spawnMock = spawn as unknown as jest.Mock;
+
+/**
+ * The optional system-binary adapter NEVER spawns a process in tests: the
+ * command runner is injected. These specs pin the two safety invariants —
+ * argument vectors built ONLY from validated integers and the confined
+ * internal path, and controlled errors that never echo stderr or paths.
+ */
+// The CONCRETE local adapter type (path capability lives there, not on the
+// provider-neutral VideoStoragePort).
+const storageStub = {
+  internalPathFor: (key: string) => `/confined/root/${key}`,
+} as unknown as LocalVideoStorageAdapter;
+
+beforeEach(() => {
+  // Every spec asserts on THIS test's spawns (several assert none at all).
+  spawnMock.mockReset();
+});
+
+describe('argument builders', () => {
+  it('builds probe args as a fixed vector ending in the internal path', () => {
+    expect(buildProbeArgs('/confined/root/a/original.mp4')).toEqual([
+      '-v',
+      'error',
+      '-print_format',
+      'json',
+      '-show_format',
+      '-show_streams',
+      '-select_streams',
+      'v:0',
+      '/confined/root/a/original.mp4',
+    ]);
+  });
+
+  it('renders timestamps as fixed-point seconds and crop boxes as integers', () => {
+    const frame = buildFrameArgs('/p/v.mp4', 2500);
+    expect(frame).toContain('2.500');
+    const crop = buildCropArgs('/p/v.mp4', 1000, {
+      x: 10,
+      y: 20,
+      width: 300,
+      height: 200,
+    });
+    expect(crop).toContain('crop=300:200:10:20');
+  });
+
+  it.each([
+    [Number.NaN],
+    [1.5],
+    [-1],
+    [Number.POSITIVE_INFINITY],
+    [2_147_483_648],
+  ])('rejects non-integer/out-of-range numeric input %p', (bad) => {
+    expect(() => buildFrameArgs('/p/v.mp4', bad)).toThrow(
+      ExtractionFailedError,
+    );
+    expect(() =>
+      buildCropArgs('/p/v.mp4', 0, { x: bad, y: 0, width: 1, height: 1 }),
+    ).toThrow(ExtractionFailedError);
+  });
+
+  it('never produces a shell-interpretable compound argument', () => {
+    // Args are execFile vectors (no shell), but keep them clean anyway.
+    const args = buildCropArgs('/p/v.mp4', 1000, {
+      x: 1,
+      y: 2,
+      width: 3,
+      height: 4,
+    });
+    for (const arg of args.slice(0, -1)) {
+      expect(arg).not.toMatch(/[;&|><`$]/);
+    }
+  });
+});
+
+describe('parseProbeOutput', () => {
+  it('parses stream metadata into probe results', () => {
+    const probe = parseProbeOutput(
+      JSON.stringify({
+        streams: [
+          { width: 1920, height: 1080, r_frame_rate: '30000/1001', duration: '12.5' },
+        ],
+      }),
+    );
+    expect(probe.durationMs).toBe(12_500);
+    expect(probe.width).toBe(1920);
+    expect(probe.height).toBe(1080);
+    expect(probe.fps).toBeCloseTo(29.97, 2);
+  });
+
+  it('falls back to format duration and rejects unusable metadata', () => {
+    const probe = parseProbeOutput(
+      JSON.stringify({
+        streams: [{ width: 640, height: 480, r_frame_rate: '25/1' }],
+        format: { duration: '3.0' },
+      }),
+    );
+    expect(probe.durationMs).toBe(3000);
+    for (const bad of [
+      '{not json',
+      JSON.stringify({}),
+      JSON.stringify({ streams: [{ width: 0, height: 480, r_frame_rate: '25/1', duration: '3' }] }),
+      JSON.stringify({ streams: [{ width: 640, height: 480, r_frame_rate: '0/0', duration: '3' }] }),
+    ]) {
+      expect(() => parseProbeOutput(bad)).toThrow(ExtractionFailedError);
+    }
+  });
+
+  it('bounds attacker-supplied probe metadata (duration, geometry, pixels, fps)', () => {
+    const probe = (overrides: Record<string, unknown>) =>
+      JSON.stringify({
+        streams: [
+          {
+            width: 1920,
+            height: 1080,
+            r_frame_rate: '30/1',
+            duration: '12.5',
+            ...overrides,
+          },
+        ],
+      });
+    // A tiny crafted container can CLAIM any metadata: oversized duration
+    // would overflow the PG Int column, oversized geometry would balloon
+    // later full-frame decodes. All controlled rejections.
+    for (const bad of [
+      probe({ duration: String(MAX_PROBE_DURATION_MS / 1000 + 1) }),
+      probe({ width: MAX_PROBE_DIMENSION + 1 }),
+      probe({ height: MAX_PROBE_DIMENSION + 1 }),
+      probe({ width: 16_000, height: 16_000 }), // per-axis ok, pixels not
+      probe({ r_frame_rate: '100000/1' }),
+      probe({ duration: '2147483648' }),
+    ]) {
+      expect(() => parseProbeOutput(bad)).toThrow(ExtractionFailedError);
+    }
+    // Boundary values stay accepted.
+    expect(
+      parseProbeOutput(probe({ duration: '3600', width: 7680, height: 4320 })),
+    ).toMatchObject({ durationMs: 3_600_000, width: 7680 });
+    // Sub-millisecond durations ROUND to 0 and must reject (the DB CHECK
+    // requires durationMs > 0 — an accepted 0 would 500 at persistence).
+    expect(() => parseProbeOutput(probe({ duration: '0.0001' }))).toThrow(
+      ExtractionFailedError,
+    );
+  });
+
+  it('prefers avg_frame_rate so VFR sources are not bounced off the fps cap', () => {
+    // Screen recordings / MediaRecorder output report the container TICK
+    // rate in r_frame_rate (can read 1000+); avg_frame_rate carries the
+    // honest rate. A legitimate VFR clip must probe fine.
+    const vfr = parseProbeOutput(
+      JSON.stringify({
+        streams: [
+          {
+            width: 1280,
+            height: 720,
+            r_frame_rate: '90000/1',
+            avg_frame_rate: '2997/100',
+            duration: '10.0',
+          },
+        ],
+      }),
+    );
+    expect(vfr.fps).toBeCloseTo(29.97, 2);
+    // Degenerate avg ("0/0") falls back to r_frame_rate.
+    const cfr = parseProbeOutput(
+      JSON.stringify({
+        streams: [
+          {
+            width: 1280,
+            height: 720,
+            r_frame_rate: '30/1',
+            avg_frame_rate: '0/0',
+            duration: '10.0',
+          },
+        ],
+      }),
+    );
+    expect(cfr.fps).toBe(30);
+  });
+
+  it('reports DISPLAY geometry for rotated (portrait phone) videos', () => {
+    // Phones store landscape coded dimensions + a ±90° rotation side-data;
+    // ffmpeg autorotates extraction output, so the probe must report the
+    // rotated axes or crop bounds validate against the wrong dimensions.
+    const portrait = parseProbeOutput(
+      JSON.stringify({
+        streams: [
+          {
+            width: 1920,
+            height: 1080,
+            r_frame_rate: '30/1',
+            duration: '10.0',
+            side_data_list: [{ rotation: -90 }],
+          },
+        ],
+      }),
+    );
+    expect(portrait.width).toBe(1080);
+    expect(portrait.height).toBe(1920);
+    // 180° keeps the axes.
+    const upsideDown = parseProbeOutput(
+      JSON.stringify({
+        streams: [
+          {
+            width: 1920,
+            height: 1080,
+            r_frame_rate: '30/1',
+            duration: '10.0',
+            side_data_list: [{ rotation: 180 }],
+          },
+        ],
+      }),
+    );
+    expect(upsideDown.width).toBe(1920);
+  });
+});
+
+describe('FfmpegVideoFrameExtractor (mocked command runner)', () => {
+  it('maps a missing binary to a controlled unavailable error', async () => {
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () => {
+      const error = new Error('spawn ENOENT') as NodeJS.ErrnoException;
+      error.code = 'ENOENT';
+      return Promise.reject(error);
+    });
+    await expect(extractor.probe('a/original.mp4')).rejects.toBeInstanceOf(
+      ExtractorUnavailableError,
+    );
+  });
+
+  it('maps a failing command to a controlled failure that never echoes stderr', async () => {
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.reject(new Error('ffmpeg exploded: /secret/path/original.mp4')),
+    );
+    await expect(
+      extractor.extractFrameAt(
+        'a/original.mp4',
+        { durationMs: 10_000, width: 100, height: 100, fps: 30 },
+        0,
+      ),
+    ).rejects.toMatchObject({
+      name: 'ExtractionFailedError',
+      message: expect.not.stringContaining('/secret/path') as unknown,
+    });
+  });
+
+  it('keeps ffprobe INFRASTRUCTURE failures retryable — never a content rejection', async () => {
+    // A timeout kill, an OS resource/permission refusal, or a maxBuffer
+    // overrun says nothing about the video; mapping any of these to
+    // ExtractionFailedError would let the validation flow permanently
+    // REJECT an otherwise-valid UPLOADED asset.
+    const probe = (rejection: unknown) =>
+      new FfmpegVideoFrameExtractor(storageStub, () =>
+        Promise.reject(rejection),
+      ).probe('a/original.mp4');
+
+    // Killed by the 30s timeout: killed=true + signal, code null.
+    const timeoutKill = new Error('spawn killed') as NodeJS.ErrnoException & {
+      killed: boolean;
+      signal: string;
+    };
+    timeoutKill.killed = true;
+    timeoutKill.signal = 'SIGTERM';
+    await expect(probe(timeoutKill)).rejects.toBeInstanceOf(
+      ExtractionInfrastructureError,
+    );
+
+    // External kill (e.g. OOM killer): signal set without killed.
+    const externalKill = Object.assign(new Error('killed'), {
+      killed: false,
+      signal: 'SIGKILL',
+    });
+    await expect(probe(externalKill)).rejects.toBeInstanceOf(
+      ExtractionInfrastructureError,
+    );
+
+    // Transient OS spawn errors carry STRING errno codes.
+    for (const errno of ['EACCES', 'EAGAIN', 'ENOMEM', 'EMFILE']) {
+      const spawnError = new Error(`spawn ${errno}`) as NodeJS.ErrnoException;
+      spawnError.code = errno;
+      await expect(probe(spawnError)).rejects.toBeInstanceOf(
+        ExtractionInfrastructureError,
+      );
+    }
+
+    // maxBuffer overrun: modern Node sets a string code; older shapes only
+    // carry the message.
+    const maxBufferCoded = Object.assign(
+      new RangeError('stdout maxBuffer length exceeded'),
+      { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' },
+    );
+    await expect(probe(maxBufferCoded)).rejects.toBeInstanceOf(
+      ExtractionInfrastructureError,
+    );
+    await expect(
+      probe(new Error('stdout maxBuffer length exceeded')),
+    ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+  });
+
+  it('keeps a nonzero ffprobe exit (tool ran, judged the file) a content failure', async () => {
+    // Numeric exit code = the tool executed and reported the container
+    // unreadable — the ONLY case that stays ExtractionFailedError.
+    const exitFailure = Object.assign(
+      new Error('ffprobe exited 1: moov atom not found'),
+      { code: 1, killed: false, signal: null },
+    );
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.reject(exitFailure),
+    );
+    await expect(extractor.probe('a/original.mp4')).rejects.toBeInstanceOf(
+      ExtractionFailedError,
+    );
+  });
+
+  it('classifies ffmpeg frame-extraction infrastructure failures the same way', async () => {
+    // The frame/crop exec path shares run(): a timeout kill there is just
+    // as environmental as on the probe path.
+    const timeoutKill = Object.assign(new Error('killed'), {
+      killed: true,
+      signal: 'SIGTERM',
+    });
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.reject(timeoutKill),
+    );
+    const probe = { durationMs: 10_000, width: 100, height: 100, fps: 30 };
+    await expect(
+      extractor.extractFrameAt('a/original.mp4', probe, 0),
+    ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+    await expect(
+      extractor.extractCrop('a/original.mp4', probe, 0, {
+        x: 0,
+        y: 0,
+        width: 10,
+        height: 10,
+      }),
+    ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+    await expect(
+      extractor.extractFrames('a/original.mp4', probe, {
+        intervalMs: 1000,
+        maxFrames: 5,
+        startMs: 0,
+      }),
+    ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+  });
+
+  it('never echoes signals, errno values, or paths from classified errors', () => {
+    const noisy = Object.assign(
+      new Error('spawn EACCES /secret/path/ffprobe'),
+      { code: 'EACCES' },
+    );
+    const classified = classifyCommandError(noisy);
+    expect(classified).toBeInstanceOf(ExtractionInfrastructureError);
+    expect(classified.message).not.toContain('EACCES');
+    expect(classified.message).not.toContain('/secret/path');
+    // Degenerate shapes (nullish rejection) stay a controlled content error.
+    expect(classifyCommandError(undefined)).toBeInstanceOf(
+      ExtractionFailedError,
+    );
+  });
+
+  it('returns stdout bytes with honest geometry for frames and crops', async () => {
+    const calls: { binary: string; args: string[] }[] = [];
+    const extractor = new FfmpegVideoFrameExtractor(
+      storageStub,
+      (binary, args) => {
+        calls.push({ binary, args });
+        return Promise.resolve({ stdout: Buffer.from('png-bytes') });
+      },
+    );
+    const probe = { durationMs: 10_000, width: 1920, height: 1080, fps: 30 };
+    const frame = await extractor.extractFrameAt('a/original.mp4', probe, 1000);
+    expect(frame.width).toBe(1920);
+    const crop = await extractor.extractCrop('a/original.mp4', probe, 1000, {
+      x: 5,
+      y: 6,
+      width: 70,
+      height: 80,
+    });
+    expect(crop.width).toBe(70);
+    expect(crop.height).toBe(80);
+    // Every invocation received the CONFINED internal path, never the key.
+    for (const call of calls) {
+      expect(call.args[call.args.indexOf('-i') + 1]).toBe(
+        '/confined/root/a/original.mp4',
+      );
+    }
+  });
+
+  it('samples strictly BEFORE the duration (exclusive endpoint)', async () => {
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.resolve({ stdout: Buffer.from('png') }),
+    );
+    const frames = await extractor.extractFrames(
+      'a/original.mp4',
+      { durationMs: 10_000, width: 100, height: 100, fps: 30 },
+      { intervalMs: 5000, maxFrames: 30, startMs: 0 },
+    );
+    // 0, 5000 — 10000 is the exclusive endpoint (no frame exists there).
+    expect(frames.map((f) => f.timestampMs)).toEqual([0, 5000]);
+  });
+
+  it('enforces a request-wide decoded-byte budget by ending the batch, not failing it', async () => {
+    // Each mocked frame is ~half the budget; a second frame would exceed
+    // it. The per-invocation maxBuffer cannot catch this — only the
+    // aggregate budget does — and exhaustion returns the frames that fit
+    // (a server memory verdict, never a content failure of the video).
+    const bigFrame = Buffer.alloc(Math.ceil(MAX_TOTAL_EXTRACTION_BYTES / 2) + 1);
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.resolve({ stdout: bigFrame }),
+    );
+    const frames = await extractor.extractFrames(
+      'a/original.mp4',
+      { durationMs: 10_000, width: 100, height: 100, fps: 30 },
+      { intervalMs: 1000, maxFrames: 10, startMs: 0 },
+    );
+    // Frame 2 (over the shrunken remainder) is dropped and the batch ends.
+    expect(frames.map((f) => f.timestampMs)).toEqual([0]);
+  });
+
+  it('stops preemptively (no further decode) once the pool is exactly consumed', async () => {
+    // One frame consuming the ENTIRE pool: the next iteration's
+    // remaining-budget pre-check must end the batch BEFORE any decode.
+    const calls: number[] = [];
+    const extractor = new FfmpegVideoFrameExtractor(
+      storageStub,
+      (_binary, _args, maxOutputBytes) => {
+        calls.push(maxOutputBytes);
+        return Promise.resolve({
+          stdout: Buffer.alloc(MAX_TOTAL_EXTRACTION_BYTES),
+        });
+      },
+    );
+    const frames = await extractor.extractFrames(
+      'a/original.mp4',
+      { durationMs: 10_000, width: 100, height: 100, fps: 30 },
+      { intervalMs: 1000, maxFrames: 10, startMs: 0 },
+    );
+    expect(frames.map((f) => f.timestampMs)).toEqual([0]);
+    expect(calls.length).toBe(1);
+  });
+
+  it('still fails the batch when the FIRST frame exceeds the entire pool', async () => {
+    // Nothing decoded means no partial batch to return — the pre-existing
+    // content failure stands (backstop for runners ignoring the exec cap).
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.resolve({ stdout: Buffer.alloc(MAX_TOTAL_EXTRACTION_BYTES + 1) }),
+    );
+    await expect(
+      extractor.extractFrames(
+        'a/original.mp4',
+        { durationMs: 10_000, width: 100, height: 100, fps: 30 },
+        { intervalMs: 1000, maxFrames: 10, startMs: 0 },
+      ),
+    ).rejects.toBeInstanceOf(ExtractionFailedError);
+  });
+
+  it('maps empty output at an explicit timestamp to FrameUnavailable (not batch failure)', async () => {
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.resolve({ stdout: Buffer.alloc(0) }),
+    );
+    await expect(
+      extractor.extractFrameAt(
+        'a/original.mp4',
+        { durationMs: 10_000, width: 100, height: 100, fps: 30 },
+        0,
+      ),
+    ).rejects.toBeInstanceOf(FrameUnavailableError);
+  });
+
+  it('treats end-of-stream mid-sampling as a normal stop, not a batch failure', async () => {
+    // Containers routinely report a duration slightly past the last
+    // decodable frame; sampling must return what it got.
+    let call = 0;
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () => {
+      call += 1;
+      return Promise.resolve({
+        stdout: call <= 2 ? Buffer.from('png') : Buffer.alloc(0),
+      });
+    });
+    const frames = await extractor.extractFrames(
+      'a/original.mp4',
+      { durationMs: 10_000, width: 100, height: 100, fps: 30 },
+      { intervalMs: 3000, maxFrames: 10, startMs: 0 },
+    );
+    expect(frames.map((f) => f.timestampMs)).toEqual([0, 3000]);
+  });
+
+  describe('inspectBuffer (fully in-memory stdin inspection)', () => {
+    const PNG_SIG = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    ]);
+    /** A synthetic "PNG": the real signature + a distinct filler byte. */
+    const fakePng = (marker: number, size = 32) =>
+      Buffer.concat([PNG_SIG, Buffer.alloc(size - PNG_SIG.length, marker)]);
+    const probeJson = (durationSeconds: string) =>
+      JSON.stringify({
+        streams: [
+          {
+            width: 1280,
+            height: 720,
+            r_frame_rate: '30/1',
+            duration: durationSeconds,
+          },
+        ],
+      });
+    interface RunnerCall {
+      binary: string;
+      args: string[];
+      maxOutputBytes: number;
+      stdin?: Buffer;
+    }
+    /** Runner answering ffprobe with probe JSON and ffmpeg with the given
+     *  stdout, recording every call INCLUDING the stdin payload. */
+    const recordingRunner =
+      (calls: RunnerCall[], ffmpegStdout: Buffer, durationSeconds = '10.0') =>
+      (
+        binary: string,
+        args: string[],
+        maxOutputBytes: number,
+        stdin?: Buffer,
+      ) => {
+        calls.push({ binary, args, maxOutputBytes, stdin });
+        return Promise.resolve({
+          stdout:
+            binary === 'ffprobe'
+              ? Buffer.from(probeJson(durationSeconds))
+              : ffmpegStdout,
+        });
+      };
+
+    it('probes from stdin with the EXACT upload buffer and never touches the filesystem', async () => {
+      const calls: RunnerCall[] = [];
+      const extractor = new FfmpegVideoFrameExtractor(
+        storageStub,
+        recordingRunner(calls, fakePng(1)),
+      );
+      const data = Buffer.from('unscreened-card-bearing-bytes');
+      const session = await extractor.inspectBuffer(data);
+      // Opening runs NO tooling; the first probe() does.
+      expect(calls).toHaveLength(0);
+      const probe = await session.probe();
+      expect(probe.durationMs).toBe(10_000);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].binary).toBe('ffprobe');
+      // The input is pipe:0 — no path argument anywhere in the vector.
+      expect(calls[0].args[calls[0].args.length - 1]).toBe('pipe:0');
+      // The child received the exact unscreened buffer on stdin.
+      expect(calls[0].stdin).toBe(data);
+      // Memoized: a second probe() never re-runs the tool.
+      await session.probe();
+      expect(calls).toHaveLength(1);
+      // NOTHING was ever materialized on disk.
+      expect(mkdtemp).not.toHaveBeenCalled();
+      expect(writeFile).not.toHaveBeenCalled();
+      expect(rm).not.toHaveBeenCalled();
+      await session.close();
+      expect(mkdtemp).not.toHaveBeenCalled();
+      expect(writeFile).not.toHaveBeenCalled();
+    });
+
+    it('fails CLOSED on an unstreamable container: controlled content error, no stderr/path echo', async () => {
+      // A non-faststart MP4 (moov at the end) cannot be probed from a
+      // pipe: ffprobe RUNS and exits nonzero. That is a CONTENT failure —
+      // the service rejects the upload rather than ever spooling the
+      // unscreened bytes to disk (the documented fail-closed cost; test
+      // clips must be encoded streamable, +faststart).
+      const exitFailure = Object.assign(
+        new Error('ffprobe exited 1: moov atom not found /secret/upload.mp4'),
+        { code: 1, killed: false, signal: null },
+      );
+      const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+        Promise.reject(exitFailure),
+      );
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      const error: Error = await session
+        .probe()
+        .then(() => {
+          throw new Error('expected rejection');
+        })
+        .catch((caught: Error) => caught);
+      expect(error).toBeInstanceOf(ExtractionFailedError);
+      expect(error.message).toBe(UNSTREAMABLE_CONTAINER_MESSAGE);
+      expect(error.message).not.toContain('moov');
+      expect(error.message).not.toContain('/secret');
+      await session.close();
+    });
+
+    it('rejects a degenerate maxFrames cap WITHOUT spawning anything', async () => {
+      const runner = jest.fn(() => Promise.resolve({ stdout: fakePng(1) }));
+      const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      for (const maxFrames of [0, -1, 1.5, Number.NaN]) {
+        await expect(
+          session.streamFrames({
+            maxFrames,
+            maxBytesPerFrame: 1024,
+            deadlineMs: 5000,
+            onFrame: () => Promise.resolve('continue'),
+          }),
+        ).rejects.toBeInstanceOf(FrameCountExceededError);
+      }
+      expect(runner).not.toHaveBeenCalled();
+      expect(spawnMock).not.toHaveBeenCalled();
+      await session.close();
+    });
+
+    it('rejects a degenerate per-frame budget WITHOUT spawning anything', async () => {
+      const runner = jest.fn(() =>
+        Promise.resolve({ stdout: Buffer.from(probeJson('10.0')) }),
+      );
+      const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      for (const maxBytesPerFrame of [0, -1, 1.5, Number.NaN]) {
+        await expect(
+          session.streamFrames({
+            maxFrames: 900,
+            maxBytesPerFrame,
+            deadlineMs: 5000,
+            onFrame: () => Promise.resolve('continue'),
+          }),
+        ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
+      }
+      expect(runner).not.toHaveBeenCalled();
+      expect(spawnMock).not.toHaveBeenCalled();
+      await session.close();
+    });
+
+    it('rejects a degenerate deadline WITHOUT spawning anything', async () => {
+      const runner = jest.fn(() =>
+        Promise.resolve({ stdout: Buffer.from(probeJson('10.0')) }),
+      );
+      const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      for (const deadlineMs of [0, -1, 1.5, Number.NaN]) {
+        await expect(
+          session.streamFrames({
+            maxFrames: 900,
+            maxBytesPerFrame: 1024,
+            deadlineMs,
+            onFrame: () => Promise.resolve('continue'),
+          }),
+        ).rejects.toBeInstanceOf(ScreeningDeadlineExceededError);
+      }
+      expect(runner).not.toHaveBeenCalled();
+      expect(spawnMock).not.toHaveBeenCalled();
+      await session.close();
+    });
+
+    it('keeps the stdin PROBE path on the injected runner with its own classification', async () => {
+      const timeoutKill = Object.assign(new Error('killed'), {
+        killed: true,
+        signal: 'SIGTERM',
+      });
+      const probeKilled = new FfmpegVideoFrameExtractor(storageStub, () =>
+        Promise.reject(timeoutKill),
+      );
+      const killedSession = await probeKilled.inspectBuffer(Buffer.from('x'));
+      await expect(killedSession.probe()).rejects.toBeInstanceOf(
+        ExtractionInfrastructureError,
+      );
+      await killedSession.close();
+    });
+
+    /**
+     * The Codex P2 fix: the AGGREGATE screening budget must cover PROBING
+     * too. Before this, probe() took no deadline and ran on the adapter's
+     * fixed 30 s command timeout, so a 1 s configured budget still allowed
+     * ~30 s inside ffprobe — the promised upload-wide bound did not reach
+     * the FIRST external-tool stage.
+     */
+    describe('probe deadline (the aggregate budget covers probing too)', () => {
+      /** Runner recording the TIMEOUT each invocation was handed. */
+      const timeoutRecordingRunner =
+        (timeouts: (number | undefined)[], duration = '10.0') =>
+        (
+          _binary: string,
+          _args: string[],
+          _maxOutputBytes: number,
+          _stdin?: Buffer,
+          timeoutMs?: number,
+        ) => {
+          timeouts.push(timeoutMs);
+          return Promise.resolve({ stdout: Buffer.from(probeJson(duration)) });
+        };
+
+      /** A `killed`/`signal` failure — the shape BOTH a timer kill and an
+       *  external SIGKILL present at the injected runner seam. */
+      const killFailure = (message = 'killed /secret/upload.mp4') =>
+        Object.assign(new Error(message), { killed: true, signal: 'SIGTERM' });
+
+      /**
+       * Runs `body` against a MOCKED monotonic-ish clock. The adapter now
+       * MEASURES elapsed wall clock to decide whether its own configured
+       * timer is what killed the child, so a test that wants a timer kill
+       * must let the timer's worth of time actually pass — `advance` is how
+       * a test says "the child lived this long before it died".
+       */
+      const withClock = async (
+        body: (advance: (ms: number) => void) => Promise<void>,
+      ): Promise<void> => {
+        let clock = 1_000_000;
+        const now = jest.spyOn(Date, 'now').mockImplementation(() => clock);
+        try {
+          await body((ms) => {
+            clock += ms;
+          });
+        } finally {
+          now.mockRestore();
+        }
+      };
+
+      /**
+       * An extractor whose runner rejects with `rejection` after the clock
+       * has advanced by `elapsedMs` — i.e. after the child "lived" that
+       * long.
+       */
+      const killedAfter = (
+        advance: (ms: number) => void,
+        elapsedMs: number,
+        rejection: unknown,
+      ) =>
+        new FfmpegVideoFrameExtractor(storageStub, () => {
+          advance(elapsedMs);
+          return Promise.reject(rejection);
+        });
+
+      /** The error a single probe under `deadlineMs` rejected with. */
+      const probeError = async (
+        extractor: FfmpegVideoFrameExtractor,
+        deadlineMs?: number,
+      ): Promise<Error> => {
+        const session = await extractor.inspectBuffer(Buffer.from('x'));
+        const caught: Error = await session
+          .probe(deadlineMs === undefined ? undefined : { deadlineMs })
+          .then(
+            () => {
+              throw new Error('expected rejection');
+            },
+            (error: Error) => error,
+          );
+        await session.close();
+        return caught;
+      };
+
+      it('clamps the ffprobe timeout DOWN to the remaining aggregate budget', async () => {
+        const timeouts: (number | undefined)[] = [];
+        const extractor = new FfmpegVideoFrameExtractor(
+          storageStub,
+          timeoutRecordingRunner(timeouts),
+        );
+        const session = await extractor.inspectBuffer(Buffer.from('x'));
+        await expect(session.probe({ deadlineMs: 1000 })).resolves.toMatchObject(
+          { durationMs: 10_000 },
+        );
+        // THE regression pin: the invocation's kill timeout is the caller's
+        // remaining budget, not the adapter's 30 s ceiling.
+        expect(timeouts).toEqual([1000]);
+        expect(timeouts[0]).toBeLessThan(COMMAND_TIMEOUT_MS);
+        await session.close();
+      });
+
+      it('keeps the adapter fixed ceiling when the remaining budget is larger (a caller budget never RAISES it)', async () => {
+        const timeouts: (number | undefined)[] = [];
+        const extractor = new FfmpegVideoFrameExtractor(
+          storageStub,
+          timeoutRecordingRunner(timeouts),
+        );
+        // Memoization means one probe per session — a session each.
+        const generous = await extractor.inspectBuffer(Buffer.from('x'));
+        await generous.probe({ deadlineMs: COMMAND_TIMEOUT_MS * 4 });
+        // Exactly at the ceiling: min() picks the SAME NUMBER either way,
+        // so the invocation's kill timeout is unchanged here — but the
+        // bound that BINDS at a tie is the caller's budget, which is a
+        // CLASSIFICATION question, pinned below ('classifies a kill at a
+        // TIE ... as the DEADLINE verdict'). This assertion is about the
+        // number handed to the runner, not about whose bound it is.
+        const tie = await extractor.inspectBuffer(Buffer.from('x'));
+        await tie.probe({ deadlineMs: COMMAND_TIMEOUT_MS });
+        // No budget at all → the pre-existing behavior, unchanged.
+        const none = await extractor.inspectBuffer(Buffer.from('x'));
+        await none.probe();
+        expect(timeouts).toEqual([
+          COMMAND_TIMEOUT_MS,
+          COMMAND_TIMEOUT_MS,
+          COMMAND_TIMEOUT_MS,
+        ]);
+        await generous.close();
+        await tie.close();
+        await none.close();
+      });
+
+      it('rejects ScreeningDeadlineExceededError when the configured timer EXPIRED under a BINDING aggregate budget', async () => {
+        // The caller's budget — not the fixed ceiling — is what bounded
+        // this child, AND the budget's worth of wall clock actually
+        // elapsed, so the kill is the same fail-closed DEADLINE verdict
+        // streamFrames gives, never a retryable infrastructure failure.
+        await withClock(async (advance) => {
+          const error = await probeError(
+            killedAfter(advance, 1000, killFailure()),
+            1000,
+          );
+          expect(error).toBeInstanceOf(ScreeningDeadlineExceededError);
+          // Same controlled message as the decode deadline — no timings or
+          // paths echoed.
+          expect(error.message).toBe(
+            'The screening decode exceeded its time budget',
+          );
+          expect(error.message).not.toContain('/secret');
+        });
+      });
+
+      it('classifies a TIMER kill at a TIE (remaining budget EXACTLY the command ceiling) as the DEADLINE verdict', async () => {
+        // The Codex finding: the tie was decided by a STRICT `<`, so the
+        // abort reason stayed unset and a probe timeout became a retryable
+        // INFRASTRUCTURE failure (503). The tie is not exotic — the
+        // DEFAULT 30 s aggregate screening budget IS COMMAND_TIMEOUT_MS,
+        // so the first probe of every default screen lands exactly here.
+        // At a tie the caller's allowance is what MEANS something: it
+        // asked for at most that much wall clock, so running out of it is
+        // the controlled pre-storage screening rejection.
+        await withClock(async (advance) => {
+          const error = await probeError(
+            killedAfter(
+              advance,
+              COMMAND_TIMEOUT_MS,
+              killFailure('killed /secret/x.mp4'),
+            ),
+            COMMAND_TIMEOUT_MS,
+          );
+          expect(error).toBeInstanceOf(ScreeningDeadlineExceededError);
+          expect(error).not.toBeInstanceOf(ExtractionInfrastructureError);
+          expect(error.message).toBe(
+            'The screening decode exceeded its time budget',
+          );
+          expect(error.message).not.toContain('/secret');
+        });
+      });
+
+      it('keeps an EXTERNAL kill under a BINDING budget INFRASTRUCTURE-classified (OOM killer / operator SIGKILL)', async () => {
+        // The second Codex finding: a binding budget was treated as
+        // SUFFICIENT, so any `killed`/`signal` failure became the deadline
+        // verdict — a content-style pre-storage rejection. But an OOM
+        // killer or an operator's SIGKILL presents at this seam with the
+        // EXACT same shape, and the adapter's own timer never fired: the
+        // child died at ~0 ms under a 30 s allowance. That is an
+        // infrastructure failure and must stay retryable (503), never a
+        // permanent refusal of a perfectly good upload.
+        await withClock(async (advance) => {
+          const external = Object.assign(new Error('Killed /secret/x.mp4'), {
+            killed: false,
+            signal: 'SIGKILL',
+          });
+          const error = await probeError(
+            killedAfter(advance, 0, external),
+            COMMAND_TIMEOUT_MS,
+          );
+          expect(error).toBeInstanceOf(ExtractionInfrastructureError);
+          expect(error).not.toBeInstanceOf(ScreeningDeadlineExceededError);
+          expect(error.message).not.toContain('/secret');
+          expect(error.message).not.toContain('SIGKILL');
+        });
+      });
+
+      it('pins the attribution TOLERANCE on both sides of the boundary', async () => {
+        // The tolerance absorbs timer/clock/reporting slop ONLY: a kill at
+        // (timeout - tolerance) is still the timer firing a beat early; one
+        // millisecond earlier than that is somebody else's signal.
+        await withClock(async (advance) => {
+          const atBoundary = await probeError(
+            killedAfter(
+              advance,
+              1000 - TIMEOUT_ATTRIBUTION_TOLERANCE_MS,
+              killFailure(),
+            ),
+            1000,
+          );
+          expect(atBoundary).toBeInstanceOf(ScreeningDeadlineExceededError);
+        });
+        await withClock(async (advance) => {
+          const justInside = await probeError(
+            killedAfter(
+              advance,
+              1000 - TIMEOUT_ATTRIBUTION_TOLERANCE_MS - 1,
+              killFailure(),
+            ),
+            1000,
+          );
+          expect(justInside).toBeInstanceOf(ExtractionInfrastructureError);
+          expect(justInside).not.toBeInstanceOf(ScreeningDeadlineExceededError);
+        });
+      });
+
+      it('keeps an external kill under a NON-binding budget infrastructure-classified (unchanged)', async () => {
+        // Budget STRICTLY GREATER than the ceiling: the adapter's own bound
+        // is what the timer expresses, so the deadline verdict was never on
+        // the table — with or without elapsed time. Both the instant kill
+        // and a kill at the full ceiling stay retryable.
+        await withClock(async (advance) => {
+          const instant = await probeError(
+            killedAfter(advance, 0, killFailure()),
+            COMMAND_TIMEOUT_MS * 4,
+          );
+          expect(instant).toBeInstanceOf(ExtractionInfrastructureError);
+        });
+        await withClock(async (advance) => {
+          const atCeiling = await probeError(
+            killedAfter(advance, COMMAND_TIMEOUT_MS, killFailure()),
+            COMMAND_TIMEOUT_MS * 4,
+          );
+          expect(atCeiling).toBeInstanceOf(ExtractionInfrastructureError);
+        });
+        await withClock(async (advance) => {
+          // No budget at all: the same, unchanged.
+          const none = await probeError(
+            killedAfter(advance, COMMAND_TIMEOUT_MS, killFailure()),
+          );
+          expect(none).toBeInstanceOf(ExtractionInfrastructureError);
+        });
+      });
+
+      it('keeps a kill at the adapter OWN fixed ceiling infrastructure-classified', async () => {
+        const timeoutKill = Object.assign(new Error('killed'), {
+          killed: true,
+          signal: 'SIGTERM',
+        });
+        const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+          Promise.reject(timeoutKill),
+        );
+        // Infrastructure is reserved for a budget STRICTLY GREATER than
+        // the ceiling (or none at all): only then is the adapter's own
+        // bound what fired, so the existing retryable classification
+        // stands. One millisecond over is enough to be strictly greater.
+        const barely = await extractor.inspectBuffer(Buffer.from('x'));
+        await expect(
+          barely.probe({ deadlineMs: COMMAND_TIMEOUT_MS + 1 }),
+        ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+        await barely.close();
+        // A budget WIDER than the ceiling: the ceiling is what fired, so
+        // the existing retryable classification stands.
+        const generous = await extractor.inspectBuffer(Buffer.from('x'));
+        await expect(
+          generous.probe({ deadlineMs: COMMAND_TIMEOUT_MS * 4 }),
+        ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+        // No budget at all: unchanged behavior.
+        const none = await extractor.inspectBuffer(Buffer.from('x'));
+        await expect(none.probe()).rejects.toBeInstanceOf(
+          ExtractionInfrastructureError,
+        );
+        await generous.close();
+        await none.close();
+      });
+
+      it('rejects a degenerate/EXPIRED remaining budget WITHOUT spawning anything', async () => {
+        const runner = jest.fn(() =>
+          Promise.resolve({ stdout: Buffer.from(probeJson('10.0')) }),
+        );
+        const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+        // An expired budget (<= 0) and non-integer shapes alike: nothing
+        // can be probed inside them, decided BEFORE any tool runs. One
+        // session per case — the verdict is memoized per session.
+        for (const deadlineMs of [0, -1, -5000, 1.5, Number.NaN]) {
+          const session = await extractor.inspectBuffer(Buffer.from('x'));
+          await expect(session.probe({ deadlineMs })).rejects.toBeInstanceOf(
+            ScreeningDeadlineExceededError,
+          );
+          await session.close();
+        }
+        expect(runner).not.toHaveBeenCalled();
+        expect(spawnMock).not.toHaveBeenCalled();
+        // And nothing was ever materialized on disk.
+        expect(mkdtemp).not.toHaveBeenCalled();
+        expect(writeFile).not.toHaveBeenCalled();
+      });
+
+      it('memoizes the FIRST probe: a later call with different options returns it without re-running the tool', async () => {
+        const timeouts: (number | undefined)[] = [];
+        const extractor = new FfmpegVideoFrameExtractor(
+          storageStub,
+          timeoutRecordingRunner(timeouts),
+        );
+        const session = await extractor.inspectBuffer(Buffer.from('x'));
+        const first = await session.probe({ deadlineMs: 1000 });
+        const second = await session.probe({ deadlineMs: 25 });
+        const third = await session.probe();
+        expect(second).toEqual(first);
+        expect(third).toEqual(first);
+        // Only the FIRST call's budget ever reached the tool.
+        expect(timeouts).toEqual([1000]);
+        await session.close();
+      });
+
+      it('memoizes a probe DEADLINE failure too — a later generous budget never re-runs the tool', async () => {
+        const runner = jest.fn(() =>
+          Promise.resolve({ stdout: Buffer.from(probeJson('10.0')) }),
+        );
+        const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+        const session = await extractor.inspectBuffer(Buffer.from('x'));
+        await expect(session.probe({ deadlineMs: 0 })).rejects.toBeInstanceOf(
+          ScreeningDeadlineExceededError,
+        );
+        // The verdict on these bytes cannot change mid-session: the
+        // memoized failure stands and the tooling stays unspawned.
+        await expect(
+          session.probe({ deadlineMs: COMMAND_TIMEOUT_MS }),
+        ).rejects.toBeInstanceOf(ScreeningDeadlineExceededError);
+        expect(runner).not.toHaveBeenCalled();
+        expect(spawnMock).not.toHaveBeenCalled();
+        await session.close();
+      });
+
+      it('keeps NON-kill failures classified as before under a binding budget', async () => {
+        // The deadline attribution keys on a KILL under a binding budget —
+        // it must not swallow the other classifications.
+        const cases: [unknown, unknown][] = [
+          [
+            Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }),
+            ExtractorUnavailableError,
+          ],
+          [
+            Object.assign(new Error('spawn EACCES'), { code: 'EACCES' }),
+            ExtractionInfrastructureError,
+          ],
+          [
+            // The tool RAN and refused the piped container: still the
+            // controlled unstreamable-container content failure.
+            Object.assign(new Error('ffprobe exited 1: moov atom not found'), {
+              code: 1,
+              killed: false,
+              signal: null,
+            }),
+            ExtractionFailedError,
+          ],
+        ];
+        for (const [rejection, expected] of cases) {
+          const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+            Promise.reject(rejection),
+          );
+          const session = await extractor.inspectBuffer(Buffer.from('x'));
+          await expect(
+            session.probe({ deadlineMs: 1000 }),
+          ).rejects.toBeInstanceOf(expected as new () => Error);
+          await session.close();
+        }
+      });
+    });
+
+    it('close() is idempotent; a closed session fails controlled, never touching tooling or disk', async () => {
+      const runner = jest.fn(() =>
+        Promise.resolve({ stdout: Buffer.from(probeJson('10.0')) }),
+      );
+      const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+      const session = await extractor.inspectBuffer(Buffer.from('x'));
+      await expect(session.close()).resolves.toBeUndefined();
+      await expect(session.close()).resolves.toBeUndefined();
+      await expect(session.probe()).rejects.toBeInstanceOf(
+        ExtractionFailedError,
+      );
+      await expect(
+        session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 1024,
+          deadlineMs: 5000,
+          onFrame: () => Promise.resolve('continue'),
+        }),
+      ).rejects.toBeInstanceOf(ExtractionFailedError);
+      expect(runner).not.toHaveBeenCalled();
+      expect(spawnMock).not.toHaveBeenCalled();
+      expect(mkdtemp).not.toHaveBeenCalled();
+      expect(writeFile).not.toHaveBeenCalled();
+    });
+
+    /**
+     * The Codex P1 fix: screening frames are CONSUMED INCREMENTALLY. The
+     * old single-exec pass clamped the ENTIRE concatenated PNG stream at
+     * MAX_TOTAL_EXTRACTION_BYTES — a normal multi-second 720p/1080p clip
+     * crosses that aggregate long before the frame budget, so ffmpeg was
+     * killed and (the cap being the adapter's own ceiling) the overflow
+     * classified as INFRASTRUCTURE: a 503 and a FAILED row for a valid
+     * upload. These specs drive a FAKE stdout stream chunk by chunk.
+     */
+    describe('streamFrames (incremental, pull-based screening decode)', () => {
+      /** A fake ffmpeg child: real streams, a recorded kill. */
+      const makeChild = () => {
+        const stdout = new PassThrough();
+        const stdin = new PassThrough();
+        const stdinChunks: Buffer[] = [];
+        stdin.on('data', (chunk: Buffer) => stdinChunks.push(chunk));
+        const kill = jest.fn(() => true);
+        const child = Object.assign(new EventEmitter(), {
+          stdout,
+          stdin,
+          kill,
+        });
+        spawnMock.mockReturnValue(child);
+        return { child, stdout, stdin, stdinChunks, kill };
+      };
+
+      /** Let the paused/resumed stream and the consumption chain settle. */
+      const flush = async (times = 8): Promise<void> => {
+        for (let i = 0; i < times; i += 1) {
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      };
+
+      const openSession = async (data = Buffer.from('unstored-bytes')) => {
+        const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+          Promise.reject(new Error('the streaming path must not use the runner')),
+        );
+        return { session: await extractor.inspectBuffer(data), data };
+      };
+
+      it('spawns ONE exhaustive ffmpeg pass over stdin with NO aggregate stdout clamp', async () => {
+        const { child, stdout, stdinChunks } = makeChild();
+        const { session, data } = await openSession();
+        const seen: number[] = [];
+        const promise = session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 1024,
+          deadlineMs: 5000,
+          onFrame: (frame) => {
+            seen.push(frame[8]);
+            return Promise.resolve('continue');
+          },
+        });
+        stdout.write(fakePng(1));
+        stdout.write(fakePng(2));
+        stdout.end();
+        await flush();
+        child.emit('close', 0, null);
+        await expect(promise).resolves.toEqual({
+          framesSeen: 2,
+          stoppedEarly: false,
+        });
+        expect(seen).toEqual([1, 2]);
+        // EVERY decoded source frame — no fps filter (an fps=1 sample let a
+        // pan visible only between one-second ticks reach storage).
+        expect(spawnMock).toHaveBeenCalledTimes(1);
+        const [binary, args, options] = spawnMock.mock.calls[0] as [
+          string,
+          string[],
+          Record<string, unknown>,
+        ];
+        expect(binary).toBe('ffmpeg');
+        expect(args).toEqual(buildAllFramesArgs());
+        expect(args).not.toContain('-vf');
+        expect(args).not.toContain('fps=1');
+        expect(args[args.indexOf('-i') + 1]).toBe('pipe:0');
+        expect(options.shell).toBe(false);
+        // stderr discarded at the OS level: attacker-tinted text is never
+        // read, and no undrained pipe can deadlock the decode.
+        expect(options.stdio).toEqual(['pipe', 'pipe', 'ignore']);
+        // THE regression pin: no aggregate output clamp bounds this path.
+        expect(options).not.toHaveProperty('maxBuffer');
+        expect(Object.values(options)).not.toContain(
+          MAX_TOTAL_EXTRACTION_BYTES,
+        );
+        // The exact unstored bytes went to the child's stdin — never disk.
+        expect(Buffer.concat(stdinChunks).equals(data)).toBe(true);
+        expect(mkdtemp).not.toHaveBeenCalled();
+        expect(writeFile).not.toHaveBeenCalled();
+        await session.close();
+      });
+
+      it('delivers each frame as soon as the NEXT signature delimits it, never holding the stream', async () => {
+        const { child, stdout } = makeChild();
+        const { session } = await openSession();
+        const seen: number[] = [];
+        const sizes: number[] = [];
+        const promise = session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 1024,
+          deadlineMs: 5000,
+          onFrame: (frame) => {
+            seen.push(frame[8]);
+            sizes.push(frame.length);
+            return Promise.resolve('continue');
+          },
+        });
+        // Frame 1 is complete the moment frame 2's signature arrives — and
+        // that MUST reach the screener before frame 3's bytes exist.
+        stdout.write(fakePng(1));
+        stdout.write(fakePng(2));
+        await flush();
+        expect(seen).toEqual([1]);
+        stdout.write(fakePng(3));
+        await flush();
+        expect(seen).toEqual([1, 2]);
+        // End of stream delimits the LAST frame.
+        stdout.end();
+        await flush();
+        child.emit('close', 0, null);
+        await expect(promise).resolves.toEqual({
+          framesSeen: 3,
+          stoppedEarly: false,
+        });
+        expect(seen).toEqual([1, 2, 3]);
+        // Each callback got ONE frame's bytes, never a growing aggregate.
+        expect(sizes).toEqual([32, 32, 32]);
+        await session.close();
+      });
+
+      it('reassembles a signature SPLIT across chunk boundaries', async () => {
+        const { child, stdout } = makeChild();
+        const { session } = await openSession();
+        const seen: number[] = [];
+        const promise = session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 1024,
+          deadlineMs: 5000,
+          onFrame: (frame) => {
+            seen.push(frame[8]);
+            return Promise.resolve('continue');
+          },
+        });
+        const stream = Buffer.concat([fakePng(1), fakePng(2)]);
+        // Cut mid-signature of the SECOND frame (32 + 4 bytes in).
+        stdout.write(stream.subarray(0, 36));
+        await flush();
+        expect(seen).toEqual([]);
+        stdout.write(stream.subarray(36));
+        stdout.end();
+        await flush();
+        child.emit('close', 0, null);
+        await expect(promise).resolves.toEqual({
+          framesSeen: 2,
+          stoppedEarly: false,
+        });
+        expect(seen).toEqual([1, 2]);
+        await session.close();
+      });
+
+      it('pauses stdout while a slow screener holds a frame and resumes after (backpressure)', async () => {
+        const { child, stdout } = makeChild();
+        const { session } = await openSession();
+        let release: (() => void) | undefined;
+        const held = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const promise = session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 1024,
+          deadlineMs: 5000,
+          onFrame: async () => {
+            await held;
+            return 'continue';
+          },
+        });
+        // Spy AFTER the adapter attached its listeners so only the
+        // adapter's OWN pause/resume calls are recorded.
+        const pauseSpy = jest.spyOn(stdout, 'pause');
+        const resumeSpy = jest.spyOn(stdout, 'resume');
+        stdout.write(Buffer.concat([fakePng(1), fakePng(2)]));
+        await flush();
+        // The screener is still holding frame 1: nothing more is read.
+        expect(pauseSpy).toHaveBeenCalled();
+        expect(resumeSpy).not.toHaveBeenCalled();
+        release?.();
+        await flush();
+        expect(resumeSpy).toHaveBeenCalled();
+        stdout.end();
+        await flush();
+        child.emit('close', 0, null);
+        await expect(promise).resolves.toEqual({
+          framesSeen: 2,
+          stoppedEarly: false,
+        });
+        await session.close();
+      });
+
+      it("resolves stoppedEarly (never an error) when onFrame returns 'stop', killing the child", async () => {
+        const { child, stdout, kill } = makeChild();
+        const { session } = await openSession();
+        const seen: number[] = [];
+        const promise = session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 1024,
+          deadlineMs: 5000,
+          onFrame: (frame) => {
+            seen.push(frame[8]);
+            return Promise.resolve('stop');
+          },
+        });
+        stdout.write(Buffer.concat([fakePng(1), fakePng(2), fakePng(3)]));
+        await expect(promise).resolves.toEqual({
+          framesSeen: 1,
+          stoppedEarly: true,
+        });
+        // The stopping frame is the only one screened; the child is gone.
+        expect(seen).toEqual([1]);
+        expect(kill).toHaveBeenCalledWith('SIGTERM');
+        // A late close carrying OUR signal must not re-settle anything.
+        child.emit('close', null, 'SIGTERM');
+        await flush();
+        await expect(promise).resolves.toEqual({
+          framesSeen: 1,
+          stoppedEarly: true,
+        });
+        await session.close();
+      });
+
+      it('kills the child and rejects FrameExceedsBudgetError when ONE frame overruns the per-frame cap', async () => {
+        const { stdout, kill } = makeChild();
+        const { session } = await openSession();
+        const promise = session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 16,
+          deadlineMs: 5000,
+          onFrame: () => Promise.resolve('continue'),
+        });
+        // A single frame that keeps growing past the cap: the decode is
+        // abandoned BEFORE the frame is even complete.
+        stdout.write(fakePng(1, 64));
+        await expect(promise).rejects.toBeInstanceOf(FrameExceedsBudgetError);
+        expect(kill).toHaveBeenCalledWith('SIGKILL');
+        await session.close();
+      });
+
+      it('does NOT mistake several small frames in one chunk for a single oversized frame', async () => {
+        const { child, stdout } = makeChild();
+        const { session } = await openSession();
+        const promise = session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 40,
+          deadlineMs: 5000,
+          onFrame: () => Promise.resolve('continue'),
+        });
+        // 3 × 32 B frames in ONE 96 B chunk — each fits the 40 B cap.
+        stdout.write(Buffer.concat([fakePng(1), fakePng(2), fakePng(3)]));
+        stdout.end();
+        await flush();
+        child.emit('close', 0, null);
+        await expect(promise).resolves.toEqual({
+          framesSeen: 3,
+          stoppedEarly: false,
+        });
+        await session.close();
+      });
+
+      it('kills the child and rejects FrameCountExceededError one frame past maxFrames', async () => {
+        const { stdout, kill } = makeChild();
+        const { session } = await openSession();
+        const seen: number[] = [];
+        const promise = session.streamFrames({
+          maxFrames: 2,
+          maxBytesPerFrame: 1024,
+          deadlineMs: 5000,
+          onFrame: (frame) => {
+            seen.push(frame[8]);
+            return Promise.resolve('continue');
+          },
+        });
+        stdout.write(
+          Buffer.concat([fakePng(1), fakePng(2), fakePng(3), fakePng(4)]),
+        );
+        await expect(promise).rejects.toBeInstanceOf(FrameCountExceededError);
+        // Never a silent truncation — the caller is told, not shortchanged.
+        expect(seen).toEqual([1, 2]);
+        expect(kill).toHaveBeenCalledWith('SIGKILL');
+        await session.close();
+      });
+
+      it('kills the child and rejects ScreeningDeadlineExceededError when the decode outruns its budget', async () => {
+        const { stdout, kill } = makeChild();
+        const { session } = await openSession();
+        const promise = session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 1024,
+          deadlineMs: 20,
+          onFrame: () => Promise.resolve('continue'),
+        });
+        // A child that produces one frame and then hangs forever.
+        stdout.write(fakePng(1));
+        const error: Error = await promise.then(
+          () => {
+            throw new Error('expected rejection');
+          },
+          (caught: Error) => caught,
+        );
+        expect(error).toBeInstanceOf(ScreeningDeadlineExceededError);
+        // Controlled message: no timings, paths, or tool output.
+        expect(error.message).toBe('The screening decode exceeded its time budget');
+        expect(kill).toHaveBeenCalledWith('SIGKILL');
+        await session.close();
+      });
+
+      it('rejects FrameUnavailableError when a CLEAN exit yielded no frame at all', async () => {
+        const { child, stdout } = makeChild();
+        const { session } = await openSession();
+        const promise = session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 1024,
+          deadlineMs: 5000,
+          onFrame: () => Promise.resolve('continue'),
+        });
+        stdout.end();
+        await flush();
+        child.emit('close', 0, null);
+        await expect(promise).rejects.toBeInstanceOf(FrameUnavailableError);
+        await session.close();
+      });
+
+      it('classifies a GENUINE spawn errno / signal kill as infrastructure — never confused with our own kills', async () => {
+        // A kill WE did not initiate: the tool never got to judge the file.
+        const { child, stdout } = makeChild();
+        const { session } = await openSession();
+        const externalKill = session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 1024,
+          deadlineMs: 5000,
+          onFrame: () => Promise.resolve('continue'),
+        });
+        stdout.write(fakePng(1));
+        stdout.end();
+        await flush();
+        child.emit('close', null, 'SIGKILL');
+        await expect(externalKill).rejects.toBeInstanceOf(
+          ExtractionInfrastructureError,
+        );
+        await session.close();
+
+        // OS refusals arrive as an 'error' event with a STRING errno.
+        for (const errno of ['EACCES', 'ENOMEM']) {
+          const spawned = makeChild();
+          const opened = await openSession();
+          const promise = opened.session.streamFrames({
+            maxFrames: 900,
+            maxBytesPerFrame: 1024,
+            deadlineMs: 5000,
+            onFrame: () => Promise.resolve('continue'),
+          });
+          spawned.child.emit(
+            'error',
+            Object.assign(new Error(`spawn ${errno} /secret/path/ffmpeg`), {
+              code: errno,
+            }),
+          );
+          const error: Error = await promise.then(
+            () => {
+              throw new Error('expected rejection');
+            },
+            (caught: Error) => caught,
+          );
+          expect(error).toBeInstanceOf(ExtractionInfrastructureError);
+          expect(error.message).not.toContain(errno);
+          expect(error.message).not.toContain('/secret/path');
+          await opened.session.close();
+        }
+
+        // A missing binary stays the controlled unavailable error.
+        const missing = makeChild();
+        const missingSession = await openSession();
+        const missingPromise = missingSession.session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 1024,
+          deadlineMs: 5000,
+          onFrame: () => Promise.resolve('continue'),
+        });
+        missing.child.emit(
+          'error',
+          Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }),
+        );
+        await expect(missingPromise).rejects.toBeInstanceOf(
+          ExtractorUnavailableError,
+        );
+        await missingSession.session.close();
+      });
+
+      it('keeps a NONZERO exit (the tool ran and judged the file) a content failure', async () => {
+        const { child, stdout } = makeChild();
+        const { session } = await openSession();
+        const promise = session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 1024,
+          deadlineMs: 5000,
+          onFrame: () => Promise.resolve('continue'),
+        });
+        stdout.end();
+        await flush();
+        child.emit('close', 1, null);
+        await expect(promise).rejects.toBeInstanceOf(ExtractionFailedError);
+        await session.close();
+      });
+
+      it("propagates the SCREENER's own failure unchanged after abandoning the decode", async () => {
+        const { stdout, kill } = makeChild();
+        const { session } = await openSession();
+        const screenerFailure = new Error('recognizer unavailable');
+        const promise = session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 1024,
+          deadlineMs: 5000,
+          onFrame: () => Promise.reject(screenerFailure),
+        });
+        stdout.write(Buffer.concat([fakePng(1), fakePng(2)]));
+        await expect(promise).rejects.toBe(screenerFailure);
+        expect(kill).toHaveBeenCalledWith('SIGKILL');
+        await session.close();
+      });
+
+      it('resolves FEW frames AS-IS (the service decides sufficiency against its floor)', async () => {
+        const { child, stdout } = makeChild();
+        const { session } = await openSession();
+        const promise = session.streamFrames({
+          maxFrames: 900,
+          maxBytesPerFrame: 1024,
+          deadlineMs: 5000,
+          onFrame: () => Promise.resolve('continue'),
+        });
+        stdout.write(Buffer.concat([fakePng(1), fakePng(2), fakePng(3)]));
+        stdout.end();
+        await flush();
+        child.emit('close', 0, null);
+        await expect(promise).resolves.toEqual({
+          framesSeen: 3,
+          stoppedEarly: false,
+        });
+        await session.close();
+      });
+    });
+  });
+
+  it('declares itself byte-reading (screening previews may serve from it)', () => {
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.resolve({ stdout: Buffer.from('png') }),
+    );
+    expect(extractor.readsRealBytes).toBe(true);
+  });
+
+  it('enforces a caller-supplied maxBytes as the exec maxBuffer, clamped by the ceiling', async () => {
+    const budgets: number[] = [];
+    const extractor = new FfmpegVideoFrameExtractor(
+      storageStub,
+      (_binary, _args, maxOutputBytes) => {
+        budgets.push(maxOutputBytes);
+        return Promise.resolve({ stdout: Buffer.from('png') });
+      },
+    );
+    const probe = { durationMs: 10_000, width: 100, height: 100, fps: 30 };
+    // A tightened caller budget IS the invocation's maxBuffer.
+    await extractor.extractFrameAt('a/original.mp4', probe, 0, {
+      maxBytes: 1000,
+    });
+    // A caller budget can never RAISE the adapter's own ceiling.
+    await extractor.extractFrameAt('a/original.mp4', probe, 0, {
+      maxBytes: MAX_OUTPUT_BYTES * 4,
+    });
+    // No caller budget → the ceiling, unchanged.
+    await extractor.extractFrameAt('a/original.mp4', probe, 0);
+    expect(budgets).toEqual([1000, MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES]);
+  });
+
+  it('maps a BUDGET-tripped maxBuffer overflow to FrameExceedsBudgetError, not infrastructure', async () => {
+    const overflow = () =>
+      Promise.reject(
+        Object.assign(new RangeError('stdout maxBuffer length exceeded'), {
+          code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+        }),
+      );
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, overflow);
+    const probe = { durationMs: 10_000, width: 100, height: 100, fps: 30 };
+    // The caller-supplied cap (below the ceiling) is what fired → a budget
+    // verdict the caller can treat as a skip.
+    await expect(
+      extractor.extractFrameAt('a/original.mp4', probe, 0, { maxBytes: 1000 }),
+    ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
+    // The adapter's OWN ceiling firing stays the existing infrastructure
+    // classification (a parent-side cap, not a caller budget).
+    await expect(
+      extractor.extractFrameAt('a/original.mp4', probe, 0),
+    ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+    await expect(
+      extractor.extractFrameAt('a/original.mp4', probe, 0, {
+        maxBytes: MAX_OUTPUT_BYTES,
+      }),
+    ).rejects.toBeInstanceOf(ExtractionInfrastructureError);
+  });
+
+  it('rejects a degenerate caller budget WITHOUT spawning anything', async () => {
+    const runner = jest.fn(() =>
+      Promise.resolve({ stdout: Buffer.from('png') }),
+    );
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+    const probe = { durationMs: 10_000, width: 100, height: 100, fps: 30 };
+    for (const maxBytes of [0, -1, 1.5, Number.NaN]) {
+      await expect(
+        extractor.extractFrameAt('a/original.mp4', probe, 0, { maxBytes }),
+      ).rejects.toBeInstanceOf(FrameExceedsBudgetError);
+    }
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it('ends a batch whose SHRINKING budget trips the exec cap with the decoded frames', async () => {
+    // Once the aggregate pool drops below the per-frame ceiling the
+    // remainder becomes the exec cap; a real overflow there surfaces as
+    // FrameExceedsBudgetError inside the loop and must END the batch with
+    // the frames already decoded — never an infrastructure 503, and never
+    // a content failure that flips a valid asset to FAILED.
+    let call = 0;
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () => {
+      call += 1;
+      if (call <= 2) {
+        return Promise.resolve({
+          stdout: Buffer.alloc(48 * 1024 * 1024),
+        });
+      }
+      return Promise.reject(
+        Object.assign(new RangeError('stdout maxBuffer length exceeded'), {
+          code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+        }),
+      );
+    });
+    const frames = await extractor.extractFrames(
+      'a/original.mp4',
+      { durationMs: 20_000, width: 100, height: 100, fps: 30 },
+      { intervalMs: 1000, maxFrames: 10, startMs: 0 },
+    );
+    expect(frames.map((f) => f.timestampMs)).toEqual([0, 1000]);
+  });
+
+  it('returns a documented high-res batch partially instead of failing the asset', async () => {
+    // The Codex P2 scenario: a 30 s 4K clip, intervalMs=1000, maxFrames=30
+    // — ~13 MiB PNG frames exhaust the 128 MiB aggregate pool around frame
+    // 10. The runner honors its maxBuffer like the real execFile: a frame
+    // larger than the shrunken remainder overflows. The batch must resolve
+    // with the frames that fit; the caller never sees an
+    // ExtractionFailedError (which flipped VALIDATED/READY → FAILED).
+    const frameBytes = 13 * 1024 * 1024;
+    const extractor = new FfmpegVideoFrameExtractor(
+      storageStub,
+      (_binary, _args, maxOutputBytes) => {
+        if (frameBytes > maxOutputBytes) {
+          return Promise.reject(
+            Object.assign(new RangeError('stdout maxBuffer length exceeded'), {
+              code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+            }),
+          );
+        }
+        return Promise.resolve({ stdout: Buffer.alloc(frameBytes) });
+      },
+    );
+    const frames = await extractor.extractFrames(
+      'a/original.mp4',
+      { durationMs: 30_000, width: 3840, height: 2160, fps: 30 },
+      { intervalMs: 1000, maxFrames: 30, startMs: 0 },
+    );
+    // 9 × 13 MiB fit the 128 MiB pool; frame 10's 11 MiB remainder cannot
+    // hold a 13 MiB frame, so the batch ends there.
+    expect(frames.length).toBe(9);
+    expect(frames[0].timestampMs).toBe(0);
+    expect(frames[8].timestampMs).toBe(8000);
+  });
+
+  it('forwards the SHRINKING remaining budget once the pool drops below the per-frame cap', async () => {
+    // Reverting the budget-before-decode fix (passing a constant maxBuffer)
+    // must fail this test: with 48 MiB frames against the 128 MiB pool, the
+    // third invocation's allowance must be the 32 MiB remainder — not the
+    // full per-frame cap.
+    const frameBytes = 48 * 1024 * 1024;
+    const budgets: number[] = [];
+    const frame = Buffer.alloc(frameBytes);
+    const extractor = new FfmpegVideoFrameExtractor(
+      storageStub,
+      (_binary, _args, maxOutputBytes) => {
+        budgets.push(maxOutputBytes);
+        return Promise.resolve({ stdout: frame });
+      },
+    );
+    // Third frame (48 MiB) exceeds its 32 MiB allowance via the runner
+    // backstop — the batch ends with the two frames that fit rather than
+    // blowing the pool (or failing the asset).
+    const frames = await extractor.extractFrames(
+      'a/original.mp4',
+      { durationMs: 20_000, width: 100, height: 100, fps: 30 },
+      { intervalMs: 1000, maxFrames: 10, startMs: 0 },
+    );
+    expect(frames.map((f) => f.timestampMs)).toEqual([0, 1000]);
+    expect(budgets.length).toBe(3);
+    expect(budgets[2]).toBe(MAX_TOTAL_EXTRACTION_BYTES - 2 * frameBytes);
+    expect(budgets[2]).toBeLessThan(budgets[0]);
+  });
+});
+
+/**
+ * The Codex finding this closes: the pre-Multer upload guard only consulted
+ * the CAPABILITY FLAGS (readsRealBytes / readsRealPixels). Those are static
+ * claims about the STRATEGY — with VIDEO_FFMPEG_ENABLED=true and no ffmpeg
+ * on the host the flag is still true — so the guard passed and multer
+ * buffered the entire upload before anything failed. checkToolingReady is
+ * the runtime half: it actually runs the binaries.
+ *
+ * The follow-up finding: RUNNING is not the same as being ABLE. A build can
+ * answer `-version` and still lack the PNG encoder / image2pipe muxer the
+ * screening decode needs, so the gate would open and the real decode fail
+ * after multer had buffered the body. ffmpeg is therefore exercised through
+ * the ACTUAL pipeline — one synthetic frame encoded down the same
+ * image2pipe/png path — and only real PNG bytes count as ready.
+ *
+ * The invariants pinned here: BOTH binaries are exercised, ffmpeg by
+ * capability rather than executability, every failure shape is a plain
+ * `false`, the answer (positive AND negative) is memoized
+ * for the TTL so the gate stays cheap and a missing binary cannot cause a
+ * spawn storm, and NOTHING but a boolean ever comes back — no path, argv,
+ * errno, or stderr.
+ */
+describe('FfmpegVideoFrameExtractor.checkToolingReady', () => {
+  /** One recorded runner invocation. */
+  interface Invocation {
+    binary: string;
+    args: string[];
+    maxOutputBytes: number;
+    stdin?: Buffer;
+    timeoutMs?: number;
+  }
+
+  // Real PNG bytes: the readiness CAPABILITY probe is satisfied only by
+  // output that actually begins with the PNG signature, so a "capable"
+  // fake runner has to produce one.
+  const PNG_SIGNATURE_BYTES = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  ]);
+  const capablePng = Buffer.concat([
+    PNG_SIGNATURE_BYTES,
+    Buffer.from('IHDR...a 16x16 black frame'),
+  ]);
+
+  /** A host where BOTH the probe binary and the PNG pipe capability work. */
+  const fullyCapable = (binary: string) =>
+    Promise.resolve({
+      stdout:
+        binary === 'ffmpeg' ? capablePng : Buffer.from('ffprobe version 6.0'),
+    });
+
+  const recordingRunner = (
+    calls: Invocation[],
+    outcome: (binary: string) => Promise<{ stdout: Buffer }> = fullyCapable,
+  ) =>
+    jest.fn(
+      (
+        binary: string,
+        args: string[],
+        maxOutputBytes: number,
+        stdin?: Buffer,
+        timeoutMs?: number,
+      ) => {
+        calls.push({ binary, args, maxOutputBytes, stdin, timeoutMs });
+        return outcome(binary);
+      },
+    );
+
+  const enoent = () =>
+    Promise.reject(
+      Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }),
+    );
+
+  it('reports ready when ffprobe RUNS and ffmpeg proves the PNG pipe CAPABILITY', async () => {
+    const calls: Invocation[] = [];
+    const extractor = new FfmpegVideoFrameExtractor(
+      storageStub,
+      recordingRunner(calls),
+    );
+    const ready = await extractor.checkToolingReady();
+    expect(ready).toBe(true);
+    // A screen needs the probe AND the decode, so both binaries are proved
+    // — and exactly TWO execs do it: ffmpeg's executability is implicit in
+    // the capability invocation, so no separate `ffmpeg -version` runs.
+    expect(calls.map((call) => call.binary)).toEqual(['ffprobe', 'ffmpeg']);
+    // ffprobe: the cheap executability banner.
+    expect(calls[0].args).toEqual(buildVersionArgs());
+    expect(calls[0].args).toEqual(['-version']);
+    // ffmpeg: the real pipeline, not a banner.
+    expect(calls[1].args).toEqual(buildCapabilityProbeArgs());
+    expect(calls[1].args).not.toEqual(buildVersionArgs());
+    for (const call of calls) {
+      // No bytes are fed to a readiness check.
+      expect(call.stdin).toBeUndefined();
+      // Far tighter than the work ceiling — this must stay CHEAP.
+      expect(call.timeoutMs).toBe(TOOLING_READY_TIMEOUT_MS);
+      expect(call.timeoutMs as number).toBeLessThan(COMMAND_TIMEOUT_MS);
+    }
+    // The readiness check itself never spawns or touches disk.
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(mkdtemp).not.toHaveBeenCalled();
+    expect(writeFile).not.toHaveBeenCalled();
+  });
+
+  it('exercises the EXACT image2pipe/png path streamFrames uses, with no fixture and no input path', () => {
+    const capability = buildCapabilityProbeArgs();
+    const screening = buildAllFramesArgs();
+    // THE point of the check: the output half of the vector — the muxer and
+    // encoder a build can be missing — is byte-for-byte the screening
+    // decode's own.
+    const outputTail = ['-f', 'image2pipe', '-vcodec', 'png', 'pipe:1'];
+    expect(capability.slice(-outputTail.length)).toEqual(outputTail);
+    expect(screening.slice(-outputTail.length)).toEqual(outputTail);
+    // The frame comes from ffmpeg's OWN synthetic generator: no fixture
+    // file is committed, nothing is read from disk, and one frame only.
+    expect(capability).toEqual([
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      'color=c=black:s=16x16:d=1',
+      '-frames:v',
+      '1',
+      ...outputTail,
+    ]);
+    // Fixed and input-free: no storage path, no stdin pipe, no interpolated
+    // value, and nothing a shell could reinterpret.
+    for (const arg of capability) {
+      expect(arg).not.toContain('/');
+      expect(arg).not.toContain('pipe:0');
+      expect(arg).not.toMatch(/[;&|`$><]/);
+    }
+    // Pure: the vector is the same every call.
+    expect(buildCapabilityProbeArgs()).toEqual(capability);
+  });
+
+  it.each([
+    // The tool ran the pipeline and FAILED — the encoder or muxer is absent
+    // from this build.
+    [
+      'a nonzero exit from the capability probe',
+      () =>
+        Promise.reject(
+          Object.assign(
+            new Error('Unknown encoder "png" at /secret/path'),
+            { code: 1, killed: false, signal: null },
+          ),
+        ),
+    ],
+    // Exit ZERO but nothing came out: a clean exit is not an image.
+    [
+      'a zero exit with EMPTY stdout',
+      () => Promise.resolve({ stdout: Buffer.alloc(0) }),
+    ],
+    // Exit zero with output that is not a PNG at all.
+    [
+      'a zero exit with GARBAGE stdout',
+      () => Promise.resolve({ stdout: Buffer.from('not an image at all') }),
+    ],
+    // Exit zero with a TRUNCATED signature — a prefix is not a match.
+    [
+      'a zero exit with a TRUNCATED PNG signature',
+      () => Promise.resolve({ stdout: PNG_SIGNATURE_BYTES.subarray(0, 7) }),
+    ],
+    // Exit zero with a signature that is merely PRESENT, not leading: the
+    // stream must START with it.
+    [
+      'a zero exit whose PNG signature is not at the START',
+      () =>
+        Promise.resolve({
+          stdout: Buffer.concat([Buffer.from('junk'), capablePng]),
+        }),
+    ],
+    // A runner resolving with a nonsense shape must not escape either.
+    [
+      'a runner resolving with a non-Buffer stdout',
+      () =>
+        Promise.resolve({ stdout: 'a string' as unknown as Buffer }),
+    ],
+  ])(
+    'reports NOT ready when the binaries START but the PNG pipe capability is missing: %s',
+    async (_label, ffmpegOutcome) => {
+      // THE hole this closes: `-version` succeeds on both binaries, the
+      // gate opens, Multer buffers the entire upload, and only THEN does
+      // the real decode fail. Executability is not capability.
+      const calls: Invocation[] = [];
+      const runner = recordingRunner(calls, (binary) =>
+        binary === 'ffmpeg'
+          ? ffmpegOutcome()
+          : Promise.resolve({ stdout: Buffer.from('ffprobe version 6.0') }),
+      );
+      const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+      const ready = await extractor.checkToolingReady();
+      expect(typeof ready).toBe('boolean');
+      expect(ready).toBe(false);
+      // The probe binary was fine; it is the CAPABILITY that failed.
+      expect(calls.map((call) => call.binary)).toEqual(['ffprobe', 'ffmpeg']);
+      expect(calls[1].args).toEqual(buildCapabilityProbeArgs());
+    },
+  );
+
+  it('MEMOIZES a missing CAPABILITY too — a broken build cannot cause a spawn storm', async () => {
+    const calls: Invocation[] = [];
+    const runner = recordingRunner(calls, (binary) =>
+      binary === 'ffmpeg'
+        ? Promise.resolve({ stdout: Buffer.alloc(0) })
+        : Promise.resolve({ stdout: Buffer.from('ffprobe version 6.0') }),
+    );
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+    for (let request = 0; request < 25; request += 1) {
+      await expect(extractor.checkToolingReady()).resolves.toBe(false);
+    }
+    // Two execs for 25 refused uploads, not fifty.
+    expect(runner).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    // Missing binary.
+    ['ENOENT (missing binary)', { code: 'ENOENT' }],
+    // Present but not executable.
+    ['EACCES (non-executable)', { code: 'EACCES' }],
+    // The tool ran and exited nonzero.
+    ['a nonzero exit', { code: 1, killed: false, signal: null }],
+    // Killed by the readiness timeout (or any external signal).
+    ['a timeout kill', { killed: true, signal: 'SIGTERM' }],
+    // Output overran the parent cap — fail-closed, never a pass.
+    ['an output overrun', { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }],
+  ])('reports NOT ready on %s, without throwing', async (_label, failure) => {
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, () =>
+      Promise.reject(
+        Object.assign(
+          new Error('spawn /usr/local/bin/ffprobe failed at /secret/path'),
+          failure,
+        ),
+      ),
+    );
+    const ready = await extractor.checkToolingReady();
+    // A BARE boolean: no error escapes, and nothing that could carry a
+    // path, argv, errno string, or stderr comes back through this seam.
+    expect(typeof ready).toBe('boolean');
+    expect(ready).toBe(false);
+  });
+
+  it('reports NOT ready when only ONE of the two binaries runs', async () => {
+    // ffprobe present, ffmpeg missing: probing would work and the DECODE
+    // would not, so the screen cannot run — reporting ready on the strength
+    // of one binary would recreate the very hole this check closes.
+    const calls: Invocation[] = [];
+    const runner = recordingRunner(calls, (binary) =>
+      binary === 'ffmpeg'
+        ? enoent()
+        : Promise.resolve({ stdout: Buffer.from('ffprobe version 6.0') }),
+    );
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+    await expect(extractor.checkToolingReady()).resolves.toBe(false);
+    expect(calls.map((call) => call.binary)).toEqual(['ffprobe', 'ffmpeg']);
+  });
+
+  it('short-circuits: a failing FIRST binary never invokes the second', async () => {
+    const calls: Invocation[] = [];
+    const runner = recordingRunner(calls, enoent);
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+    await expect(extractor.checkToolingReady()).resolves.toBe(false);
+    expect(calls.map((call) => call.binary)).toEqual(['ffprobe']);
+  });
+
+  it('MEMOIZES a positive result: later calls within the TTL never re-invoke the runner', async () => {
+    const calls: Invocation[] = [];
+    const runner = recordingRunner(calls);
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+    await expect(extractor.checkToolingReady()).resolves.toBe(true);
+    expect(runner).toHaveBeenCalledTimes(2); // one per binary
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await expect(extractor.checkToolingReady()).resolves.toBe(true);
+    }
+    // A per-request spawn would defeat the point of a CHEAP pre-buffer gate.
+    expect(runner).toHaveBeenCalledTimes(2);
+  });
+
+  it('MEMOIZES a NEGATIVE result too — a missing binary cannot cause a spawn storm', async () => {
+    const runner = jest.fn(enoent);
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+    for (let request = 0; request < 25; request += 1) {
+      await expect(extractor.checkToolingReady()).resolves.toBe(false);
+    }
+    // ONE failed exec for 25 refused uploads, not 25.
+    expect(runner).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-checks once the TTL has elapsed (an operator installing the tool need not restart)', async () => {
+    const calls: Invocation[] = [];
+    let missing = true;
+    const runner = recordingRunner(calls, (binary) =>
+      missing ? enoent() : fullyCapable(binary),
+    );
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+    const now = jest.spyOn(Date, 'now');
+    try {
+      now.mockReturnValue(1_000_000);
+      await expect(extractor.checkToolingReady()).resolves.toBe(false);
+      expect(runner).toHaveBeenCalledTimes(1);
+      // One millisecond short of the TTL: still the cached answer.
+      now.mockReturnValue(1_000_000 + TOOLING_READY_TTL_MS - 1);
+      await expect(extractor.checkToolingReady()).resolves.toBe(false);
+      expect(runner).toHaveBeenCalledTimes(1);
+      // At the TTL the answer is stale — the tooling is consulted again.
+      missing = false;
+      now.mockReturnValue(1_000_000 + TOOLING_READY_TTL_MS);
+      await expect(extractor.checkToolingReady()).resolves.toBe(true);
+      expect(runner).toHaveBeenCalledTimes(3); // 1 failed + 2 binaries
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('collapses CONCURRENT checks on a cold cache onto one invocation', async () => {
+    const calls: Invocation[] = [];
+    const runner = recordingRunner(calls);
+    const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+    const results = await Promise.all([
+      extractor.checkToolingReady(),
+      extractor.checkToolingReady(),
+      extractor.checkToolingReady(),
+    ]);
+    expect(results).toEqual([true, true, true]);
+    expect(runner).toHaveBeenCalledTimes(2); // one per binary, not per call
+  });
+
+  it('never rejects, even when the runner throws SYNCHRONOUSLY or rejects with a non-Error', async () => {
+    const hostile: (() => Promise<{ stdout: Buffer }>)[] = [
+      () => {
+        throw Object.assign(new Error('/secret/ffmpeg exploded'), {
+          code: 'EACCES',
+        });
+      },
+      () =>
+        Promise.reject(
+          'a bare string naming /secret/path',
+        ) as Promise<{ stdout: Buffer }>,
+      () => Promise.reject(undefined) as Promise<{ stdout: Buffer }>,
+    ];
+    for (const runner of hostile) {
+      const extractor = new FfmpegVideoFrameExtractor(storageStub, runner);
+      const ready = await extractor.checkToolingReady();
+      expect(typeof ready).toBe('boolean');
+      expect(ready).toBe(false);
+    }
+  });
+});

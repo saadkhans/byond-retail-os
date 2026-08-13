@@ -19,6 +19,7 @@ import {
 } from '../auth/decorators/request-context.decorators';
 import { RequestContext } from '../auth/request-context';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
+import { RecordMovementDto } from './dto/record-movement.dto';
 import { QueryLevelsDto, QueryMovementsDto } from './dto/query-inventory.dto';
 import { AdjustmentResult } from './inventory.repository';
 import { InventoryService, StockLevelView } from './inventory.service';
@@ -88,6 +89,36 @@ export class InventoryController {
     @CurrentUser() actor: RequestContext,
   ): Promise<AdjustmentResult> {
     return this.inventoryService.adjustStock(tenantId, dto, {
+      id: actor.userId,
+      email: actor.email,
+    });
+  }
+
+  @Post('movements')
+  @RequirePermissions('inventory:adjust')
+  @ApiOperation({
+    summary:
+      'Record an external inventory movement (RECEIPT / CORRECTION_IN / ' +
+      'CORRECTION_OUT), idempotent by reference',
+    description:
+      'Appends exactly one immutable ledger movement per unique reference: ' +
+      'retrying the same reference REPLAYS the recorded movement instead ' +
+      'of stocking twice. Quantities are positive; the movement type ' +
+      'carries the direction. Stock can never go below zero.',
+  })
+  @ApiCreatedResponse({ description: 'Movement recorded (or replayed)' })
+  @ApiNotFoundResponse({
+    description: 'Location or product not found in this tenant',
+  })
+  @ApiConflictResponse({
+    description: 'Would take stock below zero, or product is archived',
+  })
+  recordMovement(
+    @CurrentTenantId() tenantId: string,
+    @Body() dto: RecordMovementDto,
+    @CurrentUser() actor: RequestContext,
+  ): Promise<AdjustmentResult & { replayed: boolean }> {
+    return this.inventoryService.recordMovement(tenantId, dto, {
       id: actor.userId,
       email: actor.email,
     });

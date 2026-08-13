@@ -72,7 +72,7 @@ export class EdgeRegistrationRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceAdvisoryLockKey(
         candidate.tenantId,
         candidate.id,
-      )}))`;
+      )}))::text`;
       const device = await tx.device.findFirst({
         where: { id: candidate.id, registrationTokenHash: tokenHash },
       });

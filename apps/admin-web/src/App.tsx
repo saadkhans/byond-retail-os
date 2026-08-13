@@ -20,6 +20,7 @@ import {
   InferenceJobsPage,
 } from './pages/InferenceJobsPage';
 import { InventoryPage } from './pages/InventoryPage';
+import { JourneyDetailPage, JourneysPage } from './pages/JourneysPage';
 import { LoginPage } from './pages/LoginPage';
 import { OrderDetailPage, OrdersPage } from './pages/OrdersPage';
 import { PaymentEventsPage } from './pages/PaymentEventsPage';
@@ -27,12 +28,18 @@ import {
   PaymentIntentDetailPage,
   PaymentsPage,
 } from './pages/PaymentsPage';
+import { PickupValidationPage } from './pages/PickupValidationPage';
 import {
   ReconciliationDetailPage,
   ReconciliationPage,
 } from './pages/ReconciliationPage';
+import { ReferenceLibraryPage } from './pages/ReferenceLibraryPage';
 import { StoreDetailPage, StoresPage } from './pages/StoresPage';
 import { UnitDetailPage, UnitsPage } from './pages/UnitsPage';
+import {
+  VideoAssetDetailPage,
+  VideoAssetsPage,
+} from './pages/VideoAssetsPage';
 import {
   VisionEventDetailPage,
   VisionEventsPage,
@@ -71,6 +78,10 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/reconciliation">Reconciliation</NavLink>
         <NavLink to="/vision-events">CV events</NavLink>
         <NavLink to="/inference">Inference jobs</NavLink>
+        <NavLink to="/video-assets">Test videos</NavLink>
+        <NavLink to="/reference-library">Reference library</NavLink>
+        <NavLink to="/pickup-validation">Pickup validation</NavLink>
+        <NavLink to="/journeys">Journeys</NavLink>
         <div className="spacer" />
         <div className="who">{user?.email}</div>
         <button onClick={() => void logout()}>Sign out</button>
@@ -137,6 +148,24 @@ export function App() {
                     <Route
                       path="inference/:id"
                       element={<InferenceJobDetailPage />}
+                    />
+                    <Route path="video-assets" element={<VideoAssetsPage />} />
+                    <Route
+                      path="video-assets/:id"
+                      element={<VideoAssetDetailPage />}
+                    />
+                    <Route
+                      path="reference-library"
+                      element={<ReferenceLibraryPage />}
+                    />
+                    <Route
+                      path="pickup-validation"
+                      element={<PickupValidationPage />}
+                    />
+                    <Route path="journeys" element={<JourneysPage />} />
+                    <Route
+                      path="journeys/:id"
+                      element={<JourneyDetailPage />}
                     />
                     <Route path="*" element={<Navigate to="/" replace />} />
                   </Routes>

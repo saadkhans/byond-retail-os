@@ -901,7 +901,7 @@ export class PaymentsRepository extends TenantScopedRepository {
           await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${orderPaymentAdvisoryLockKey(
             scopedTenantId,
             targetOrderId,
-          )}))`;
+          )}))::text`;
           order = await tx.order.findFirst({
             where: { id: targetOrderId, tenantId: scopedTenantId },
           });
@@ -1015,7 +1015,7 @@ export class PaymentsRepository extends TenantScopedRepository {
     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${orderPaymentAdvisoryLockKey(
       tenantId,
       order.id,
-    )}))`;
+    )}))::text`;
     return tx.order.findFirst({ where: { id: order.id, tenantId } });
   }
 
@@ -1209,6 +1209,6 @@ export class PaymentsRepository extends TenantScopedRepository {
     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${paymentIntentAdvisoryLockKey(
       tenantId,
       intentId,
-    )}))`;
+    )}))::text`;
   }
 }

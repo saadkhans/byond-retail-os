@@ -1,0 +1,12 @@
+-- Verified platform-sandbox identity (Codex rounds 7-8 P1): the reserved
+-- slug alone is not proof a tenant row is the dedicated sandbox, and
+-- neither is the display name — before this migration, tenant creation
+-- accepted the then-unreserved slug AND an arbitrary name, so BOTH fields
+-- are customer-controllable. This migration therefore adds the marker
+-- column ONLY and verifies NO existing row: every pre-marker row fails
+-- closed (AuthRepository refuses to resolve it; platform users keep no
+-- tenant context). The verified sandbox is provisioned exclusively by
+-- seedPlatformSandboxTenant, which creates it — marker included — only
+-- when the reserved slug is unused, and refuses with a controlled error
+-- to take over any existing row that lacks the marker.
+ALTER TABLE "Tenant" ADD COLUMN "isPlatformSandbox" BOOLEAN NOT NULL DEFAULT false;

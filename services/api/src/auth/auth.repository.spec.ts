@@ -25,6 +25,7 @@ describe('AuthRepository (tenant-status enforcement)', () => {
       findUnique: jest.Mock;
       updateMany: jest.Mock;
     };
+    tenant: { findFirst: jest.Mock };
     $transaction: jest.Mock;
     $queryRaw: jest.Mock;
   };
@@ -38,6 +39,7 @@ describe('AuthRepository (tenant-status enforcement)', () => {
         findUnique: jest.fn().mockResolvedValue(tenantUser),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
+      tenant: { findFirst: jest.fn().mockResolvedValue(null) },
       $transaction: jest.fn(async (callback: (tx: unknown) => unknown) =>
         callback(prisma),
       ),
@@ -123,6 +125,50 @@ describe('AuthRepository (tenant-status enforcement)', () => {
   it('returns null when the user itself is missing', async () => {
     prisma.user.findFirst.mockResolvedValue(null);
     await expect(repository.findActiveById('ghost')).resolves.toBeNull();
+  });
+
+  describe('findPlatformSandboxTenantId (verified reserved identity)', () => {
+    it('resolves only a tenant carrying the VERIFIED sandbox marker', async () => {
+      prisma.tenant.findFirst.mockResolvedValueOnce({ id: 'sandbox-1' });
+
+      await expect(repository.findPlatformSandboxTenantId()).resolves.toBe(
+        'sandbox-1',
+      );
+      // The lookup demands slug AND ACTIVE AND the seeder-only marker —
+      // the slug alone is never proof of sandbox identity.
+      expect(prisma.tenant.findFirst).toHaveBeenCalledWith({
+        where: {
+          slug: 'platform-sandbox',
+          status: TenantStatus.ACTIVE,
+          isPlatformSandbox: true,
+        },
+        select: { id: true },
+      });
+    });
+
+    it('never assigns a customer tenant squatting the reserved slug', async () => {
+      // Verified lookup misses; the collision probe then finds an
+      // UNMARKED tenant holding the slug — a customer tenant.
+      prisma.tenant.findFirst
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ id: 'customer-1' });
+
+      // Fails closed: platform users get NO tenant context rather than
+      // someone else's tenant.
+      await expect(
+        repository.findPlatformSandboxTenantId(),
+      ).resolves.toBeNull();
+      expect(prisma.tenant.findFirst).toHaveBeenNthCalledWith(2, {
+        where: { slug: 'platform-sandbox', isPlatformSandbox: false },
+        select: { id: true },
+      });
+    });
+
+    it('resolves null when no sandbox exists at all', async () => {
+      await expect(
+        repository.findPlatformSandboxTenantId(),
+      ).resolves.toBeNull();
+    });
   });
 
   describe('markLoggedIn (write-bound active check + atomic audit)', () => {

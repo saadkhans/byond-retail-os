@@ -40,6 +40,12 @@ describe('PrismaInferenceQueue', () => {
     leaseExpiresAt: new Date(Date.now() + 300_000),
   } as InferenceJobDetail;
 
+  /** Two-phase creation, first phase: created but NOT yet published. */
+  const pendingLinkJob = {
+    ...queuedJob,
+    status: InferenceJobStatus.PENDING_LINK,
+  } as InferenceJobDetail;
+
   const normalizedResult: NormalizedInferenceResult = {
     eventType: 'PRODUCT_PICKUP',
     quantityDelta: 2,
@@ -145,6 +151,12 @@ describe('PrismaInferenceQueue', () => {
       expect(() =>
         queue.fail('', 'job-1', 0, { errorCode: 'X_Y' }, transitionAudit),
       ).toThrow(TenantIdRequiredError);
+      expect(() =>
+        queue.cancelQueued('', 'job-1', transitionAudit),
+      ).toThrow(TenantIdRequiredError);
+      expect(() =>
+        queue.publishPendingLink('', 'job-1', transitionAudit),
+      ).toThrow(TenantIdRequiredError);
     });
 
     it('scopes every enqueue reference check to the tenant', async () => {
@@ -181,6 +193,49 @@ describe('PrismaInferenceQueue', () => {
         expect.objectContaining({ entityType: 'InferenceJob' }),
         tx,
       );
+    });
+
+    it('writes NO status for a normal enqueue — the QUEUED column default stands (Phase 9 unchanged)', async () => {
+      await queue.enqueue(
+        'tenant-a',
+        { ...baseEnqueue, pendingLink: false },
+        enqueueAudit,
+      );
+      const createArgs = tx.inferenceJob.create.mock.calls[0][0] as {
+        data: Record<string, unknown>;
+      };
+      expect(createArgs.data).not.toHaveProperty('status');
+    });
+
+    it('creates a NON-CLAIMABLE PENDING_LINK job for two-phase creation', async () => {
+      const result = await queue.enqueue(
+        'tenant-a',
+        { ...baseEnqueue, pendingLink: true },
+        enqueueAudit,
+      );
+      const createArgs = tx.inferenceJob.create.mock.calls[0][0] as {
+        data: { status: InferenceJobStatus };
+      };
+      expect(createArgs.data.status).toBe(InferenceJobStatus.PENDING_LINK);
+      expect(result).toEqual(expect.objectContaining({ replayed: false }));
+      // Creation is still audited: the row exists and must be traceable
+      // even if the caller crashes before publishing it.
+      expect(auditLog.record).toHaveBeenCalledTimes(1);
+    });
+
+    it('replays an existing PENDING_LINK job for the same idempotency key without writing', async () => {
+      // Crash-window recovery: the retry finds the unpublished job under
+      // the deterministic key instead of minting a second one.
+      tx.inferenceJob.findFirst.mockResolvedValue(pendingLinkJob);
+      await expect(
+        queue.enqueue(
+          'tenant-a',
+          { ...baseEnqueue, idempotencyKey: 'video-crop:art-1', pendingLink: true },
+          enqueueAudit,
+        ),
+      ).resolves.toEqual({ job: pendingLinkJob, replayed: true });
+      expect(tx.inferenceJob.create).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
     });
 
     it('replays an existing job for the same idempotency key without writing', async () => {
@@ -407,6 +462,15 @@ describe('PrismaInferenceQueue', () => {
       expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
     });
 
+    it('rejects a PENDING_LINK job as not-claimable (non-terminal) without writing', async () => {
+      tx.inferenceJob.findFirst.mockResolvedValue(pendingLinkJob);
+      await expect(
+        queue.markRunning('tenant-a', 'job-1', 'simulated', transitionAudit),
+      ).resolves.toBe('not-claimable');
+      expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
+    });
+
     it('loses a claim race as not-claimable without auditing', async () => {
       tx.inferenceJob.updateMany.mockResolvedValue({ count: 0 });
       await expect(
@@ -440,6 +504,56 @@ describe('PrismaInferenceQueue', () => {
         { id: 'asc' },
       ]);
       expect(claimed).toBe(runningJob);
+    });
+
+    it('NEVER hands a PENDING_LINK job to a worker (the claim query pins QUEUED)', async () => {
+      // Simulates the table: only rows matching the claim predicate come
+      // back. The PENDING_LINK row sorts first on every ordering key, so a
+      // claim that did not pin the status would pick it up.
+      const rows = [
+        { id: 'job-pending', status: InferenceJobStatus.PENDING_LINK },
+        { id: 'job-queued', status: InferenceJobStatus.QUEUED },
+      ];
+      prismaFindFirst.mockImplementation(
+        ({ where }: { where: { status: InferenceJobStatus } }) =>
+          Promise.resolve(
+            rows.find((row) => row.status === where.status) ?? null,
+          ),
+      );
+      tx.inferenceJob.findFirst.mockResolvedValue(queuedJob);
+      const claimed = await queue.claimNext(
+        'tenant-a',
+        'simulated',
+        transitionAudit,
+      );
+      expect(claimed).toBe(runningJob);
+      const { where } = prismaFindFirst.mock.calls[0][0] as {
+        where: { status: InferenceJobStatus };
+      };
+      expect(where.status).toBe(InferenceJobStatus.QUEUED);
+      // The claimed id is the QUEUED row's — the unpublished job was never
+      // even a candidate.
+      expect(tx.inferenceJob.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            id: 'job-queued',
+            status: InferenceJobStatus.QUEUED,
+          }),
+        }),
+      );
+    });
+
+    it('returns null when only PENDING_LINK work exists in the tenant', async () => {
+      prismaFindFirst.mockImplementation(
+        ({ where }: { where: { status: InferenceJobStatus } }) =>
+          Promise.resolve(
+            where.status === InferenceJobStatus.QUEUED ? null : { id: 'job-1' },
+          ),
+      );
+      await expect(
+        queue.claimNext('tenant-a', 'simulated', transitionAudit),
+      ).resolves.toBeNull();
+      expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
     });
 
     it('returns null when the tenant queue is empty', async () => {
@@ -568,10 +682,114 @@ describe('PrismaInferenceQueue', () => {
       expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
     });
 
+    it('never sweeps a PENDING_LINK job — RUNNING with an expired lease only', async () => {
+      // An unpublished job carries no lease and no worker, so the crashed-
+      // worker sweep must not touch it (and can never publish it by
+      // accident through the requeue branch).
+      const rows = [
+        {
+          id: 'job-pending',
+          status: InferenceJobStatus.PENDING_LINK,
+          leaseExpiresAt: null,
+        },
+      ];
+      prismaFindMany.mockImplementation(
+        ({ where }: { where: { status: InferenceJobStatus } }) =>
+          Promise.resolve(
+            rows
+              .filter((row) => row.status === where.status)
+              .map(({ id }) => ({ id })),
+          ),
+      );
+      await expect(queue.reclaimExpired('tenant-a')).resolves.toEqual([]);
+      expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
+    });
+
+    it('re-pins RUNNING inside the reclaim transaction as well', async () => {
+      await queue.reclaimExpired('tenant-a');
+      expect(tx.inferenceJob.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: InferenceJobStatus.RUNNING,
+            leaseExpiresAt: { lt: expect.any(Date) },
+          }),
+        }),
+      );
+    });
+
     it('rejects a blank tenantId instead of widening the query', async () => {
       await expect(queue.reclaimExpired('')).rejects.toThrow(
         TenantIdRequiredError,
       );
+    });
+  });
+
+  describe('publishPendingLink', () => {
+    beforeEach(() => {
+      tx.inferenceJob.findFirst.mockResolvedValue(pendingLinkJob);
+      tx.inferenceJob.findFirstOrThrow.mockResolvedValue(queuedJob);
+    });
+
+    it('flips PENDING_LINK → QUEUED with a tenant-scoped compare-and-set and audits it in the SAME transaction', async () => {
+      const result = await queue.publishPendingLink(
+        'tenant-a',
+        'job-1',
+        transitionAudit,
+      );
+      expect(tx.inferenceJob.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'job-1',
+          tenantId: 'tenant-a',
+          status: InferenceJobStatus.PENDING_LINK,
+        },
+        // Publication moves NO timestamps, takes no lease, and does not
+        // touch attempts: claiming is still markRunning's job.
+        data: { status: InferenceJobStatus.QUEUED },
+      });
+      expect(result).toBe(queuedJob);
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ entityType: 'InferenceJob' }),
+        tx,
+      );
+    });
+
+    it('returns null when the job is missing in this tenant', async () => {
+      tx.inferenceJob.findFirst.mockResolvedValue(null);
+      await expect(
+        queue.publishPendingLink('tenant-a', 'missing', transitionAudit),
+      ).resolves.toBeNull();
+      expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      InferenceJobStatus.QUEUED,
+      InferenceJobStatus.RUNNING,
+      InferenceJobStatus.SUCCEEDED,
+      InferenceJobStatus.FAILED,
+      InferenceJobStatus.CANCELLED,
+    ])(
+      "returns 'not-pending' for a %s job without writing or auditing",
+      async (status) => {
+        tx.inferenceJob.findFirst.mockResolvedValue({
+          ...pendingLinkJob,
+          status,
+        });
+        await expect(
+          queue.publishPendingLink('tenant-a', 'job-1', transitionAudit),
+        ).resolves.toBe('not-pending');
+        expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
+        expect(auditLog.record).not.toHaveBeenCalled();
+      },
+    );
+
+    it("loses the CAS to a concurrent cancellation as 'not-pending' without auditing", async () => {
+      tx.inferenceJob.updateMany.mockResolvedValue({ count: 0 });
+      await expect(
+        queue.publishPendingLink('tenant-a', 'job-1', transitionAudit),
+      ).resolves.toBe('not-pending');
+      expect(auditLog.record).not.toHaveBeenCalled();
     });
   });
 
@@ -771,6 +989,96 @@ describe('PrismaInferenceQueue', () => {
         ),
       ).resolves.toBe('lease-superseded');
       expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('cancelQueued', () => {
+    it('cancels with a tenant-scoped QUEUED-only compare-and-set and audits it', async () => {
+      tx.inferenceJob.findFirst.mockResolvedValue(queuedJob);
+      tx.inferenceJob.findFirstOrThrow.mockResolvedValue({
+        ...queuedJob,
+        status: InferenceJobStatus.CANCELLED,
+      });
+      const result = await queue.cancelQueued(
+        'tenant-a',
+        'job-1',
+        transitionAudit,
+      );
+      expect(tx.inferenceJob.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'job-1',
+          tenantId: 'tenant-a',
+          // The CAS pins the whole cancellable set: unclaimed work is
+          // cancellable whether or not it has been published yet.
+          status: {
+            in: [InferenceJobStatus.PENDING_LINK, InferenceJobStatus.QUEUED],
+          },
+        },
+        // CANCELLED is terminal: completedAt is stamped with the flip (DB
+        // CHECK) and errorCode stays untouched (errors exist only on
+        // FAILED).
+        data: expect.objectContaining({
+          status: InferenceJobStatus.CANCELLED,
+          completedAt: expect.any(Date),
+        }),
+      });
+      expect(result).toEqual(
+        expect.objectContaining({ status: InferenceJobStatus.CANCELLED }),
+      );
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ entityType: 'InferenceJob' }),
+        tx,
+      );
+    });
+
+    it('cancels a PENDING_LINK job exactly like a QUEUED one (crash-window cleanup)', async () => {
+      // The DELETE flow found the job by its idempotency key: its artifact
+      // link never committed, so nothing else can ever retire it.
+      tx.inferenceJob.findFirst.mockResolvedValue(pendingLinkJob);
+      tx.inferenceJob.findFirstOrThrow.mockResolvedValue({
+        ...pendingLinkJob,
+        status: InferenceJobStatus.CANCELLED,
+      });
+      await expect(
+        queue.cancelQueued('tenant-a', 'job-1', transitionAudit),
+      ).resolves.toEqual(
+        expect.objectContaining({ status: InferenceJobStatus.CANCELLED }),
+      );
+      expect(tx.inferenceJob.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: InferenceJobStatus.CANCELLED,
+            completedAt: expect.any(Date),
+          }),
+        }),
+      );
+      expect(auditLog.record).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns null when the job is missing in this tenant', async () => {
+      tx.inferenceJob.findFirst.mockResolvedValue(null);
+      await expect(
+        queue.cancelQueued('tenant-a', 'missing', transitionAudit),
+      ).resolves.toBeNull();
+      expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("returns 'not-queued' for a claimed or finished job without writing", async () => {
+      tx.inferenceJob.findFirst.mockResolvedValue(runningJob);
+      await expect(
+        queue.cancelQueued('tenant-a', 'job-1', transitionAudit),
+      ).resolves.toBe('not-queued');
+      expect(tx.inferenceJob.updateMany).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
+    });
+
+    it("loses the CAS to a concurrent claim as 'not-queued' without auditing", async () => {
+      tx.inferenceJob.findFirst.mockResolvedValue(queuedJob);
+      tx.inferenceJob.updateMany.mockResolvedValue({ count: 0 });
+      await expect(
+        queue.cancelQueued('tenant-a', 'job-1', transitionAudit),
+      ).resolves.toBe('not-queued');
       expect(auditLog.record).not.toHaveBeenCalled();
     });
   });

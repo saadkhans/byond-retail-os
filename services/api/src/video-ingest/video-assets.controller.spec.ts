@@ -1,0 +1,255 @@
+import 'reflect-metadata';
+import { ExecutionContext } from '@nestjs/common';
+import { GUARDS_METADATA, INTERCEPTORS_METADATA } from '@nestjs/common/constants';
+import { Reflector } from '@nestjs/core';
+import { UserType } from '@prisma/client';
+import {
+  REQUIRED_MODULE_KEY,
+  REQUIRED_PERMISSIONS_KEY,
+  TENANT_ONLY_KEY,
+} from '../auth/decorators/access-policy.decorators';
+import { PermissionsGuard } from '../auth/guards/permissions.guard';
+import { RequestContext } from '../auth/request-context';
+import { AuditLogService } from '../common/audit/audit-log.service';
+import { TestMediaGateGuard } from './test-media-gate.guard';
+import { VideoAssetsController } from './video-assets.controller';
+import { VideoCropsController } from './video-crops.controller';
+
+/**
+ * Pins the declarative access policy: every video-ingest route is
+ * tenant-only, gated on the `video-ingest` module (ModuleEnabledGuard fails
+ * closed for disabled tenants), and each handler requires its
+ * least-privilege permission. The guards themselves are covered by
+ * guards.spec / module-enabled.guard.spec; this spec fails if a route ever
+ * loses (or broadens) its policy metadata.
+ */
+describe('VideoAssetsController access policy', () => {
+  it('is tenant-only and gated on the video-ingest module at the class level', () => {
+    expect(Reflect.getMetadata(TENANT_ONLY_KEY, VideoAssetsController)).toBe(
+      true,
+    );
+    expect(
+      Reflect.getMetadata(REQUIRED_MODULE_KEY, VideoAssetsController),
+    ).toBe('video-ingest');
+  });
+
+  it.each([
+    ['upload', ['video-asset:manage']],
+    ['list', ['video-asset:read']],
+    ['findById', ['video-asset:read']],
+    ['listArtifacts', ['video-asset:read']],
+    // Screening is its own least-privilege permission: releasing (or
+    // rejecting) a QUARANTINED upload is a distinct duty from processing.
+    // The preview (the module's only byte-returning route) is gated on the
+    // SAME screening permission — only the deciding duty may see frames.
+    ['screeningPreview', ['video-asset:screen']],
+    ['screen', ['video-asset:screen']],
+    ['validate', ['video-asset:process']],
+    ['extractFrames', ['video-asset:process']],
+    ['createCrop', ['video-asset:process']],
+    ['delete', ['video-asset:delete']],
+  ])('requires %s to hold %p', (handler, permissions) => {
+    expect(
+      Reflect.getMetadata(
+        REQUIRED_PERMISSIONS_KEY,
+        VideoAssetsController.prototype[
+          handler as keyof VideoAssetsController
+        ],
+      ),
+    ).toEqual(permissions);
+  });
+
+  /**
+   * The upload route carries BOTH the pre-buffer gate guard and the
+   * multipart interceptor. Nest runs guards BEFORE interceptors
+   * (RouterExecutionContext awaits `fnCanActivate` and only then calls
+   * `interceptorsConsumer.intercept`, which is what runs multer), so this
+   * pairing is what keeps the policy/tooling/attestation checks ahead of
+   * any byte being buffered. Behaviour is covered by
+   * test-media-gate.guard.spec; this pins the wiring.
+   */
+  it('gates the upload route with TestMediaGateGuard alongside the file interceptor', () => {
+    expect(
+      Reflect.getMetadata(GUARDS_METADATA, VideoAssetsController.prototype.upload),
+    ).toEqual([TestMediaGateGuard]);
+    expect(
+      Reflect.getMetadata(
+        INTERCEPTORS_METADATA,
+        VideoAssetsController.prototype.upload,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('applies the pre-buffer gate to the upload route ONLY', () => {
+    const handlers = Object.getOwnPropertyNames(
+      VideoAssetsController.prototype,
+    ).filter((name) => name !== 'constructor' && name !== 'upload');
+    for (const name of handlers) {
+      expect(
+        Reflect.getMetadata(
+          GUARDS_METADATA,
+          VideoAssetsController.prototype[name as keyof VideoAssetsController],
+        ),
+      ).toBeUndefined();
+    }
+  });
+
+  it('exposes no public route (default-deny: every handler carries permissions)', () => {
+    const handlers = Object.getOwnPropertyNames(
+      VideoAssetsController.prototype,
+    ).filter((name) => name !== 'constructor');
+    for (const name of handlers) {
+      expect(
+        Reflect.getMetadata(
+          REQUIRED_PERMISSIONS_KEY,
+          VideoAssetsController.prototype[
+            name as keyof VideoAssetsController
+          ],
+        ),
+      ).toBeDefined();
+    }
+  });
+});
+
+/**
+ * Runs the REAL PermissionsGuard against the REAL route metadata (real
+ * Reflector — nothing faked but the request): the seeded platform admin —
+ * a PLATFORM user whose auth context resolved to the platform sandbox
+ * tenant and whose Platform Administrator role holds every permission —
+ * can reach the video-asset routes, while the fail-closed cases stay shut.
+ */
+describe('VideoAssetsController: platform admin via the sandbox tenant', () => {
+  const ALL_VIDEO_PERMISSIONS = [
+    'video-asset:read',
+    'video-asset:manage',
+    'video-asset:screen',
+    'video-asset:process',
+    'video-asset:delete',
+  ];
+
+  // What AuthGuard builds for the seeded admin once the sandbox is seeded.
+  const platformAdmin: RequestContext = {
+    userId: 'admin-1',
+    email: 'admin@byond.local',
+    userType: UserType.PLATFORM,
+    tenantId: 'sandbox-1',
+    permissions: ALL_VIDEO_PERMISSIONS,
+    requestId: 'req-1',
+  };
+
+  let auditLog: { record: jest.Mock };
+  let guard: PermissionsGuard;
+
+  function contextFor(
+    handler: keyof VideoAssetsController,
+    context: RequestContext,
+  ): ExecutionContext {
+    return {
+      switchToHttp: () => ({
+        getRequest: () => ({
+          context,
+          method: 'GET',
+          path: '/video-assets',
+        }),
+      }),
+      getHandler: () => VideoAssetsController.prototype[handler],
+      getClass: () => VideoAssetsController,
+    } as unknown as ExecutionContext;
+  }
+
+  beforeEach(() => {
+    auditLog = { record: jest.fn().mockResolvedValue(undefined) };
+    guard = new PermissionsGuard(
+      new Reflector(),
+      auditLog as unknown as AuditLogService,
+    );
+  });
+
+  it.each([['list'], ['upload'], ['findById'], ['screen'], ['delete']])(
+    'admits the platform admin to %s',
+    async (handler) => {
+      await expect(
+        guard.canActivate(
+          contextFor(handler as keyof VideoAssetsController, platformAdmin),
+        ),
+      ).resolves.toBe(true);
+    },
+  );
+
+  it('still denies a platform user with NO resolved sandbox tenant', async () => {
+    // No sandbox seeded ⇒ AuthGuard left tenantId null ⇒ tenant-only denies
+    // even though every permission is held (fail closed, as before).
+    await expect(
+      guard.canActivate(
+        contextFor('list', { ...platformAdmin, tenantId: null }),
+      ),
+    ).rejects.toThrow('Insufficient permissions');
+  });
+
+  it('still denies a user without the route permission, sandbox or not', async () => {
+    await expect(
+      guard.canActivate(
+        contextFor('list', { ...platformAdmin, permissions: ['tenant:read'] }),
+      ),
+    ).rejects.toThrow('Insufficient permissions');
+    expect(auditLog.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'ACCESS_DENIED',
+        reason: 'Missing permission(s): video-asset:read',
+      }),
+    );
+  });
+
+  it('still denies a tenant user without the route permission', async () => {
+    const tenantViewer: RequestContext = {
+      userId: 'viewer-1',
+      email: 'viewer@tenant-a.example',
+      userType: UserType.TENANT,
+      tenantId: 'tenant-a',
+      permissions: ['catalog:read'],
+      requestId: 'req-2',
+    };
+    await expect(
+      guard.canActivate(contextFor('list', tenantViewer)),
+    ).rejects.toThrow('Insufficient permissions');
+  });
+});
+
+describe('VideoCropsController access policy', () => {
+  it('is tenant-only and gated on the video-ingest module at the class level', () => {
+    expect(Reflect.getMetadata(TENANT_ONLY_KEY, VideoCropsController)).toBe(
+      true,
+    );
+    expect(Reflect.getMetadata(REQUIRED_MODULE_KEY, VideoCropsController)).toBe(
+      'video-ingest',
+    );
+  });
+
+  it.each([
+    ['findById', ['video-asset:read']],
+    ['createInferenceJob', ['video-asset:process']],
+  ])('requires %s to hold %p', (handler, permissions) => {
+    expect(
+      Reflect.getMetadata(
+        REQUIRED_PERMISSIONS_KEY,
+        VideoCropsController.prototype[handler as keyof VideoCropsController],
+      ),
+    ).toEqual(permissions);
+  });
+
+  it('exposes no public route (default-deny: every handler carries permissions)', () => {
+    const handlers = Object.getOwnPropertyNames(
+      VideoCropsController.prototype,
+    ).filter((name) => name !== 'constructor');
+    for (const name of handlers) {
+      expect(
+        Reflect.getMetadata(
+          REQUIRED_PERMISSIONS_KEY,
+          VideoCropsController.prototype[
+            name as keyof VideoCropsController
+          ],
+        ),
+      ).toBeDefined();
+    }
+  });
+});

@@ -106,4 +106,22 @@ describe('ModuleEnabledGuard', () => {
     ).rejects.toThrow('Module not enabled');
     expect(platformModules.isEnabledForTenant).not.toHaveBeenCalled();
   });
+
+  it('admits a platform user resolved to the sandbox tenant, checked against THAT tenant', async () => {
+    const guard = buildGuard({ [REQUIRED_MODULE_KEY]: 'video-ingest' });
+    const platformWithSandbox: RequestContext = {
+      ...tenantContext,
+      userId: 'admin-1',
+      userType: UserType.PLATFORM,
+      tenantId: 'sandbox-1',
+    };
+    await expect(
+      guard.canActivate(executionContextFor(requestWith(platformWithSandbox))),
+    ).resolves.toBe(true);
+    // Enablement is evaluated for the sandbox tenant — never a wildcard.
+    expect(platformModules.isEnabledForTenant).toHaveBeenCalledWith(
+      'sandbox-1',
+      'video-ingest',
+    );
+  });
 });

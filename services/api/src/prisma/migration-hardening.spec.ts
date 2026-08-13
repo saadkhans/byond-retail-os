@@ -475,3 +475,365 @@ describe('checkout line soft-delete migration hardening', () => {
     expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
   });
 });
+
+describe('video ingest migration hardening', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260727000000_video_ingest',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('makes extraction artifacts append-only (one-shot inference link excepted)', () => {
+    expect(sql).toContain('CREATE FUNCTION prevent_video_artifact_mutation()');
+    expect(sql).toContain('BEFORE UPDATE OR DELETE ON "VideoArtifact"');
+    expect(sql).toContain('BEFORE TRUNCATE ON "VideoArtifact"');
+    // The single allowed mutation: setting inferenceJobId on a row that does
+    // not carry one yet, with every other column bit-identical.
+    expect(sql).toContain('OLD."inferenceJobId" IS NULL');
+    expect(sql).toContain('NEW."inferenceJobId" IS NOT NULL');
+    expect(sql).toContain('NEW."checksumSha256" = OLD."checksumSha256"');
+    expect(sql).toContain('NEW."storageKey" = OLD."storageKey"');
+  });
+
+  it('constrains sizes, probed metadata, and crop boxes with CHECK constraints', () => {
+    expect(sql).toContain('VideoAsset_sizeBytes_positive_check');
+    expect(sql).toContain('CHECK ("sizeBytes" > 0)');
+    expect(sql).toContain('VideoAsset_durationMs_positive_check');
+    expect(sql).toContain('VideoAsset_dimensions_positive_check');
+    expect(sql).toContain('VideoAsset_fps_positive_check');
+    expect(sql).toContain('VideoArtifact_sizeBytes_positive_check');
+    expect(sql).toContain('VideoArtifact_timestampMs_nonnegative_check');
+    expect(sql).toContain('VideoArtifact_dimensions_positive_check');
+    // A CROP always carries a complete, in-range crop box; a FRAME never
+    // carries one.
+    expect(sql).toContain('VideoArtifact_crop_box_check');
+    expect(sql).toContain(`"artifactType" = 'CROP' AND "cropX" IS NOT NULL`);
+    expect(sql).toContain(`"artifactType" = 'FRAME' AND "cropX" IS NULL`);
+  });
+
+  it('keeps error codes coherent with terminal statuses', () => {
+    expect(sql).toContain('VideoAsset_error_only_terminal_check');
+    expect(sql).toContain(
+      `CHECK (("errorCode" IS NOT NULL) = ("status" IN ('REJECTED', 'FAILED')))`,
+    );
+  });
+
+  it('enforces same-tenant references with composite foreign keys', () => {
+    for (const constraint of [
+      'VideoAsset_location_same_tenant_fkey',
+      'VideoAsset_unit_same_tenant_fkey',
+      'VideoAsset_device_same_tenant_fkey',
+      'VideoAsset_session_same_tenant_fkey',
+      'VideoAsset_uploader_same_tenant_fkey',
+      'VideoArtifact_asset_same_tenant_fkey',
+      'VideoArtifact_job_same_tenant_fkey',
+      'VideoArtifact_creator_same_tenant_fkey',
+    ]) {
+      expect(sql).toContain(constraint);
+    }
+  });
+
+  it('stores internal storage keys and checksums, never URLs', () => {
+    expect(sql).toContain('"storageKey" TEXT NOT NULL');
+    expect(sql).toContain('"checksumSha256" TEXT NOT NULL');
+    // No public/signed URL columns exist in the video tables (comments may
+    // mention URLs; quoted identifiers must not).
+    expect(sql).not.toMatch(/"[^"\n]*url[^"\n]*"/i);
+  });
+
+  it('never cascades deletes into video tables', () => {
+    expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
+  });
+});
+
+describe('video ingest module backfill migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260727000001_video_ingest_module_backfill',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('activates a pre-existing video-ingest module row instead of leaving it inactive', () => {
+    expect(sql).toContain('ON CONFLICT ("code") DO UPDATE SET');
+    expect(sql).toContain('"isActive" = true');
+    expect(sql).not.toMatch(/DO UPDATE SET[^;]*"id"\s*=/);
+  });
+
+  it('is idempotent and never overwrites a tenant admin choice', () => {
+    expect(sql).toContain('ON CONFLICT ("tenantId", "moduleId") DO NOTHING');
+    expect(sql).not.toMatch(/ON CONFLICT \("tenantId", "moduleId"\) DO UPDATE/);
+  });
+
+  it('enables video-ingest for every pre-existing tenant with deterministic ids', () => {
+    expect(sql).toContain(`'tm-' || md5(t."id" || ':video-ingest')`);
+    expect(sql).toContain(`WHERE pm."code" = 'video-ingest'`);
+  });
+
+  it('backfills the video-asset permission catalog rows (migrate deploy runs without seed)', () => {
+    for (const code of [
+      'video-asset:read',
+      'video-asset:manage',
+      'video-asset:process',
+      'video-asset:delete',
+    ]) {
+      expect(sql).toContain(`'${code}'`);
+    }
+  });
+});
+
+describe('video extraction request migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260727000002_video_extraction_request',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('makes extraction requests replayable via a tenant-scoped unique key', () => {
+    expect(sql).toContain('VideoExtractionRequest_tenantId_idempotencyKey_key');
+    expect(sql).toContain(
+      'ON "VideoExtractionRequest"("tenantId", "idempotencyKey")',
+    );
+  });
+
+  it('enforces same-tenant asset references with a composite foreign key', () => {
+    expect(sql).toContain('VideoExtractionRequest_asset_same_tenant_fkey');
+  });
+
+  it('is append-only at the database level', () => {
+    expect(sql).toContain(
+      'CREATE FUNCTION prevent_video_extraction_request_mutation()',
+    );
+    expect(sql).toContain('BEFORE UPDATE OR DELETE ON "VideoExtractionRequest"');
+    expect(sql).toContain('BEFORE TRUNCATE ON "VideoExtractionRequest"');
+  });
+
+  it('stores ids only and never cascades deletes', () => {
+    // No media, storage-key, or URL columns exist on the request table.
+    expect(sql).not.toMatch(/"[^"\n]*(storageKey|url|media)[^"\n]*" TEXT/i);
+    expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
+  });
+});
+
+describe('video asset quarantine screening migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260727000004_video_asset_quarantine_screening',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('adds the QUARANTINED lifecycle value idempotently', () => {
+    expect(sql).toContain(
+      `ALTER TYPE "VideoAssetStatus" ADD VALUE IF NOT EXISTS 'QUARANTINED'`,
+    );
+  });
+
+  it('never USES the new enum value in the same transaction (PG 12+ rule)', () => {
+    // ADD VALUE inside a transaction is legal only while the new value is
+    // unused within it: no column default flip, no CHECK, no UPDATE here —
+    // the repository sets QUARANTINED explicitly at create time instead.
+    expect(sql).not.toMatch(/DEFAULT 'QUARANTINED'/);
+    expect(sql).not.toMatch(/UPDATE\s+"VideoAsset"/i);
+    expect(sql).not.toMatch(/ADD CONSTRAINT[^;]*QUARANTINED/);
+  });
+
+  it('backfills the screening permission (migrate deploy runs without seed)', () => {
+    expect(sql).toContain(`'video-asset:screen'`);
+    expect(sql).toContain('ON CONFLICT ("code") DO UPDATE SET');
+    expect(sql).not.toMatch(/DO UPDATE SET[^;]*"id"\s*=/);
+  });
+});
+
+describe('inference job pending-link migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260729000001_inference_job_pending_link',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('adds the PENDING_LINK lifecycle value idempotently, ahead of QUEUED', () => {
+    expect(sql).toContain(
+      `ALTER TYPE "InferenceJobStatus" ADD VALUE IF NOT EXISTS 'PENDING_LINK' BEFORE 'QUEUED'`,
+    );
+  });
+
+  it('never USES the new enum value in the same transaction (PG 12+ rule)', () => {
+    // ADD VALUE inside a transaction is legal only while the new value is
+    // unused within it: no column default flip, no UPDATE, and no CHECK
+    // constraint may NAME 'PENDING_LINK' here — the queue writes the status
+    // explicitly on the opt-in create path instead.
+    expect(sql).not.toMatch(/DEFAULT 'PENDING_LINK'/);
+    expect(sql).not.toMatch(/UPDATE\s+"InferenceJob"/i);
+    expect(sql).not.toMatch(/ADD CONSTRAINT[^;]*PENDING_LINK/);
+  });
+
+  it('keeps unclaimed jobs timestamp-free by listing the STARTED statuses instead', () => {
+    // The old guard named QUEUED, so PENDING_LINK would have escaped it;
+    // naming the complement covers the new state without using its value.
+    expect(sql).toContain(
+      'ALTER TABLE "InferenceJob" DROP CONSTRAINT "InferenceJob_queued_timestamps_check"',
+    );
+    expect(sql).toContain('InferenceJob_unclaimed_timestamps_check');
+    expect(sql).toContain(
+      `CHECK ("status" IN ('RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')`,
+    );
+    expect(sql).toContain('"startedAt" IS NULL AND "completedAt" IS NULL');
+  });
+
+  it('leaves every other InferenceJob lifecycle CHECK untouched', () => {
+    // PENDING_LINK is NON-TERMINAL and carries no error, lease, or vision
+    // link, so the remaining guards already hold for it.
+    for (const constraint of [
+      'InferenceJob_terminal_completedAt_check',
+      'InferenceJob_error_only_failed_check',
+      'InferenceJob_running_lease_check',
+      'InferenceJob_visionEvent_succeeded_check',
+    ]) {
+      expect(sql).not.toContain(constraint);
+    }
+  });
+});
+
+describe('video asset media-write state migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260729000002_video_asset_media_write_state',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('adds the media-write state enum and a NULLABLE column on VideoAsset', () => {
+    expect(sql).toContain(
+      `CREATE TYPE "VideoMediaWriteState" AS ENUM ('PENDING', 'SUCCEEDED', 'FAILED')`,
+    );
+    expect(sql).toContain(
+      'ALTER TABLE "VideoAsset" ADD COLUMN "mediaWriteState" "VideoMediaWriteState"',
+    );
+    // NULLABLE and undefaulted on purpose: NULL means "no durable media
+    // write was ever attempted", which is the honest reading for existing
+    // rows and for uploads rejected before their put.
+    expect(sql).not.toMatch(/"mediaWriteState"[^;]*NOT NULL/);
+    expect(sql).not.toMatch(/"mediaWriteState"[^;]*DEFAULT/);
+  });
+
+  it('backfills NOTHING — existing rows keep byte-identical delete behaviour', () => {
+    // Only PENDING withholds the media-removal completion, so leaving
+    // every existing row NULL cannot change what any delete records.
+    expect(sql).not.toMatch(/UPDATE\s+"VideoAsset"/i);
+  });
+});
+
+describe('cv same-tenant fk migration hardening', () => {
+  // The pickup-validation, fusion-v2, and journey-skeleton migrations
+  // shipped their tables with single-column FKs only; this migration adds
+  // the composite same-tenant FKs that are the database-level
+  // tenant-isolation guarantee (AGENTS.md: tenancy).
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260811110000_cv_same_tenant_fks',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('anchors the two newly-referenced parents with UNIQUE (id, tenantId)', () => {
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "CustomerJourney_id_tenantId_key" ON "CustomerJourney"("id", "tenantId")',
+    );
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "ProductReferenceImage_id_tenantId_key" ON "ProductReferenceImage"("id", "tenantId")',
+    );
+  });
+
+  it('enforces same-tenant references with composite foreign keys on every CV table', () => {
+    for (const [constraint, columns, parent] of [
+      ['CustomerJourney_location_same_tenant_fkey', '"locationId", "tenantId"', 'Location'],
+      ['CustomerJourney_unit_same_tenant_fkey', '"unitId", "tenantId"', 'RetailUnit'],
+      ['CustomerJourneyEvent_journey_same_tenant_fkey', '"journeyId", "tenantId"', 'CustomerJourney'],
+      ['CustomerJourneyEvent_product_same_tenant_fkey', '"productId", "tenantId"', 'Product'],
+      ['ProductReferenceImage_product_same_tenant_fkey', '"productId", "tenantId"', 'Product'],
+      ['VideoGroundTruth_videoAsset_same_tenant_fkey', '"videoAssetId", "tenantId"', 'VideoAsset'],
+      ['VideoGroundTruth_product_same_tenant_fkey', '"productId", "tenantId"', 'Product'],
+      ['ProductReferenceEmbedding_product_same_tenant_fkey', '"productId", "tenantId"', 'Product'],
+      ['ProductReferenceEmbedding_referenceImage_same_tenant_fkey', '"referenceImageId", "tenantId"', 'ProductReferenceImage'],
+      ['PickupFusionRun_videoAsset_same_tenant_fkey', '"videoAssetId", "tenantId"', 'VideoAsset'],
+    ] as const) {
+      expect(sql).toContain(
+        `ADD CONSTRAINT "${constraint}" FOREIGN KEY (${columns}) REFERENCES "${parent}"("id", "tenantId")`,
+      );
+    }
+  });
+
+  it('mirrors each sibling single-column FK action — cascades ONLY with the owning lifecycle', () => {
+    // A composite RESTRICT beside a single-column CASCADE would silently
+    // veto the cascade the Prisma schema promises, so the three
+    // child-lifecycle FKs cascade and everything else restricts.
+    const cascading = [
+      'CustomerJourneyEvent_journey_same_tenant_fkey',
+      'VideoGroundTruth_videoAsset_same_tenant_fkey',
+      'ProductReferenceEmbedding_referenceImage_same_tenant_fkey',
+      'PickupFusionRun_videoAsset_same_tenant_fkey',
+    ];
+    for (const line of sql.split('\n')) {
+      if (!line.includes('ADD CONSTRAINT')) continue;
+      const expectsCascade = cascading.some((name) => line.includes(name));
+      expect(line).toContain(
+        expectsCascade
+          ? 'ON DELETE CASCADE ON UPDATE CASCADE'
+          : 'ON DELETE RESTRICT ON UPDATE CASCADE',
+      );
+    }
+  });
+
+  it('never covers User references with composite FKs (platform-sandbox exception)', () => {
+    // createdById rows written by platform admins carry (platform user,
+    // sandbox tenant) — a pair that can never exist in User(id, tenantId).
+    expect(sql).not.toMatch(/REFERENCES "User"/);
+    expect(sql).not.toMatch(/"createdById"/);
+  });
+});

@@ -71,7 +71,7 @@ export class PaymentEventsRepository extends TenantScopedRepository {
         scopedTenantId,
         data.provider,
         data.providerEventId,
-      )}))`;
+      )}))::text`;
       const existing = await tx.paymentEvent.findFirst({
         where: {
           tenantId: scopedTenantId,

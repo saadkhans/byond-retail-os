@@ -28,6 +28,7 @@ describe('TenantsService', () => {
     slug: 'acme-stores',
     status: TenantStatus.PENDING,
     settings: null,
+    isPlatformSandbox: false,
     createdAt: new Date('2026-07-02T00:00:00Z'),
     updatedAt: new Date('2026-07-02T00:00:00Z'),
   };
@@ -94,6 +95,22 @@ describe('TenantsService', () => {
       await expect(service.create({ name: '!!!' })).rejects.toBeInstanceOf(
         BadRequestException,
       );
+      expect(repository.createWithDefaultModules).not.toHaveBeenCalled();
+    });
+
+    it('rejects the RESERVED platform-sandbox slug (explicit slug)', async () => {
+      await expect(
+        service.create({ name: 'Sneaky Corp', slug: 'platform-sandbox' }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      // Reservation is enforced BEFORE any write — a customer tenant can
+      // never mint the verified sandbox identity's slug.
+      expect(repository.createWithDefaultModules).not.toHaveBeenCalled();
+    });
+
+    it('rejects the reserved slug when it is DERIVED from the name', async () => {
+      await expect(
+        service.create({ name: 'Platform Sandbox' }),
+      ).rejects.toBeInstanceOf(ConflictException);
       expect(repository.createWithDefaultModules).not.toHaveBeenCalled();
     });
 

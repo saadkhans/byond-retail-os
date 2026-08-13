@@ -6,6 +6,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
+import { UserType } from '@prisma/client';
 import { PermissionsRepository } from '../../access-control/permissions.repository';
 import { AuthRepository } from '../auth.repository';
 import { IS_PUBLIC_KEY } from '../decorators/access-policy.decorators';
@@ -60,17 +61,31 @@ export class AuthGuard implements CanActivate {
       throw new UnauthorizedException('Invalid or expired token');
     }
 
+    // Permissions are resolved against the user's OWN tenant binding (null
+    // for platform users — platform role grants), deliberately BEFORE any
+    // sandbox resolution below: operating in the sandbox never widens what
+    // a platform user is permitted to do.
     const permissions =
       await this.permissionsRepository.findEffectivePermissionCodes(
         user.id,
         user.tenantId,
       );
 
+    // Platform users carry no tenant of their own. For tenant-scoped work
+    // they resolve — server-side, from a fixed slug, never from client
+    // input — to the seeded PLATFORM SANDBOX tenant (ACTIVE only). Without
+    // a seeded sandbox the context keeps tenantId null and every
+    // tenant-scoped guard keeps failing closed exactly as before.
+    const tenantId =
+      user.userType === UserType.PLATFORM
+        ? await this.authRepository.findPlatformSandboxTenantId()
+        : user.tenantId;
+
     request.context = {
       userId: user.id,
       email: user.email,
       userType: user.userType,
-      tenantId: user.tenantId,
+      tenantId,
       permissions,
       requestId: request.requestId ?? 'unknown',
     };

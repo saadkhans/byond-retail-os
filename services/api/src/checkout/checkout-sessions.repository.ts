@@ -283,7 +283,7 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${unitAdvisoryLockKey(
         scopedTenantId,
         data.unitId,
-      )}))`;
+      )}))::text`;
       const location = await tx.location.findFirst({
         where: { id: data.locationId, tenantId: scopedTenantId },
         select: { id: true },
@@ -312,7 +312,7 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
         await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceAdvisoryLockKey(
           scopedTenantId,
           data.deviceId,
-        )}))`;
+        )}))::text`;
         const device = await tx.device.findFirst({
           where: { id: data.deviceId, tenantId: scopedTenantId },
           select: { id: true, unitId: true },
@@ -563,7 +563,7 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
         scopedTenantId,
         data.productId,
-      )}))`;
+      )}))::text`;
       const product = await tx.product.findFirst({
         where: { id: data.productId, tenantId: scopedTenantId },
         select: {
@@ -882,7 +882,7 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
         // gaps left by out-of-band data surgery.
         await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${tenantOrderNumberAdvisoryLockKey(
           scopedTenantId,
-        )}))`;
+        )}))::text`;
 
         // Recheck the key now that the tenant order lock is held: two
         // completions with the same key on DIFFERENT sessions serialize
@@ -1248,6 +1248,6 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${checkoutSessionAdvisoryLockKey(
       tenantId,
       sessionId,
-    )}))`;
+    )}))::text`;
   }
 }

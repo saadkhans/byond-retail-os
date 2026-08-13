@@ -16,3 +16,8 @@ process.env.JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN ?? '15m';
 process.env.LOGIN_THROTTLE_LIMIT = process.env.LOGIN_THROTTLE_LIMIT ?? '1000';
 process.env.LOGIN_THROTTLE_IP_LIMIT =
   process.env.LOGIN_THROTTLE_IP_LIMIT ?? '5000';
+// The developer .env enables the pickup-detection polling worker; e2e suites
+// stub PrismaService without the videoAsset delegate, so a background scan
+// firing mid-suite would crash as an unhandled rejection in whichever test
+// happens to be running. Force it off for every test process.
+process.env.PICKUP_DETECTION_ENABLED = 'false';

@@ -1,0 +1,323 @@
+import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
+import { ReferenceImagesService } from './reference-images.service';
+
+/**
+ * Upload-gate contract tests for the reference library's payment-data
+ * screens (AGENTS.md payments invariant). The pixel OCR screen alone is
+ * blind to two channels a decodable image can carry: sensitive TEXT BYTES
+ * inside the file (EXIF/comments, or bytes appended after the image
+ * terminator) and a sensitive ORIGINAL FILENAME persisted as metadata —
+ * both must reject BEFORE anything reaches storage, with the same
+ * raw-buffer/filename detectors the video-ingest upload gate uses.
+ */
+
+const TENANT = 'tenant-1';
+const PRODUCT_ID = 'p-aqua';
+
+/** Decodable-enough PNG-ish bytes; the decode gate itself is mocked. */
+function cleanPngBytes(): Buffer {
+  return Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2]);
+}
+
+function buildService() {
+  const prisma = {
+    product: {
+      findFirst: jest.fn(async () => ({
+        id: PRODUCT_ID,
+        sku: 'AQUAFINA-500ML',
+        name: 'Aquafina 500ml',
+        barcodes: [],
+      })),
+    },
+    productReferenceImage: {
+      findFirst: jest.fn(async () => null),
+      delete: jest.fn(async () => undefined),
+      create: jest.fn(
+        async ({ data }: { data: Record<string, unknown> }) => ({
+          id: 'img-1',
+          productId: data.productId,
+          originalFilename: data.originalFilename,
+          mimeType: data.mimeType,
+          sizeBytes: data.sizeBytes,
+          checksumSha256: data.checksumSha256,
+          createdAt: new Date(),
+        }),
+      ),
+    },
+  };
+  // Provider-neutral storage PORT surface only (put/read/delete) — the
+  // service must never need the local adapter's path capability.
+  const storage = {
+    put: jest.fn(async () => undefined),
+    delete: jest.fn(async () => undefined),
+    read: jest.fn(async () => Buffer.alloc(0)),
+  };
+  // The repository-owned media PORT: decode-validation by storage key.
+  const media = {
+    decodeReferenceImage: jest.fn(async () => ({ width: 4, height: 4 })),
+  };
+  const recognizer = {
+    readsRealPixels: true,
+    checkToolingReady: jest.fn(async () => true),
+    recognize: jest.fn(async () => 'aquafina water bottle'),
+  };
+  const service = new ReferenceImagesService(
+    prisma as never,
+    storage as never,
+    media as never,
+    recognizer as never,
+  );
+  return { service, prisma, storage, media, recognizer };
+}
+
+describe('ReferenceImagesService.upload payment-data screens', () => {
+  it('stores a clean upload (ZIP-path-shaped originalname included)', async () => {
+    const { service, storage, prisma } = buildService();
+    const view = await service.upload(TENANT, PRODUCT_ID, {
+      buffer: cleanPngBytes(),
+      mimetype: 'image/png',
+      originalname: 'AQUAFINA-500ML/front.png',
+    });
+    expect(view.id).toBe('img-1');
+    expect(storage.put).toHaveBeenCalledTimes(1);
+    expect(prisma.productReferenceImage.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ originalFilename: 'front.png' }),
+      }),
+    );
+  });
+
+  it('rejects a decodable image carrying sensitive text appended after the terminator', async () => {
+    const { service, storage, prisma, recognizer } = buildService();
+    // Valid image prefix, PAN smuggled in trailing bytes the OCR never
+    // renders — exactly the channel the raw-buffer screen exists for.
+    const buffer = Buffer.concat([
+      cleanPngBytes(),
+      Buffer.from('4111111111111111'),
+    ]);
+    await expect(
+      service.upload(TENANT, PRODUCT_ID, {
+        buffer,
+        mimetype: 'image/png',
+        originalname: 'front.png',
+      }),
+    ).rejects.toThrow('carries credential- or payment-bearing text');
+    // Fail-closed BEFORE anything durable — and before the OCR pass.
+    expect(storage.put).not.toHaveBeenCalled();
+    expect(prisma.productReferenceImage.create).not.toHaveBeenCalled();
+    expect(recognizer.recognize).not.toHaveBeenCalled();
+  });
+
+  it('rejects EXIF-style credential text embedded inside the image bytes', async () => {
+    const { service, storage } = buildService();
+    // A comment/EXIF text atom is just bytes inside the file body.
+    const buffer = Buffer.concat([
+      cleanPngBytes(),
+      Buffer.from('UserComment: password hunter2'),
+      cleanPngBytes(),
+    ]);
+    await expect(
+      service.upload(TENANT, PRODUCT_ID, {
+        buffer,
+        mimetype: 'image/jpeg',
+        originalname: 'front.jpg',
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(storage.put).not.toHaveBeenCalled();
+  });
+
+  it.each(['4111_1111_1111_1111.png', 'cvv123.png', 'password_hunter2.png'])(
+    'rejects the sensitive filename %s before anything is stored',
+    async (originalname) => {
+      const { service, storage, prisma } = buildService();
+      await expect(
+        service.upload(TENANT, PRODUCT_ID, {
+          buffer: cleanPngBytes(),
+          mimetype: 'image/png',
+          originalname,
+        }),
+      ).rejects.toThrow(
+        'Filename must not contain credential- or payment-bearing content',
+      );
+      expect(storage.put).not.toHaveBeenCalled();
+      expect(prisma.productReferenceImage.create).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe('ReferenceImagesService.upload insert-failure cleanup', () => {
+  function cleanUpload() {
+    return {
+      buffer: cleanPngBytes(),
+      mimetype: 'image/png' as const,
+      originalname: 'front.png',
+    };
+  }
+
+  it('a DEFINITE FK failure (P2003) deletes the just-stored bytes and rethrows', async () => {
+    const { service, storage, prisma } = buildService();
+    const fkViolation = new Prisma.PrismaClientKnownRequestError(
+      'Foreign key constraint failed',
+      { code: 'P2003', clientVersion: 'test' },
+    );
+    prisma.productReferenceImage.create.mockRejectedValueOnce(fkViolation);
+    await expect(
+      service.upload(TENANT, PRODUCT_ID, cleanUpload()),
+    ).rejects.toBe(fkViolation);
+    // The database provably rejected the row, so the file written before
+    // the insert must not survive the failure.
+    expect(storage.delete).toHaveBeenCalledTimes(1);
+    const [deletedKey] = storage.delete.mock.calls[0] as unknown as [string];
+    const [putKey] = storage.put.mock.calls[0] as unknown as [string, Buffer];
+    expect(deletedKey).toBe(putKey);
+  });
+
+  it('a failing cleanup delete never masks the original insert error', async () => {
+    const { service, storage, prisma } = buildService();
+    const fkViolation = new Prisma.PrismaClientKnownRequestError(
+      'Foreign key constraint failed',
+      { code: 'P2003', clientVersion: 'test' },
+    );
+    prisma.productReferenceImage.create.mockRejectedValueOnce(fkViolation);
+    storage.delete.mockRejectedValueOnce(new Error('disk gone too'));
+    await expect(
+      service.upload(TENANT, PRODUCT_ID, cleanUpload()),
+    ).rejects.toBe(fkViolation);
+    expect(storage.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('an AMBIGUOUS failure with a committed row replays it and keeps the bytes', async () => {
+    const { service, storage, prisma } = buildService();
+    // Connection dropped AFTER PostgreSQL may have committed — deleting
+    // the bytes here would orphan the committed row from its file.
+    const dropped = new Prisma.PrismaClientUnknownRequestError(
+      'Connection reset by peer',
+      { clientVersion: 'test' },
+    );
+    prisma.productReferenceImage.create.mockRejectedValueOnce(dropped);
+    const committed = {
+      id: 'img-committed',
+      productId: PRODUCT_ID,
+      originalFilename: 'front.png',
+      mimeType: 'image/png',
+      sizeBytes: cleanPngBytes().length,
+      checksumSha256: 'abc',
+      createdAt: new Date(),
+    };
+    // First findFirst is the preliminary duplicate probe (miss); the
+    // second is the reconciliation lookup (hit: the insert DID commit).
+    prisma.productReferenceImage.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(committed as never);
+    await expect(
+      service.upload(TENANT, PRODUCT_ID, cleanUpload()),
+    ).resolves.toEqual(committed);
+    expect(storage.delete).not.toHaveBeenCalled();
+  });
+
+  it('an AMBIGUOUS failure with no committed row keeps the bytes and rethrows', async () => {
+    const { service, storage, prisma } = buildService();
+    const panic = new Prisma.PrismaClientRustPanicError(
+      'engine panicked',
+      'test',
+    );
+    prisma.productReferenceImage.create.mockRejectedValueOnce(panic);
+    await expect(
+      service.upload(TENANT, PRODUCT_ID, cleanUpload()),
+    ).rejects.toBe(panic);
+    // Cannot prove the insert did NOT commit — an orphaned file is
+    // harmless, a committed row without bytes would 404 on serve.
+    expect(storage.delete).not.toHaveBeenCalled();
+  });
+
+  it.each(['P1001', 'P1002', 'P1008', 'P1017'])(
+    'connection-layer known code %s is treated as ambiguous (bytes kept)',
+    async (code) => {
+      const { service, storage, prisma } = buildService();
+      const connectionError = new Prisma.PrismaClientKnownRequestError(
+        'connection-layer failure',
+        { code, clientVersion: 'test' },
+      );
+      prisma.productReferenceImage.create.mockRejectedValueOnce(
+        connectionError,
+      );
+      await expect(
+        service.upload(TENANT, PRODUCT_ID, cleanUpload()),
+      ).rejects.toBe(connectionError);
+      expect(storage.delete).not.toHaveBeenCalled();
+    },
+  );
+
+  it('a failing reconciliation lookup still keeps the bytes and rethrows the original error', async () => {
+    const { service, storage, prisma } = buildService();
+    const dropped = new Prisma.PrismaClientUnknownRequestError(
+      'Connection reset by peer',
+      { clientVersion: 'test' },
+    );
+    prisma.productReferenceImage.create.mockRejectedValueOnce(dropped);
+    prisma.productReferenceImage.findFirst
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new Error('still unreachable'));
+    await expect(
+      service.upload(TENANT, PRODUCT_ID, cleanUpload()),
+    ).rejects.toBe(dropped);
+    expect(storage.delete).not.toHaveBeenCalled();
+  });
+
+  it('P2002 still deletes the losing bytes and replays the winning row', async () => {
+    const { service, storage, prisma } = buildService();
+    const collision = new Prisma.PrismaClientKnownRequestError(
+      'Unique constraint failed',
+      { code: 'P2002', clientVersion: 'test' },
+    );
+    prisma.productReferenceImage.create.mockRejectedValueOnce(collision);
+    const winner = {
+      id: 'img-winner',
+      productId: PRODUCT_ID,
+      originalFilename: 'front.png',
+      mimeType: 'image/png',
+      sizeBytes: cleanPngBytes().length,
+      checksumSha256: 'abc',
+      createdAt: new Date(),
+    };
+    // First findFirst is the preliminary duplicate probe (miss); the
+    // second is the post-collision replay lookup (hit).
+    prisma.productReferenceImage.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(winner as never);
+    await expect(
+      service.upload(TENANT, PRODUCT_ID, cleanUpload()),
+    ).resolves.toEqual(winner);
+    expect(storage.delete).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ReferenceImagesService.remove tenant scoping', () => {
+  it('deletes the row through the id_tenantId composite key, then the bytes', async () => {
+    const { service, storage, prisma } = buildService();
+    const row = {
+      id: 'img-1',
+      productId: PRODUCT_ID,
+      storageKey: `references/${TENANT}/${PRODUCT_ID}/img-1.png`,
+    };
+    prisma.productReferenceImage.findFirst.mockResolvedValueOnce(row as never);
+    await service.remove(TENANT, PRODUCT_ID, 'img-1');
+    // The destructive write must carry tenantId itself (AGENTS.md tenancy
+    // invariant) — never rely on the preceding lookup to have scoped it.
+    expect(prisma.productReferenceImage.delete).toHaveBeenCalledWith({
+      where: { id_tenantId: { id: 'img-1', tenantId: TENANT } },
+    });
+    expect(storage.delete).toHaveBeenCalledWith(row.storageKey);
+  });
+
+  it('404s without issuing any delete when the row is outside the tenant', async () => {
+    const { service, storage, prisma } = buildService();
+    prisma.productReferenceImage.findFirst.mockResolvedValueOnce(null);
+    await expect(
+      service.remove(TENANT, PRODUCT_ID, 'img-other-tenant'),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(prisma.productReferenceImage.delete).not.toHaveBeenCalled();
+    expect(storage.delete).not.toHaveBeenCalled();
+  });
+});

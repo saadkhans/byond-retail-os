@@ -208,8 +208,18 @@ export function isSensitiveKey(key: string): boolean {
  * bare key=value credential fragments (password=x, token=y, sig=z) that
  * are not part of a parseable URL at all.
  */
-const URL_CANDIDATE = /[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s"'<>]+/g;
-const USERINFO_BACKSTOP = /[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s@]+:[^/\s@]*@/;
+// The scheme and userinfo quantifiers are BOUNDED, not open-ended. With
+// `[a-zA-Z0-9+.-]*` the engine consumed an entire long token at every start
+// position before backtracking to look for "://", making these scans
+// quadratic: screening a megabyte-scale printable run (Phase 10 screens
+// attacker-supplied container bytes) took hours. Real schemes are a handful
+// of characters and real userinfo is far under 256, so bounding costs no
+// detection and makes the scan linear.
+const URL_SCHEME = '[a-zA-Z][a-zA-Z0-9+.-]{0,31}';
+const URL_CANDIDATE = new RegExp(`${URL_SCHEME}:\\/\\/[^\\s"'<>]+`, 'g');
+const USERINFO_BACKSTOP = new RegExp(
+  `${URL_SCHEME}:\\/\\/[^/\\s@]{1,256}:[^/\\s@]{0,256}@`,
+);
 // key=value credential fragments, valid-URL or not. The leading boundary
 // keeps innocent substrings out: "monkey=1" and "oauth=..." never match
 // because 'key'/'auth' are preceded by a word character.

@@ -6,6 +6,10 @@ import {
   MIN_PASSWORD_LENGTH,
 } from '../auth/password-hasher';
 import { PLATFORM_MODULE_CATALOG } from '../platform-modules/platform-module.catalog';
+import {
+  PLATFORM_SANDBOX_TENANT_NAME,
+  PLATFORM_SANDBOX_TENANT_SLUG,
+} from '../tenants/platform-sandbox';
 
 /**
  * Structural client types so seeders are unit-testable with simple mocks and
@@ -323,4 +327,117 @@ export async function seedPlatformAdmin(
   });
 
   return { userId: user.id, roleId: role.id };
+}
+
+export interface PlatformSandboxSeedClient {
+  tenant: {
+    findUnique(args: {
+      where: { slug: string };
+      select: { id: true; isPlatformSandbox: true };
+    }): Promise<{ id: string; isPlatformSandbox: boolean } | null>;
+    update(args: {
+      where: { slug: string };
+      data: { name: string; status: 'ACTIVE' };
+    }): Promise<{ id: string }>;
+    create(args: {
+      data: {
+        name: string;
+        slug: string;
+        status: 'ACTIVE';
+        isPlatformSandbox: true;
+      };
+    }): Promise<{ id: string }>;
+  };
+  platformModule: {
+    findMany(args: {
+      where: { isActive: true };
+      select: { id: true; code: true };
+    }): Promise<{ id: string; code: string }[]>;
+  };
+  tenantModule: {
+    upsert(args: {
+      where: {
+        tenantId_moduleId: { tenantId: string; moduleId: string };
+      };
+      update: Record<string, never>;
+      create: {
+        tenantId: string;
+        moduleId: string;
+        status: 'ENABLED';
+        enabledAt: Date;
+      };
+    }): Promise<unknown>;
+  };
+}
+
+/**
+ * The PLATFORM SANDBOX tenant (see ../tenants/platform-sandbox): the ONE
+ * tenant platform users resolve to on tenant-scoped routes, seeded together
+ * with the platform admin (same SEED_PLATFORM_ADMIN opt-in) so the local
+ * admin has a workspace for the Phase 10 test-video workflow.
+ *
+ * Idempotent, with the same "never overwrite operator state" stance as the
+ * admin seeder: a reseed re-ACTIVATEs a suspended sandbox — restoring a
+ * working local setup is the point of reseeding — while module enablement
+ * rows are created only when missing, so a module an operator explicitly
+ * DISABLED for the sandbox stays disabled across reseeds. Every ACTIVE
+ * catalog module is provisioned, so newly shipped modules light up for the
+ * sandbox on the next reseed.
+ *
+ * IDENTITY, not just the slug: the seeder only ever creates the sandbox
+ * WITH the verified isPlatformSandbox marker, and it REFUSES — loudly, with
+ * a controlled error and zero writes — to update a tenant that holds the
+ * reserved slug without the marker. Such a row is a customer tenant (the
+ * creation API once accepted the slug); renaming/reactivating it here would
+ * silently hand its data to every platform user.
+ */
+export async function seedPlatformSandboxTenant(
+  db: PlatformSandboxSeedClient,
+): Promise<{ tenantId: string; moduleCount: number }> {
+  const existing = await db.tenant.findUnique({
+    where: { slug: PLATFORM_SANDBOX_TENANT_SLUG },
+    select: { id: true, isPlatformSandbox: true },
+  });
+  if (existing && !existing.isPlatformSandbox) {
+    throw new Error(
+      `A tenant already uses the reserved "${PLATFORM_SANDBOX_TENANT_SLUG}" ` +
+        'slug without the verified sandbox marker — refusing to take it ' +
+        'over. Rename that tenant (or mark it manually if it truly is the ' +
+        'sandbox) and reseed.',
+    );
+  }
+  const tenant = existing
+    ? await db.tenant.update({
+        where: { slug: PLATFORM_SANDBOX_TENANT_SLUG },
+        data: { name: PLATFORM_SANDBOX_TENANT_NAME, status: 'ACTIVE' },
+      })
+    : await db.tenant.create({
+        data: {
+          name: PLATFORM_SANDBOX_TENANT_NAME,
+          slug: PLATFORM_SANDBOX_TENANT_SLUG,
+          status: 'ACTIVE',
+          isPlatformSandbox: true,
+        },
+      });
+
+  const modules = await db.platformModule.findMany({
+    where: { isActive: true },
+    select: { id: true, code: true },
+  });
+  for (const module of modules) {
+    await db.tenantModule.upsert({
+      where: {
+        tenantId_moduleId: { tenantId: tenant.id, moduleId: module.id },
+      },
+      update: {},
+      create: {
+        tenantId: tenant.id,
+        moduleId: module.id,
+        status: 'ENABLED',
+        enabledAt: new Date(),
+      },
+    });
+  }
+
+  return { tenantId: tenant.id, moduleCount: modules.length };
 }

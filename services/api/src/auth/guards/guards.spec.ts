@@ -59,7 +59,10 @@ describe('AuthGuard', () => {
     status: UserStatus.ACTIVE,
   };
 
-  let authRepository: { findActiveById: jest.Mock };
+  let authRepository: {
+    findActiveById: jest.Mock;
+    findPlatformSandboxTenantId: jest.Mock;
+  };
   let permissionsRepository: { findEffectivePermissionCodes: jest.Mock };
   let tokens: { verifyAccessToken: jest.Mock; issueAccessToken: jest.Mock };
 
@@ -75,6 +78,8 @@ describe('AuthGuard', () => {
   beforeEach(() => {
     authRepository = {
       findActiveById: jest.fn().mockResolvedValue(activeUser),
+      // No sandbox seeded unless a test says otherwise — fail closed.
+      findPlatformSandboxTenantId: jest.fn().mockResolvedValue(null),
     };
     permissionsRepository = {
       findEffectivePermissionCodes: jest.fn().mockResolvedValue(['user:read']),
@@ -148,6 +153,71 @@ describe('AuthGuard', () => {
       }),
     );
   });
+
+  it('tenant users NEVER resolve the platform sandbox tenant', async () => {
+    // Tenant isolation: a tenant user's context comes from their own
+    // database record only — the sandbox lookup must not even run.
+    const request: Partial<RequestWithContext> = {
+      headers: { authorization: 'Bearer x.y.z' },
+    };
+    const guard = buildGuard();
+
+    await expect(
+      guard.canActivate(executionContextFor(request)),
+    ).resolves.toBe(true);
+    expect(authRepository.findPlatformSandboxTenantId).not.toHaveBeenCalled();
+    expect(request.context?.tenantId).toBe('tenant-a');
+  });
+
+  it('platform users resolve the seeded sandbox tenant as their context', async () => {
+    authRepository.findActiveById.mockResolvedValue({
+      ...activeUser,
+      id: 'admin-1',
+      userType: UserType.PLATFORM,
+      tenantId: null,
+    });
+    authRepository.findPlatformSandboxTenantId.mockResolvedValue('sandbox-1');
+    tokens.verifyAccessToken.mockResolvedValue({ sub: 'admin-1' });
+    const request: Partial<RequestWithContext> = {
+      headers: { authorization: 'Bearer x.y.z' },
+    };
+    const guard = buildGuard();
+
+    await expect(
+      guard.canActivate(executionContextFor(request)),
+    ).resolves.toBe(true);
+    expect(request.context).toEqual(
+      expect.objectContaining({
+        userType: UserType.PLATFORM,
+        tenantId: 'sandbox-1',
+      }),
+    );
+    // Permissions stay resolved against the PLATFORM binding (tenantId
+    // null), not the sandbox — the sandbox never widens grants.
+    expect(
+      permissionsRepository.findEffectivePermissionCodes,
+    ).toHaveBeenCalledWith('admin-1', null);
+  });
+
+  it('platform users keep a NULL tenant context when no sandbox is seeded', async () => {
+    authRepository.findActiveById.mockResolvedValue({
+      ...activeUser,
+      id: 'admin-1',
+      userType: UserType.PLATFORM,
+      tenantId: null,
+    });
+    tokens.verifyAccessToken.mockResolvedValue({ sub: 'admin-1' });
+    const request: Partial<RequestWithContext> = {
+      headers: { authorization: 'Bearer x.y.z' },
+    };
+    const guard = buildGuard();
+
+    await expect(
+      guard.canActivate(executionContextFor(request)),
+    ).resolves.toBe(true);
+    // Downstream tenant-scoped guards fail closed on this null.
+    expect(request.context?.tenantId).toBeNull();
+  });
 });
 
 describe('PermissionsGuard', () => {
@@ -197,11 +267,23 @@ describe('PermissionsGuard', () => {
     ).resolves.toBe(true);
   });
 
-  it('tenant-only: rejects platform users', async () => {
+  it('tenant-only: rejects platform users without a resolved tenant context', async () => {
+    // platformContext has tenantId null (no sandbox seeded) — fail closed.
     const guard = buildGuard({ [TENANT_ONLY_KEY]: true });
     await expect(
       guard.canActivate(executionContextFor(requestWith(platformContext))),
     ).rejects.toThrow('Insufficient permissions');
+  });
+
+  it('tenant-only: admits platform users resolved to the sandbox tenant', async () => {
+    const guard = buildGuard({ [TENANT_ONLY_KEY]: true });
+    await expect(
+      guard.canActivate(
+        executionContextFor(
+          requestWith({ ...platformContext, tenantId: 'sandbox-1' }),
+        ),
+      ),
+    ).resolves.toBe(true);
   });
 
   it('tenant-only: admits tenant users with tenant context', async () => {

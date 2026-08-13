@@ -1,17 +1,25 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { PERMISSION_CATALOG } from '../access-control/permission.catalog';
 import {
   DEFAULT_ENABLED_MODULE_CODES,
   PLATFORM_MODULE_CATALOG,
 } from '../platform-modules/platform-module.catalog';
 import {
+  PLATFORM_SANDBOX_TENANT_NAME,
+  PLATFORM_SANDBOX_TENANT_SLUG,
+} from '../tenants/platform-sandbox';
+import {
   assertSeedAdminPasswordAllowed,
   assertSeedAllowed,
   normalizeSeedAdminEmail,
   PLATFORM_ADMIN_ROLE_NAME,
   PlatformAdminSeedClient,
+  PlatformSandboxSeedClient,
   seedPermissions,
   seedPlatformAdmin,
   seedPlatformModules,
+  seedPlatformSandboxTenant,
   shouldSeedPlatformAdmin,
 } from './seeders';
 
@@ -22,8 +30,10 @@ describe('permission catalog', () => {
   });
 
   it('uses the resource:action code format', () => {
+    // Kebab-case resources are allowed (Phase 10 `video-asset:*`), matching
+    // the kebab-case module codes (`video-ingest`); actions stay one word.
     for (const permission of PERMISSION_CATALOG) {
-      expect(permission.code).toMatch(/^[a-z]+:[a-z]+$/);
+      expect(permission.code).toMatch(/^[a-z]+(?:-[a-z]+)*:[a-z]+$/);
     }
   });
 });
@@ -34,9 +44,10 @@ describe('platform module catalog', () => {
     expect(new Set(codes).size).toBe(codes.length);
   });
 
-  it('default-enables core plus the shipped inventory, devices, checkout, payments, cv, and inference modules', () => {
+  it('default-enables core plus the shipped inventory, devices, checkout, payments, cv, inference, and video-ingest modules', () => {
     // inventory (Phase 3), devices (Phase 4), checkout (Phase 5), payments
-    // (Phase 6), cv (Phase 7), and inference (Phase 9) are default-enabled so
+    // (Phase 6), cv (Phase 7), inference (Phase 9), and video-ingest
+    // (Phase 10) are default-enabled so
     // their routes are reachable for every new tenant (the only enable
     // endpoint is tenant-scoped and needs a
     // module:manage tenant user, which a brand-new tenant does not yet have).
@@ -48,6 +59,7 @@ describe('platform module catalog', () => {
       'payments',
       'cv',
       'inference',
+      'video-ingest',
     ]);
   });
 
@@ -68,7 +80,8 @@ describe('platform module catalog', () => {
     // payments (intents, simulated auth/capture, reconciliation): Phase 6;
     // cv (vision events, evidence bundle lineage, review → basket flow):
     // Phase 7; inference (jobs, queue foundation, simulated adapter):
-    // Phase 9.
+    // Phase 9; video-ingest (test video upload, frame/crop extraction
+    // contracts): Phase 10.
     expect(active).toEqual([
       'core',
       'inventory',
@@ -77,6 +90,7 @@ describe('platform module catalog', () => {
       'payments',
       'cv',
       'inference',
+      'video-ingest',
     ]);
   });
 
@@ -414,6 +428,153 @@ describe('assertSeedAdminPasswordAllowed', () => {
     expect(() => assertSeedAdminPasswordAllowed('€'.repeat(25))).toThrow(
       /72-byte/,
     );
+  });
+});
+
+describe('seedPlatformSandboxTenant', () => {
+  let db: {
+    tenant: { findUnique: jest.Mock; update: jest.Mock; create: jest.Mock };
+    platformModule: { findMany: jest.Mock };
+    tenantModule: { upsert: jest.Mock };
+  };
+
+  beforeEach(() => {
+    db = {
+      tenant: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        update: jest.fn().mockResolvedValue({ id: 'sandbox-1' }),
+        create: jest.fn().mockResolvedValue({ id: 'sandbox-1' }),
+      },
+      platformModule: {
+        findMany: jest.fn().mockResolvedValue([
+          { id: 'm-core', code: 'core' },
+          { id: 'm-video', code: 'video-ingest' },
+        ]),
+      },
+      tenantModule: { upsert: jest.fn().mockResolvedValue({}) },
+    };
+  });
+
+  function client(): PlatformSandboxSeedClient {
+    return db as unknown as PlatformSandboxSeedClient;
+  }
+
+  it('creates a missing sandbox WITH the verified marker, ACTIVE', async () => {
+    const result = await seedPlatformSandboxTenant(client());
+
+    expect(db.tenant.create).toHaveBeenCalledWith({
+      data: {
+        name: PLATFORM_SANDBOX_TENANT_NAME,
+        slug: PLATFORM_SANDBOX_TENANT_SLUG,
+        status: 'ACTIVE',
+        // The verified identity is minted ONLY here — the tenant-creation
+        // API can neither set it nor use the reserved slug.
+        isPlatformSandbox: true,
+      },
+    });
+    expect(db.tenant.update).not.toHaveBeenCalled();
+    expect(result).toEqual({ tenantId: 'sandbox-1', moduleCount: 2 });
+  });
+
+  it('re-activates an existing VERIFIED sandbox on reseed', async () => {
+    db.tenant.findUnique.mockResolvedValue({
+      id: 'sandbox-1',
+      isPlatformSandbox: true,
+    });
+
+    const result = await seedPlatformSandboxTenant(client());
+
+    // A reseed re-ACTIVATEs a suspended sandbox — restoring a working
+    // local setup is the point of reseeding.
+    expect(db.tenant.update).toHaveBeenCalledWith({
+      where: { slug: PLATFORM_SANDBOX_TENANT_SLUG },
+      data: { name: PLATFORM_SANDBOX_TENANT_NAME, status: 'ACTIVE' },
+    });
+    expect(db.tenant.create).not.toHaveBeenCalled();
+    expect(result).toEqual({ tenantId: 'sandbox-1', moduleCount: 2 });
+  });
+
+  it('the marker migration adds the column WITHOUT blessing any existing row', () => {
+    // Both the slug AND the display name were customer-controllable before
+    // the marker existed (tenant creation accepted the then-unreserved
+    // slug), so the migration must not verify ANY pre-existing row — the
+    // verified sandbox is provisioned exclusively by the seeder below, and
+    // every pre-marker row fails closed.
+    const sql = readFileSync(
+      join(
+        __dirname,
+        '..',
+        '..',
+        'prisma',
+        'migrations',
+        '20260813090000_platform_sandbox_verified_identity',
+        'migration.sql',
+      ),
+      'utf8',
+    );
+    expect(sql).toContain('ADD COLUMN "isPlatformSandbox"');
+    const statements = sql
+      .split('\n')
+      .filter((line) => !line.trimStart().startsWith('--'))
+      .join('\n');
+    expect(statements.toUpperCase()).not.toContain('UPDATE');
+    expect(statements).not.toContain('= true');
+  });
+
+  it('REFUSES to take over an unmarked tenant squatting the reserved slug', async () => {
+    // A customer tenant that acquired the slug before it was reserved:
+    // same slug, but no verified marker.
+    db.tenant.findUnique.mockResolvedValue({
+      id: 'customer-1',
+      isPlatformSandbox: false,
+    });
+
+    await expect(seedPlatformSandboxTenant(client())).rejects.toThrow(
+      /refusing to take it over/i,
+    );
+    // Loud failure with ZERO writes — the customer tenant is untouched and
+    // no module rows are provisioned onto it.
+    expect(db.tenant.update).not.toHaveBeenCalled();
+    expect(db.tenant.create).not.toHaveBeenCalled();
+    expect(db.tenantModule.upsert).not.toHaveBeenCalled();
+  });
+
+  it('provisions every ACTIVE catalog module as ENABLED for the sandbox', async () => {
+    await seedPlatformSandboxTenant(client());
+
+    expect(db.platformModule.findMany).toHaveBeenCalledWith({
+      where: { isActive: true },
+      select: { id: true, code: true },
+    });
+    expect(db.tenantModule.upsert).toHaveBeenCalledTimes(2);
+    expect(db.tenantModule.upsert).toHaveBeenCalledWith({
+      where: {
+        tenantId_moduleId: { tenantId: 'sandbox-1', moduleId: 'm-video' },
+      },
+      // Create-only: an operator's explicit DISABLED row survives reseeds
+      // (same "never overwrite operator state" stance as the admin seeder).
+      update: {},
+      create: expect.objectContaining({
+        tenantId: 'sandbox-1',
+        moduleId: 'm-video',
+        status: 'ENABLED',
+      }),
+    });
+  });
+
+  it('is idempotent: a rerun updates the verified sandbox instead of re-creating', async () => {
+    await seedPlatformSandboxTenant(client());
+    // The second run now finds the row the first one created — marked.
+    db.tenant.findUnique.mockResolvedValue({
+      id: 'sandbox-1',
+      isPlatformSandbox: true,
+    });
+    await seedPlatformSandboxTenant(client());
+
+    expect(db.tenant.create).toHaveBeenCalledTimes(1);
+    expect(db.tenant.update).toHaveBeenCalledTimes(1);
+    // Module rows stay upserts keyed on stable unique identities.
+    expect(db.tenantModule.upsert).toHaveBeenCalledTimes(4);
   });
 });
 

@@ -1,0 +1,19 @@
+-- Phase 10 follow-up (Codex P1: provide a real inspection path before
+-- approval): audited quarantine screening preview.
+--
+-- Screeners holding `video-asset:screen` previously had no in-product way to
+-- SEE the frames they attest to screening — the quarantine gate was a second
+-- blind attestation. `POST /video-assets/:id/screening-preview` (same
+-- `video-asset:screen` permission, QUARANTINED assets only) now probes the
+-- quarantined media and serves a bounded set of sample frames extracted
+-- IN MEMORY: no artifact rows, no storage writes, nothing persisted. This is
+-- the module's ONE deliberate exception to "bytes are never served": frames
+-- only (never the video container or original bytes — the video file itself
+-- is still never downloadable), quarantine-only, audited on every serve.
+--
+-- The audit vocabulary had no read-shaped action (every existing value marks
+-- a state change, a lifecycle event, or a denial), so this migration adds
+-- READ for audited byte-exposing reads. Postgres 12+ allows ADD VALUE inside
+-- a transaction as long as the new value is not used in the same
+-- transaction — nothing below references it.
+ALTER TYPE "AuditAction" ADD VALUE IF NOT EXISTS 'READ';

@@ -209,6 +209,18 @@ describe('UnitsService', () => {
     ).rejects.toBeInstanceOf(ConflictException);
   });
 
+  it('maps the has-video-assets reparent rejection to a conflict naming the count', async () => {
+    repository.update.mockResolvedValue({
+      rejection: 'has-video-assets',
+      assetCount: 3,
+    });
+    const attempt = service.update('tenant-a', 'unit-1', {
+      locationId: 'loc-b1',
+    });
+    await expect(attempt).rejects.toBeInstanceOf(ConflictException);
+    await expect(attempt).rejects.toThrow(/3 live video asset/);
+  });
+
   it('maps a concurrent delete during update (P2025) to a 404', async () => {
     repository.update.mockRejectedValue({ code: 'P2025' });
     await expect(

@@ -1,0 +1,480 @@
+import {
+  BadRequestException,
+  ConflictException,
+  NotFoundException,
+} from '@nestjs/common';
+import {
+  CustomerJourneyEventType,
+  CustomerJourneyStatus,
+} from '@prisma/client';
+import { JourneyService, foldBasket } from './journey.service';
+
+const TENANT = 'tenant-1';
+
+/** Fixed capture baseline for the mock video asset — fusion imports derive
+ *  occurredAt from createdAt + evidence peakMs (v1 pipeline rule). */
+const ASSET_CREATED_AT = new Date('2026-08-01T10:00:00.000Z');
+
+type EventRow = {
+  id: string;
+  eventType: CustomerJourneyEventType;
+  productId: string | null;
+  sku: string | null;
+  productName: string | null;
+  quantity: number;
+};
+
+function event(
+  eventType: CustomerJourneyEventType,
+  productId: string | null = null,
+  quantity = 1,
+): EventRow {
+  return {
+    id: `e-${Math.abs(quantity)}-${eventType}-${productId ?? 'none'}`,
+    eventType,
+    productId,
+    sku: productId ? `SKU-${productId}` : null,
+    productName: productId ? `Product ${productId}` : null,
+    quantity,
+  };
+}
+
+describe('foldBasket (provisional basket = pure fold over events)', () => {
+  it('accumulates pickups and subtracts returns per product', () => {
+    const { basket, issues } = foldBasket([
+      event(CustomerJourneyEventType.ENTRY),
+      event(CustomerJourneyEventType.PRODUCT_PICKUP, 'a', 2),
+      event(CustomerJourneyEventType.PRODUCT_PICKUP, 'b', 1),
+      event(CustomerJourneyEventType.PRODUCT_RETURN, 'a', 1),
+      event(CustomerJourneyEventType.EXIT),
+    ]);
+    expect(basket).toEqual([
+      expect.objectContaining({ productId: 'a', quantity: 1 }),
+      expect.objectContaining({ productId: 'b', quantity: 1 }),
+    ]);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('flags REVIEW_REQUIRED events, unknown products, and returns without pickups', () => {
+    const { basket, issues } = foldBasket([
+      event(CustomerJourneyEventType.REVIEW_REQUIRED),
+      event(CustomerJourneyEventType.PRODUCT_RETURN, 'x', 1),
+    ]);
+    expect(basket).toEqual([expect.objectContaining({ productId: 'x', quantity: -1 })]);
+    const kinds = issues.map((issue) => issue.kind).sort();
+    expect(kinds).toEqual(['NEGATIVE_QUANTITY', 'RETURN_WITHOUT_PICKUP', 'REVIEW_EVENT']);
+  });
+
+  it('drops fully-returned lines from the basket without losing the audit trail', () => {
+    const { basket, issues } = foldBasket([
+      event(CustomerJourneyEventType.PRODUCT_PICKUP, 'a', 1),
+      event(CustomerJourneyEventType.PRODUCT_RETURN, 'a', 1),
+    ]);
+    expect(basket).toHaveLength(0);
+    expect(issues).toHaveLength(0);
+  });
+});
+
+/**
+ * The prisma mock exposes ONLY journey tables + read-only product/location
+ * lookups — any attempt by the service to touch checkout sessions, orders,
+ * payments, or inventory would throw immediately (shadow-mode guarantee).
+ */
+function buildService(overrides: {
+  journeyStatus?: CustomerJourneyStatus;
+  fusionRun?: Record<string, unknown> | null;
+  /** The fusion-import video asset's store context (null = asset absent). */
+  asset?: {
+    locationId: string | null;
+    unitId: string | null;
+    createdAt?: Date;
+  } | null;
+  unit?: { id: string } | null;
+} = {}) {
+  const createdEvents: Record<string, unknown>[] = [];
+  const journeyRow = {
+    id: 'j-1',
+    tenantId: TENANT,
+    locationId: 'store-1',
+    unitId: null,
+    status: overrides.journeyStatus ?? CustomerJourneyStatus.OPEN,
+    startedAt: new Date(),
+    endedAt: null,
+    events: [] as Record<string, unknown>[],
+  };
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  const prisma: any = {
+    location: { findFirst: jest.fn(async () => ({ id: 'store-1' })) },
+    retailUnit: {
+      findFirst: jest.fn(async () =>
+        overrides.unit === undefined ? { id: 'unit-1' } : overrides.unit,
+      ),
+    },
+    product: {
+      findFirst: jest.fn(async () => ({ sku: 'SKU-A', name: 'Product A' })),
+    },
+    videoAsset: {
+      findFirst: jest.fn(async () =>
+        overrides.asset === undefined
+          ? { locationId: 'store-1', unitId: null, createdAt: ASSET_CREATED_AT }
+          : overrides.asset,
+      ),
+    },
+    customerJourney: {
+      create: jest.fn(async () => journeyRow),
+      findFirst: jest.fn(async () => journeyRow),
+      update: jest.fn(async (args: { data: Record<string, unknown> }) => {
+        Object.assign(journeyRow, args.data);
+        return journeyRow;
+      }),
+      findMany: jest.fn(async () => []),
+    },
+    customerJourneyEvent: {
+      create: jest.fn(async (args: { data: Record<string, unknown> }) => {
+        const row = { id: `e-${createdEvents.length + 1}`, ...args.data };
+        createdEvents.push(row);
+        journeyRow.events.push(row);
+        return row;
+      }),
+      findFirst: jest.fn(
+        async (args: {
+          where?: { videoAssetId?: string; sourceType?: string };
+        }) =>
+          journeyRow.events.find(
+            (row) =>
+              args.where?.videoAssetId !== undefined &&
+              row.videoAssetId === args.where.videoAssetId &&
+              (args.where.sourceType === undefined ||
+                row.sourceType === args.where.sourceType),
+          ) ?? null,
+      ),
+      findMany: jest.fn(async () => journeyRow.events),
+    },
+    pickupFusionRun: {
+      findFirst: jest.fn(async () => overrides.fusionRun ?? null),
+    },
+    $queryRaw: jest.fn(async () => []),
+  };
+  // Interactive transaction: hand the same mock back as the tx client —
+  // the service's advisory lock + open-check + writes all run through it.
+  prisma.$transaction = jest.fn(
+    async (fn: (tx: unknown) => Promise<unknown>) => fn(prisma),
+  );
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+  return {
+    service: new JourneyService(prisma as never),
+    prisma,
+    createdEvents,
+    journeyRow,
+  };
+}
+
+describe('JourneyService', () => {
+  it('create opens the journey with an ENTRY event', async () => {
+    const { service, createdEvents } = buildService();
+    await service.create(TENANT, { locationId: 'store-1' }, 'user-1');
+    expect(createdEvents[0]).toMatchObject({
+      eventType: CustomerJourneyEventType.ENTRY,
+    });
+  });
+
+  it('create writes the journey and its ENTRY event in ONE transaction (atomic open)', async () => {
+    const { service, prisma, journeyRow } = buildService();
+    // Track whether each write ran inside the $transaction callback: a
+    // journey insert that commits without its ENTRY event would leave an
+    // OPEN journey that a retry then duplicates.
+    let inTransaction = false;
+    const writes: string[] = [];
+    prisma.$transaction.mockImplementation(
+      async (fn: (tx: unknown) => Promise<unknown>) => {
+        inTransaction = true;
+        try {
+          return await fn(prisma);
+        } finally {
+          inTransaction = false;
+        }
+      },
+    );
+    prisma.customerJourney.create.mockImplementation(async () => {
+      writes.push(inTransaction ? 'journey:tx' : 'journey:outside');
+      return journeyRow;
+    });
+    prisma.customerJourneyEvent.create.mockImplementation(
+      async (args: { data: Record<string, unknown> }) => {
+        writes.push(inTransaction ? 'entry:tx' : 'entry:outside');
+        return { id: 'e-1', ...args.data };
+      },
+    );
+    await service.create(TENANT, { locationId: 'store-1' }, 'user-1');
+    expect(writes).toEqual(['journey:tx', 'entry:tx']);
+  });
+
+  it('create rejects when the ENTRY insert fails (transaction rolls both writes back)', async () => {
+    const { service, prisma } = buildService();
+    prisma.customerJourneyEvent.create.mockRejectedValueOnce(
+      new Error('ENTRY insert failed'),
+    );
+    await expect(
+      service.create(TENANT, { locationId: 'store-1' }),
+    ).rejects.toThrow('ENTRY insert failed');
+  });
+
+  it('append rejects on a closed journey (append-only stream stays coherent)', async () => {
+    const { service } = buildService({
+      journeyStatus: CustomerJourneyStatus.RECONCILED,
+    });
+    await expect(
+      service.appendEvent(TENANT, 'j-1', {
+        eventType: CustomerJourneyEventType.SHELF_INTERACTION,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('pickup/return events REQUIRE a product; unidentified goes to REVIEW_REQUIRED', async () => {
+    const { service } = buildService();
+    await expect(
+      service.appendEvent(TENANT, 'j-1', {
+        eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('exit reconciles CLEAN journeys to RECONCILED', async () => {
+    const { service, journeyRow } = buildService();
+    await service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+    });
+    await service.exit(TENANT, 'j-1');
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.RECONCILED);
+  });
+
+  it('exit scopes the status update by the id_tenantId composite key (tenant isolation at the write)', async () => {
+    const { service, prisma } = buildService();
+    await service.exit(TENANT, 'j-1');
+    // The update must carry the composite unique key — id alone would let
+    // a caller-supplied journey id address another tenant's row.
+    expect(prisma.customerJourney.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id_tenantId: { id: 'j-1', tenantId: TENANT } },
+      }),
+    );
+  });
+
+  it('exit routes journeys with unresolved issues to REVIEW_REQUIRED', async () => {
+    const { service, journeyRow } = buildService();
+    await service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+      note: 'unidentified pickup',
+    });
+    await service.exit(TENANT, 'j-1');
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.REVIEW_REQUIRED);
+  });
+
+  it('fusion-run import maps AUTO_PROPOSE to a product event and anything else to review', async () => {
+    const autoRun = {
+      id: 'run-1',
+      policy: 'AUTO_PROPOSE',
+      fusedTopScore: 0.51,
+      fusedTopSku: 'SKU-A',
+      evidence: {
+        detector: { events: [{ kind: 'PICKUP' }] },
+        fused: [{ productId: 'prod-a', sku: 'SKU-A', productName: 'Product A' }],
+      },
+    };
+    const { service, createdEvents } = buildService({ fusionRun: autoRun });
+    await service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    expect(createdEvents[0]).toMatchObject({
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+      sourceType: 'FUSION_SHADOW',
+      fusionRunId: 'run-1',
+    });
+
+    const reviewRun = { ...autoRun, policy: 'NEEDS_HUMAN_REVIEW' };
+    const second = buildService({ fusionRun: reviewRun });
+    await second.service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    expect(second.createdEvents[0]).toMatchObject({
+      eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+      sourceType: 'FUSION_SHADOW',
+    });
+  });
+
+  it('fusion-run import stamps the SOURCE occurrence time (asset createdAt + evidence peakMs)', async () => {
+    const autoRun = {
+      id: 'run-1',
+      policy: 'AUTO_PROPOSE',
+      fusedTopScore: 0.51,
+      fusedTopSku: 'SKU-A',
+      evidence: {
+        detector: { events: [{ kind: 'PICKUP', peakMs: 4500 }] },
+        fused: [{ productId: 'prod-a', sku: 'SKU-A', productName: 'Product A' }],
+      },
+    };
+    const { service, createdEvents } = buildService({ fusionRun: autoRun });
+    await service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    // Stamped at capture time, NOT import time — a clip imported hours
+    // later must not fabricate chronology in the ordered basket fold.
+    expect(createdEvents[0].occurredAt).toEqual(
+      new Date(ASSET_CREATED_AT.getTime() + 4500),
+    );
+    // Review-path imports carry the same source timestamp.
+    const review = buildService({
+      fusionRun: { ...autoRun, policy: 'NEEDS_HUMAN_REVIEW' },
+    });
+    await review.service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    expect(review.createdEvents[0].occurredAt).toEqual(
+      new Date(ASSET_CREATED_AT.getTime() + 4500),
+    );
+  });
+
+  it('fusion-run import falls back to append-time stamping when peakMs is missing', async () => {
+    const before = Date.now();
+    const { service, createdEvents } = buildService({
+      fusionRun: {
+        id: 'run-1',
+        policy: 'AUTO_PROPOSE',
+        fusedTopScore: 0.51,
+        fusedTopSku: 'SKU-A',
+        evidence: {
+          detector: { events: [{ kind: 'PICKUP' }] },
+          fused: [{ productId: 'prod-a', sku: 'SKU-A', productName: 'Product A' }],
+        },
+      },
+    });
+    await service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    const occurredAt = createdEvents[0].occurredAt as Date;
+    expect(occurredAt.getTime()).toBeGreaterThanOrEqual(before);
+    expect(occurredAt.getTime()).toBeLessThanOrEqual(Date.now());
+  });
+
+  it('fusion-run import is IDEMPOTENT: a retry replays instead of doubling the basket', async () => {
+    const autoRun = {
+      id: 'run-1',
+      policy: 'AUTO_PROPOSE',
+      fusedTopScore: 0.51,
+      fusedTopSku: 'SKU-A',
+      evidence: {
+        detector: { events: [{ kind: 'PICKUP' }] },
+        fused: [{ productId: 'prod-a', sku: 'SKU-A', productName: 'Product A' }],
+      },
+    };
+    const { service, createdEvents } = buildService({ fusionRun: autoRun });
+    await service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    await service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    expect(
+      createdEvents.filter((row) => row.fusionRunId === 'run-1'),
+    ).toHaveLength(1);
+  });
+
+  it('fusion-run dedup keys on the VIDEO, not the run id: a re-run cannot double-count', async () => {
+    const runOf = (id: string) => ({
+      id,
+      policy: 'AUTO_PROPOSE',
+      fusedTopScore: 0.51,
+      fusedTopSku: 'SKU-A',
+      evidence: {
+        detector: { events: [{ kind: 'PICKUP' }] },
+        fused: [{ productId: 'prod-a', sku: 'SKU-A', productName: 'Product A' }],
+      },
+    });
+    const { service, prisma, createdEvents } = buildService({
+      fusionRun: runOf('run-1'),
+    });
+    await service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    // Fusion is re-run on the same video (a normal admin action), so the
+    // LATEST run is now run-2: a repeated import resolves a FRESH run id
+    // that a run-id-only dedup would wave through.
+    prisma.pickupFusionRun.findFirst.mockResolvedValue(runOf('run-2'));
+    await service.appendFromFusionRun(TENANT, 'j-1', 'asset-1');
+    expect(
+      createdEvents.filter((row) => row.videoAssetId === 'asset-1'),
+    ).toHaveLength(1);
+  });
+
+  it('append rejects a note carrying payment- or credential-bearing content', async () => {
+    const { service, createdEvents } = buildService();
+    // A Luhn-valid PAN would otherwise persist verbatim and echo back on
+    // every journey read — the AGENTS.md payments invariant.
+    await expect(
+      service.appendEvent(TENANT, 'j-1', {
+        eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+        note: 'shopper card 4242 4242 4242 4242 cvv=123',
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    // Credential-bearing URLs reject too.
+    await expect(
+      service.appendEvent(TENANT, 'j-1', {
+        eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+        note: 'camera at rtsp://admin:hunter2@10.0.0.5/stream',
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(createdEvents).toHaveLength(0);
+  });
+
+  it('append keeps benign notes (the screen rejects secrets, not prose)', async () => {
+    const { service, createdEvents } = buildService();
+    await service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+      note: 'shopper picked up an unidentified bottle near aisle four',
+    });
+    expect(createdEvents[0]).toMatchObject({
+      note: 'shopper picked up an unidentified bottle near aisle four',
+    });
+  });
+
+  it("fusion-run import rejects a video from a different store context", async () => {
+    const { service } = buildService({
+      fusionRun: { id: 'run-1', policy: 'AUTO_PROPOSE', evidence: {} },
+      asset: { locationId: 'store-OTHER', unitId: null },
+    });
+    await expect(
+      service.appendFromFusionRun(TENANT, 'j-1', 'asset-1'),
+    ).rejects.toBeInstanceOf(ConflictException);
+    // An asset with NO location context cannot prove it matches either.
+    const noContext = buildService({
+      fusionRun: { id: 'run-1', policy: 'AUTO_PROPOSE', evidence: {} },
+      asset: { locationId: null, unitId: null },
+    });
+    await expect(
+      noContext.service.appendFromFusionRun(TENANT, 'j-1', 'asset-1'),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('create validates a supplied unit within the tenant AND location', async () => {
+    const { service, prisma } = buildService({ unit: null });
+    await expect(
+      service.create(TENANT, { locationId: 'store-1', unitId: 'unit-foreign' }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(prisma.retailUnit.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          tenantId: TENANT,
+          id: 'unit-foreign',
+          locationId: 'store-1',
+        }),
+      }),
+    );
+  });
+
+  it('append re-checks OPEN inside the locked transaction (exit race cannot slip an event in)', async () => {
+    const { service, prisma } = buildService();
+    // The journey CLOSES between the caller's intent and the transaction:
+    // the in-tx open check must reject the append.
+    prisma.customerJourney.findFirst.mockResolvedValueOnce({
+      id: 'j-1',
+      tenantId: TENANT,
+      locationId: 'store-1',
+      unitId: null,
+      status: CustomerJourneyStatus.RECONCILED,
+      events: [],
+    });
+    await expect(
+      service.appendEvent(TENANT, 'j-1', {
+        eventType: CustomerJourneyEventType.SHELF_INTERACTION,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    // And the lock was actually taken before the check.
+    expect(prisma.$queryRaw).toHaveBeenCalled();
+  });
+});

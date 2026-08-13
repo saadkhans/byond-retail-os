@@ -162,4 +162,8 @@ describe('InferenceJobsRepository', () => {
       expect(auditLog.record).not.toHaveBeenCalled();
     });
   });
+
+  // Queue-lifecycle cancellation (formerly cancelQueuedJob here) lives on
+  // the InferenceQueuePort now — see PrismaInferenceQueue.cancelQueued and
+  // its spec.
 });

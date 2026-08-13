@@ -130,6 +130,24 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
     isActive: true,
   },
   {
+    code: 'video-ingest',
+    name: 'Video Ingestion',
+    description:
+      'Controlled test video upload, safe local/dev media storage, ' +
+      'frame/crop extraction contracts, and the connection from crop ' +
+      'artifacts to Phase 9 inference jobs (no production camera runtime; ' +
+      'no real model execution; no raw media in the database).',
+    // Shipped in Phase 10 and DEFAULT-ENABLED for the same reason as
+    // inventory/devices/checkout/payments/cv/inference (see above): the only
+    // enable endpoint is @TenantOnly(), so leaving this false would strand
+    // new tenants behind 403s. RBAC still gates every route independently.
+    // Tenants that existed BEFORE Phase 10 are covered by the
+    // 20260727000001_video_ingest_module_backfill migration — defaultEnabled
+    // only applies at tenant creation time.
+    defaultEnabled: true,
+    isActive: true,
+  },
+  {
     code: 'esl',
     name: 'Electronic Shelf Labels',
     description: 'ESL vendor integration (later phase).',

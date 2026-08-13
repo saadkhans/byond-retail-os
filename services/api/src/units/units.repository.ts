@@ -31,8 +31,21 @@ export type RetailUnitWithLocation = Prisma.RetailUnitGetPayload<{
  *   lifecycle transition (see UNIT_STATUS_TRANSITIONS).
  * - 'has-devices': the unit still has devices assigned; deleting it would
  *   orphan them (and future phases will add inventory references).
+ * - { rejection: 'has-video-assets', assetCount }: a store move is blocked
+ *   while live (non-deleted) Phase 10 video assets reference the unit —
+ *   assets denormalize the store/unit/device hierarchy they were captured
+ *   under, and reparenting would strand their crops (the inference queue
+ *   rejects the stale tuple with unit-location-mismatch). The count rides
+ *   along so the HTTP mapping can name it.
  */
-export type UnitUpdateRejection = 'retired-blocked' | 'transition-blocked';
+export interface UnitReparentRejection {
+  rejection: 'has-video-assets';
+  assetCount: number;
+}
+export type UnitUpdateRejection =
+  | 'retired-blocked'
+  | 'transition-blocked'
+  | UnitReparentRejection;
 export type UnitDeleteRejection = 'has-devices';
 
 /**
@@ -175,7 +188,7 @@ export class UnitsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${unitAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const before = await tx.retailUnit.findFirst({
         where: { id, tenantId: scopedTenantId },
       });
@@ -194,6 +207,33 @@ export class UnitsRepository extends TenantScopedRepository {
           !UNIT_STATUS_TRANSITIONS[before.status].includes(data.status)
         ) {
           return 'transition-blocked' as const;
+        }
+      }
+      // Phase 10 video assets denormalize the store/unit/device hierarchy
+      // they were captured under (their bindings are historical evidence);
+      // moving the unit to another store would leave every referencing
+      // asset with a stale unit→store tuple, and the inference queue would
+      // then reject its crops with unit-location-mismatch — permanently
+      // stranding them. A store move is therefore BLOCKED while live
+      // assets reference the unit; soft-deleted assets (deletedAt set) do
+      // not block. Race-free under the unit advisory lock above:
+      // VideoAssetsRepository.createAsset() takes the SAME unit lock
+      // (canonical unit → device order) and holds it through its insert,
+      // so a concurrent upload cannot land between this count and the
+      // update below.
+      if (
+        data.locationId !== undefined &&
+        data.locationId !== before.locationId
+      ) {
+        const assetCount = await tx.videoAsset.count({
+          where: {
+            unitId: before.id,
+            tenantId: scopedTenantId,
+            deletedAt: null,
+          },
+        });
+        if (assetCount > 0) {
+          return { rejection: 'has-video-assets', assetCount } as const;
         }
       }
       const after = await tx.retailUnit.update({
@@ -219,7 +259,7 @@ export class UnitsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${unitAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const existing = await tx.retailUnit.findFirst({
         where: { id, tenantId: scopedTenantId },
       });

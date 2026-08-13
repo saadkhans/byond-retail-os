@@ -111,7 +111,7 @@ export class LocationsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${locationAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const before = await tx.location.findFirst({
         where: { id, tenantId: scopedTenantId },
       });
@@ -137,7 +137,7 @@ export class LocationsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${locationAdvisoryLockKey(
         scopedTenantId,
         id,
-      )}))`;
+      )}))::text`;
       const existing = await tx.location.findFirst({
         where: { id, tenantId: scopedTenantId },
       });

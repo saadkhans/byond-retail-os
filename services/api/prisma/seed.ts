@@ -7,8 +7,10 @@ import {
   seedPermissions,
   seedPlatformAdmin,
   seedPlatformModules,
+  seedPlatformSandboxTenant,
   shouldSeedPlatformAdmin,
 } from '../src/seed/seeders';
+import { PLATFORM_SANDBOX_TENANT_SLUG } from '../src/tenants/platform-sandbox';
 
 async function main(): Promise<void> {
   assertSeedAllowed(process.env);
@@ -39,6 +41,17 @@ async function main(): Promise<void> {
       );
       await seedPlatformAdmin(prisma, { email, passwordHash });
       console.log(`Platform admin ready: ${email}`);
+
+      // The sandbox tenant is the ONE tenant platform users resolve to on
+      // tenant-scoped routes (server-side, by fixed slug — see
+      // src/tenants/platform-sandbox.ts). Seeded only together with the
+      // platform admin: without the explicit opt-in above, no sandbox
+      // exists and platform users keep failing closed on tenant routes.
+      const sandbox = await seedPlatformSandboxTenant(prisma);
+      console.log(
+        `Platform sandbox tenant ready: ${PLATFORM_SANDBOX_TENANT_SLUG} ` +
+          `(${sandbox.moduleCount} active modules provisioned).`,
+      );
     } else {
       console.log(`Skipping platform admin seed: ${adminGate.reason}.`);
     }

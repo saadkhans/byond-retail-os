@@ -296,6 +296,12 @@ describe('Catalog & Inventory (e2e, no live database)', () => {
       },
     },
     auditLog: { create: auditCreateSpy },
+    tenant: {
+      // Platform-sandbox lookup (AuthGuard): no sandbox tenant in these
+      // fixtures, so platform users keep a NULL tenant context and every
+      // tenant-scoped route stays 403 for them.
+      findFirst: async () => null,
+    },
     platformModule: {
       findUnique: async ({ where }: { where: Where }) =>
         platformModules.find((module) => module.code === where.code) ?? null,

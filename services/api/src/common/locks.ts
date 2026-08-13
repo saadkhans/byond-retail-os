@@ -1,6 +1,15 @@
 /**
  * Advisory-lock keys used to serialize operations that a single database row
  * lock cannot cover on its own.
+ *
+ * Every call site invokes the lock as
+ * `tx.$queryRaw\`SELECT pg_advisory_xact_lock(hashtext(<key>))::text\``.
+ * The `::text` cast is load-bearing: `pg_advisory_xact_lock` returns the
+ * Postgres `void` type, which Prisma's `$queryRaw` refuses to deserialize
+ * ("Failed to deserialize column of type 'void'"), turning every locked
+ * transaction into a 500. Casting to text keeps the statement a no-result
+ * side effect while staying on `$queryRaw` (which the repository specs
+ * assert on).
  */
 
 /**
@@ -179,6 +188,45 @@ export function reconciliationAdvisoryLockKey(
   recordId: string,
 ): string {
   return `reconciliation:${tenantId}:${recordId}`;
+}
+
+/**
+ * Serializes a video asset's audited status transitions against the
+ * screening preview's final serve authorization within a tenant. A
+ * screening decision is a read-then-write CAS on the asset's status, and
+ * the preview serves quarantined frame BYTES that must never be
+ * audited/served for an asset whose terminal decision already committed —
+ * on POSIX, an extraction racing a rejection's media removal can even keep
+ * reading an unlinked-while-open file. Both
+ * `VideoAssetsRepository.transitionStatus()` (every decision CAS) and
+ * `VideoAssetsRepository.authorizeScreeningPreviewServe()` (the re-read +
+ * READ audit that gates the preview response) take
+ * `pg_advisory_xact_lock(hashtext(key))` first, so a preview
+ * authorization and a decision serialize: whichever commits second
+ * observes the other. Both call sites MUST derive the key identically.
+ */
+export function videoAssetAdvisoryLockKey(
+  tenantId: string,
+  assetId: string,
+): string {
+  return `video-asset:${tenantId}:${assetId}`;
+}
+
+/**
+ * Serializes a customer journey's event appends against its EXIT
+ * reconciliation within a tenant. Both paths decide from a read-then-write
+ * of the journey's OPEN status: without the lock, an append that passed the
+ * open check can commit AFTER exit folded the basket and marked the journey
+ * RECONCILED, leaving a "clean" closed journey with an unaccounted event.
+ * Every JourneyService mutation (appendEvent, appendFromFusionRun via
+ * appendEvent, exit) MUST take this lock inside its transaction before the
+ * open-state check.
+ */
+export function journeyAdvisoryLockKey(
+  tenantId: string,
+  journeyId: string,
+): string {
+  return `journey:${tenantId}:${journeyId}`;
 }
 
 /**

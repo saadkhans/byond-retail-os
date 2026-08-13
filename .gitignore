@@ -111,3 +111,66 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+
+# Phase 10 — local video ingestion storage. Uploaded test videos and every
+# extracted frame/crop artifact live under these roots (VIDEO_STORAGE_ROOT;
+# default <repo>/.local/video-ingest) and must NEVER be committed — no real
+# videos, frames, crops, datasets, or customer media in the repo. The
+# directories are ignored WHOLESALE (any extension, any nesting, any case),
+# wherever they appear — the API may run with a cwd of services/api, so the
+# roots can materialize at the repo root or inside a workspace. Only a
+# README/.gitkeep may be tracked. Media extension patterns below are a
+# second layer for anything media-shaped that lands NEXT TO those roots
+# under .local/ or storage/ by mistake — deliberately scoped (not repo-wide)
+# so future web/app image assets stay trackable, mirroring the ml/ block
+# above.
+.local/video-ingest/**
+**/.local/video-ingest/**
+storage/video-ingest/**
+**/storage/video-ingest/**
+!**/video-ingest/README.md
+!**/video-ingest/.gitkeep
+.local/**/*.[mM][pP]4
+.local/**/*.[mM]4[vV]
+.local/**/*.[mM][oO][vV]
+.local/**/*.[aA][vV][iI]
+.local/**/*.[mM][kK][vV]
+.local/**/*.[wW][eE][bB][mM]
+.local/**/*.[mM][pP][eE][gG]
+.local/**/*.[mM][pP][gG]
+.local/**/*.[jJ][pP][gG]
+.local/**/*.[jJ][pP][eE][gG]
+.local/**/*.[pP][nN][gG]
+.local/**/*.[wW][eE][bB][pP]
+.local/**/*.[bB][mM][pP]
+.local/**/*.[tT][iI][fF]
+.local/**/*.[tT][iI][fF][fF]
+.local/**/*.[gG][iI][fF]
+.local/**/*.[hH][eE][iI][cC]
+.local/**/*.[hH][eE][iI][fF]
+.local/**/*.[aA][vV][iI][fF]
+storage/**/*.[mM][pP]4
+storage/**/*.[mM]4[vV]
+storage/**/*.[mM][oO][vV]
+storage/**/*.[aA][vV][iI]
+storage/**/*.[mM][kK][vV]
+storage/**/*.[wW][eE][bB][mM]
+storage/**/*.[mM][pP][eE][gG]
+storage/**/*.[mM][pP][gG]
+storage/**/*.[jJ][pP][gG]
+storage/**/*.[jJ][pP][eE][gG]
+storage/**/*.[pP][nN][gG]
+storage/**/*.[wW][eE][bB][pP]
+storage/**/*.[bB][mM][pP]
+storage/**/*.[tT][iI][fF]
+storage/**/*.[tT][iI][fF][fF]
+storage/**/*.[gG][iI][fF]
+storage/**/*.[hH][eE][iI][cC]
+storage/**/*.[hH][eE][iI][fF]
+storage/**/*.[aA][vV][iI][fF]
+
+# Browser-automation artifacts (Playwright MCP snapshots/screenshots)
+.playwright-mcp/
+# Screenshots dropped at the repo root by browser-automation sessions; real
+# image assets always live under an app/service directory, never the root.
+/*.png

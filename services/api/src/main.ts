@@ -5,6 +5,7 @@ import { NestExpressApplication } from '@nestjs/platform-express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import { parseCorsOrigins, parseTrustProxy } from './config/env.validation';
+import { UPLOAD_ATTESTATION_HEADERS } from './video-ingest/test-media-gate.guard';
 
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
@@ -20,7 +21,14 @@ async function bootstrap(): Promise<void> {
   app.enableCors({
     origin: parseCorsOrigins(config.get<string>('CORS_ORIGINS')),
     methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'],
-    allowedHeaders: ['Authorization', 'Content-Type'],
+    // The test-media upload gate reads its attestation headers BEFORE the
+    // body is buffered; the browser therefore preflights them, and they
+    // must be allowed here or the upload never leaves the browser.
+    allowedHeaders: [
+      'Authorization',
+      'Content-Type',
+      ...UPLOAD_ATTESTATION_HEADERS.map(({ header }) => header),
+    ],
     maxAge: 600,
   });
 

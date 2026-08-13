@@ -85,6 +85,11 @@ enum AuditAction {
   APPROVE
   REJECT
   OVERRIDE
+  // Phase 10 — audited byte-exposing reads (quarantine screening preview).
+  // The only audited READ so far: sample frames of a QUARANTINED upload
+  // served in-memory to a `video-asset:screen` holder so the screening
+  // decision is informed, not blind. Ordinary metadata reads stay unaudited.
+  READ
   // Phase 6 — payment lifecycle. Intent creation reuses CREATE; these cover
   // the state-machine transitions that have no generic equivalent.
   AUTHORIZE
@@ -133,6 +138,13 @@ enum BarcodeFormat {
 enum InventoryMovementType {
   ADJUSTMENT
   SALE
+  // Operator-recorded external movements (pickup-lab setup workflow):
+  // stock arriving (RECEIPT) and signed count corrections. Same append-only
+  // ledger + projection invariants as ADJUSTMENT; idempotent by external
+  // reference at the service layer.
+  RECEIPT
+  CORRECTION_IN
+  CORRECTION_OUT
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +195,11 @@ model Tenant {
   slug      String       @unique
   status    TenantStatus @default(PENDING)
   settings  Json?
+  /// VERIFIED platform-sandbox identity: set exclusively by the sandbox
+  /// seeder, never by the tenant-creation API. Platform users resolve
+  /// their request context ONLY to a tenant carrying this marker — a
+  /// customer tenant squatting the reserved slug can never be resolved.
+  isPlatformSandbox Boolean @default(false)
   createdAt DateTime     @default(now())
   updatedAt DateTime     @updatedAt
 
@@ -218,6 +235,16 @@ model Tenant {
   inferenceJobs       InferenceJob[]
   inferenceResults    InferenceResult[]
   inferenceCandidates InferenceCandidate[]
+
+  videoAssets             VideoAsset[]
+  videoArtifacts          VideoArtifact[]
+  productReferenceImages  ProductReferenceImage[]
+  videoGroundTruths       VideoGroundTruth[]
+  productReferenceEmbeddings ProductReferenceEmbedding[]
+  pickupFusionRuns        PickupFusionRun[]
+  customerJourneys        CustomerJourney[]
+  customerJourneyEvents   CustomerJourneyEvent[]
+  videoExtractionRequests VideoExtractionRequest[]
 }
 
 model User {
@@ -257,6 +284,9 @@ model User {
   paymentReconciliationCreated PaymentReconciliationRecord[] @relation("PaymentReconciliationActor")
 
   inferenceJobsCreated InferenceJob[] @relation("InferenceJobActor")
+
+  videoAssetsUploaded   VideoAsset[]    @relation("VideoAssetUploader")
+  videoArtifactsCreated VideoArtifact[] @relation("VideoArtifactActor")
 
   // Composite FK target for same-tenant creator constraints (id alone is
   // already unique; this adds nothing semantically, only an FK anchor).
@@ -348,6 +378,8 @@ model Location {
   orders             Order[]
   visionEvents       VisionEvent[]
   inferenceJobs      InferenceJob[]
+  videoAssets        VideoAsset[]
+  customerJourneys   CustomerJourney[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -471,6 +503,11 @@ model Product {
   sku         String
   name        String
   description String?
+  // OCR/text-evidence catalog fields (pickup-fusion-v2): the Arabic
+  // display/label name and free-form aliases the label may carry. Optional;
+  // maintained through the same catalog ingestion path as everything else.
+  nameArabic  String?
+  aliases     String[] @default([])
   categoryId  String?
   brandId     String?
   unitOfMeasure UnitOfMeasure @default(EACH)
@@ -492,6 +529,10 @@ model Product {
   orderLines           OrderLine[]
   visionEventCandidates VisionEventCandidate[]
   visionReviewsApplied  VisionEventReview[]   @relation("VisionReviewAppliedProduct")
+  referenceImages       ProductReferenceImage[]
+  groundTruths          VideoGroundTruth[]
+  referenceEmbeddings   ProductReferenceEmbedding[]
+  journeyEvents         CustomerJourneyEvent[]
 
   @@unique([tenantId, sku])
   @@unique([id, tenantId])
@@ -516,6 +557,194 @@ model ProductBarcode {
 
   @@unique([tenantId, value])
   @@index([productId])
+}
+
+// Pickup-detection reference image for one catalog product. The row is
+// METADATA + an internal storage key — the API serves bytes only through
+// the authenticated image endpoint and never exposes the key (same rule as
+// VideoAsset/VideoArtifact). A product is INFERENCE-READY only when it has
+// at least PICKUP_MIN_REFERENCE_IMAGES (5) of these.
+model ProductReferenceImage {
+  id               String  @id @default(cuid())
+  tenantId         String
+  productId        String
+  originalFilename String
+  mimeType         String
+  sizeBytes        Int
+  checksumSha256   String
+  storageKey       String
+  createdById      String?
+  createdAt        DateTime @default(now())
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+  embeddings ProductReferenceEmbedding[]
+
+  // Anchor for hand-written same-tenant composite FKs
+  // (20260811110000_cv_same_tenant_fks).
+  @@unique([id, tenantId])
+  @@unique([tenantId, productId, checksumSha256])
+  @@index([tenantId, productId])
+}
+
+// Versioned visual descriptor of ONE reference image (pickup-fusion-v2
+// retrieval index). One row per (image, modelKey) so a new embedding model
+// backfills alongside the old instead of overwriting it; deleting the
+// reference image cascades its vectors away.
+model ProductReferenceEmbedding {
+  id               String  @id @default(cuid())
+  tenantId         String
+  referenceImageId String
+  productId        String
+  modelKey         String
+  modelVersion     String
+  // L2-normalized Float array (small dimensionality) as JSON.
+  vector           Json
+  createdAt        DateTime @default(now())
+
+  tenant         Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  product        Product               @relation(fields: [productId], references: [id], onDelete: Restrict)
+  referenceImage ProductReferenceImage @relation(fields: [referenceImageId], references: [id], onDelete: Cascade)
+
+  @@unique([referenceImageId, modelKey])
+  @@index([tenantId, modelKey])
+  @@index([tenantId, productId])
+}
+
+// ---------------------------------------------------------------------------
+// Customer journey SKELETON (shadow mode): a shopper's visit as an
+// append-only event stream. The provisional basket is a FOLD over these
+// events — never a checkout-session, order, payment, or inventory write.
+// ---------------------------------------------------------------------------
+
+enum CustomerJourneyStatus {
+  OPEN
+  EXITED
+  RECONCILED
+  REVIEW_REQUIRED
+}
+
+enum CustomerJourneyEventType {
+  ENTRY
+  EXIT
+  SHELF_INTERACTION
+  PRODUCT_PICKUP
+  PRODUCT_RETURN
+  REVIEW_REQUIRED
+}
+
+model CustomerJourney {
+  id         String                @id @default(cuid())
+  tenantId   String
+  locationId String
+  unitId     String?
+  status     CustomerJourneyStatus @default(OPEN)
+  startedAt  DateTime              @default(now())
+  endedAt    DateTime?
+  createdAt  DateTime              @default(now())
+  updatedAt  DateTime              @updatedAt
+
+  tenant   Tenant      @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location Location    @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit     RetailUnit? @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  events   CustomerJourneyEvent[]
+
+  // Anchor for hand-written same-tenant composite FKs
+  // (20260811110000_cv_same_tenant_fks).
+  @@unique([id, tenantId])
+  @@index([tenantId, status, startedAt(sort: Desc)])
+}
+
+// APPEND-ONLY (service discipline; no update path exists): what the CV
+// shadow pipeline OBSERVED, one row per observation. productId is the
+// canonical link; sku/productName snapshots keep rows meaningful even if
+// the catalog renames later.
+model CustomerJourneyEvent {
+  id          String                   @id @default(cuid())
+  tenantId    String
+  journeyId   String
+  eventType   CustomerJourneyEventType
+  occurredAt  DateTime
+  productId   String?
+  sku         String?
+  productName String?
+  quantity    Int                      @default(1)
+  /** Uncalibrated score carried from the producing shadow pipeline. */
+  matchScore  Float?
+  sourceType  String                   @default("MANUAL")
+  videoAssetId String?
+  fusionRunId  String?
+  note        String?
+  createdById String?
+  createdAt   DateTime                 @default(now())
+
+  tenant  Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  journey CustomerJourney @relation(fields: [journeyId], references: [id], onDelete: Cascade)
+  product Product?        @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, journeyId, occurredAt])
+}
+
+enum FusionPolicyResult {
+  AUTO_PROPOSE
+  NEEDS_VLM
+  NEEDS_HUMAN_REVIEW
+  UNKNOWN_PRODUCT
+  FAILED
+}
+
+// One pickup-fusion-v2 SHADOW run over a test video: full per-stage
+// evidence (timeline/tracks, crops + quality, barcode, OCR, retrieval,
+// classical, context, fused candidates, VLM exchange, per-stage timings)
+// as safe-descriptor JSON. Deliberately DISCONNECTED from billing,
+// checkout sessions, and vision events — CV proposes, this table records.
+model PickupFusionRun {
+  id              String             @id @default(cuid())
+  tenantId        String
+  videoAssetId    String
+  pipelineVersion String
+  policy          FusionPolicyResult
+  fusedTopSku     String?
+  fusedTopScore   Float?
+  scoreMargin     Float?
+  evidence        Json
+  processingMs    Int
+  createdAt       DateTime           @default(now())
+
+  tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  videoAsset VideoAsset @relation(fields: [videoAssetId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, videoAssetId, createdAt(sort: Desc)])
+}
+
+// What ACTUALLY happened in one controlled test video — operator-entered
+// ground truth the validation dashboard scores detections against. One row
+// per asset (upsert semantics); NONE means "no pickup occurs in this clip".
+enum GroundTruthEventKind {
+  PICKUP
+  RETURN
+  NONE
+}
+
+model VideoGroundTruth {
+  id                String               @id @default(cuid())
+  tenantId          String
+  videoAssetId      String               @unique
+  eventKind         GroundTruthEventKind
+  productId         String?
+  actualTimestampMs Int?
+  quantity          Int                  @default(1)
+  note              String?
+  createdById       String?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  videoAsset VideoAsset @relation(fields: [videoAssetId], references: [id], onDelete: Cascade)
+  product    Product?   @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@unique([tenantId, videoAssetId])
+  @@index([tenantId, productId])
 }
 
 // DERIVED stock projection — never written directly from user input. The
@@ -567,6 +796,8 @@ model RetailUnit {
   orders           Order[]
   visionEvents     VisionEvent[]
   inferenceJobs    InferenceJob[]
+  videoAssets      VideoAsset[]
+  customerJourneys CustomerJourney[]
 
   @@unique([tenantId, code])
   // Enables composite same-tenant FKs (devices must reference a unit of the
@@ -611,6 +842,7 @@ model Device {
   checkoutSessions CheckoutSession[]
   visionEvents     VisionEvent[]
   inferenceJobs    InferenceJob[]
+  videoAssets      VideoAsset[]
 
   @@unique([tenantId, serialNumber])
   @@unique([id, tenantId])
@@ -764,6 +996,7 @@ model CheckoutSession {
   visionEvents   VisionEvent[]
   paymentIntents PaymentIntent[]
   inferenceJobs  InferenceJob[]
+  videoAssets    VideoAsset[]
 
   // Enables composite same-tenant FKs (lines/orders must reference a session
   // of the SAME tenant) — mirrors the Phase 3/4 hardening pattern.
@@ -1460,6 +1693,13 @@ enum InferenceJobType {
 }
 
 enum InferenceJobStatus {
+  // NON-CLAIMABLE creation state for callers that must commit a downstream
+  // link (e.g. a video crop artifact → job link) before the work may be
+  // delivered: the row exists and is discoverable/cancellable, but no
+  // claim ever returns it. The caller publishes PENDING_LINK → QUEUED once
+  // the link commits; a crash in between leaves work nothing can consume
+  // and a later delete can retire.
+  PENDING_LINK
   QUEUED
   RUNNING
   SUCCEEDED
@@ -1467,11 +1707,12 @@ enum InferenceJobStatus {
   CANCELLED
 }
 
-// A queued unit of inference work. Lifecycle QUEUED → RUNNING →
-// SUCCEEDED/FAILED (CANCELLED reserved for a future cancel path); terminal
-// statuses never transition again. The job row is the queue entry: claiming
-// is a guarded compare-and-set on status, ordered by priority DESC then
-// requestedAt ASC then id ASC (deterministic).
+// A queued unit of inference work. Lifecycle (PENDING_LINK →) QUEUED →
+// RUNNING → SUCCEEDED/FAILED, with CANCELLED reachable from PENDING_LINK
+// and QUEUED (orphan compensation); terminal statuses never transition
+// again. The job row is the queue entry: claiming is a guarded
+// compare-and-set on status, ordered by priority DESC then requestedAt ASC
+// then id ASC (deterministic). Only QUEUED rows are claimable.
 model InferenceJob {
   id       String @id @default(cuid())
   tenantId String
@@ -1525,6 +1766,7 @@ model InferenceJob {
   visionEvent VisionEvent?     @relation(fields: [visionEventId], references: [id], onDelete: Restrict)
   createdBy   User?            @relation("InferenceJobActor", fields: [createdById], references: [id], onDelete: Restrict)
   result InferenceResult?
+  videoArtifacts VideoArtifact[]
 
   @@unique([id, tenantId])
   @@unique([tenantId, idempotencyKey])
@@ -1592,4 +1834,224 @@ model InferenceCandidate {
   @@unique([id, tenantId])
   @@unique([tenantId, resultId, rank])
   @@unique([tenantId, resultId, sku])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10 — Video ingestion & crop extraction (controlled TEST videos only).
+// Rows carry METADATA + an INTERNAL storage key only: raw media bytes never
+// enter the database, no public/signed URLs exist, and the storage key is
+// never exposed through the API. Local/dev storage adapter only — production
+// camera runtime, streaming, and real model execution are later phases.
+// ---------------------------------------------------------------------------
+
+enum VideoAssetStatus {
+  // DB-first staging state: the metadata row committed but the media write
+  // has not succeeded yet. NOT screenable and NOT processable — a screening
+  // decision, preview, validate, or extraction on a PENDING_MEDIA asset is
+  // a controlled 409, so a concurrent screener can never APPROVE an asset
+  // whose bytes may still fail to land. The upload publishes the asset
+  // (PENDING_MEDIA → QUARANTINED) only AFTER the media write succeeds; a
+  // failed write parks it PENDING_MEDIA → FAILED (UPLOAD_INCOMPLETE). A
+  // crash in the window leaves this row as the recovery record (DELETE
+  // cleans it).
+  PENDING_MEDIA
+  // Every upload whose media landed is published QUARANTINED: bytes are held
+  // in local storage but the asset is NOT processable (validate/extract/crop
+  // all 409) until an
+  // audited frame-content screening decision APPROVEs it (→ UPLOADED) or
+  // REJECTs it (media removed, → REJECTED). The upload attestation is
+  // defense-in-depth only — quarantine is the enforced control.
+  QUARANTINED
+  UPLOADED
+  VALIDATED
+  REJECTED
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum VideoArtifactType {
+  FRAME
+  CROP
+}
+
+// Why a crop/frame was extracted — a closed vocabulary (mirrors the Phase 9
+// job types plus shelf/cart context) so free text can never leak into it.
+enum VideoCropReason {
+  PRODUCT_PICKUP
+  PRODUCT_RETURN
+  SHELF_AUDIT
+  CART_INSERTION
+  OCR_REVIEW
+  VLM_REVIEW
+}
+
+// DURABLE outcome of an upload's ONE media write (storage.put). Not a
+// lifecycle status: it records whether a put is still in flight, so the
+// DELETE cleanup can OBSERVE the drain instead of INFERRING it. PENDING is
+// claimed under the asset advisory lock immediately before the put (in the
+// same locked transaction as the pre-put liveness read, so a concurrent
+// soft-delete either sees the claim or precedes it); SUCCEEDED is written
+// the moment the put returns, FAILED when it throws. NULL means no durable
+// media write was ever attempted for this row (rejected before the put, or
+// a pre-existing row).
+enum VideoMediaWriteState {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+// A controlled test video uploaded for the Phase 9 inference pipeline.
+// Lifecycle: UPLOADED → VALIDATED → PROCESSING → READY (or REJECTED/FAILED).
+// Soft delete: deletedAt marks the row; the local file is removed and the
+// metadata row is kept for audit lineage (artifacts keep their references).
+model VideoAsset {
+  id       String @id @default(cuid())
+  tenantId String
+  // Optional store/unit/device/session context, same binding rules as
+  // Phase 9 inference jobs (all same-tenant, composite FKs in migration SQL).
+  locationId String?
+  unitId     String?
+  deviceId   String?
+  sessionId  String?
+  // Sanitized original filename (basename only, safe charset) — display only,
+  // NEVER used to build storage paths.
+  originalFilename String
+  mimeType         String
+  sizeBytes        Int
+  // Probed metadata (null until a probe/validate ran).
+  durationMs Int?
+  width      Int?
+  height     Int?
+  fps        Float?
+  status VideoAssetStatus @default(UPLOADED)
+  // INTERNAL storage key relative to the configured local storage root
+  // (opaque, server-generated). Never exposed in API responses and never
+  // user-supplied.
+  storageKey     String
+  checksumSha256 String
+  // Safe, stable failure information (UPPER_SNAKE code + screened message).
+  errorCode    String?
+  errorMessage String?
+  // Server-side SCREENING INSPECTION EVIDENCE: stamped ONLY by the guarded
+  // screening-preview serve authorization (which requires a byte-reading
+  // extractor and at least one actually-served frame), and REQUIRED by the
+  // APPROVE screening decision — so an approval can never happen blind.
+  // Cleared on EVERY status transition (evidence is QUARANTINED-scoped and
+  // single-use; a fresh QUARANTINED publish starts with none).
+  screeningInspectedAt     DateTime?
+  screeningInspectedBy     String?
+  screeningInspectedFrames Int?
+  uploadedById String?
+  deletedAt    DateTime?
+  // EXACTLY-ONCE media-removal completion marker: stamped by a DB
+  // compare-and-set (updateMany WHERE mediaRemovedAt IS NULL) in the same
+  // transaction as the "media removal completed" audit entry, so the
+  // durable completion evidence is written exactly once no matter how the
+  // filesystem removal and its retries/replays interleave — the marker,
+  // never the storage adapter's "did anything exist" report, is the
+  // authority. Shared by the screening-rejection removal and the delete
+  // cleanup (the completion audit reason distinguishes them).
+  mediaRemovedAt DateTime?
+  // DURABLE media-write phase for the upload's single storage.put. The
+  // DELETE cleanup may record its exactly-once completion ONLY when this is
+  // RESOLVED (SUCCEEDED/FAILED — or NULL, meaning no put was ever
+  // attempted): while it is PENDING a put that claimed the write before the
+  // soft-delete committed can still land bytes just after the prefix was
+  // drained, so completion would be recorded over media that did not exist
+  // yet. Replaces the old inference "the row is PENDING_MEDIA / already
+  // soft-deleted, so the write must have drained", which a DELETE REPLAY
+  // could not observe at all.
+  mediaWriteState VideoMediaWriteState?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  tenant     Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location   Location?        @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit       RetailUnit?      @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  device     Device?          @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  session    CheckoutSession? @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  uploadedBy User?            @relation("VideoAssetUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
+  artifacts  VideoArtifact[]
+  extractionRequests VideoExtractionRequest[]
+  groundTruth VideoGroundTruth?
+  fusionRuns  PickupFusionRun[]
+
+  @@unique([id, tenantId])
+  @@index([tenantId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([tenantId, status])
+  @@index([tenantId, sessionId])
+}
+
+// A frame or crop extracted from a VideoAsset. Internal reference only —
+// like the asset, the row carries metadata + an internal storage key, never
+// media bytes or a download URL. Append-only (triggers in migration SQL)
+// except the one-shot inferenceJobId link set when a Phase 9 job is created
+// from a crop.
+model VideoArtifact {
+  id           String @id @default(cuid())
+  tenantId     String
+  videoAssetId String
+  artifactType VideoArtifactType
+  reason       VideoCropReason?
+  // Position in the source video.
+  timestampMs Int
+  // Crop box within the source frame (CROP only; null for full FRAMEs).
+  cropX      Int?
+  cropY      Int?
+  cropWidth  Int?
+  cropHeight Int?
+  // Output dimensions of the extracted artifact.
+  width     Int
+  height    Int
+  mimeType  String
+  sizeBytes Int
+  checksumSha256 String
+  // INTERNAL storage key relative to the configured local storage root —
+  // never exposed in API responses.
+  storageKey String
+  // Set once when a Phase 9 inference job is created from this crop; the
+  // job's input descriptor references this artifact BY ID only.
+  inferenceJobId String?
+  createdById    String?
+  createdAt      DateTime @default(now())
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  videoAsset   VideoAsset    @relation(fields: [videoAssetId], references: [id], onDelete: Restrict)
+  inferenceJob InferenceJob? @relation(fields: [inferenceJobId], references: [id], onDelete: Restrict)
+  createdBy    User?         @relation("VideoArtifactActor", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@index([tenantId, videoAssetId, createdAt])
+  @@index([tenantId, createdAt(sort: Desc), id(sort: Desc)])
+}
+
+// One extraction request (frames batch or manual crop) per tenant-scoped
+// idempotency key. Artifact rows are append-only, so retrying a committed
+// batch whose HTTP response was lost must REPLAY the recorded artifacts —
+// never extract and append again. The row stores only ids (no media, no
+// storage keys) and is written in the SAME transaction as its batch.
+model VideoExtractionRequest {
+  id             String   @id @default(cuid())
+  tenantId       String
+  videoAssetId   String
+  idempotencyKey String
+  // The artifact ids the committed batch produced, in creation order —
+  // replay resolves them through the tenant-scoped artifact reads.
+  artifactIds    Json
+  // Canonical fingerprint of the request parameters that produced the batch
+  // (fixed operation tag, fixed field order, defaults applied). A replay is
+  // honored ONLY when the incoming request's fingerprint matches — the same
+  // key with changed parameters is a controlled 409, never a silent replay
+  // of the old batch. Null only on rows recorded before this column existed
+  // (those fail closed: they can no longer prove the request is identical).
+  requestFingerprint String?
+  createdAt      DateTime @default(now())
+
+  tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  videoAsset VideoAsset @relation(fields: [videoAssetId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, videoAssetId])
 }

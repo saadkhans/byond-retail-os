@@ -13,7 +13,13 @@ export const RequirePermissions = (...permissions: string[]) =>
 export const PLATFORM_ONLY_KEY = 'byond:platformOnly';
 export const PlatformOnly = () => SetMetadata(PLATFORM_ONLY_KEY, true);
 
-/** Route is restricted to tenant users with a resolved tenant context. */
+/**
+ * Route requires a RESOLVED tenant context. Tenant users always carry one
+ * (their own tenant). Platform users carry one only when the platform
+ * sandbox tenant is seeded (local development — see
+ * ../../tenants/platform-sandbox); they then operate on SANDBOX data only,
+ * never on customer tenants. Without a resolved tenant the route denies.
+ */
 export const TENANT_ONLY_KEY = 'byond:tenantOnly';
 export const TenantOnly = () => SetMetadata(TENANT_ONLY_KEY, true);
 

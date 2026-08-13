@@ -241,7 +241,7 @@ export class VisionEventsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${unitAdvisoryLockKey(
         scopedTenantId,
         data.unitId,
-      )}))`;
+      )}))::text`;
       const location = await tx.location.findFirst({
         where: { id: data.locationId, tenantId: scopedTenantId },
         select: { id: true },
@@ -267,7 +267,7 @@ export class VisionEventsRepository extends TenantScopedRepository {
         await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceAdvisoryLockKey(
           scopedTenantId,
           data.deviceId,
-        )}))`;
+        )}))::text`;
         const device = await tx.device.findFirst({
           where: { id: data.deviceId, tenantId: scopedTenantId },
           select: { id: true, unitId: true },
@@ -495,7 +495,7 @@ export class VisionEventsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${visionEventAdvisoryLockKey(
         scopedTenantId,
         eventId,
-      )}))`;
+      )}))::text`;
       const event = await tx.visionEvent.findFirst({
         where: { id: eventId, tenantId: scopedTenantId },
         include: {
@@ -576,7 +576,7 @@ export class VisionEventsRepository extends TenantScopedRepository {
         await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${checkoutSessionAdvisoryLockKey(
           scopedTenantId,
           event.sessionId,
-        )}))`;
+        )}))::text`;
         const session = await tx.checkoutSession.findFirst({
           where: { id: event.sessionId, tenantId: scopedTenantId },
           select: { id: true, status: true },
@@ -681,7 +681,7 @@ export class VisionEventsRepository extends TenantScopedRepository {
           await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${productStockAdvisoryLockKey(
             scopedTenantId,
             appliedProductId,
-          )}))`;
+          )}))::text`;
           const product = await tx.product.findFirst({
             where: { id: appliedProductId, tenantId: scopedTenantId },
             select: {
@@ -812,7 +812,7 @@ export class VisionEventsRepository extends TenantScopedRepository {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${visionEventAdvisoryLockKey(
         scopedTenantId,
         eventId,
-      )}))`;
+      )}))::text`;
       const event = await tx.visionEvent.findFirst({
         where: { id: eventId, tenantId: scopedTenantId },
       });
