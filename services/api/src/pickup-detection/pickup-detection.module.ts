@@ -4,8 +4,10 @@ import { InferenceModule } from '../inference/inference.module';
 import { PlatformModulesModule } from '../platform-modules/platform-modules.module';
 import { VideoIngestModule } from '../video-ingest/video-ingest.module';
 import { PickupAnalysisFrameDecoder } from './analysis/analysis-frames';
+import { LocalPickupMediaAdapter } from './local-pickup-media.adapter';
 import { PickupClassicalAdapter } from './pickup.adapter';
 import { PickupDetectionConfig } from './pickup-detection.config';
+import { PickupMediaPort } from './pickup-media.port';
 import {
   PickupDetectionController,
   PickupValidationController,
@@ -47,6 +49,13 @@ import { PickupReferenceLibrary } from './reference-library';
       provide: PickupAnalysisFrameDecoder,
       useFactory: () => new PickupAnalysisFrameDecoder(),
     },
+    // The ONLY place classical-v1 names the concrete local storage adapter
+    // and decoder together: core services (detection, reference library,
+    // reference images) consume the storage-key PORT alone, so an
+    // object-store deployment or replacement decoder swaps this binding —
+    // never a core edit. Mirrors the fusion module's PICKUP_MEDIA_DECODER.
+    LocalPickupMediaAdapter,
+    { provide: PickupMediaPort, useExisting: LocalPickupMediaAdapter },
     PickupReferenceLibrary,
     PickupClassicalAdapter,
     PickupDetectionService,

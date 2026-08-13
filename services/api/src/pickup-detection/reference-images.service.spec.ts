@@ -46,13 +46,15 @@ function buildService() {
       ),
     },
   };
+  // Provider-neutral storage PORT surface only (put/read/delete) — the
+  // service must never need the local adapter's path capability.
   const storage = {
     put: jest.fn(async () => undefined),
     delete: jest.fn(async () => undefined),
     read: jest.fn(async () => Buffer.alloc(0)),
-    internalPathFor: jest.fn(() => '/internal/path'),
   };
-  const decoder = {
+  // The repository-owned media PORT: decode-validation by storage key.
+  const media = {
     decodeReferenceImage: jest.fn(async () => ({ width: 4, height: 4 })),
   };
   const recognizer = {
@@ -63,10 +65,10 @@ function buildService() {
   const service = new ReferenceImagesService(
     prisma as never,
     storage as never,
-    decoder as never,
+    media as never,
     recognizer as never,
   );
-  return { service, prisma, storage, recognizer };
+  return { service, prisma, storage, media, recognizer };
 }
 
 describe('ReferenceImagesService.upload payment-data screens', () => {

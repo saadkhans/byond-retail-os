@@ -14,12 +14,12 @@ import {
   filenameCarriesSensitiveContent,
 } from '../video-ingest/media-safety';
 import { FrameTextRecognizerPort } from '../video-ingest/recognition/frame-text-recognizer.port';
-import { LocalVideoStorageAdapter } from '../video-ingest/storage/local-video-storage.adapter';
+import { VideoStoragePort } from '../video-ingest/storage/video-storage.port';
 import {
   EMBEDDING_MODEL_KEY,
   EMBEDDING_MODEL_VERSION,
 } from '../pickup-fusion/primitives';
-import { PickupAnalysisFrameDecoder } from './analysis/analysis-frames';
+import { PickupMediaPort } from './pickup-media.port';
 
 /**
  * A product is INFERENCE-READY only at five or more reference images: one
@@ -128,8 +128,12 @@ export class ReferenceImagesService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly storage: LocalVideoStorageAdapter,
-    private readonly decoder: PickupAnalysisFrameDecoder,
+    // Byte operations go through the provider-neutral storage PORT and
+    // decode-validation through the repository-owned media port — module
+    // composition binds the local implementations; nothing here depends on
+    // the concrete local adapter or its path capability.
+    private readonly storage: VideoStoragePort,
+    private readonly media: PickupMediaPort,
     private readonly recognizer: FrameTextRecognizerPort,
   ) {}
 
@@ -251,9 +255,7 @@ export class ReferenceImagesService {
     // an image can never become a reference row (they would silently
     // weaken every later match). Failure removes the stored bytes.
     try {
-      await this.decoder.decodeReferenceImage(
-        this.storage.internalPathFor(storageKey),
-      );
+      await this.media.decodeReferenceImage(storageKey);
     } catch {
       await this.storage.delete(storageKey).catch(() => undefined);
       throw new BadRequestException(

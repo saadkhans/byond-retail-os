@@ -15,10 +15,9 @@ import {
 import { InferenceJobsService } from '../inference/inference-jobs.service';
 import { PlatformModulesService } from '../platform-modules/platform-modules.service';
 import { PrismaService } from '../prisma/prisma.service';
-import { LocalVideoStorageAdapter } from '../video-ingest/storage/local-video-storage.adapter';
 import { VideoAssetsRepository } from '../video-ingest/video-assets.repository';
 import { VideoAssetsService } from '../video-ingest/video-assets.service';
-import { PickupAnalysisFrameDecoder, analysisGeometryFor } from './analysis/analysis-frames';
+import { analysisGeometryFor } from './analysis/analysis-frames';
 import {
   AnalysisGeometry,
   BoundingBox,
@@ -34,6 +33,7 @@ import {
   matchProduct,
 } from './analysis/product-matcher';
 import { PickupDetectionConfig } from './pickup-detection.config';
+import { PickupMediaPort } from './pickup-media.port';
 import { PickupReferenceLibrary } from './reference-library';
 
 export const PICKUP_ADAPTER_KEY = 'pickup-classical-v1';
@@ -157,13 +157,15 @@ export class PickupDetectionService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: PickupDetectionConfig,
-    private readonly decoder: PickupAnalysisFrameDecoder,
+    // Storage-key media access behind the repository-owned port — never
+    // the concrete local adapter/decoder pair (module composition binds
+    // those), so classical-v1 core stays provider-neutral.
+    private readonly media: PickupMediaPort,
     private readonly referenceLibrary: PickupReferenceLibrary,
     private readonly inferenceJobs: InferenceJobsService,
     private readonly platformModules: PlatformModulesService,
     private readonly videoAssets: VideoAssetsService,
     private readonly videoAssetsRepository: VideoAssetsRepository,
-    private readonly storage: LocalVideoStorageAdapter,
   ) {}
 
   /** Latest pickup job for the asset, newest attempt first. The result
@@ -693,8 +695,8 @@ export class PickupDetectionService {
     );
     let frames;
     try {
-      frames = await this.decoder.decodeAnalysisFrames(
-        this.storage.internalPathFor(internal.storageKey),
+      frames = await this.media.decodeAnalysisFrames(
+        internal.storageKey,
         this.config.analysisFps,
         geometry,
         // Probed duration lets the decoder downsample fps instead of

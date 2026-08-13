@@ -331,10 +331,21 @@ export async function seedPlatformAdmin(
 
 export interface PlatformSandboxSeedClient {
   tenant: {
-    upsert(args: {
+    findUnique(args: {
       where: { slug: string };
-      update: { name: string; status: 'ACTIVE' };
-      create: { name: string; slug: string; status: 'ACTIVE' };
+      select: { id: true; isPlatformSandbox: true };
+    }): Promise<{ id: string; isPlatformSandbox: boolean } | null>;
+    update(args: {
+      where: { slug: string };
+      data: { name: string; status: 'ACTIVE' };
+    }): Promise<{ id: string }>;
+    create(args: {
+      data: {
+        name: string;
+        slug: string;
+        status: 'ACTIVE';
+        isPlatformSandbox: true;
+      };
     }): Promise<{ id: string }>;
   };
   platformModule: {
@@ -366,25 +377,48 @@ export interface PlatformSandboxSeedClient {
  * admin has a workspace for the Phase 10 test-video workflow.
  *
  * Idempotent, with the same "never overwrite operator state" stance as the
- * admin seeder: the tenant row is upserted by its fixed slug (a reseed
- * re-ACTIVATEs a suspended sandbox — restoring a working local setup is the
- * point of reseeding), while module enablement rows are created only when
- * missing — a module an operator explicitly DISABLED for the sandbox stays
- * disabled across reseeds. Every ACTIVE catalog module is provisioned, so
- * newly shipped modules light up for the sandbox on the next reseed.
+ * admin seeder: a reseed re-ACTIVATEs a suspended sandbox — restoring a
+ * working local setup is the point of reseeding — while module enablement
+ * rows are created only when missing, so a module an operator explicitly
+ * DISABLED for the sandbox stays disabled across reseeds. Every ACTIVE
+ * catalog module is provisioned, so newly shipped modules light up for the
+ * sandbox on the next reseed.
+ *
+ * IDENTITY, not just the slug: the seeder only ever creates the sandbox
+ * WITH the verified isPlatformSandbox marker, and it REFUSES — loudly, with
+ * a controlled error and zero writes — to update a tenant that holds the
+ * reserved slug without the marker. Such a row is a customer tenant (the
+ * creation API once accepted the slug); renaming/reactivating it here would
+ * silently hand its data to every platform user.
  */
 export async function seedPlatformSandboxTenant(
   db: PlatformSandboxSeedClient,
 ): Promise<{ tenantId: string; moduleCount: number }> {
-  const tenant = await db.tenant.upsert({
+  const existing = await db.tenant.findUnique({
     where: { slug: PLATFORM_SANDBOX_TENANT_SLUG },
-    update: { name: PLATFORM_SANDBOX_TENANT_NAME, status: 'ACTIVE' },
-    create: {
-      name: PLATFORM_SANDBOX_TENANT_NAME,
-      slug: PLATFORM_SANDBOX_TENANT_SLUG,
-      status: 'ACTIVE',
-    },
+    select: { id: true, isPlatformSandbox: true },
   });
+  if (existing && !existing.isPlatformSandbox) {
+    throw new Error(
+      `A tenant already uses the reserved "${PLATFORM_SANDBOX_TENANT_SLUG}" ` +
+        'slug without the verified sandbox marker — refusing to take it ' +
+        'over. Rename that tenant (or mark it manually if it truly is the ' +
+        'sandbox) and reseed.',
+    );
+  }
+  const tenant = existing
+    ? await db.tenant.update({
+        where: { slug: PLATFORM_SANDBOX_TENANT_SLUG },
+        data: { name: PLATFORM_SANDBOX_TENANT_NAME, status: 'ACTIVE' },
+      })
+    : await db.tenant.create({
+        data: {
+          name: PLATFORM_SANDBOX_TENANT_NAME,
+          slug: PLATFORM_SANDBOX_TENANT_SLUG,
+          status: 'ACTIVE',
+          isPlatformSandbox: true,
+        },
+      });
 
   const modules = await db.platformModule.findMany({
     where: { isActive: true },

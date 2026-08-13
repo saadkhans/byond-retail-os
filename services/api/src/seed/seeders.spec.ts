@@ -431,14 +431,18 @@ describe('assertSeedAdminPasswordAllowed', () => {
 
 describe('seedPlatformSandboxTenant', () => {
   let db: {
-    tenant: { upsert: jest.Mock };
+    tenant: { findUnique: jest.Mock; update: jest.Mock; create: jest.Mock };
     platformModule: { findMany: jest.Mock };
     tenantModule: { upsert: jest.Mock };
   };
 
   beforeEach(() => {
     db = {
-      tenant: { upsert: jest.fn().mockResolvedValue({ id: 'sandbox-1' }) },
+      tenant: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        update: jest.fn().mockResolvedValue({ id: 'sandbox-1' }),
+        create: jest.fn().mockResolvedValue({ id: 'sandbox-1' }),
+      },
       platformModule: {
         findMany: jest.fn().mockResolvedValue([
           { id: 'm-core', code: 'core' },
@@ -453,21 +457,57 @@ describe('seedPlatformSandboxTenant', () => {
     return db as unknown as PlatformSandboxSeedClient;
   }
 
-  it('upserts the sandbox tenant by its FIXED slug, ACTIVE on create and update', async () => {
+  it('creates a missing sandbox WITH the verified marker, ACTIVE', async () => {
     const result = await seedPlatformSandboxTenant(client());
 
-    expect(db.tenant.upsert).toHaveBeenCalledWith({
-      where: { slug: PLATFORM_SANDBOX_TENANT_SLUG },
-      // A reseed re-ACTIVATEs a suspended sandbox — restoring a working
-      // local setup is the point of reseeding.
-      update: { name: PLATFORM_SANDBOX_TENANT_NAME, status: 'ACTIVE' },
-      create: {
+    expect(db.tenant.create).toHaveBeenCalledWith({
+      data: {
         name: PLATFORM_SANDBOX_TENANT_NAME,
         slug: PLATFORM_SANDBOX_TENANT_SLUG,
         status: 'ACTIVE',
+        // The verified identity is minted ONLY here — the tenant-creation
+        // API can neither set it nor use the reserved slug.
+        isPlatformSandbox: true,
       },
     });
+    expect(db.tenant.update).not.toHaveBeenCalled();
     expect(result).toEqual({ tenantId: 'sandbox-1', moduleCount: 2 });
+  });
+
+  it('re-activates an existing VERIFIED sandbox on reseed', async () => {
+    db.tenant.findUnique.mockResolvedValue({
+      id: 'sandbox-1',
+      isPlatformSandbox: true,
+    });
+
+    const result = await seedPlatformSandboxTenant(client());
+
+    // A reseed re-ACTIVATEs a suspended sandbox — restoring a working
+    // local setup is the point of reseeding.
+    expect(db.tenant.update).toHaveBeenCalledWith({
+      where: { slug: PLATFORM_SANDBOX_TENANT_SLUG },
+      data: { name: PLATFORM_SANDBOX_TENANT_NAME, status: 'ACTIVE' },
+    });
+    expect(db.tenant.create).not.toHaveBeenCalled();
+    expect(result).toEqual({ tenantId: 'sandbox-1', moduleCount: 2 });
+  });
+
+  it('REFUSES to take over an unmarked tenant squatting the reserved slug', async () => {
+    // A customer tenant that acquired the slug before it was reserved:
+    // same slug, but no verified marker.
+    db.tenant.findUnique.mockResolvedValue({
+      id: 'customer-1',
+      isPlatformSandbox: false,
+    });
+
+    await expect(seedPlatformSandboxTenant(client())).rejects.toThrow(
+      /refusing to take it over/i,
+    );
+    // Loud failure with ZERO writes — the customer tenant is untouched and
+    // no module rows are provisioned onto it.
+    expect(db.tenant.update).not.toHaveBeenCalled();
+    expect(db.tenant.create).not.toHaveBeenCalled();
+    expect(db.tenantModule.upsert).not.toHaveBeenCalled();
   });
 
   it('provisions every ACTIVE catalog module as ENABLED for the sandbox', async () => {
@@ -493,12 +533,18 @@ describe('seedPlatformSandboxTenant', () => {
     });
   });
 
-  it('is idempotent: rerunning issues only upserts, never bare creates', async () => {
+  it('is idempotent: a rerun updates the verified sandbox instead of re-creating', async () => {
     await seedPlatformSandboxTenant(client());
+    // The second run now finds the row the first one created — marked.
+    db.tenant.findUnique.mockResolvedValue({
+      id: 'sandbox-1',
+      isPlatformSandbox: true,
+    });
     await seedPlatformSandboxTenant(client());
 
-    // Two runs, same shape: upserts keyed on stable unique identities.
-    expect(db.tenant.upsert).toHaveBeenCalledTimes(2);
+    expect(db.tenant.create).toHaveBeenCalledTimes(1);
+    expect(db.tenant.update).toHaveBeenCalledTimes(1);
+    // Module rows stay upserts keyed on stable unique identities.
     expect(db.tenantModule.upsert).toHaveBeenCalledTimes(4);
   });
 });

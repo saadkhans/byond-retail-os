@@ -104,6 +104,7 @@ function assetRow(overrides: Record<string, unknown> = {}) {
 
 interface Harness {
   service: PickupDetectionService;
+  media: Record<string, jest.Mock>;
   inferenceJobs: Record<string, jest.Mock>;
   platformModules: Record<string, jest.Mock>;
   videoAssets: Record<string, jest.Mock>;
@@ -155,7 +156,9 @@ function buildService(overrides: {
     confidenceThreshold: overrides.threshold ?? 0.62,
     referenceDir: '/unused',
   };
-  const decoder = {
+  // The repository-owned media PORT (storage-key based) — the service must
+  // run against this mock alone, never a concrete local adapter or path.
+  const media = {
     decodeAnalysisFrames: jest.fn(async () => frames),
     decodeReferenceImage: jest.fn(),
   };
@@ -200,20 +203,19 @@ function buildService(overrides: {
   const repository = {
     findByIdInternal: jest.fn(async () => assetRow(overrides.asset)),
   };
-  const storage = { internalPathFor: jest.fn(() => '/root/x') };
   const service = new PickupDetectionService(
     prisma as never,
     config as never,
-    decoder as never,
+    media as never,
     referenceLibrary as never,
     inferenceJobs as never,
     platformModules as never,
     videoAssets as never,
     repository as never,
-    storage as never,
   );
   return {
     service,
+    media: media as never,
     inferenceJobs: inferenceJobs as never,
     platformModules: platformModules as never,
     videoAssets: videoAssets as never,
@@ -241,6 +243,21 @@ describe('scaleBoxToSource', () => {
 });
 
 describe('PickupDetectionService.detectForAsset', () => {
+  it('decodes media through the injected port by STORAGE KEY — never a local path', async () => {
+    const { service, media } = buildService();
+    await service.detectForAsset(TENANT, ASSET);
+
+    // The service hands the port the managed storage key from the asset
+    // row; path resolution (internalPathFor) lives in the bound adapter
+    // alone, so the whole pipeline runs against this plain mock.
+    expect(media.decodeAnalysisFrames).toHaveBeenCalledWith(
+      `${TENANT}/uuid/original.mp4`,
+      2,
+      { width: GEOMETRY.width, height: GEOMETRY.height },
+      8000,
+    );
+  });
+
   it('completes the job with pixel-derived candidates and records PRODUCT_MATCHED', async () => {
     const { service, inferenceJobs, prisma } = buildService();
     await service.detectForAsset(TENANT, ASSET);

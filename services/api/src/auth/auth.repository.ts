@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { TenantStatus, User, UserStatus, UserType } from '@prisma/client';
 import {
   AuditEntry,
@@ -30,6 +30,8 @@ class LoginIneligibleError extends Error {}
  */
 @Injectable()
 export class AuthRepository {
+  private readonly logger = new Logger(AuthRepository.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly auditLog: AuditLogService,
@@ -61,18 +63,46 @@ export class AuthRepository {
    * Resolves the PLATFORM SANDBOX tenant — the ONE tenant platform users
    * operate in on tenant-scoped routes (see ../tenants/platform-sandbox).
    * Strictly server-side: a FIXED slug looked up in the database, never
-   * client input. A missing or non-ACTIVE sandbox resolves to null, which
-   * keeps every tenant-scoped guard failing closed for platform users.
+   * client input — AND the row must carry the VERIFIED isPlatformSandbox
+   * marker, which only the sandbox seeder ever sets. The slug alone is not
+   * proof of identity: a customer tenant that acquired the (previously
+   * unreserved) slug must never become every platform user's request
+   * context. A missing, non-ACTIVE, or UNMARKED sandbox resolves to null,
+   * which keeps every tenant-scoped guard failing closed for platform
+   * users; an unmarked slug-squatter is additionally logged loudly as a
+   * collision so operators see WHY resolution refuses.
    */
   async findPlatformSandboxTenantId(): Promise<string | null> {
     const tenant = await this.prisma.tenant.findFirst({
       where: {
         slug: PLATFORM_SANDBOX_TENANT_SLUG,
         status: TenantStatus.ACTIVE,
+        isPlatformSandbox: true,
       },
       select: { id: true },
     });
-    return tenant?.id ?? null;
+    if (tenant) {
+      return tenant.id;
+    }
+    // Collision detection (only on the miss path, so the happy path stays
+    // one query): a tenant holding the reserved slug WITHOUT the verified
+    // marker is a customer tenant, never the sandbox — refuse it and say so.
+    const squatter = await this.prisma.tenant.findFirst({
+      where: {
+        slug: PLATFORM_SANDBOX_TENANT_SLUG,
+        isPlatformSandbox: false,
+      },
+      select: { id: true },
+    });
+    if (squatter) {
+      this.logger.error(
+        `A tenant holds the reserved "${PLATFORM_SANDBOX_TENANT_SLUG}" slug ` +
+          'without the verified sandbox marker — refusing to resolve it as ' +
+          'the platform sandbox (platform users stay without tenant context ' +
+          'until the collision is resolved)',
+      );
+    }
+    return null;
   }
 
   /**

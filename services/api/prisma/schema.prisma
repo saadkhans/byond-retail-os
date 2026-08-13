@@ -195,6 +195,11 @@ model Tenant {
   slug      String       @unique
   status    TenantStatus @default(PENDING)
   settings  Json?
+  /// VERIFIED platform-sandbox identity: set exclusively by the sandbox
+  /// seeder, never by the tenant-creation API. Platform users resolve
+  /// their request context ONLY to a tenant carrying this marker — a
+  /// customer tenant squatting the reserved slug can never be resolved.
+  isPlatformSandbox Boolean @default(false)
   createdAt DateTime     @default(now())
   updatedAt DateTime     @updatedAt
 

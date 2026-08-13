@@ -1,10 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ProductStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { LocalVideoStorageAdapter } from '../video-ingest/storage/local-video-storage.adapter';
-import { PickupAnalysisFrameDecoder } from './analysis/analysis-frames';
 import { ReferenceImage, RgbImage } from './analysis/product-matcher';
 import { PickupDetectionConfig } from './pickup-detection.config';
+import { PickupMediaPort } from './pickup-media.port';
 import { PICKUP_MIN_REFERENCE_IMAGES } from './reference-images.service';
 
 /** Decoded-image cache cap — 200 x (96x96x3 bytes) ≈ 5.5 MiB. */
@@ -42,8 +41,9 @@ export class PickupReferenceLibrary {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly storage: LocalVideoStorageAdapter,
-    private readonly decoder: PickupAnalysisFrameDecoder,
+    // Storage-key decode behind the repository-owned port — the module
+    // binds the local adapter/decoder pair; this core stays provider-neutral.
+    private readonly media: PickupMediaPort,
     private readonly config: PickupDetectionConfig,
   ) {}
 
@@ -85,9 +85,7 @@ export class PickupReferenceLibrary {
           continue;
         }
         try {
-          const image = await this.decoder.decodeReferenceImage(
-            this.storage.internalPathFor(row.storageKey),
-          );
+          const image = await this.media.decodeReferenceImage(row.storageKey);
           if (this.decodeCache.size >= DECODE_CACHE_MAX) {
             const oldest = this.decodeCache.keys().next().value;
             if (oldest !== undefined) {

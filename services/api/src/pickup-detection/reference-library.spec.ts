@@ -39,9 +39,10 @@ function buildLibrary(
   const config = {
     labMode: options.labMode ?? false,
   } as PickupDetectionConfig;
+  // The repository-owned media PORT (storage-key based) is the library's
+  // only media dependency — no concrete adapter, no path capability.
   const library = new PickupReferenceLibrary(
     prisma as never,
-    { internalPathFor: jest.fn() } as never,
     { decodeReferenceImage: jest.fn() } as never,
     config,
   );

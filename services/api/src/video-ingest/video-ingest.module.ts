@@ -124,14 +124,17 @@ import { VideoCropsController } from './video-crops.controller';
   ],
   // Exported for the Phase 10 pickup-detection module: artifact
   // persistence goes through VideoAssetsService's idempotent contracts
-  // (never direct rows), asset reads through the repository, and analysis
-  // decoding needs the CONCRETE local adapter's path capability — the same
-  // capability the ffmpeg extractor uses. The recognizer port is exported
-  // so REFERENCE-IMAGE uploads run the SAME payment-data pixel screen as
-  // video frames before any byte becomes durable.
+  // (never direct rows), asset reads through the repository, byte access
+  // through the provider-neutral storage PORT, and the CONCRETE local
+  // adapter only for the composition-layer media adapters that need its
+  // path capability — the same capability the ffmpeg extractor uses. The
+  // recognizer port is exported so REFERENCE-IMAGE uploads run the SAME
+  // payment-data pixel screen as video frames before any byte becomes
+  // durable.
   exports: [
     VideoAssetsService,
     VideoAssetsRepository,
+    VideoStoragePort,
     LocalVideoStorageAdapter,
     FrameTextRecognizerPort,
   ],

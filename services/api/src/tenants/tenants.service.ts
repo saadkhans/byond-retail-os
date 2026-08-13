@@ -11,6 +11,7 @@ import {
 } from '../common/audit/audit-log.service';
 import { DEFAULT_ENABLED_MODULE_CODES } from '../platform-modules/platform-module.catalog';
 import { CreateTenantDto } from './dto/create-tenant.dto';
+import { PLATFORM_SANDBOX_TENANT_SLUG } from './platform-sandbox';
 import { TenantsRepository } from './tenants.repository';
 
 export function toSlug(input: string): string {
@@ -43,6 +44,15 @@ export class TenantsService {
     if (!slug) {
       throw new BadRequestException(
         'Tenant slug could not be derived from the given name; provide a slug',
+      );
+    }
+    // The sandbox slug is RESERVED: ordinary tenant creation must never
+    // mint it (whether passed explicitly or derived from the name), so a
+    // customer tenant can never collide with the verified platform-sandbox
+    // identity — only the seeder creates that tenant, marker included.
+    if (slug === PLATFORM_SANDBOX_TENANT_SLUG) {
+      throw new ConflictException(
+        `Tenant slug "${slug}" is reserved for the platform sandbox`,
       );
     }
 
