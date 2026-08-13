@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { PERMISSION_CATALOG } from '../access-control/permission.catalog';
 import {
   DEFAULT_ENABLED_MODULE_CODES,
@@ -490,6 +492,33 @@ describe('seedPlatformSandboxTenant', () => {
     });
     expect(db.tenant.create).not.toHaveBeenCalled();
     expect(result).toEqual({ tenantId: 'sandbox-1', moduleCount: 2 });
+  });
+
+  it('the marker migration adds the column WITHOUT blessing any existing row', () => {
+    // Both the slug AND the display name were customer-controllable before
+    // the marker existed (tenant creation accepted the then-unreserved
+    // slug), so the migration must not verify ANY pre-existing row — the
+    // verified sandbox is provisioned exclusively by the seeder below, and
+    // every pre-marker row fails closed.
+    const sql = readFileSync(
+      join(
+        __dirname,
+        '..',
+        '..',
+        'prisma',
+        'migrations',
+        '20260813090000_platform_sandbox_verified_identity',
+        'migration.sql',
+      ),
+      'utf8',
+    );
+    expect(sql).toContain('ADD COLUMN "isPlatformSandbox"');
+    const statements = sql
+      .split('\n')
+      .filter((line) => !line.trimStart().startsWith('--'))
+      .join('\n');
+    expect(statements.toUpperCase()).not.toContain('UPDATE');
+    expect(statements).not.toContain('= true');
   });
 
   it('REFUSES to take over an unmarked tenant squatting the reserved slug', async () => {
