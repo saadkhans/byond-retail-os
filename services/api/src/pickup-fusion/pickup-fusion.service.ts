@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   BadRequestException,
   ConflictException,
@@ -70,6 +71,48 @@ import {
 } from './primitives';
 
 export const FUSION_PIPELINE_VERSION = 'pickup-fusion-v2';
+
+/** Marker pushed into evidence.detector.warnings when the selected-crop
+ *  artifact could not be persisted — the run stays valid but the gap is
+ *  VISIBLE in the evidence, never a silent missing-crop success. */
+export const CROP_ARTIFACT_FAILED = 'CROP_ARTIFACT_FAILED';
+
+/**
+ * Collision-safe crop idempotency key (Codex P2). The key is derived
+ * from CONTENT, never from a run ordinal: two overlapping runs of the
+ * same asset used to read the same `count()` before either persisted,
+ * collide on `fusion:<asset>:r<ordinal>`, and lose one crop artifact to
+ * a swallowed fingerprint conflict. Here the key commits to everything
+ * the extraction fingerprint checks — run scope, the replay window
+ * identity (or whole-clip), and the crop's timestamp/box — so identical
+ * content REPLAYS the same artifact (exact-retry idempotency, both runs
+ * sharing one crop is correct) while ANY difference yields a different
+ * key and conflicts become structurally impossible. The digest is split
+ * with a letter guard so the key can never contain a 13+ digit run the
+ * secret-free key screen could mistake for a card number.
+ */
+export function fusionCropIdempotencyKey(
+  videoAssetId: string,
+  runScope: 'WHOLE_CLIP' | 'REPLAY_WINDOW',
+  window: { startMs: number; endMs: number; peakMs: number } | null,
+  crop: { timestampMs: number; x: number; y: number; width: number; height: number },
+): string {
+  const digest = createHash('sha256')
+    .update(
+      JSON.stringify({
+        scope: runScope,
+        window: window
+          ? { s: window.startMs, p: window.peakMs, e: window.endMs }
+          : null,
+        crop,
+      }),
+    )
+    .digest('hex');
+  return (
+    `fusion:${videoAssetId}:${runScope === 'REPLAY_WINDOW' ? 'rw' : 'wc'}` +
+    `:h${digest.slice(0, 8)}x${digest.slice(8, 16)}`
+  );
+}
 
 /** Quiet lead-in prepended to a replay window's detector slice: the
  *  classical detector models background from its earliest frames, so a
@@ -965,22 +1008,41 @@ export class PickupFusionService {
       }));
 
       // Persist the selected crop as a real artifact (audited, idempotent).
-      const runOrdinal = await this.prisma.pickupFusionRun.count({
-        where: { tenantId, videoAssetId },
-      });
+      // The key is CONTENT-derived (fusionCropIdempotencyKey) — never a
+      // run ordinal that overlapping runs could race: identical content
+      // replays one shared artifact; different windows/detections get
+      // their own keys and cannot conflict or steal each other's crop.
       try {
         const sourceBox = scaleBoxToSource(primary.box, geometrySmall, source);
-        const artifact = await this.videoAssets.createCrop(tenantId, videoAssetId, {
-          timestampMs: Math.max(0, Math.min(bestPre.timestampMs, internal.durationMs - 1)),
+        const cropRequest = {
+          timestampMs: Math.max(
+            0,
+            Math.min(bestPre.timestampMs, internal.durationMs - 1),
+          ),
           x: sourceBox.x,
           y: sourceBox.y,
           width: sourceBox.width,
           height: sourceBox.height,
+        };
+        const artifact = await this.videoAssets.createCrop(tenantId, videoAssetId, {
+          ...cropRequest,
           reason: 'PRODUCT_PICKUP',
-          idempotencyKey: `fusion:${videoAssetId}:r${runOrdinal}`,
+          idempotencyKey: fusionCropIdempotencyKey(
+            videoAssetId,
+            window ? 'REPLAY_WINDOW' : 'WHOLE_CLIP',
+            window,
+            cropRequest,
+          ),
         });
         evidence.cropArtifactId = artifact.artifact.id;
       } catch (error) {
+        // A failure here can no longer be a same-key fingerprint conflict
+        // (the key commits to the fingerprint) — whatever it is, surface
+        // it IN THE EVIDENCE instead of a silent missing-crop success.
+        evidence.detector.warnings = [
+          ...evidence.detector.warnings,
+          CROP_ARTIFACT_FAILED,
+        ];
         this.logger.warn(
           `fusion crop artifact failed: ${error instanceof Error ? error.message : 'unknown'}`,
         );

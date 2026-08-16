@@ -11,11 +11,13 @@ import { HogLabVisualRetriever } from './adapters/visual-signals';
 import { EMBEDDING_MODEL_KEY, EMBEDDING_MODEL_VERSION } from './primitives';
 import {
   BARCODE_VALUE_SUPPRESSED,
+  CROP_ARTIFACT_FAILED,
   FUSION_PIPELINE_VERSION,
   FusionEvidence,
   OCR_TEXT_SUPPRESSED,
   PickupFusionService,
   applyVlmVerdictToEvidence,
+  fusionCropIdempotencyKey,
 } from './pickup-fusion.service';
 import { CandidateSignal, OcrExecutionStatus, VlmVerdict } from './ports';
 
@@ -1287,5 +1289,103 @@ describe('Phase 13 runLiveWindow (live RTSP shadow sessions)', () => {
     });
     expect(createdRuns[0].data.evidence.cropArtifactId).toBeNull();
     expect(videoAssets.createCrop).not.toHaveBeenCalled();
+  });
+});
+
+describe('fusion crop idempotency keys are collision-safe (Codex P2)', () => {
+  const NO_CANDIDATES = {
+    catalog: [] as CatalogFixture[],
+    barcodeSeen: '6281000000002',
+    classicalSignals: [] as CandidateSignal[],
+  };
+  const CROP = { timestampMs: 1000, x: 1, y: 2, width: 30, height: 40 };
+  const WINDOW_A = { startMs: 1000, endMs: 2000, peakMs: 1600 };
+  const WINDOW_B = { startMs: 1500, endMs: 2500, peakMs: 2100 };
+
+  const cropKeyAt = (
+    stub: { createCrop: jest.Mock },
+    index: number,
+  ): string =>
+    (
+      stub.createCrop.mock.calls as unknown as [
+        string,
+        string,
+        { idempotencyKey: string },
+      ][]
+    )[index][2].idempotencyKey;
+
+  it('two replay windows on one asset derive DIFFERENT keys — no cross-window steal', () => {
+    const a = fusionCropIdempotencyKey('asset-1', 'REPLAY_WINDOW', WINDOW_A, CROP);
+    const b = fusionCropIdempotencyKey('asset-1', 'REPLAY_WINDOW', WINDOW_B, CROP);
+    expect(a).not.toBe(b);
+  });
+
+  it('exact retry of the same window derives the SAME key — the artifact replays', () => {
+    const a = fusionCropIdempotencyKey('asset-1', 'REPLAY_WINDOW', WINDOW_A, CROP);
+    const b = fusionCropIdempotencyKey('asset-1', 'REPLAY_WINDOW', { ...WINDOW_A }, { ...CROP });
+    expect(a).toBe(b);
+  });
+
+  it('whole-clip and a replay window never share a key even for identical crops', () => {
+    const clip = fusionCropIdempotencyKey('asset-1', 'WHOLE_CLIP', null, CROP);
+    const win = fusionCropIdempotencyKey('asset-1', 'REPLAY_WINDOW', WINDOW_A, CROP);
+    expect(clip).not.toBe(win);
+  });
+
+  it('a different detection crop changes the key', () => {
+    const a = fusionCropIdempotencyKey('asset-1', 'WHOLE_CLIP', null, CROP);
+    const b = fusionCropIdempotencyKey('asset-1', 'WHOLE_CLIP', null, {
+      ...CROP,
+      timestampMs: 1400,
+    });
+    expect(a).not.toBe(b);
+  });
+
+  it('keys never contain a 13+ digit run (secret-free key screen stays happy)', () => {
+    const keys = [
+      fusionCropIdempotencyKey('asset-1', 'WHOLE_CLIP', null, CROP),
+      fusionCropIdempotencyKey(
+        'asset-1',
+        'REPLAY_WINDOW',
+        { startMs: 1500000, endMs: 1501000, peakMs: 1500500 },
+        { timestampMs: 1500500, x: 100, y: 200, width: 300, height: 400 },
+      ),
+    ];
+    for (const key of keys) {
+      expect(key).not.toMatch(/\d{13,}/);
+      expect(key).toMatch(/^fusion:asset-1:(wc|rw):h[0-9a-f]{8}x[0-9a-f]{8}$/);
+    }
+  });
+
+  it('run() derives the key from content — the racy run-count read is GONE and overlapping runs share the replayed artifact', async () => {
+    const { service, videoAssets, prisma } = buildService(NO_CANDIDATES);
+    await service.run('tenant-1', 'asset-1');
+    expect(prisma.pickupFusionRun.count).not.toHaveBeenCalled();
+    const first = cropKeyAt(videoAssets, 0);
+    expect(first).toMatch(/^fusion:asset-1:wc:h[0-9a-f]{8}x[0-9a-f]{8}$/);
+    // A second overlapping whole-clip run with identical detection content
+    // computes the SAME key: the extraction layer replays one shared
+    // artifact instead of rejecting a colliding ordinal.
+    await service.run('tenant-1', 'asset-1');
+    expect(cropKeyAt(videoAssets, 1)).toBe(first);
+  });
+
+  it('window-scoped runs pass window-scoped keys distinct from the whole-clip key', async () => {
+    const { service, videoAssets } = buildService(NO_CANDIDATES);
+    await service.run('tenant-1', 'asset-1');
+    await service.run('tenant-1', 'asset-1', { window: WINDOW_B });
+    const clipKey = cropKeyAt(videoAssets, 0);
+    const windowKey = cropKeyAt(videoAssets, 1);
+    expect(windowKey).toMatch(/^fusion:asset-1:rw:/);
+    expect(windowKey).not.toBe(clipKey);
+  });
+
+  it('a crop failure surfaces CROP_ARTIFACT_FAILED in the evidence — never a silent missing-crop success', async () => {
+    const { service, videoAssets, createdRuns } = buildService(NO_CANDIDATES);
+    videoAssets.createCrop.mockRejectedValueOnce(new Error('boom'));
+    await service.run('tenant-1', 'asset-1');
+    const { data } = createdRuns[0];
+    expect(data.evidence.cropArtifactId).toBeNull();
+    expect(data.evidence.detector.warnings).toContain(CROP_ARTIFACT_FAILED);
   });
 });
