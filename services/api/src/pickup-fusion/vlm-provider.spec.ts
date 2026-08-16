@@ -1,5 +1,7 @@
 import { ConfigService } from '@nestjs/config';
+import { VlmRequestEvidence } from './ports';
 import {
+  parseVlmFaultMode,
   parseVlmProviderKey,
   selectVlmVerifier,
 } from './vlm-provider';
@@ -10,10 +12,14 @@ import {
  * vendors, and it maps each vendor's readiness onto one neutral shape.
  */
 
-function config(provider?: string): ConfigService {
+function config(provider?: string, fault?: string): ConfigService {
   return {
     get: (key: string) =>
-      key === 'PICKUP_VLM_PROVIDER' ? provider : undefined,
+      key === 'PICKUP_VLM_PROVIDER'
+        ? provider
+        : key === 'PICKUP_VLM_FAULT'
+          ? fault
+          : undefined,
   } as unknown as ConfigService;
 }
 
@@ -94,6 +100,18 @@ describe('selectVlmVerifier', () => {
     });
   });
 
+  it('no fault mode → the concrete verifier is handed over UNWRAPPED', () => {
+    const ollama = fakeOllama();
+    for (const fault of [undefined, 'NONE']) {
+      const selected = selectVlmVerifier(
+        config('local', fault),
+        fakeAnthropic(true) as never,
+        ollama as never,
+      );
+      expect(selected.verifier).toBe(ollama);
+    }
+  });
+
   it('anthropic readiness collapses onto key presence (no paid call from readiness)', async () => {
     for (const ready of [true, false]) {
       const selected = selectVlmVerifier(
@@ -111,5 +129,66 @@ describe('selectVlmVerifier', () => {
         lastInference: null,
       });
     }
+  });
+});
+
+describe('parseVlmFaultMode', () => {
+  it('only the two exact drill modes inject — everything else is NONE', () => {
+    expect(parseVlmFaultMode('UNAVAILABLE')).toBe('UNAVAILABLE');
+    expect(parseVlmFaultMode('INVALID_SKU')).toBe('INVALID_SKU');
+    expect(parseVlmFaultMode(undefined)).toBe('NONE');
+    expect(parseVlmFaultMode('NONE')).toBe('NONE');
+    expect(parseVlmFaultMode('unavailable')).toBe('NONE');
+  });
+});
+
+describe('PICKUP_VLM_FAULT injection (shadow/test drills)', () => {
+  const evidence: VlmRequestEvidence = {
+    frames: [],
+    crops: [],
+    candidates: [
+      { sku: 'SKU-A', name: 'Product A', fusedScore: 0.3, referenceImages: [] },
+    ],
+    ocrText: null,
+    barcode: null,
+    shelfContext: null,
+  };
+
+  it('UNAVAILABLE: verify() reports PROVIDER_UNREACHABLE with NO network call', async () => {
+    const ollama = fakeOllama();
+    const selected = selectVlmVerifier(
+      config('local', 'UNAVAILABLE'),
+      fakeAnthropic(true) as never,
+      ollama as never,
+    );
+    const verdict = await selected.verifier.verify(evidence, 5000);
+    expect(verdict.status).toBe('PROVIDER_UNREACHABLE');
+    expect(verdict.result).toBeNull();
+    expect(verdict.latencyMs).toBe(0);
+    expect(ollama.verify).not.toHaveBeenCalled();
+  });
+
+  it('INVALID_SKU: the invented SKU flows through the REAL strict parser', async () => {
+    const ollama = fakeOllama();
+    const selected = selectVlmVerifier(
+      config('local', 'INVALID_SKU'),
+      fakeAnthropic(true) as never,
+      ollama as never,
+    );
+    const verdict = await selected.verifier.verify(evidence, 5000);
+    expect(verdict.status).toBe('INVALID_SKU');
+    expect(verdict.result).toBeNull();
+    expect(ollama.verify).not.toHaveBeenCalled();
+  });
+
+  it('readiness passes through to the real provider under any fault', async () => {
+    const ollama = fakeOllama();
+    const selected = selectVlmVerifier(
+      config('local', 'UNAVAILABLE'),
+      fakeAnthropic(true) as never,
+      ollama as never,
+    );
+    await selected.readiness();
+    expect(ollama.readiness).toHaveBeenCalled();
   });
 });

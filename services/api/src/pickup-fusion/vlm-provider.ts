@@ -1,8 +1,9 @@
-import { Provider } from '@nestjs/common';
+import { Logger, Provider } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { VlmVerifier } from './ports';
+import { VlmRequestEvidence, VlmVerdict, VlmVerifier } from './ports';
 import { AnthropicVlmVerifier } from './adapters/vlm-verifier';
 import { OllamaVlmVerifier } from './adapters/ollama-vlm';
+import { allowedSkus, parseStrictVerdict } from './adapters/vlm-shared';
 
 /**
  * VLM verifier selection — the ONLY place that knows which concrete
@@ -49,6 +50,67 @@ export function parseVlmProviderKey(
   return raw === 'anthropic' ? 'anthropic' : 'local';
 }
 
+export type PickupVlmFaultMode = 'NONE' | 'UNAVAILABLE' | 'INVALID_SKU';
+
+/** Only the two exact drill modes inject; anything else (including
+ *  unset) is NONE — env validation already constrains the raw value. */
+export function parseVlmFaultMode(raw: string | undefined): PickupVlmFaultMode {
+  return raw === 'UNAVAILABLE' || raw === 'INVALID_SKU' ? raw : 'NONE';
+}
+
+/**
+ * SHADOW/TEST-ONLY fault injection (PICKUP_VLM_FAULT) for the Phase 11
+ * controlled test-run drills. The wrapper NEVER touches the network:
+ * - UNAVAILABLE reports PROVIDER_UNREACHABLE, proving the pipeline
+ *   degrades to review when the verifier is down.
+ * - INVALID_SKU synthesizes a schema-valid completion whose selectedSku
+ *   is NOT a supplied candidate and pushes it through the REAL strict
+ *   parser — the genuine anti-invention rejection path runs end-to-end.
+ * readiness()/checkReady() pass through to the real provider so the
+ * readiness panel stays honest about what is actually installed.
+ */
+export function withFaultInjection(
+  verifier: VlmVerifier,
+  mode: Exclude<PickupVlmFaultMode, 'NONE'>,
+): VlmVerifier {
+  return {
+    adapterKey: verifier.adapterKey,
+    version: verifier.version,
+    checkReady: () => verifier.checkReady(),
+    verify: async (evidence: VlmRequestEvidence): Promise<VlmVerdict> => {
+      if (mode === 'UNAVAILABLE') {
+        return {
+          status: 'PROVIDER_UNREACHABLE',
+          result: null,
+          modelKey: verifier.adapterKey,
+          modelVersion: verifier.version,
+          latencyMs: 0,
+          errorDetail: 'fault injection: PICKUP_VLM_FAULT=UNAVAILABLE',
+        };
+      }
+      const invented = JSON.stringify({
+        verdict: 'MATCH',
+        selectedSku: 'PHANTOM-SKU-999',
+        visualSupport: 'STRONG',
+        ocrSupport: 'NONE',
+        barcodeSupport: 'NONE',
+        reasonCodes: ['REFERENCE_VISUAL_MATCH'],
+        contradictions: [],
+        requiresHumanReview: false,
+      });
+      const parsed = parseStrictVerdict(invented, allowedSkus(evidence));
+      return {
+        status: parsed.status,
+        result: parsed.result,
+        modelKey: verifier.adapterKey,
+        modelVersion: verifier.version,
+        latencyMs: 0,
+        errorDetail: parsed.errorDetail,
+      };
+    },
+  };
+}
+
 export function selectVlmVerifier(
   config: ConfigService,
   anthropic: AnthropicVlmVerifier,
@@ -57,10 +119,21 @@ export function selectVlmVerifier(
   const provider = parseVlmProviderKey(
     config.get<string>('PICKUP_VLM_PROVIDER'),
   );
+  const fault = parseVlmFaultMode(config.get<string>('PICKUP_VLM_FAULT'));
+  const armed = (verifier: VlmVerifier): VlmVerifier => {
+    if (fault === 'NONE') {
+      return verifier;
+    }
+    new Logger('PickupVlmFault').warn(
+      `PICKUP_VLM_FAULT=${fault} is ACTIVE — VLM verify() calls are ` +
+        'fault-injected (shadow/test drill; never a production setting)',
+    );
+    return withFaultInjection(verifier, fault);
+  };
   if (provider === 'anthropic') {
     return {
       provider,
-      verifier: anthropic,
+      verifier: armed(anthropic),
       readiness: async () => {
         // Key presence is the only cheap cloud probe — reachable and
         // model-available collapse onto it (no paid call from readiness).
@@ -79,7 +152,7 @@ export function selectVlmVerifier(
   }
   return {
     provider,
-    verifier: ollama,
+    verifier: armed(ollama),
     readiness: async () => {
       const readiness = await ollama.readiness();
       return {

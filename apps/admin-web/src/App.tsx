@@ -13,6 +13,7 @@ import {
   CheckoutSessionDetailPage,
   CheckoutSessionsPage,
 } from './pages/CheckoutSessionsPage';
+import { CvEvaluationPage } from './pages/CvEvaluationPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { DeviceDetailPage, DevicesPage } from './pages/DevicesPage';
 import {
@@ -81,6 +82,7 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/video-assets">Test videos</NavLink>
         <NavLink to="/reference-library">Reference library</NavLink>
         <NavLink to="/pickup-validation">Pickup validation</NavLink>
+        <NavLink to="/cv-evaluation">CV Evaluation</NavLink>
         <NavLink to="/journeys">Journeys</NavLink>
         <div className="spacer" />
         <div className="who">{user?.email}</div>
@@ -161,6 +163,10 @@ export function App() {
                     <Route
                       path="pickup-validation"
                       element={<PickupValidationPage />}
+                    />
+                    <Route
+                      path="cv-evaluation"
+                      element={<CvEvaluationPage />}
                     />
                     <Route path="journeys" element={<JourneysPage />} />
                     <Route

@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { GroundTruthEventKind } from '@prisma/client';
+import { CvTestScenario, GroundTruthEventKind } from '@prisma/client';
 import { Transform } from 'class-transformer';
 import {
   IsEnum,
@@ -62,4 +62,14 @@ export class UpsertGroundTruthDto {
   @IsString()
   @MaxLength(500)
   note?: string;
+
+  @ApiPropertyOptional({
+    enum: CvTestScenario,
+    description:
+      'Which CONTROLLED test scenario this clip exercises (Phase 11 ' +
+      'evaluation breaks accuracy down per scenario)',
+  })
+  @IsOptionalNonNull()
+  @IsEnum(CvTestScenario)
+  testType?: CvTestScenario;
 }

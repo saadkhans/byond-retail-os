@@ -447,6 +447,70 @@ describe('validateEnv', () => {
     );
   });
 
+  describe('PICKUP_VLM_FAULT is NON-PRODUCTION ONLY (startup failure outside development/test)', () => {
+    const messageFor = (fault: string, environment: string) =>
+      `PICKUP_VLM_FAULT=${fault} is not supported when NODE_ENV is ` +
+      `${environment} because VLM fault injection is a controlled-test ` +
+      'drill; it is allowed solely when NODE_ENV is explicitly ' +
+      'development or test.';
+
+    it.each(['development', 'test', 'production'])(
+      'accepts NONE (and unset) in NODE_ENV=%s',
+      (nodeEnv) => {
+        expect(() =>
+          validateEnv({ ...validConfig, NODE_ENV: nodeEnv, PICKUP_VLM_FAULT: 'NONE' }),
+        ).not.toThrow();
+        expect(() =>
+          validateEnv({ ...validConfig, NODE_ENV: nodeEnv }),
+        ).not.toThrow();
+      },
+    );
+
+    it.each([
+      ['UNAVAILABLE', 'development'],
+      ['UNAVAILABLE', 'test'],
+      ['INVALID_SKU', 'development'],
+      ['INVALID_SKU', 'test'],
+    ])('accepts %s when NODE_ENV=%s', (fault, nodeEnv) => {
+      const validated = validateEnv({
+        ...validConfig,
+        NODE_ENV: nodeEnv,
+        PICKUP_VLM_FAULT: fault,
+      });
+      expect(validated.PICKUP_VLM_FAULT).toBe(fault);
+    });
+
+    it.each(['UNAVAILABLE', 'INVALID_SKU'])(
+      'fails validation when NODE_ENV=production and PICKUP_VLM_FAULT=%s',
+      (fault) => {
+        expect(() =>
+          validateEnv({
+            ...validConfig,
+            NODE_ENV: 'production',
+            PICKUP_VLM_FAULT: fault,
+          }),
+        ).toThrow(messageFor(fault, 'production'));
+      },
+    );
+
+    it('fails validation when NODE_ENV is UNSET and a fault is armed (same hole as production)', () => {
+      const { NODE_ENV: _omit, ...withoutNodeEnv } = validConfig;
+      expect(() =>
+        validateEnv({ ...withoutNodeEnv, PICKUP_VLM_FAULT: 'UNAVAILABLE' }),
+      ).toThrow(messageFor('UNAVAILABLE', 'unset'));
+    });
+
+    it('rejects NODE_ENV=staging with a fault armed (non-enum NODE_ENV fails upstream)', () => {
+      expect(() =>
+        validateEnv({
+          ...validConfig,
+          NODE_ENV: 'staging',
+          PICKUP_VLM_FAULT: 'INVALID_SKU',
+        }),
+      ).toThrow(/NODE_ENV/);
+    });
+  });
+
   describe('VIDEO_SCREENING_TIMEOUT_MS bounds (Phase 10 upload-wide screening deadline)', () => {
     it('accepts the default and both boundary values', () => {
       for (const value of ['30000', '1000', '300000']) {

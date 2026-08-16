@@ -335,6 +335,19 @@ class EnvironmentVariables {
   })
   PICKUP_VLM_LEGACY_COMPAT?: string;
 
+  // SHADOW/TEST-ONLY fault-injection drill for the Phase 11 controlled
+  // test-run workflow — NEVER a production setting. UNAVAILABLE makes the
+  // selected verifier report PROVIDER_UNREACHABLE without any network
+  // call; INVALID_SKU synthesizes an invented-SKU completion and pushes
+  // it through the REAL strict parser so the genuine rejection path
+  // (INVALID_SKU → NEEDS_HUMAN_REVIEW) is exercised end-to-end. Default
+  // NONE (no injection, real provider untouched).
+  @IsOptional()
+  @Matches(/^(NONE|UNAVAILABLE|INVALID_SKU)$/, {
+    message: 'PICKUP_VLM_FAULT must be NONE, UNAVAILABLE, or INVALID_SKU',
+  })
+  PICKUP_VLM_FAULT?: string;
+
   // Optional local YOLO ONNX model path for the fusion event detector;
   // absent/empty means the classical motion detector runs alone.
   @IsOptional()
@@ -487,6 +500,35 @@ export function assertTestMediaIngestNonProduction(
   );
 }
 
+/**
+ * Startup rule (same post-validate idiom as assertTestMediaIngestNonProduction):
+ * VLM fault injection is a SHADOW/TEST drill, never a production setting. A
+ * leaked PICKUP_VLM_FAULT in production would globally fabricate VLM
+ * failures (UNAVAILABLE) or invented-SKU responses (INVALID_SKU) for every
+ * fusion run, so any value other than NONE may only boot when NODE_ENV is
+ * EXPLICITLY development or test. An UNSET NODE_ENV is treated exactly like
+ * production — a deployment that forgets NODE_ENV must not silently become
+ * a fault-injecting environment. NONE (or unset) is fine everywhere.
+ */
+export function assertVlmFaultNonProduction(
+  fault: string | undefined,
+  nodeEnv: NodeEnv | undefined,
+): void {
+  if (fault === undefined || fault === 'NONE') {
+    return;
+  }
+  if (nodeEnv === NodeEnv.Development || nodeEnv === NodeEnv.Test) {
+    return;
+  }
+  const environment = nodeEnv === undefined ? 'unset' : nodeEnv;
+  throw new Error(
+    `PICKUP_VLM_FAULT=${fault} is not supported when NODE_ENV is ` +
+      `${environment} because VLM fault injection is a controlled-test ` +
+      'drill; it is allowed solely when NODE_ENV is explicitly ' +
+      'development or test.',
+  );
+}
+
 export function validateEnv(
   config: Record<string, unknown>,
 ): EnvironmentVariables {
@@ -510,5 +552,6 @@ export function validateEnv(
     validated.VIDEO_TEST_MEDIA_INGEST_ENABLED,
     validated.NODE_ENV,
   );
+  assertVlmFaultNonProduction(validated.PICKUP_VLM_FAULT, validated.NODE_ENV);
   return validated;
 }

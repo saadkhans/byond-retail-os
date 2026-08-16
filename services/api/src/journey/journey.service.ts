@@ -1,15 +1,23 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import {
+  AuditAction,
+  CustomerJourneyDecision,
   CustomerJourneyEventType,
   CustomerJourneyStatus,
   FusionPolicyResult,
+  JourneyEventReviewDecision,
   Prisma,
+  TenantStatus,
+  UserType,
 } from '@prisma/client';
+import { AuditLogService } from '../common/audit/audit-log.service';
 import { journeyAdvisoryLockKey } from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
 import { containsSensitiveFreeText } from '../video-ingest/media-safety';
@@ -42,11 +50,50 @@ export interface JourneyIssue {
   eventId?: string;
 }
 
+/** One append-only reviewer decision over one journey observation. */
+export interface JourneyEventReviewView {
+  id: string;
+  decision: JourneyEventReviewDecision;
+  correctedEventType: CustomerJourneyEventType | null;
+  correctedProductId: string | null;
+  correctedSku: string | null;
+  correctedProductName: string | null;
+  correctedQuantity: number | null;
+  reason: string | null;
+  reviewedById: string | null;
+  createdAt: Date;
+}
+
+/** SAFE summary of an imported fusion run — descriptor fields only; the
+ *  evidence JSON's rawPreview/errorDetail/OCR text never leave the API. */
+export interface JourneyFusionRunSummary {
+  runId: string;
+  videoAssetId: string;
+  pipelineVersion: string;
+  policy: FusionPolicyResult;
+  fusedTopSku: string | null;
+  /** Uncalibrated ranking score, not a probability. */
+  fusedTopScore: number | null;
+  createdAt: Date;
+  vlm: {
+    invoked: boolean;
+    status: string | null;
+    verdict: string | null;
+    selectedSku: string | null;
+    requiresHumanReview: boolean;
+    reasonCodes: string[];
+    contradictions: string[];
+  } | null;
+}
+
 export interface JourneyDetail {
   id: string;
   locationId: string;
   unitId: string | null;
   status: CustomerJourneyStatus;
+  decision: CustomerJourneyDecision | null;
+  decisionReason: string | null;
+  decidedAt: Date | null;
   startedAt: Date;
   endedAt: Date | null;
   events: {
@@ -62,12 +109,40 @@ export interface JourneyDetail {
     videoAssetId: string | null;
     fusionRunId: string | null;
     note: string | null;
+    reviews: JourneyEventReviewView[];
   }[];
   basket: ProvisionalBasketLine[];
   issues: JourneyIssue[];
+  fusionRuns: JourneyFusionRunSummary[];
 }
 
-/** Pure basket fold — exported for direct testing. */
+/** The review fields the fold needs — a subset of the stored row. */
+export interface FoldReview {
+  id: string;
+  eventId: string;
+  decision: JourneyEventReviewDecision;
+  correctedEventType: CustomerJourneyEventType | null;
+  correctedProductId: string | null;
+  correctedSku: string | null;
+  correctedProductName: string | null;
+  correctedQuantity: number | null;
+  createdAt: Date;
+}
+
+/**
+ * Pure basket fold — exported for direct testing.
+ *
+ * Phase 11: the fold is review-aware. Reviews are APPEND-ONLY corrections
+ * that never rewrite the observation rows — the LATEST review per event
+ * (createdAt, then id) decides how that event contributes:
+ *   REJECT  → the event contributes nothing and raises no issue;
+ *   APPROVE → a product event counts as-is; a REVIEW_REQUIRED event is
+ *             resolved as a non-event (reviewed, nothing to add);
+ *   CORRECT → the event counts as the reviewer's product/quantity/kind.
+ * Fold-arithmetic issues (RETURN_WITHOUT_PICKUP, NEGATIVE_QUANTITY) still
+ * surface for corrected events — a correction fixes an observation, not
+ * the journey's consistency.
+ */
 export function foldBasket(
   events: {
     id: string;
@@ -77,11 +152,51 @@ export function foldBasket(
     productName: string | null;
     quantity: number;
   }[],
+  reviews: FoldReview[] = [],
 ): { basket: ProvisionalBasketLine[]; issues: JourneyIssue[] } {
+  // Latest review per event wins. Sort defensively — callers pass rows in
+  // createdAt order, but a pure function should not depend on it.
+  const latestReview = new Map<string, FoldReview>();
+  for (const review of [...reviews].sort(
+    (a, b) =>
+      a.createdAt.getTime() - b.createdAt.getTime() ||
+      (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+  )) {
+    latestReview.set(review.eventId, review);
+  }
   const lines = new Map<string, ProvisionalBasketLine>();
   const issues: JourneyIssue[] = [];
-  for (const event of events) {
+  for (const original of events) {
+    const review = latestReview.get(original.id);
+    if (review?.decision === JourneyEventReviewDecision.REJECT) {
+      continue;
+    }
+    let event = original;
+    if (review?.decision === JourneyEventReviewDecision.CORRECT) {
+      const effectiveType = review.correctedEventType ?? original.eventType;
+      if (
+        effectiveType !== CustomerJourneyEventType.PRODUCT_PICKUP &&
+        effectiveType !== CustomerJourneyEventType.PRODUCT_RETURN
+      ) {
+        // A correction that names no product event kind (only possible for
+        // a REVIEW_REQUIRED original — the service requires the kind there)
+        // resolves the observation without a basket effect.
+        continue;
+      }
+      event = {
+        id: original.id,
+        eventType: effectiveType,
+        productId: review.correctedProductId,
+        sku: review.correctedSku,
+        productName: review.correctedProductName,
+        quantity: review.correctedQuantity ?? original.quantity,
+      };
+    }
     if (event.eventType === CustomerJourneyEventType.REVIEW_REQUIRED) {
+      if (review?.decision === JourneyEventReviewDecision.APPROVE) {
+        // Reviewed and resolved as a non-event: nothing was taken.
+        continue;
+      }
       issues.push({
         kind: 'REVIEW_EVENT',
         detail: 'an observation needs human review',
@@ -138,9 +253,126 @@ export function foldBasket(
   };
 }
 
+/**
+ * Pure final-decision rule — exported for direct testing. FAILED is never
+ * produced here: the service sets it only when reconciliation itself
+ * throws. The reason string is built from issue-kind counts ONLY — never
+ * from event free text, which would echo operator notes into a summary
+ * field.
+ */
+export function decideJourney(issues: JourneyIssue[]): {
+  decision: CustomerJourneyDecision;
+  reason: string;
+} {
+  const count = (kinds: JourneyIssue['kind'][]) =>
+    issues.filter((issue) => kinds.includes(issue.kind)).length;
+  const journeyLevel = count(['RETURN_WITHOUT_PICKUP', 'NEGATIVE_QUANTITY']);
+  const eventLevel = count(['REVIEW_EVENT', 'UNKNOWN_PRODUCT_EVENT']);
+  if (journeyLevel > 0) {
+    return {
+      decision: CustomerJourneyDecision.NEEDS_JOURNEY_REVIEW,
+      reason: `${journeyLevel} journey-level inconsistenc${
+        journeyLevel === 1 ? 'y' : 'ies'
+      } (returns without pickups / negative quantities)`,
+    };
+  }
+  if (eventLevel > 0) {
+    return {
+      decision: CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+      reason: `${eventLevel} unresolved event${
+        eventLevel === 1 ? '' : 's'
+      } awaiting review`,
+    };
+  }
+  return {
+    decision: CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    reason: 'no unresolved issues — shadow basket is consistent',
+  };
+}
+
+/**
+ * Pure AGGREGATE stock check — exported for direct testing. Fusion
+ * validates each observation independently, and shadow mode reserves
+ * nothing: with one unit on hand, two individually-PLAUSIBLE pickups can
+ * fold to a basket inventory cannot satisfy. Before a journey is declared
+ * READY_TO_SETTLE_SHADOW, the FOLDED per-SKU totals are compared against
+ * the on-hand projection (returns already reduced the fold). Read-only by
+ * construction: the caller passes quantities it READ — nothing here (or
+ * anywhere in this module) writes or reserves inventory.
+ *
+ * `onHandByProductId` has an entry per basket product that HAS a level
+ * row; a missing entry means the product is not stocked at this location
+ * and cannot satisfy any quantity. Reasons are built from SKU snapshots
+ * and counts only — never event free text.
+ */
+export function validateAggregateBasket(
+  basket: ProvisionalBasketLine[],
+  onHandByProductId: Map<string, number>,
+): { ok: boolean; reason: string | null } {
+  const short: string[] = [];
+  for (const line of basket) {
+    if (!line.productId || line.quantity <= 0) {
+      continue;
+    }
+    const onHand = onHandByProductId.get(line.productId);
+    if (onHand === undefined || line.quantity > onHand) {
+      short.push(line.sku ?? line.productId);
+    }
+  }
+  if (short.length === 0) {
+    return { ok: true, reason: null };
+  }
+  return {
+    ok: false,
+    reason: `aggregate basket exceeds on-hand stock for ${short.join(', ')}`,
+  };
+}
+
+/** SAFE extraction of the VLM block from a run's evidence JSON: named
+ *  descriptor fields only — rawPreview / errorDetail / OCR text are
+ *  deliberately not read, let alone returned. */
+function vlmSummaryFromEvidence(
+  evidence: unknown,
+): JourneyFusionRunSummary['vlm'] {
+  const vlm = (evidence as { vlm?: unknown } | null)?.vlm;
+  if (!vlm || typeof vlm !== 'object') {
+    return null;
+  }
+  const record = vlm as Record<string, unknown>;
+  const text = (value: unknown) => (typeof value === 'string' ? value : null);
+  const codes = (value: unknown) =>
+    Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === 'string')
+      : [];
+  return {
+    invoked: record.invoked === true,
+    status: text(record.status),
+    verdict: text(record.verdict),
+    selectedSku: text(record.selectedSku),
+    requiresHumanReview: record.requiresHumanReview === true,
+    reasonCodes: codes(record.reasonCodes),
+    contradictions: codes(record.contradictions),
+  };
+}
+
+/** Review reason as it is stored, audited, and fingerprint-matched:
+ *  trimmed, capped at the 500-char storage bound, empty → null. Exported
+ *  for direct testing. */
+export function normalizeReviewReason(
+  value: string | null | undefined,
+): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed.slice(0, 500) : null;
+}
+
 @Injectable()
 export class JourneyService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(JourneyService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly audit: AuditLogService,
+  ) {}
 
   async create(
     tenantId: string,
@@ -210,6 +442,30 @@ export class JourneyService {
       journey: { id: string; locationId: string; unitId: string | null },
     ) => Promise<T>,
   ): Promise<T> {
+    return this.withJourney(tenantId, journeyId, async (tx, journey) => {
+      if (journey.status !== CustomerJourneyStatus.OPEN) {
+        throw new ConflictException('Journey is no longer open');
+      }
+      return work(tx, journey);
+    });
+  }
+
+  /** Same lock + tenant-scoped re-read, WITHOUT the OPEN requirement —
+   *  reviews target exited journeys too. Every journey mutation still
+   *  serializes behind the per-journey advisory lock. */
+  private async withJourney<T>(
+    tenantId: string,
+    journeyId: string,
+    work: (
+      tx: Prisma.TransactionClient,
+      journey: {
+        id: string;
+        locationId: string;
+        unitId: string | null;
+        status: CustomerJourneyStatus;
+      },
+    ) => Promise<T>,
+  ): Promise<T> {
     return this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${journeyAdvisoryLockKey(
         tenantId,
@@ -221,10 +477,85 @@ export class JourneyService {
       if (!journey) {
         throw new NotFoundException('Journey not found');
       }
-      if (journey.status !== CustomerJourneyStatus.OPEN) {
-        throw new ConflictException('Journey is no longer open');
-      }
       return work(tx, journey);
+    });
+  }
+
+  /**
+   * Fold + decide + persist, inside the caller's locked transaction. The
+   * SHADOW decision is a recorded conclusion: nothing here (or anywhere in
+   * this module) creates checkout sessions, orders, payment intents, or
+   * payment events. FAILED is reserved for reconciliation itself
+   * throwing — the journey then lands in REVIEW_REQUIRED instead of
+   * presenting a half-computed basket as settled.
+   */
+  private async reconcile(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    journeyId: string,
+    locationId: string,
+    options: { setEndedAt: boolean },
+  ): Promise<void> {
+    let decision: CustomerJourneyDecision;
+    let reason: string;
+    try {
+      // TENANT SCOPE on every read, including the nested/derived ones:
+      // relation and composite-FK integrity are the backstop, never the
+      // predicate (repo rule: every tenant-data query carries tenantId).
+      const events = await tx.customerJourneyEvent.findMany({
+        where: { tenantId, journeyId },
+        orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
+      });
+      const reviews = await tx.customerJourneyEventReview.findMany({
+        where: { tenantId, journeyId },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      });
+      const { basket, issues } = foldBasket(events, reviews);
+      ({ decision, reason } = decideJourney(issues));
+      if (decision === CustomerJourneyDecision.READY_TO_SETTLE_SHADOW) {
+        // AGGREGATE stock check before declaring the shadow basket
+        // settleable — READ-ONLY lookups of the on-hand projection at the
+        // journey's store; no inventory write or reservation exists in
+        // shadow mode.
+        const onHand = new Map<string, number>();
+        for (const line of basket) {
+          if (!line.productId || line.quantity <= 0) {
+            continue;
+          }
+          const level = await tx.inventoryLevel.findFirst({
+            where: { tenantId, locationId, productId: line.productId },
+            select: { quantity: true },
+          });
+          if (level) {
+            onHand.set(line.productId, level.quantity);
+          }
+        }
+        const aggregate = validateAggregateBasket(basket, onHand);
+        if (!aggregate.ok) {
+          decision = CustomerJourneyDecision.NEEDS_JOURNEY_REVIEW;
+          reason = aggregate.reason!;
+        }
+      }
+    } catch (error) {
+      this.logger.error(
+        `journey ${journeyId} reconciliation failed`,
+        error instanceof Error ? error.stack : String(error),
+      );
+      decision = CustomerJourneyDecision.FAILED;
+      reason = 'reconciliation failed unexpectedly — see server logs';
+    }
+    await tx.customerJourney.update({
+      where: { id_tenantId: { id: journeyId, tenantId } },
+      data: {
+        status:
+          decision === CustomerJourneyDecision.READY_TO_SETTLE_SHADOW
+            ? CustomerJourneyStatus.RECONCILED
+            : CustomerJourneyStatus.REVIEW_REQUIRED,
+        decision,
+        decisionReason: reason,
+        decidedAt: new Date(),
+        ...(options.setEndedAt ? { endedAt: new Date() } : {}),
+      },
     });
   }
 
@@ -437,12 +768,14 @@ export class JourneyService {
     );
   }
 
-  /** EXIT + reconciliation: fold the basket, surface unresolved issues,
-   *  and settle the journey status — RECONCILED only when clean. Runs
-   *  entirely under the per-journey lock so no append can land between
-   *  the fold and the status transition. */
+  /** EXIT + reconciliation: fold the (review-aware) basket, surface
+   *  unresolved issues, and settle status + the final SHADOW decision —
+   *  RECONCILED/READY_TO_SETTLE_SHADOW only when clean. Runs entirely
+   *  under the per-journey lock so no append can land between the fold
+   *  and the status transition. The decision mutates ONLY the journey
+   *  row — never checkout, order, payment, or inventory state. */
   async exit(tenantId: string, journeyId: string, actorId?: string) {
-    await this.withOpenJourney(tenantId, journeyId, async (tx) => {
+    await this.withOpenJourney(tenantId, journeyId, async (tx, journey) => {
       await tx.customerJourneyEvent.create({
         data: {
           tenantId,
@@ -453,25 +786,292 @@ export class JourneyService {
           createdById: actorId ?? null,
         },
       });
-      const events = await tx.customerJourneyEvent.findMany({
-        where: { tenantId, journeyId },
-        orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
-      });
-      const { issues } = foldBasket(events);
-      // Tenant-scoped via the composite unique key: id alone must never
-      // address another tenant's journey, even after withOpenJourney's
-      // scoped lookup (the write itself enforces isolation).
-      await tx.customerJourney.update({
-        where: { id_tenantId: { id: journeyId, tenantId } },
-        data: {
-          status:
-            issues.length > 0
-              ? CustomerJourneyStatus.REVIEW_REQUIRED
-              : CustomerJourneyStatus.RECONCILED,
-          endedAt: new Date(),
-        },
+      // Tenant-scoped via the composite unique key inside reconcile(): id
+      // alone must never address another tenant's journey, even after
+      // withOpenJourney's scoped lookup (the write itself enforces
+      // isolation).
+      await this.reconcile(tx, tenantId, journeyId, journey.locationId, {
+        setEndedAt: true,
       });
     });
+    return this.detail(tenantId, journeyId);
+  }
+
+  /**
+   * Reviewer decision over ONE observation — APPEND-ONLY and audited.
+   * The observation row is never rewritten (DB triggers reject UPDATE);
+   * the review row and its AuditLog entry commit atomically, and the fold
+   * applies the latest review per event on read. On a closed journey the
+   * final decision is recomputed in the same transaction. No review
+   * outcome creates or mutates checkout, order, payment, or inventory
+   * state.
+   */
+  async reviewEvent(
+    tenantId: string,
+    journeyId: string,
+    eventId: string,
+    input: {
+      decision: JourneyEventReviewDecision;
+      reason?: string | null;
+      correctedEventType?: CustomerJourneyEventType | null;
+      correctedProductId?: string | null;
+      correctedQuantity?: number | null;
+      idempotencyKey?: string | null;
+    },
+    actor: { id: string; email: string },
+  ) {
+    // Same reject-on-write screen as journey notes: reviewer free text
+    // persists and echoes back on every read.
+    if (
+      input.reason !== undefined &&
+      input.reason !== null &&
+      containsSensitiveFreeText(input.reason)
+    ) {
+      throw new BadRequestException(
+        'reason must not contain credential- or payment-bearing content',
+      );
+    }
+    const isCorrect = input.decision === JourneyEventReviewDecision.CORRECT;
+    if (!isCorrect) {
+      if (
+        input.correctedEventType != null ||
+        input.correctedProductId != null ||
+        input.correctedQuantity != null
+      ) {
+        throw new BadRequestException(
+          'corrected fields are only valid with a CORRECT decision',
+        );
+      }
+    } else {
+      if (!input.correctedProductId) {
+        throw new BadRequestException(
+          'CORRECT requires correctedProductId and correctedQuantity',
+        );
+      }
+      const quantity = input.correctedQuantity;
+      if (!Number.isInteger(quantity) || quantity! < 1 || quantity! > 100) {
+        throw new BadRequestException(
+          'correctedQuantity must be a whole number 1..100',
+        );
+      }
+    }
+    const idempotencyKey = input.idempotencyKey?.trim() || null;
+    // Normalized ONCE and used for the insert, the audit row, and the
+    // idempotency fingerprint, so all three always agree: trimmed,
+    // capped at the storage bound, empty collapsing to null.
+    const normalizedReason = normalizeReviewReason(input.reason);
+    // A stored review "is the same action" when decision + corrected
+    // payload + reason all match; correctedEventType is compared only
+    // when the caller supplied one (product events default it
+    // server-side). The reason is PART of the immutable record — a retry
+    // that changes it is a different action, and silently keeping the
+    // first reason while reporting success would misrepresent what the
+    // reviewer wrote.
+    const matchesStored = (stored: {
+      decision: JourneyEventReviewDecision;
+      correctedEventType: CustomerJourneyEventType | null;
+      correctedProductId: string | null;
+      correctedQuantity: number | null;
+      reason: string | null;
+    }) =>
+      stored.decision === input.decision &&
+      normalizeReviewReason(stored.reason) === normalizedReason &&
+      stored.correctedProductId ===
+        (isCorrect ? input.correctedProductId! : null) &&
+      stored.correctedQuantity ===
+        (isCorrect ? input.correctedQuantity! : null) &&
+      (!isCorrect ||
+        input.correctedEventType == null ||
+        stored.correctedEventType === input.correctedEventType);
+    const replayOrConflict = (stored: Parameters<typeof matchesStored>[0]) => {
+      if (!matchesStored(stored)) {
+        throw new ConflictException(
+          'idempotency key was already used for a different review action',
+        );
+      }
+      // REPLAY: the first attempt committed (review + audit); a retry
+      // whose response was lost gets the same outcome with no second
+      // immutable record of the same human action.
+    };
+    try {
+      await this.withJourney(tenantId, journeyId, async (tx, journey) => {
+        const event = await tx.customerJourneyEvent.findFirst({
+          where: { tenantId, journeyId, id: eventId },
+        });
+        if (!event) {
+          throw new NotFoundException('Event not found in this journey');
+        }
+        if (
+          event.eventType !== CustomerJourneyEventType.PRODUCT_PICKUP &&
+          event.eventType !== CustomerJourneyEventType.PRODUCT_RETURN &&
+          event.eventType !== CustomerJourneyEventType.REVIEW_REQUIRED
+        ) {
+          throw new BadRequestException(
+            'only PRODUCT_PICKUP / PRODUCT_RETURN / REVIEW_REQUIRED ' +
+              'observations are reviewable',
+          );
+        }
+        // REVIEWER ATTRIBUTION is resolved at the data-access boundary
+        // with the SAME tenant scoping as every other read here — never a
+        // global lookup that could authorize a user against a tenant they
+        // do not belong to. A TENANT reviewer must be a user OF this
+        // tenant. A PLATFORM reviewer (tenantId null — the reason the
+        // same-tenant-FK migrations exempt user attribution columns) is
+        // accepted ONLY when this journey's tenant is the VERIFIED
+        // platform sandbox — the isPlatformSandbox marker introduced in
+        // Phase 10, mirroring AuthRepository.findPlatformSandboxTenantId;
+        // the reserved slug alone is not identity. Platform users act in
+        // the sandbox and nowhere else, so a customer-tenant review can
+        // never be attributed to a platform-only user.
+        let reviewerId: string;
+        const tenantReviewer = await tx.user.findFirst({
+          where: { id: actor.id, tenantId },
+          select: { id: true },
+        });
+        if (tenantReviewer) {
+          reviewerId = tenantReviewer.id;
+        } else {
+          const platformReviewer = await tx.user.findFirst({
+            where: { id: actor.id, userType: UserType.PLATFORM, tenantId: null },
+            select: { id: true },
+          });
+          const verifiedSandbox = platformReviewer
+            ? await tx.tenant.findFirst({
+                where: {
+                  id: tenantId,
+                  status: TenantStatus.ACTIVE,
+                  isPlatformSandbox: true,
+                },
+                select: { id: true },
+              })
+            : null;
+          if (!platformReviewer || !verifiedSandbox) {
+            throw new ForbiddenException(
+              'reviewer does not belong to this tenant',
+            );
+          }
+          reviewerId = platformReviewer.id;
+        }
+        // IDEMPOTENT reviews: a lost-response retry replays instead of
+        // appending a second immutable record. Checked under the journey
+        // lock, in the same transaction as the insert; tenant-scoped like
+        // every read here.
+        if (idempotencyKey) {
+          const existing = await tx.customerJourneyEventReview.findFirst({
+            where: { tenantId, eventId, idempotencyKey },
+          });
+          if (existing) {
+            replayOrConflict(existing);
+            return;
+          }
+        }
+        let correctedEventType: CustomerJourneyEventType | null = null;
+        let snapshot: { sku: string; name: string } | null = null;
+        if (isCorrect) {
+          // A REVIEW_REQUIRED original has no product kind of its own — the
+          // reviewer must say whether it was a pickup or a return. Product
+          // events default to their observed kind.
+          correctedEventType =
+            input.correctedEventType ??
+            (event.eventType === CustomerJourneyEventType.REVIEW_REQUIRED
+              ? null
+              : event.eventType);
+          if (
+            correctedEventType !== CustomerJourneyEventType.PRODUCT_PICKUP &&
+            correctedEventType !== CustomerJourneyEventType.PRODUCT_RETURN
+          ) {
+            throw new BadRequestException(
+              'CORRECT on a REVIEW_REQUIRED observation requires ' +
+                'correctedEventType PRODUCT_PICKUP or PRODUCT_RETURN',
+            );
+          }
+          // TENANT ISOLATION: the corrected product is resolved within this
+          // tenant before anything is written — a known foreign product id
+          // must never enter another tenant's journey.
+          const product = await tx.product.findFirst({
+            where: { tenantId, id: input.correctedProductId! },
+            select: { sku: true, name: true },
+          });
+          if (!product) {
+            throw new BadRequestException('Product not found in this tenant');
+          }
+          snapshot = { sku: product.sku, name: product.name };
+        }
+        const review = await tx.customerJourneyEventReview.create({
+          data: {
+            tenantId,
+            journeyId,
+            eventId,
+            decision: input.decision,
+            correctedEventType,
+            correctedProductId: isCorrect ? input.correctedProductId! : null,
+            correctedSku: snapshot?.sku ?? null,
+            correctedProductName: snapshot?.name ?? null,
+            correctedQuantity: isCorrect ? input.correctedQuantity! : null,
+            reason: normalizedReason,
+            reviewedById: reviewerId,
+            idempotencyKey,
+          },
+        });
+        // Audit commits or rolls back WITH the review (fail closed). CORRECT
+        // maps to OVERRIDE — AuditAction's existing reviewer vocabulary.
+        // Written only for genuinely NEW reviews — a replay records nothing.
+        await this.audit.record(
+          {
+            tenantId,
+            actorId: actor.id,
+            actorEmail: actor.email,
+            action:
+              input.decision === JourneyEventReviewDecision.APPROVE
+                ? AuditAction.APPROVE
+                : input.decision === JourneyEventReviewDecision.REJECT
+                  ? AuditAction.REJECT
+                  : AuditAction.OVERRIDE,
+            entityType: 'CustomerJourneyEvent',
+            entityId: eventId,
+            after: {
+              reviewId: review.id,
+              decision: input.decision,
+              correctedEventType,
+              correctedProductId: isCorrect ? input.correctedProductId : null,
+              correctedSku: snapshot?.sku ?? null,
+              correctedQuantity: isCorrect ? input.correctedQuantity : null,
+            },
+            reason: normalizedReason ?? undefined,
+          },
+          tx,
+        );
+        // A review on a CLOSED journey re-settles the final decision in the
+        // same transaction; an OPEN journey decides at exit.
+        if (journey.status !== CustomerJourneyStatus.OPEN) {
+          await this.reconcile(tx, tenantId, journeyId, journey.locationId, {
+            setEndedAt: false,
+          });
+        }
+      });
+    } catch (error) {
+      // RACE BACKSTOP for the unique (tenantId, eventId, idempotencyKey)
+      // index: two concurrent retries both miss the pre-check; the loser's
+      // transaction aborts on P2002 and must re-read OUTSIDE it (the
+      // aborted tx cannot serve queries) to replay or conflict.
+      if (
+        idempotencyKey &&
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        const existing =
+          await this.prisma.customerJourneyEventReview.findFirst({
+            where: { tenantId, eventId, idempotencyKey },
+          });
+        if (existing) {
+          replayOrConflict(existing);
+        } else {
+          throw error;
+        }
+      } else {
+        throw error;
+      }
+    }
     return this.detail(tenantId, journeyId);
   }
 
@@ -487,6 +1087,7 @@ export class JourneyService {
       locationId: journey.locationId,
       unitId: journey.unitId,
       status: journey.status,
+      decision: journey.decision,
       startedAt: journey.startedAt,
       endedAt: journey.endedAt,
       eventCount: journey._count.events,
@@ -494,21 +1095,55 @@ export class JourneyService {
   }
 
   async detail(tenantId: string, journeyId: string): Promise<JourneyDetail> {
+    // TENANT SCOPE at every nesting level, not just the root: the nested
+    // event and review reads carry their own tenantId predicate rather
+    // than leaning on relation/composite-FK integrity (repo rule — the
+    // database constraints are the backstop, never the query filter).
     const journey = await this.prisma.customerJourney.findFirst({
       where: { tenantId, id: journeyId },
       include: {
-        events: { orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }] },
+        events: {
+          where: { tenantId },
+          orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
+          include: {
+            reviews: {
+              where: { tenantId },
+              orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+            },
+          },
+        },
       },
     });
     if (!journey) {
       throw new NotFoundException('Journey not found');
     }
-    const { basket, issues } = foldBasket(journey.events);
+    const allReviews = journey.events.flatMap((event) => event.reviews ?? []);
+    const { basket, issues } = foldBasket(journey.events, allReviews);
+    // Imported fusion runs, summarized for the review UI. Tenant-scoped
+    // re-read: an event's stored fusionRunId is only ever rendered through
+    // a lookup constrained to THIS tenant.
+    const runIds = [
+      ...new Set(
+        journey.events
+          .map((event) => event.fusionRunId)
+          .filter((id): id is string => id !== null),
+      ),
+    ];
+    const runs =
+      runIds.length === 0
+        ? []
+        : await this.prisma.pickupFusionRun.findMany({
+            where: { tenantId, id: { in: runIds } },
+            orderBy: [{ createdAt: 'asc' }],
+          });
     return {
       id: journey.id,
       locationId: journey.locationId,
       unitId: journey.unitId,
       status: journey.status,
+      decision: journey.decision,
+      decisionReason: journey.decisionReason,
+      decidedAt: journey.decidedAt,
       startedAt: journey.startedAt,
       endedAt: journey.endedAt,
       events: journey.events.map((event) => ({
@@ -524,9 +1159,31 @@ export class JourneyService {
         videoAssetId: event.videoAssetId,
         fusionRunId: event.fusionRunId,
         note: event.note,
+        reviews: (event.reviews ?? []).map((review) => ({
+          id: review.id,
+          decision: review.decision,
+          correctedEventType: review.correctedEventType,
+          correctedProductId: review.correctedProductId,
+          correctedSku: review.correctedSku,
+          correctedProductName: review.correctedProductName,
+          correctedQuantity: review.correctedQuantity,
+          reason: review.reason,
+          reviewedById: review.reviewedById,
+          createdAt: review.createdAt,
+        })),
       })),
       basket,
       issues,
+      fusionRuns: runs.map((run) => ({
+        runId: run.id,
+        videoAssetId: run.videoAssetId,
+        pipelineVersion: run.pipelineVersion,
+        policy: run.policy,
+        fusedTopSku: run.fusedTopSku,
+        fusedTopScore: run.fusedTopScore,
+        createdAt: run.createdAt,
+        vlm: vlmSummaryFromEvidence(run.evidence),
+      })),
     };
   }
 }

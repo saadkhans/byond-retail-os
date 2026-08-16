@@ -14,6 +14,7 @@ import { PlatformModulesModule } from '../platform-modules/platform-modules.modu
 import { AppendJourneyEventDto } from './dto/append-journey-event.dto';
 import { CreateJourneyDto } from './dto/create-journey.dto';
 import { FromFusionRunDto } from './dto/from-fusion-run.dto';
+import { ReviewJourneyEventDto } from './dto/review-journey-event.dto';
 import { JourneyService } from './journey.service';
 
 /**
@@ -105,6 +106,44 @@ export class JourneyController {
       id,
       body.videoAssetId,
       actor.userId,
+    );
+  }
+
+  @Post(':id/events/:eventId/review')
+  // vision:review, matching the vision-event review endpoint: deciding an
+  // observation is a reviewer action, and a least-privilege reviewer does
+  // not hold the adapter-facing ingest permission.
+  @RequirePermissions('vision:review')
+  @ApiOperation({
+    summary:
+      'Review one observation (APPROVE / REJECT / CORRECT) — append-only, ' +
+      'audited; corrections never rewrite the observation row and never ' +
+      'touch checkout/order/payment state',
+  })
+  reviewEvent(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Param('eventId') eventId: string,
+    @Body() body: ReviewJourneyEventDto,
+    @CurrentUser() actor: RequestContext,
+  ) {
+    // Forward ONLY the declared review fields. Snapshot fields
+    // (correctedSku, correctedProductName) are never caller-supplied —
+    // the service resolves the product within this tenant and snapshots
+    // them itself.
+    return this.journeys.reviewEvent(
+      tenantId,
+      id,
+      eventId,
+      {
+        decision: body.decision,
+        reason: body.reason,
+        correctedEventType: body.correctedEventType,
+        correctedProductId: body.correctedProductId,
+        correctedQuantity: body.correctedQuantity,
+        idempotencyKey: body.idempotencyKey,
+      },
+      { id: actor.userId, email: actor.email },
     );
   }
 

@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useRef, useState } from 'react';
 import {
   ApiError,
+  CvTestScenario,
   GroundTruthEventKind,
   GroundTruthView,
   Paginated,
@@ -10,6 +11,7 @@ import {
   apiObjectUrl,
 } from '../api';
 import { useLoad } from '../components';
+import { TEST_TYPE_LABEL } from '../cv-evaluation-utils';
 import {
   GroundTruthFieldErrors,
   canReview,
@@ -47,6 +49,7 @@ function GroundTruthForm({
   const [productId, setProductId] = useState('');
   const [timestampMs, setTimestampMs] = useState('');
   const [quantity, setQuantity] = useState('1');
+  const [testType, setTestType] = useState('');
 
   const existing = useLoad<GroundTruthView | null>(
     () => api(`/video-assets/${assetId}/ground-truth`),
@@ -62,6 +65,7 @@ function GroundTruthForm({
         truth.actualTimestampMs !== null ? String(truth.actualTimestampMs) : '',
       );
       setQuantity(String(truth.quantity));
+      setTestType(truth.testType ?? '');
     }
   }, [existing.data?.videoAssetId, existing.data?.updatedAt]);
 
@@ -88,9 +92,17 @@ function GroundTruthForm({
     try {
       // `payload.productId` is the canonical product id (the option VALUE),
       // and `actualTimestampMs`/`quantity` are validated numbers.
+      // testType rides beside the validated payload: optional and
+      // independent of the event fields (omitting it clears the label).
       const saved = await api<GroundTruthView>(
         `/video-assets/${assetId}/ground-truth`,
-        { method: 'PUT', body: validated.payload },
+        {
+          method: 'PUT',
+          body: {
+            ...validated.payload,
+            ...(testType ? { testType } : {}),
+          },
+        },
       );
       setSavedNotice(
         `Saved: ${saved.eventKind}${saved.sku ? ` · ${saved.sku}` : ''}` +
@@ -175,6 +187,20 @@ function GroundTruthForm({
             </span>
           </>
         ) : null}
+        <select
+          value={testType}
+          title="Controlled test scenario (Phase 11 evaluation)"
+          onChange={(e) => setTestType(e.target.value)}
+        >
+          <option value="">— unlabeled —</option>
+          {(Object.keys(TEST_TYPE_LABEL) as CvTestScenario[]).map(
+            (scenario) => (
+              <option key={scenario} value={scenario}>
+                {TEST_TYPE_LABEL[scenario]}
+              </option>
+            ),
+          )}
+        </select>
         <button className="primary" type="submit" disabled={saving}>
           {saving ? 'Saving…' : 'Save ground truth'}
         </button>
