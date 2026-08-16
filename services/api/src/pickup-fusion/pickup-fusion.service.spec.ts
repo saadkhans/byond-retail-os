@@ -1065,4 +1065,71 @@ describe('Phase 12 replay-window scoping (camera runtime)', () => {
     });
     expect(createdRuns[0].data.runScope).toBe(FusionRunScope.REPLAY_WINDOW);
   });
+
+  it('latestEvidence returns the WHOLE_CLIP run even when replay-window runs are newer (Codex P1)', async () => {
+    const { service } = buildService(NO_CANDIDATES);
+    // The builder keeps its prisma stub private — reach the same instance
+    // the service holds to install an honoring run store.
+    const prisma = (
+      service as unknown as {
+        prisma: { pickupFusionRun: { findFirst: jest.Mock } };
+      }
+    ).prisma;
+    // Honoring stub: two stored runs for the asset — a NEWER window run
+    // and an older whole-clip run. Only a query that filters runScope in
+    // the database gets the whole-clip one back.
+    const rows = [
+      {
+        id: 'run-window-newer',
+        runScope: FusionRunScope.REPLAY_WINDOW,
+        createdAt: new Date('2026-08-16T12:30:00.000Z'),
+        pipelineVersion: 'pickup-fusion-v2',
+        policy: 'UNKNOWN_PRODUCT',
+        fusedTopSku: null,
+        fusedTopScore: null,
+        scoreMargin: null,
+        processingMs: 10,
+        evidence: {
+          shadow: {},
+          fused: [],
+          vlm: { status: 'UNAVAILABLE', verdict: null, selectedSku: null },
+        },
+      },
+      {
+        id: 'run-whole-clip',
+        runScope: FusionRunScope.WHOLE_CLIP,
+        createdAt: new Date('2026-08-16T12:00:00.000Z'),
+        pipelineVersion: 'pickup-fusion-v2',
+        policy: 'AUTO_PROPOSE',
+        fusedTopSku: 'SKU-A',
+        fusedTopScore: 0.5,
+        scoreMargin: 0.2,
+        processingMs: 10,
+        evidence: {
+          shadow: {},
+          fused: [],
+          vlm: { status: 'UNAVAILABLE', verdict: null, selectedSku: null },
+        },
+      },
+    ];
+    prisma.pickupFusionRun.findFirst = jest.fn(
+      async (args: { where: { runScope?: FusionRunScope } }) =>
+        [...rows]
+          .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+          .find(
+            (row) =>
+              args.where.runScope === undefined ||
+              row.runScope === args.where.runScope,
+          ) ?? null,
+    );
+    const result = await service.latestEvidence('tenant-1', 'asset-1');
+    expect(result?.runId).toBe('run-whole-clip');
+    expect(prisma.pickupFusionRun.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          runScope: FusionRunScope.WHOLE_CLIP,
+        }),
+      }),
+    );
+  });
 });

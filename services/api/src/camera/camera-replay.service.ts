@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   ConflictException,
   Injectable,
@@ -46,10 +47,16 @@ import {
 
 export const DEFAULT_FRAME_INTERVAL_MS = 500;
 
-/** A RUNNING run older than this is presumed orphaned (process died mid
- *  replay): it is failed with STALE_REPLAY_RUN and its key is released so
- *  the footage can be retried under the same token. */
+/** A RUNNING run whose HEARTBEAT is older than this is presumed orphaned
+ *  (process died mid replay): it is failed with STALE_REPLAY_RUN and its
+ *  key is released so the footage can be retried under the same token. */
 export const STALE_REPLAY_RUN_MS = 15 * 60_000;
+
+/** Periodic lease heartbeat while a stage is IN PROGRESS (Codex P1): a
+ *  single stage slower than the stale threshold must still prove the
+ *  replay alive — beating only at stage boundaries would let a retry
+ *  reclaim an active run mid-decode. Far below the stale threshold. */
+export const REPLAY_HEARTBEAT_INTERVAL_MS = 60_000;
 
 const ANALYSIS_TARGET_WIDTH = 192;
 
@@ -243,6 +250,7 @@ export class CameraReplayService {
         status: CameraPilotRunStatus.FAILED,
         finishedAt: new Date(),
         idempotencyKey: null,
+        leaseOwner: null,
         errors: [
           ...storedErrors(existing),
           { stage: 'replay', code: 'STALE_REPLAY_RUN' },
@@ -348,6 +356,11 @@ export class CameraReplayService {
       );
     }
 
+    // LEASE OWNERSHIP (Codex P1): this attempt's token. Every heartbeat
+    // and finalization write is conditional on (status RUNNING AND this
+    // owner) — an attempt that lost its lease to stale reclaim can never
+    // overwrite the row's later state.
+    const leaseOwner = randomUUID();
     let run: CameraPilotRun;
     try {
       run = await this.prisma.cameraPilotRun.create({
@@ -357,6 +370,8 @@ export class CameraReplayService {
           videoAssetId,
           frameIntervalMs,
           idempotencyKey,
+          leaseOwner,
+          heartbeatAt: new Date(),
           createdById: actorId ?? null,
         },
       });
@@ -408,12 +423,36 @@ export class CameraReplayService {
     let journeyId: string | null = null;
     let decision: CustomerJourneyDecision | null = null;
     let failed = false;
+    let leaseLost = false;
+
+    // CONDITIONAL heartbeat (Codex P1): the beat itself is the ownership
+    // probe — it updates only a row that is still RUNNING under THIS
+    // attempt's token. Zero rows means the lease was reclaimed (or the
+    // row finalized elsewhere): the attempt stops early and never
+    // finalizes. Best-effort on transport errors — a DB hiccup must not
+    // fail the pipeline (staleness handles a truly dead attempt).
+    const beat = async (): Promise<void> => {
+      const alive = await this.prisma.cameraPilotRun
+        .updateMany({
+          where: {
+            id: run.id,
+            tenantId,
+            status: CameraPilotRunStatus.RUNNING,
+            leaseOwner,
+          },
+          data: { heartbeatAt: new Date() },
+        })
+        .catch(() => null);
+      if (alive !== null && alive.count === 0) {
+        leaseLost = true;
+      }
+    };
 
     const stage = async <T>(
       name: string,
       work: () => Promise<T>,
     ): Promise<T | null> => {
-      if (failed) {
+      if (failed || leaseLost) {
         return null;
       }
       const startedAt = Date.now();
@@ -431,17 +470,20 @@ export class CameraReplayService {
         return null;
       } finally {
         stageTimings.push({ stage: name, ms: Date.now() - startedAt });
-        // Lease heartbeat: every stage boundary proves the replay is
-        // alive, so stale recovery can never reclaim a long-but-live run.
-        // Best-effort — a heartbeat hiccup must not fail the pipeline.
-        await this.prisma.cameraPilotRun
-          .update({
-            where: { id_tenantId: { id: run.id, tenantId } },
-            data: { heartbeatAt: new Date() },
-          })
-          .catch(() => undefined);
+        await beat();
       }
     };
+
+    // PERIODIC lease heartbeat while a stage is in progress — a single
+    // slow decode or fusion call must keep the lease alive, not just the
+    // boundaries between stages. Cleared in the finally below; unref'd so
+    // it can never hold the process open.
+    const heartbeatTimer = setInterval(() => {
+      void beat();
+    }, REPLAY_HEARTBEAT_INTERVAL_MS);
+    if (typeof heartbeatTimer.unref === 'function') {
+      heartbeatTimer.unref();
+    }
 
     // Narrowed once for the closures below.
     const durationMs = internal.durationMs;
@@ -534,12 +576,31 @@ export class CameraReplayService {
           } else {
             counters.vlmSkipped += 1;
           }
+          // NO-DETECTION timestamps (Codex P1): if this window's fusion
+          // run carries no detector peak, the observation must STILL land
+          // on the replay timeline — the window's own peak (else midpoint,
+          // else start), clamped to the clip — never the wall clock, which
+          // can drift past the source-time EXIT when processing outruns
+          // the footage.
+          const fallbackPeakMs = Math.max(
+            0,
+            Math.min(
+              Number.isFinite(window.peakMs)
+                ? window.peakMs
+                : Math.round((window.startMs + window.endMs) / 2),
+              durationMs,
+            ),
+          );
           await this.journeys.appendFromFusionRun(
             tenantId,
             journeyId!,
             videoAssetId,
             actorId,
-            { fusionRunId: runId, sourceTimeBase: run.startedAt },
+            {
+              fusionRunId: runId,
+              sourceTimeBase: run.startedAt,
+              fallbackPeakMs,
+            },
           );
           counters.eventWindowsProcessed += 1;
         });
@@ -587,7 +648,9 @@ export class CameraReplayService {
     // `failed` is set, and this cleanup exists precisely for that case
     // (all windows failed, or journey-exit itself failed). The abort
     // settles the journey as decision FAILED with a controlled code.
-    if (failed && journeyId !== null) {
+    // Skipped when the LEASE was lost: an attempt that no longer owns
+    // its run mutates nothing further (Codex P1).
+    if (failed && !leaseLost && journeyId !== null) {
       try {
         const aborted = await this.journeys.abortShadowJourney(
           tenantId,
@@ -606,11 +669,39 @@ export class CameraReplayService {
       }
     }
 
+    clearInterval(heartbeatTimer);
+
+    // LEASE-SAFE finalization (Codex P1): the final write is conditional
+    // on (still RUNNING + still THIS owner). Losing the condition means a
+    // stale reclaim (or another finalizer) took the row while we worked —
+    // the loser overwrites NOTHING and reports the row's current state.
+    const readCurrent = async (): Promise<RunWithSource> => {
+      const current = await this.prisma.cameraPilotRun.findFirst({
+        where: { tenantId, id: run.id },
+        include: { cameraSource: { select: { name: true, sourceType: true } } },
+      });
+      if (!current) {
+        throw new NotFoundException('Pilot run not found');
+      }
+      return current as RunWithSource;
+    };
+    if (leaseLost) {
+      this.logger.warn(
+        `pilot run ${run.id} lost its lease mid-replay — result discarded, returning current row state`,
+      );
+      return toDetail(await readCurrent());
+    }
+
     const status = failed
       ? CameraPilotRunStatus.FAILED
       : CameraPilotRunStatus.SUCCEEDED;
-    const updated = await this.prisma.cameraPilotRun.update({
-      where: { id_tenantId: { id: run.id, tenantId } },
+    const finalized = await this.prisma.cameraPilotRun.updateMany({
+      where: {
+        id: run.id,
+        tenantId,
+        status: CameraPilotRunStatus.RUNNING,
+        leaseOwner,
+      },
       data: {
         status,
         journeyId,
@@ -620,17 +711,24 @@ export class CameraReplayService {
         stageTimings: stageTimings as unknown as Prisma.InputJsonValue,
         errors: errors as unknown as Prisma.InputJsonValue,
         finishedAt: new Date(),
+        leaseOwner: null,
       },
-      include: { cameraSource: { select: { name: true, sourceType: true } } },
     });
-    // Operator signal on the source row: last replay outcome, code only.
+    if (finalized.count === 0) {
+      this.logger.warn(
+        `pilot run ${run.id} finalization lost the lease race — not overwriting`,
+      );
+      return toDetail(await readCurrent());
+    }
+    // Operator signal on the source row: last replay outcome, code only —
+    // written only by the attempt that actually finalized the run.
     await this.prisma.cameraSource.update({
       where: { id_tenantId: { id: cameraSourceId, tenantId } },
       data: {
         lastError: failed ? (errors[errors.length - 1]?.code ?? null) : null,
       },
     });
-    return toDetail(updated as RunWithSource);
+    return toDetail(await readCurrent());
   }
 
   async list(tenantId: string): Promise<PilotRunView[]> {

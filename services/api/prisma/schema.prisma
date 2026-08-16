@@ -948,10 +948,13 @@ model CameraPilotRun {
   // the existing run instead of replaying the footage twice.
   idempotencyKey String?
   startedAt      DateTime  @default(now())
-  // Lease heartbeat: bumped as replay stages advance. A RUNNING row is
-  // reclaimable as stale only when the heartbeat (not merely startedAt)
-  // has expired — a long legitimate replay keeps its lease alive.
+  // Lease heartbeat + owner: the heartbeat is bumped PERIODICALLY while a
+  // stage runs (not merely between stages), and every heartbeat and
+  // finalization write is conditional on status=RUNNING AND the owner
+  // token — a reclaimed or completed row can never be overwritten by an
+  // attempt that lost its lease.
   heartbeatAt    DateTime?
+  leaseOwner     String?
   finishedAt     DateTime?
   createdById    String?
   createdAt      DateTime  @default(now())

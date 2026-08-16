@@ -550,4 +550,102 @@ describe('JourneyService.reviewQueue', () => {
     expect(items).toHaveLength(REVIEW_QUEUE_MAX_ITEMS);
     expect(items[0].eventId).toBe('e-000');
   });
+
+  it(`MERGE BEFORE CAP: ${REVIEW_QUEUE_MAX_ITEMS} direct rows cannot hide an OLDER known-product inconsistency (Codex P1)`, async () => {
+    // A full page of direct unresolved observations (all newer)…
+    const directRows = Array.from({ length: REVIEW_QUEUE_MAX_ITEMS }, (_, i) =>
+      reviewRequiredEvent(`e-direct-${String(i).padStart(3, '0')}`, {
+        journeyId: 'j-direct',
+        occurredAt: new Date(Date.UTC(2026, 7, 11, 10, 0, i)),
+        fusionRunId: null,
+        videoAssetId: null,
+      }),
+    );
+    // …and ONE older known-product return-without-pickup in another
+    // journey. Before the merge fix, the issue scan was skipped once the
+    // direct stream filled the cap — this row simply vanished.
+    const olderIssueReturn = reviewRequiredEvent('e-old-return', {
+      journeyId: 'j-issue',
+      eventType: CustomerJourneyEventType.PRODUCT_RETURN,
+      productId: 'prod-a',
+      sku: 'SKU-A',
+      productName: 'Product A',
+      occurredAt: new Date(Date.UTC(2026, 7, 9, 10, 0, 0)),
+      fusionRunId: null,
+      videoAssetId: null,
+    });
+    const { service } = buildService(
+      [...directRows, olderIssueReturn],
+      [
+        {
+          id: 'j-direct',
+          status: CustomerJourneyStatus.REVIEW_REQUIRED,
+          decision: CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+          startedAt: new Date('2026-08-11T09:00:00.000Z'),
+        },
+        {
+          id: 'j-issue',
+          status: CustomerJourneyStatus.REVIEW_REQUIRED,
+          decision: CustomerJourneyDecision.NEEDS_JOURNEY_REVIEW,
+          startedAt: new Date('2026-08-09T09:00:00.000Z'),
+        },
+      ],
+    );
+    const items = await service.reviewQueue(TENANT);
+    // Cap applies AFTER the merge: still one page…
+    expect(items).toHaveLength(REVIEW_QUEUE_MAX_ITEMS);
+    // …with the older inconsistency present and FIRST (oldest-first sort
+    // over the MERGED set)…
+    expect(items[0].eventId).toBe('e-old-return');
+    expect(items[0].reason).toBe('RETURN_WITHOUT_PICKUP');
+    // …the NEWEST direct row displaced past the page boundary…
+    const ids = items.map((item) => item.eventId);
+    expect(ids).not.toContain(
+      `e-direct-${String(REVIEW_QUEUE_MAX_ITEMS - 1).padStart(3, '0')}`,
+    );
+    // …and no event id returned twice.
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('the merged page holds ONE row per event id with stream-correct reasons', async () => {
+    // Direct/issue stream overlap is structurally impossible today (the
+    // fold anchors RETURN_WITHOUT_PICKUP / NEGATIVE_QUANTITY only to
+    // KNOWN-product events, while the direct stream takes only
+    // REVIEW_REQUIRED / UNKNOWN-product ones) — the merge still dedupes
+    // by event id and prefers the issue reason defensively should those
+    // shapes ever drift. This pins the observable contract: a mixed page
+    // has exactly one row per event, each with its own stream's reason.
+    const direct = reviewRequiredEvent('e-direct', {
+      journeyId: 'j-mixed',
+      occurredAt: new Date('2026-08-10T10:00:00.000Z'),
+      fusionRunId: null,
+      videoAssetId: null,
+    });
+    const issueReturn = reviewRequiredEvent('e-issue-return', {
+      journeyId: 'j-mixed',
+      eventType: CustomerJourneyEventType.PRODUCT_RETURN,
+      productId: 'prod-a',
+      sku: 'SKU-A',
+      productName: 'Product A',
+      occurredAt: new Date('2026-08-10T10:05:00.000Z'),
+      fusionRunId: null,
+      videoAssetId: null,
+    });
+    const { service } = buildService(
+      [direct, issueReturn],
+      [
+        {
+          id: 'j-mixed',
+          status: CustomerJourneyStatus.REVIEW_REQUIRED,
+          decision: CustomerJourneyDecision.NEEDS_JOURNEY_REVIEW,
+          startedAt: new Date('2026-08-10T09:00:00.000Z'),
+        },
+      ],
+    );
+    const items = await service.reviewQueue(TENANT);
+    expect(items.map((item) => [item.eventId, item.reason])).toEqual([
+      ['e-direct', 'REVIEW_REQUIRED observation'],
+      ['e-issue-return', 'RETURN_WITHOUT_PICKUP'],
+    ]);
+  });
 });

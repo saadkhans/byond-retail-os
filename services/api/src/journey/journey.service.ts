@@ -764,6 +764,13 @@ export class JourneyService {
        *  the RUN start, not the original upload's createdAt — an old
        *  asset replayed today must not predate the journey's ENTRY). */
       sourceTimeBase?: Date;
+      /** Deterministic offset used when the run's evidence has NO
+       *  detector peak (a no-detection window): with a sourceTimeBase the
+       *  observation must still land on the replay timeline — never on
+       *  the wall clock, which can drift past the source-time EXIT when
+       *  processing outruns the footage. Callers pass the replay window's
+       *  peak (or midpoint/start); absent, the base itself is used. */
+      fallbackPeakMs?: number;
     },
   ) {
     const journey = await this.prisma.customerJourney.findFirst({
@@ -822,10 +829,16 @@ export class JourneyService {
     // falls back to append-time stamping, the pre-existing behavior.
     const peakMs = evidence.detector?.events?.[0]?.peakMs;
     const sourceTimeBase = options?.sourceTimeBase ?? asset.createdAt;
-    const occurredAt =
+    const effectivePeakMs =
       typeof peakMs === 'number' && Number.isFinite(peakMs)
+        ? peakMs
+        : options?.sourceTimeBase !== undefined
+          ? Math.max(0, options.fallbackPeakMs ?? 0)
+          : null;
+    const occurredAt =
+      effectivePeakMs !== null
         ? new Date(
-            sourceTimeBase.getTime() + Math.max(0, Math.round(peakMs)),
+            sourceTimeBase.getTime() + Math.max(0, Math.round(effectivePeakMs)),
           ).toISOString()
         : undefined;
     const top = evidence.fused?.[0];
@@ -1308,9 +1321,12 @@ export class JourneyService {
    * leaves is genuinely handled). Issue rows (RETURN_WITHOUT_PICKUP /
    * NEGATIVE_QUANTITY) are governed by FOLD RESOLUTION instead: they stay
    * queued — even past a historical APPROVE — until the review-aware fold
-   * stops flagging them. READ-ONLY: approve/reject/correct continue
-   * through the existing review endpoint; no second mutation path exists
-   * here.
+   * stops flagging them. Both streams are collected in full (within their
+   * own scan bounds), merged and deduped by event id (issue reason wins),
+   * sorted oldest-first, and ONLY THEN capped — direct rows can never
+   * starve inconsistency rows out of the page. READ-ONLY:
+   * approve/reject/correct continue through the existing review endpoint;
+   * no second mutation path exists here.
    */
   async reviewQueue(tenantId: string): Promise<ReviewQueueItem[]> {
     // TENANT SCOPE at every nesting level (repo rule): the event query,
@@ -1381,11 +1397,15 @@ export class JourneyService {
     // review-decision journeys without queueable fold issues must not
     // hide a newer journey's genuine inconsistency. A hard scan ceiling
     // keeps the walk bounded.
+    //
+    // The scan runs to the ceiling REGARDLESS of how many direct rows
+    // were collected (Codex P1, round 3): both streams are gathered IN
+    // FULL (within their own bounds), merged, and only the MERGED result
+    // is capped below — 100 direct unresolved rows must never starve the
+    // inconsistency stream, whose rows may be older than every direct
+    // row and therefore sort ahead of them.
     let scannedJourneys = 0;
-    while (
-      candidates.size < REVIEW_QUEUE_MAX_ITEMS &&
-      scannedJourneys < REVIEW_QUEUE_JOURNEY_SCAN_CEILING
-    ) {
+    while (scannedJourneys < REVIEW_QUEUE_JOURNEY_SCAN_CEILING) {
       const batch = await this.prisma.customerJourney.findMany({
         where: {
           tenantId,
@@ -1433,12 +1453,26 @@ export class JourneyService {
           if (
             (issue.kind !== 'RETURN_WITHOUT_PICKUP' &&
               issue.kind !== 'NEGATIVE_QUANTITY') ||
-            !issue.eventId ||
-            candidates.has(issue.eventId)
+            !issue.eventId
           ) {
             continue;
           }
-          const event = journeyEvents.find((row) => row.id === issue.eventId);
+          // MERGE + DEDUPE by event id: one row per event. When an event
+          // qualifies through both streams the ISSUE reason wins — the
+          // fold inconsistency is the more specific, more actionable
+          // finding, and its resolution rule (fold-driven) is the
+          // stricter of the two.
+          const existing = candidates.get(issue.eventId);
+          if (
+            existing &&
+            (existing.reason === 'RETURN_WITHOUT_PICKUP' ||
+              existing.reason === 'NEGATIVE_QUANTITY')
+          ) {
+            continue;
+          }
+          const event =
+            existing?.event ??
+            journeyEvents.find((row) => row.id === issue.eventId);
           if (!event) {
             continue;
           }
@@ -1449,6 +1483,8 @@ export class JourneyService {
         break;
       }
     }
+    // Final page: sort the MERGED set (occurredAt asc, event id for
+    // stability) and apply the cap only now — after both streams landed.
     const unresolved = [...candidates.values()]
       .sort(
         (a, b) =>

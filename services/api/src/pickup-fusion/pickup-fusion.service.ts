@@ -1369,8 +1369,14 @@ export class PickupFusionService {
   }
 
   async latestEvidence(tenantId: string, videoAssetId: string) {
+    // WHOLE_CLIP only (Codex P1): this read backs the video asset's
+    // fusion panel and the whole-ground-truth shadow verdicts below. A
+    // camera replay appends REPLAY_WINDOW runs for the SAME video — the
+    // newest of those must never displace the asset's whole-clip result
+    // here. Window evidence stays reachable solely through the pilot-run
+    // detail, which reads its exact run id.
     const run = await this.prisma.pickupFusionRun.findFirst({
-      where: { tenantId, videoAssetId },
+      where: { tenantId, videoAssetId, runScope: FusionRunScope.WHOLE_CLIP },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
     });
     if (!run) {

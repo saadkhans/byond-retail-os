@@ -10,10 +10,12 @@ import {
   CameraSourceType,
   Prisma,
 } from '@prisma/client';
-import { containsSensitiveValue } from '../common/sensitive-keys';
 import { PrismaService } from '../prisma/prisma.service';
 import { containsSensitiveFreeText } from '../video-ingest/media-safety';
-import { CreateCameraSourceDto } from './dto/create-camera-source.dto';
+import {
+  CAMERA_CREDENTIAL_SLOTS,
+  CreateCameraSourceDto,
+} from './dto/create-camera-source.dto';
 import { UpdateCameraSourceDto } from './dto/update-camera-source.dto';
 
 /**
@@ -37,67 +39,25 @@ export const PLACEHOLDER_SOURCE_TYPES: readonly CameraSourceType[] = [
 export const SOURCE_TYPE_NOT_ENABLED =
   'source type not enabled in shadow pilot';
 
-/**
- * The ONLY credentialRef shape this API persists: a reserved slot name in
- * the CAMERA_SECRET_SLOT_* namespace (mirrored by a DB CHECK). The
- * namespace is the point — a password, PAN, API key, JWT, URL, or
- * connection string cannot ACCIDENTALLY be shaped like this, so an
- * operator pasting a real secret gets a controlled rejection instead of
- * a persisted credential.
- */
-export const CREDENTIAL_SLOT_PATTERN = /^CAMERA_SECRET_SLOT_[A-Z0-9_]{3,40}$/;
+// The allowlist itself lives in create-camera-source.dto.ts (single
+// definition, mirrored by the DB CHECK) and is re-exported here for the
+// specs and any server-side caller.
+export { CAMERA_CREDENTIAL_SLOTS } from './dto/create-camera-source.dto';
 
 const CREDENTIAL_REF_REJECTED =
-  'credentialRef must name a reserved credential slot ' +
-  '(CAMERA_SECRET_SLOT_<NAME>, A-Z/0-9/_ only) — never a password, card ' +
+  'credentialRef must be one of the server-recognized credential slots ' +
+  `(${CAMERA_CREDENTIAL_SLOTS.join(', ')}) — never a password, card ` +
   'number, key, token, URL, or connection string';
 
-/** Suffix words that would make a "slot name" a secret label in costume —
- *  an operator typing CAMERA_SECRET_SLOT_PASSWORD is about to paste the
- *  password itself somewhere; refuse the pattern early. */
-const RESERVED_SUFFIX_WORDS = new Set([
-  'PASSWORD',
-  'PASSWD',
-  'SECRET',
-  'TOKEN',
-  'APIKEY',
-  'KEY',
-  'JWT',
-  'BEARER',
-  'PAN',
-  'CARD',
-]);
-
-/** Pure credentialRef validator — null = acceptable slot name, else the
- *  controlled rejection message. Belt AND braces: the strict namespace
- *  pattern first, then separator-normalized PAN detection, suffix shape
- *  rules, and the shared secret-value detector. */
+/** Pure credentialRef validator — null = a server-recognized slot, else
+ *  the controlled rejection message listing the allowed slots. The
+ *  allowlist replaces every shape heuristic (Codex P1): caller-composed
+ *  suffixes could smuggle letter-separated card numbers or password
+ *  words past any pattern, so only server-issued names are trusted. */
 export function validateCredentialRef(value: string): string | null {
-  if (!CREDENTIAL_SLOT_PATTERN.test(value)) {
-    return CREDENTIAL_REF_REJECTED;
-  }
-  // Separator-NORMALIZED digit check (Codex P1): a card number split by
-  // the slot charset's own underscores (or pasted with spaces/dashes)
-  // must be caught — strip separators first, then any card-length digit
-  // run is out, whether or not it Luhn-validates.
-  const normalized = value.replace(/[\s_-]/g, '');
-  if (/\d{12,}/.test(normalized)) {
-    return CREDENTIAL_REF_REJECTED;
-  }
-  const suffix = value.slice('CAMERA_SECRET_SLOT_'.length);
-  // A mostly-numeric suffix is an account/card fragment wearing a slot
-  // name, not a name — names are words.
-  const digitCount = (suffix.match(/\d/g) ?? []).length;
-  if (digitCount * 2 > suffix.length) {
-    return CREDENTIAL_REF_REJECTED;
-  }
-  if (suffix.split('_').some((word) => RESERVED_SUFFIX_WORDS.has(word))) {
-    return CREDENTIAL_REF_REJECTED;
-  }
-  if (containsSensitiveValue(value)) {
-    return CREDENTIAL_REF_REJECTED;
-  }
-  return null;
+  return (CAMERA_CREDENTIAL_SLOTS as readonly string[]).includes(value)
+    ? null
+    : CREDENTIAL_REF_REJECTED;
 }
 
 // connectionNote is FREE TEXT for humans — never an address. The note is
@@ -114,6 +74,35 @@ const CONNECTION_KEY_VALUE =
  *  "2.5m" or "aisle 3.5" start with digits and pass. */
 const DOTTED_HOSTNAME = /\b(?=[a-z])[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}\b/i;
 const IPV4_ADDRESS = /\b\d{1,3}(\.\d{1,3}){3}\b/;
+/** Scheme-relative URL (//host/…): a source address with the scheme
+ *  merely omitted — "//" immediately followed by a non-space is never
+ *  prose. */
+const SCHEME_RELATIVE = /(^|\s)\/\/\S/;
+/** Bracketed IPv6 literal, with or without :port — [fd00::1]:554. */
+const BRACKETED_IPV6 = /\[[0-9a-f:.]+\](:\d+)?/i;
+
+/** Bare IPv6 literal detection over whitespace-split tokens: an address
+ *  has ≥2 colons AND either a compressed "::" or a hex LETTER — so shift
+ *  times ("12:30"), ratios ("3:2"), and even "12:30:45" stay valid free
+ *  text, while fd00::1, ::1, fe80::1%eth0, and full-form addresses with
+ *  hex groups are rejected. (An all-digit full-form address with no "::"
+ *  is not caught here — the bracketed form above still is.) */
+function containsBareIpv6(note: string): boolean {
+  for (const raw of note.split(/[\s,;()]+/)) {
+    const token = raw.replace(/^\[+|\]+$/g, '').split('%')[0];
+    if (!/^[0-9a-f:]+$/i.test(token)) {
+      continue;
+    }
+    const colons = (token.match(/:/g) ?? []).length;
+    if (colons < 2) {
+      continue;
+    }
+    if (token.includes('::') || /[a-f]/i.test(token)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 const CONNECTION_NOTE_REJECTED =
   'connectionNote is free text only — URLs, hostnames, addresses, and ' +
@@ -128,7 +117,10 @@ export function connectionNoteViolation(note: string): string | null {
     SCHEME_COLON.test(note) ||
     CONNECTION_KEY_VALUE.test(note) ||
     DOTTED_HOSTNAME.test(note) ||
-    IPV4_ADDRESS.test(note)
+    IPV4_ADDRESS.test(note) ||
+    SCHEME_RELATIVE.test(note) ||
+    BRACKETED_IPV6.test(note) ||
+    containsBareIpv6(note)
   ) {
     return CONNECTION_NOTE_REJECTED;
   }

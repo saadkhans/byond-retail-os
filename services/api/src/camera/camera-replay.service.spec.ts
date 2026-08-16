@@ -8,6 +8,7 @@ import {
 import { AnalysisFrame } from '../pickup-detection/analysis/pickup-analyzer';
 import {
   CameraReplayService,
+  REPLAY_HEARTBEAT_INTERVAL_MS,
   STALE_REPLAY_RUN_MS,
   replayGeometry,
 } from './camera-replay.service';
@@ -73,6 +74,17 @@ function buildService(overrides: {
   const runUpdates: Record<string, unknown>[] = [];
   let fusionCalls = 0;
   /* eslint-disable @typescript-eslint/no-explicit-any */
+  // Row store shared by create/findFirst/updateMany — the stub HONORS the
+  // conditional where clauses (status, leaseOwner, heartbeat expiry)
+  // exactly like the database, so lease races are exercised for real.
+  const allRows = (): Record<string, unknown>[] =>
+    overrides.existingRun
+      ? [overrides.existingRun as Record<string, unknown>, ...createdRuns]
+      : createdRuns;
+  const withInclude = (row: Record<string, unknown>) => ({
+    ...row,
+    cameraSource: { name: 'Fridge cam', sourceType: sourceRow.sourceType },
+  });
   const prisma: any = {
     cameraPilotRun: {
       create: jest.fn(async (args: { data: Record<string, unknown> }) => {
@@ -87,63 +99,66 @@ function buildService(overrides: {
         createdRuns.push(row);
         return row;
       }),
-      findFirst: jest.fn(async () => overrides.existingRun ?? null),
-      update: jest.fn(
+      findFirst: jest.fn(
         async (args: {
-          where: { id_tenantId: { id: string } };
-          data: Record<string, unknown>;
+          where: { id?: string; idempotencyKey?: string };
         }) => {
-          runUpdates.push({ id: args.where.id_tenantId.id, ...args.data });
-          return {
-            ...((createdRuns[0] as object) ?? {
-              id: args.where.id_tenantId.id,
-              startedAt: new Date(),
-            }),
-            ...args.data,
-            cameraSource: {
-              name: 'Fridge cam',
-              sourceType: sourceRow.sourceType,
-            },
-          };
+          if (args.where.id !== undefined) {
+            const row = allRows().find((r) => r.id === args.where.id);
+            return row ? withInclude(row) : null;
+          }
+          return overrides.existingRun ?? null;
         },
       ),
-      // ATOMIC stale-claim: honors the conditional where like the real DB —
-      // only a still-RUNNING row whose heartbeat (or startedAt fallback)
-      // has expired is claimed.
+      // No longer used by the service (all writes are conditional
+      // updateMany) — kept so "never called" assertions stay meaningful.
+      update: jest.fn(),
       updateMany: jest.fn(
         async (args: {
           where: {
             id: string;
-            status: string;
-            OR: [
+            status?: string;
+            leaseOwner?: string;
+            OR?: [
               { heartbeatAt: { lt: Date } },
               { heartbeatAt: null; startedAt: { lt: Date } },
             ];
           };
           data: Record<string, unknown>;
         }) => {
-          const row = overrides.existingRun as
+          const row = allRows().find((r) => r.id === args.where.id) as
             | {
-                id: string;
                 status: string;
+                leaseOwner?: string | null;
                 heartbeatAt?: Date | null;
                 startedAt: Date;
               }
-            | null
             | undefined;
-          if (!row || row.id !== args.where.id) {
+          if (!row) {
             return { count: 0 };
           }
-          const cutoff = args.where.OR[0].heartbeatAt.lt;
-          const beat = row.heartbeatAt ?? row.startedAt;
           if (
-            row.status === CameraPilotRunStatus.RUNNING &&
-            beat.getTime() < cutoff.getTime()
+            args.where.status !== undefined &&
+            row.status !== args.where.status
           ) {
-            Object.assign(row, args.data);
-            return { count: 1 };
+            return { count: 0 };
           }
-          return { count: 0 };
+          if (
+            args.where.leaseOwner !== undefined &&
+            row.leaseOwner !== args.where.leaseOwner
+          ) {
+            return { count: 0 };
+          }
+          if (args.where.OR) {
+            const cutoff = args.where.OR[0].heartbeatAt.lt;
+            const beat = row.heartbeatAt ?? row.startedAt;
+            if (beat.getTime() >= cutoff.getTime()) {
+              return { count: 0 };
+            }
+          }
+          Object.assign(row, args.data);
+          runUpdates.push({ id: args.where.id, ...args.data });
+          return { count: 1 };
         },
       ),
       findMany: jest.fn(async () => []),
@@ -226,6 +241,7 @@ function buildService(overrides: {
     detection,
     fusion,
     journeys,
+    createdRuns,
     runUpdates,
     finalRunUpdate,
   };
@@ -711,5 +727,104 @@ describe('replayGeometry', () => {
     const geometry = replayGeometry({ width: 100, height: 50 });
     expect(geometry.width).toBeLessThanOrEqual(100);
     expect(geometry.width % 2).toBe(0);
+  });
+});
+
+describe('CameraReplayService — lease ownership (Codex P1 round 3)', () => {
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('an attempt whose lease was taken cannot finalize — the row is not overwritten', async () => {
+    const built = buildService({});
+    // Simulate a reclaim mid-replay: by the time the journey exits, the
+    // row belongs to someone else (foreign lease owner token).
+    built.journeys.exit.mockImplementation(async () => {
+      (built.createdRuns[0] as { leaseOwner: string }).leaseOwner =
+        'foreign-owner-token';
+      return {
+        decision: 'READY_TO_SETTLE_SHADOW',
+        events: [{ sourceType: 'MANUAL' }],
+        issues: [],
+      };
+    });
+    const view = await built.service.replayRun(TENANT, 'cam-1', {}, 'user-1');
+    // The conditional finalization LOST: no status write landed, the
+    // source row was not touched, and the caller sees the row's current
+    // (still RUNNING, foreign-owned) state instead of a fabricated result.
+    expect(built.finalRunUpdate()).toBeUndefined();
+    expect(built.prisma.cameraSource.update).not.toHaveBeenCalled();
+    expect(view.status).toBe(CameraPilotRunStatus.RUNNING);
+  });
+
+  it('a lost heartbeat stops the pipeline early — later stages never run', async () => {
+    const built = buildService({});
+    // The stage-boundary beat after decode discovers the lease is gone.
+    built.media.decodeAnalysisFrames.mockImplementation(async () => {
+      (built.createdRuns[0] as { leaseOwner: string }).leaseOwner =
+        'foreign-owner-token';
+      return flatFrames();
+    });
+    const view = await built.service.replayRun(TENANT, 'cam-1', {}, 'user-1');
+    // The beat after decode-frames reports count 0 → every later stage is
+    // suppressed: no pickup-detection, no journey, no finalization.
+    expect(built.detection.detectForAsset).not.toHaveBeenCalled();
+    expect(built.journeys.create).not.toHaveBeenCalled();
+    expect(built.finalRunUpdate()).toBeUndefined();
+    expect(view.status).toBe(CameraPilotRunStatus.RUNNING);
+  });
+
+  it('the heartbeat beats PERIODICALLY inside a slow stage, not only at boundaries', async () => {
+    jest.useFakeTimers();
+    const built = buildService({});
+    let releaseDecode: (frames: AnalysisFrame[]) => void = () => undefined;
+    built.media.decodeAnalysisFrames.mockImplementation(
+      () =>
+        new Promise<AnalysisFrame[]>((resolve) => {
+          releaseDecode = resolve;
+        }),
+    );
+    const pending = built.service.replayRun(TENANT, 'cam-1', {}, 'user-1');
+    // Let the run row be created, then advance time INSIDE the still-
+    // pending decode stage: the interval must beat while no stage
+    // boundary has been reached yet.
+    await jest.advanceTimersByTimeAsync(REPLAY_HEARTBEAT_INTERVAL_MS + 1);
+    const beatsDuringDecode = built.runUpdates.filter(
+      (update) => 'heartbeatAt' in update && !('status' in update),
+    );
+    expect(beatsDuringDecode.length).toBeGreaterThanOrEqual(1);
+    // The rest of the pipeline is pure microtasks — no further timers
+    // needed; the service clears its own interval before finalizing.
+    releaseDecode(flatFrames());
+    const view = await pending;
+    expect(view.status).toBe(CameraPilotRunStatus.SUCCEEDED);
+  });
+});
+
+describe('CameraReplayService — no-detection observations stay on the replay timeline (Codex P1 round 3)', () => {
+  it('every window import carries a deterministic clamped fallbackPeakMs, ascending across windows', async () => {
+    const built = buildService({
+      frames: twoBurstFrames(),
+      exitEvents: [
+        { sourceType: 'MANUAL' },
+        { sourceType: 'FUSION_SHADOW' },
+        { sourceType: 'FUSION_SHADOW' },
+        { sourceType: 'MANUAL' },
+      ],
+    });
+    await built.service.replayRun(TENANT, 'cam-1', {}, 'user-1');
+    const options = (
+      built.journeys.appendFromFusionRun.mock.calls as unknown as unknown[][]
+    ).map((call) => call[4] as { fallbackPeakMs: number; sourceTimeBase: Date });
+    expect(options).toHaveLength(2);
+    // Window peaks (500, 2500) clamped to the 5000ms clip — deterministic
+    // source-time offsets, never wall clock, preserving relative order.
+    expect(options[0].fallbackPeakMs).toBe(500);
+    expect(options[1].fallbackPeakMs).toBe(2500);
+    expect(options[0].fallbackPeakMs).toBeLessThan(options[1].fallbackPeakMs);
+    // And both stay inside the EXIT stamp (start + max(duration, lastEnd) + 1s).
+    for (const option of options) {
+      expect(option.fallbackPeakMs).toBeLessThanOrEqual(5000 + 1000);
+    }
   });
 });

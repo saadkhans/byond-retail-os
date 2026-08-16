@@ -3,18 +3,35 @@ import { CameraSourceType } from '@prisma/client';
 import { Transform } from 'class-transformer';
 import {
   IsEnum,
+  IsIn,
   IsString,
-  Matches,
   MaxLength,
   MinLength,
 } from 'class-validator';
 import { IsOptionalNonNull } from '../../common/validation';
 
-/** Reserved secret-slot namespace — the ONLY credentialRef shape accepted
- *  (mirrored by a DB CHECK). A password, card number, key, token, URL, or
- *  connection string cannot accidentally take this shape; the service
- *  additionally runs the shared secret-value detector before persisting. */
-export const CREDENTIAL_REF_PATTERN = /^CAMERA_SECRET_SLOT_[A-Z0-9_]{3,40}$/;
+/**
+ * The ONLY credential references accepted: an explicit SERVER-RECOGNIZED
+ * allowlist (mirrored by a DB CHECK). Adding a slot is a code+migration
+ * change, never operator input — and that is the point (Codex P1): any
+ * caller-composed suffix could smuggle a letter-separated card number
+ * (…SLOT_ABCD4111…) or a password word past every shape heuristic, so no
+ * heuristic is trusted. The value is only ever the lookup NAME of an
+ * operator-managed secret slot; no secret is stored, and responses expose
+ * only a hasCredentialRef boolean.
+ */
+export const CAMERA_CREDENTIAL_SLOTS = [
+  'CAMERA_SECRET_SLOT_TEST',
+  'CAMERA_SECRET_SLOT_ALPHA',
+  'CAMERA_SECRET_SLOT_DEMO',
+  'CAMERA_SECRET_SLOT_EDGE_CAM_A',
+  'CAMERA_SECRET_SLOT_EDGE_CAM_B',
+] as const;
+
+export const CREDENTIAL_REF_MESSAGE =
+  'credentialRef must be one of the server-recognized credential slots ' +
+  `(${CAMERA_CREDENTIAL_SLOTS.join(', ')}) — never a password, card ` +
+  'number, key, token, URL, or connection string';
 
 /**
  * Camera source registration. No credential and no URL is ever accepted:
@@ -63,16 +80,12 @@ export class CreateCameraSourceDto {
 
   @ApiPropertyOptional({
     description:
-      'Reserved slot name (CAMERA_SECRET_SLOT_<NAME>) of an ' +
-      'operator-managed secret — never the secret itself',
+      'Server-recognized credential slot name of an operator-managed ' +
+      'secret — never the secret itself',
+    enum: CAMERA_CREDENTIAL_SLOTS,
   })
   @IsOptionalNonNull()
-  @Matches(CREDENTIAL_REF_PATTERN, {
-    message:
-      'credentialRef must name a reserved credential slot ' +
-      '(CAMERA_SECRET_SLOT_<NAME>, A-Z/0-9/_ only) — never a password, ' +
-      'card number, key, token, URL, or connection string',
-  })
+  @IsIn([...CAMERA_CREDENTIAL_SLOTS], { message: CREDENTIAL_REF_MESSAGE })
   credentialRef?: string;
 
   @ApiPropertyOptional({

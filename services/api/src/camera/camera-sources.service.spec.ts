@@ -1,6 +1,7 @@
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { CameraSourceStatus, CameraSourceType } from '@prisma/client';
 import {
+  CAMERA_CREDENTIAL_SLOTS,
   CameraSourcesService,
   connectionNoteViolation,
   toCameraSourceView,
@@ -172,12 +173,12 @@ describe('CameraSourcesService — no secrets, no URLs', () => {
 });
 
 describe('validateCredentialRef — only reserved slot names, never secrets', () => {
-  it('accepts a reserved slot name', () => {
-    expect(validateCredentialRef('CAMERA_SECRET_SLOT_FRIDGE_1')).toBeNull();
-    expect(validateCredentialRef('CAMERA_SECRET_SLOT_ALPHA')).toBeNull();
-    expect(validateCredentialRef('CAMERA_SECRET_SLOT_TEST')).toBeNull();
-    expect(validateCredentialRef('CAMERA_SECRET_SLOT_EDGE_CAM_A')).toBeNull();
-  });
+  it.each([...CAMERA_CREDENTIAL_SLOTS])(
+    'accepts the server-recognized slot %s',
+    (slot) => {
+      expect(validateCredentialRef(slot)).toBeNull();
+    },
+  );
 
   it.each([
     ['password-like', assemble('hun', 'ter2!', 'Win', 'ter', '2026')],
@@ -222,8 +223,33 @@ describe('validateCredentialRef — only reserved slot names, never secrets', ()
     expect(validateCredentialRef(value)).not.toBeNull();
   });
 
-  it('a slot suffix with digits in a MINORITY stays acceptable', () => {
-    expect(validateCredentialRef('CAMERA_SECRET_SLOT_FRIDGE_12')).toBeNull();
+  it('ALLOWLIST semantics, not shape (Codex P1): benign-looking but non-recognized slots are rejected', () => {
+    // A letter-separated PAN would pass every shape heuristic — the
+    // allowlist is the fix, so even harmless-looking strangers reject.
+    expect(validateCredentialRef('CAMERA_SECRET_SLOT_SHELF')).not.toBeNull();
+    expect(
+      validateCredentialRef('CAMERA_SECRET_SLOT_FRIDGE_12'),
+    ).not.toBeNull();
+  });
+
+  it('rejects a PAN split by allowed slot LETTERS (Codex P1 fixture)', () => {
+    expect(
+      validateCredentialRef(
+        assemble(
+          'CAMERA_SECRET_SLOT_',
+          'ABCD4111',
+          'EFGH1111',
+          'IJKL1111',
+          'MNOP1111',
+        ),
+      ),
+    ).not.toBeNull();
+  });
+
+  it('rejects a password-word suffix (Codex P1 fixture)', () => {
+    expect(
+      validateCredentialRef(assemble('CAMERA_SECRET_SLOT_', 'HUNTER', '2')),
+    ).not.toBeNull();
   });
 
   it('the service refuses to persist a rejected credentialRef', async () => {
@@ -264,6 +290,22 @@ describe('connectionNoteViolation — free text only, no URLs or addresses', () 
     ['scheme-colon form', 'rtsp:cam3'],
     ['connection key=value', 'host=10.0.0.5 user=cam'],
     ['bare IPv4 address', 'feed at 10.0.0.5 please'],
+    // Codex P1 round 3 — scheme-relative and IPv6 endpoints (assembled at
+    // runtime so no address-shaped literal lives in this file).
+    [
+      'scheme-relative URL with bracketed IPv6 and port',
+      assemble('//', '[fd00::1]', ':554/live'),
+    ],
+    ['scheme-relative URL', assemble('//', 'cam-host/stream')],
+    ['bracketed IPv6 with port', assemble('[', 'fd00::1', ']', ':554')],
+    ['bracketed IPv6 without port', assemble('[', '2001:db8::7', ']')],
+    ['bare IPv6 literal', assemble('fd00:', ':1')],
+    ['bare loopback IPv6', assemble(':', ':1')],
+    ['link-local IPv6 with zone', assemble('fe80:', ':1', '%eth0')],
+    [
+      'full-form IPv6 with hex groups',
+      assemble('2001:db8:85a3', ':0:0:8a2e', ':370:7334'),
+    ],
   ])('rejects a %s', (_label, note) => {
     expect(connectionNoteViolation(note)).not.toBeNull();
   });
@@ -272,6 +314,12 @@ describe('connectionNoteViolation — free text only, no URLs or addresses', () 
     expect(connectionNoteViolation('fridge cam, aisle 3, 2.5m height')).toBeNull();
     expect(connectionNoteViolation('mounted above shelf, angle 3.5 degrees')).toBeNull();
     expect(connectionNoteViolation('replaced 2026-08, lens cleaned')).toBeNull();
+  });
+
+  it('colon-bearing prose is NOT an IPv6 address: times and ratios stay valid', () => {
+    expect(connectionNoteViolation('shift 12:30, aisle 3')).toBeNull();
+    expect(connectionNoteViolation('aspect 3:2 crop')).toBeNull();
+    expect(connectionNoteViolation('maintenance window 12:30:45 daily')).toBeNull();
   });
 
   it('the service rejects a credential-free URL note on create AND update', async () => {
