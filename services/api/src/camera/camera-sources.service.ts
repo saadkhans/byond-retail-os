@@ -111,62 +111,58 @@ const SCHEME_RELATIVE = /\/\/\S/;
  *  malformed-but-address-shaped bracketed endpoint is refused. */
 const BRACKETED_IPV6 = /\[[0-9a-f:.]+\](:\d+)?/i;
 
-/** Separator characters that can butt a URL or address token in operator
- *  input. Colons are deliberately NOT separators — they belong inside
- *  IPv6 candidates; the parser decides what is an address. */
-const NOTE_TOKEN_SEPARATORS = /[\s=()[\]{}<>"'`,;|@]+/;
+/** Candidate runs for IPv6 extraction: maximal substrings of hex digits
+ *  and colons, pulled straight from the RAW note. Delimiter-INDEPENDENT
+ *  by construction (Codex P1): any character that is not hex or a colon
+ *  — slash, hash, hyphen, '=', '@', whitespace, brackets, anything —
+ *  simply terminates a run, so there is no separator allowlist whose
+ *  next unenumerated character leaks an address through. */
+const IPV6_CANDIDATE_RUN = /[0-9a-f:]{3,}/gi;
 
-/** Judge one token, including COLON-LABELED forms (Codex P1): a label
- *  attaches to an address with a colon and no whitespace
- *  (endpoint:2001:0:0:0:0:0:0:1), so the token as a whole is not an
- *  address — every colon-SUFFIX is therefore tested too, and only a
- *  substring the parser itself validates (`isIP === 6`) rejects the
- *  note. Prose with ordinary colons stays safe: "12:30" suffixes to
- *  "30", "note:" suffixes to "" — nothing a parser calls an address. */
-function tokenContainsIpv6(token: string): boolean {
-  if (isIP(token) === 6) {
-    return true;
-  }
-  for (
-    let colon = token.indexOf(':');
-    colon !== -1;
-    colon = token.indexOf(':', colon + 1)
-  ) {
-    if (isIP(token.slice(colon + 1)) === 6) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/** F. IPv6 literals and endpoints, PARSER-based (Codex P1): every
- *  candidate is judged by Node's own address parser (`isIP(...) === 6`),
- *  never by a shape heuristic — heuristics requiring "::" or hex letters
- *  miss all-numeric FULL-FORM addresses (2001:0:0:0:0:0:0:1). Candidates
- *  come from two extractions:
+/** F. IPv6 literals and endpoints, PARSER-based and delimiter-
+ *  INDEPENDENT (Codex P1): every candidate is judged by Node's own
+ *  address parser (`isIP(...) === 6`) — the regex only EXTRACTS, it
+ *  never decides validity, and no shape heuristic (hex letters, "::")
+ *  is trusted. Candidates come from two extractions over the whole raw
+ *  note, with no token-separator allowlist anywhere:
  *    1. the CONTENTS of every [bracketed] span — catches [addr],
- *       [addr]:554, and [addr]:554/live regardless of what follows;
- *    2. tokens split on whitespace + separators (colons kept inside,
- *       zone-ids stripped, sentence punctuation trimmed) — catches bare
- *       and punctuation-adjacent forms (endpoint=addr, (addr), addr.).
- *  Shift times ("12:30"), ratios ("3:2"), and "12:30:45" are not
- *  addresses to the parser and stay valid free text. */
+ *       [addr]:554, and [addr]:554/live regardless of the attaching
+ *       punctuation (endpoint-[addr]:554 included);
+ *    2. every maximal hex-and-colon RUN in the note — a label or ANY
+ *       punctuation (endpoint:…, endpoint/…, endpoint#…, endpoint-…,
+ *       "camera at …", "….") terminates or precedes the run without
+ *       being part of it. Each run is tested as-is, then at every
+ *       colon-boundary suffix (a label's own trailing ':' glues onto
+ *       the run — ":2001:0:…" must still surface "2001:0:…", never
+ *       dropping the leading group), each variant also with trailing
+ *       colons trimmed.
+ *  Prose with ordinary colons stays valid free text because the parser
+ *  rejects it: "12:30" → 0, "12:30:45" → 0, "note:" contributes no
+ *  parsable run at all. */
 function containsIpv6Endpoint(note: string): boolean {
   for (const bracketed of note.matchAll(/\[([^\]]*)\]/g)) {
     if (isIP(bracketed[1].split('%')[0]) === 6) {
       return true;
     }
   }
-  for (const raw of note.split(NOTE_TOKEN_SEPARATORS)) {
-    if (!raw) {
+  for (const match of note.matchAll(IPV6_CANDIDATE_RUN)) {
+    const run = match[0];
+    if (!run.includes(':')) {
       continue;
     }
-    // Zone-id off, then sentence punctuation off the ends — but never
-    // colons, which are structural in IPv6 ("::1" must stay intact);
-    // colon-labeled candidates are handled inside tokenContainsIpv6.
-    const token = raw.split('%')[0].replace(/^[.!?]+|[.!?]+$/g, '');
-    if (tokenContainsIpv6(token)) {
-      return true;
+    // Suffix starts: position 0, then after each colon — so a leading
+    // label colon is shed WITHOUT losing the first address group.
+    let start = 0;
+    for (;;) {
+      const candidate = run.slice(start);
+      if (isIP(candidate) === 6 || isIP(candidate.replace(/:+$/, '')) === 6) {
+        return true;
+      }
+      const nextColon = run.indexOf(':', start);
+      if (nextColon === -1) {
+        break;
+      }
+      start = nextColon + 1;
     }
   }
   return false;

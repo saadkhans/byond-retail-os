@@ -397,6 +397,27 @@ describe('connectionNoteViolation — free text only, no URLs or addresses', () 
       'at-sign-labeled bracketed IPv6 with port',
       assemble('endpoint@', '[', 'fd00::1', ']', ':554'),
     ],
+    // Codex P1 — ARBITRARY punctuation attachment: extraction is
+    // delimiter-independent (hex-and-colon runs from the raw note), so
+    // slash/hash/hyphen labels cannot keep an address glued to prose.
+    [
+      'slash-attached full-form IPv6',
+      assemble('endpoint/', '2001:0:0:0', ':0:0:0:1'),
+    ],
+    [
+      'hash-attached full-form IPv6',
+      assemble('endpoint#', '2001:0:0:0', ':0:0:0:1'),
+    ],
+    [
+      'hyphen-attached full-form IPv6',
+      assemble('endpoint-', '2001:0:0:0', ':0:0:0:1'),
+    ],
+    ['slash-attached compressed IPv6', assemble('endpoint/', 'fd00:', ':1')],
+    ['hash-attached compressed IPv6', assemble('endpoint#', 'fd00:', ':1')],
+    [
+      'hyphen-attached bracketed IPv6 with port',
+      assemble('endpoint-', '[', 'fd00::1', ']', ':554'),
+    ],
   ])('rejects a %s', (_label, note) => {
     expect(connectionNoteViolation(note)).not.toBeNull();
   });
