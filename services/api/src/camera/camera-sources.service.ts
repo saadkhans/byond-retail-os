@@ -114,7 +114,30 @@ const BRACKETED_IPV6 = /\[[0-9a-f:.]+\](:\d+)?/i;
 /** Separator characters that can butt a URL or address token in operator
  *  input. Colons are deliberately NOT separators — they belong inside
  *  IPv6 candidates; the parser decides what is an address. */
-const NOTE_TOKEN_SEPARATORS = /[\s=()[\]{}<>"'`,;|]+/;
+const NOTE_TOKEN_SEPARATORS = /[\s=()[\]{}<>"'`,;|@]+/;
+
+/** Judge one token, including COLON-LABELED forms (Codex P1): a label
+ *  attaches to an address with a colon and no whitespace
+ *  (endpoint:2001:0:0:0:0:0:0:1), so the token as a whole is not an
+ *  address — every colon-SUFFIX is therefore tested too, and only a
+ *  substring the parser itself validates (`isIP === 6`) rejects the
+ *  note. Prose with ordinary colons stays safe: "12:30" suffixes to
+ *  "30", "note:" suffixes to "" — nothing a parser calls an address. */
+function tokenContainsIpv6(token: string): boolean {
+  if (isIP(token) === 6) {
+    return true;
+  }
+  for (
+    let colon = token.indexOf(':');
+    colon !== -1;
+    colon = token.indexOf(':', colon + 1)
+  ) {
+    if (isIP(token.slice(colon + 1)) === 6) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /** F. IPv6 literals and endpoints, PARSER-based (Codex P1): every
  *  candidate is judged by Node's own address parser (`isIP(...) === 6`),
@@ -139,9 +162,10 @@ function containsIpv6Endpoint(note: string): boolean {
       continue;
     }
     // Zone-id off, then sentence punctuation off the ends — but never
-    // colons, which are structural in IPv6 ("::1" must stay intact).
+    // colons, which are structural in IPv6 ("::1" must stay intact);
+    // colon-labeled candidates are handled inside tokenContainsIpv6.
     const token = raw.split('%')[0].replace(/^[.!?]+|[.!?]+$/g, '');
-    if (isIP(token) === 6) {
+    if (tokenContainsIpv6(token)) {
       return true;
     }
   }

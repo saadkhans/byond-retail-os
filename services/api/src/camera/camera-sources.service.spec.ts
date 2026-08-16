@@ -365,6 +365,38 @@ describe('connectionNoteViolation — free text only, no URLs or addresses', () 
       'bracketed IPv6 with port and path',
       assemble('[', 'fd00::1', ']', ':554/live'),
     ],
+    // Codex P1 — IPv6 attached to a prose label with NO whitespace: the
+    // label and address share one token, so colon-suffix extraction (not
+    // whole-token parsing alone) must find the address.
+    [
+      'colon-labeled full-form IPv6',
+      assemble('endpoint:', '2001:0:0:0', ':0:0:0:1'),
+    ],
+    [
+      'at-sign-labeled full-form IPv6',
+      assemble('endpoint@', '2001:0:0:0', ':0:0:0:1'),
+    ],
+    [
+      'parenthesis-attached full-form IPv6',
+      assemble('endpoint(', '2001:0:0:0', ':0:0:0:1', ')'),
+    ],
+    [
+      'bracket-attached full-form IPv6',
+      assemble('endpoint[', '2001:0:0:0', ':0:0:0:1', ']'),
+    ],
+    [
+      'comma-attached full-form IPv6',
+      assemble('endpoint,', '2001:0:0:0', ':0:0:0:1'),
+    ],
+    [
+      'full-form IPv6 at a sentence end',
+      assemble('camera at ', '2001:0:0:0', ':0:0:0:1', '.'),
+    ],
+    ['colon-labeled compressed IPv6', assemble('endpoint:', 'fd00:', ':1')],
+    [
+      'at-sign-labeled bracketed IPv6 with port',
+      assemble('endpoint@', '[', 'fd00::1', ']', ':554'),
+    ],
   ])('rejects a %s', (_label, note) => {
     expect(connectionNoteViolation(note)).not.toBeNull();
   });
@@ -398,6 +430,8 @@ describe('connectionNoteViolation — free text only, no URLs or addresses', () 
     expect(
       connectionNoteViolation('edge camera slot assigned by ops'),
     ).toBeNull();
+    expect(connectionNoteViolation('note: camera placeholder only')).toBeNull();
+    expect(connectionNoteViolation('credentials stored separately')).toBeNull();
   });
 
   it('the service rejects unsafe notes on create AND update — every class through the ONE helper', async () => {
