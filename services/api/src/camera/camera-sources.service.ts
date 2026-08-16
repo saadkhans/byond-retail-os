@@ -61,46 +61,86 @@ export function validateCredentialRef(value: string): string | null {
     : CREDENTIAL_REF_REJECTED;
 }
 
-// connectionNote is FREE TEXT for humans — never an address. The note is
-// rejected when it smells like machine connection data, INDEPENDENT of
-// whether credentials are embedded (Codex P1: a credential-free internal
-// stream address is still a source URL).
+// ---------------------------------------------------------------------
+// connectionNote validation — FREE TEXT for humans, never an address.
+//
+// The note is rejected when ANY of the named checks below smells machine
+// connection data, INDEPENDENT of whether credentials are embedded (a
+// credential-free internal stream address is still a source URL). The
+// checks are layered so no single fragile pattern is load-bearing:
+//   A. explicit URI schemes (scheme://…, generic — covers rtsp, http,
+//      mqtt, redis, and every other scheme),
+//   B. scheme-colon endpoint forms (rtsp:cam3) for known schemes,
+//   C. connection-string key=value pairs (host=…, password=…),
+//   D. dotted hostnames and IPv4 addresses,
+//   E. scheme-relative URLs (//host/…) ANYWHERE — start, after
+//      whitespace, or after any punctuation/separator,
+//   F. IPv6 literals and endpoints judged by Node's OWN address parser
+//      (net.isIP) over tokenized candidates AND bracket contents —
+//      never a shape heuristic that an all-numeric full-form address
+//      could slip past.
+// ---------------------------------------------------------------------
+
+/** A. Any explicit URI scheme. */
 const URI_SCHEME = /[a-z][a-z0-9+.-]*:\/\//i;
+/** B. Scheme-colon endpoint form for known schemes (rtsp:cam3). */
 const SCHEME_COLON =
   /\b(rtsp|rtsps|rtmp|http|https|ws|wss|mqtt|tcp|udp|file|ftp|sftp|ssh|srt|postgres|postgresql|mysql|redis)\s*:/i;
+/** C. Connection-string key=value pairs. */
 const CONNECTION_KEY_VALUE =
   /\b(host|hostname|user|username|password|port|dbname|database)\s*=/i;
-/** Dotted hostname: first label starts with a LETTER and the final label
- *  is alphabetic (camera.internal, cam-3.store.local) — measurements like
- *  "2.5m" or "aisle 3.5" start with digits and pass. */
+/** D1. Dotted hostname: first label starts with a LETTER and the final
+ *  label is alphabetic (camera.internal, cam-3.store.local) —
+ *  measurements like "2.5m" or "aisle 3.5" start with digits and pass. */
 const DOTTED_HOSTNAME = /\b(?=[a-z])[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}\b/i;
+/** D2. IPv4 address. */
 const IPV4_ADDRESS = /\b\d{1,3}(\.\d{1,3}){3}\b/;
-/** Scheme-relative URL (//host/…): a source address with the scheme
- *  merely omitted. "//" immediately followed by a non-space is never
- *  prose — ANYWHERE in the note, including after punctuation and
- *  separators (endpoint=(//host/live), see [//host/live]), not only at
- *  the start or after whitespace. */
+
+/** E. Scheme-relative URL (//host/…): a source address with the scheme
+ *  merely omitted. The rule is deliberately STRICTER than a boundary
+ *  enumeration: "//" immediately followed by a non-space is never needed
+ *  in a shelf note, so it is rejected wherever it appears — at the
+ *  start, after whitespace, or butted against any punctuation or
+ *  separator (endpoint=//…, endpoint=(//…), see [//…], value:{//…},
+ *  note,'//…'). Enumerating boundary characters would leave the next
+ *  unenumerated one open. */
 const SCHEME_RELATIVE = /\/\/\S/;
-/** Bracketed IPv6 literal, with or without :port — [fd00::1]:554. */
+
+/** F-supplement: bracketed address SHAPE ([hex:digits…], with or without
+ *  :port). Kept alongside the parser-based check below so even a
+ *  malformed-but-address-shaped bracketed endpoint is refused. */
 const BRACKETED_IPV6 = /\[[0-9a-f:.]+\](:\d+)?/i;
 
-/** Bare IPv6 literal detection, PARSER-based (Codex P1): tokens are
- *  split on whitespace and punctuation (brackets, '=', quotes, …) with
- *  colons kept inside tokens, zone-ids stripped, and each candidate is
- *  judged by Node's own address parser — `isIP(token) === 6`. This
- *  catches what shape heuristics missed: all-numeric FULL-FORM addresses
- *  with no "::" and no hex letters (2001:0:0:0:0:0:0:1), compressed
- *  forms (fd00::1, ::1), and zone-id forms (fe80::1%eth0) — while shift
- *  times ("12:30"), ratios ("3:2"), and "12:30:45" are not addresses to
- *  the parser and stay valid free text. Bracketed [addr](:port) forms
- *  are rejected by BRACKETED_IPV6 above, and their bracket-stripped
- *  tokens land here as well. */
-function containsBareIpv6(note: string): boolean {
-  for (const raw of note.split(/[\s,;()=<>"'`{}[\]]+/)) {
+/** Separator characters that can butt a URL or address token in operator
+ *  input. Colons are deliberately NOT separators — they belong inside
+ *  IPv6 candidates; the parser decides what is an address. */
+const NOTE_TOKEN_SEPARATORS = /[\s=()[\]{}<>"'`,;|]+/;
+
+/** F. IPv6 literals and endpoints, PARSER-based (Codex P1): every
+ *  candidate is judged by Node's own address parser (`isIP(...) === 6`),
+ *  never by a shape heuristic — heuristics requiring "::" or hex letters
+ *  miss all-numeric FULL-FORM addresses (2001:0:0:0:0:0:0:1). Candidates
+ *  come from two extractions:
+ *    1. the CONTENTS of every [bracketed] span — catches [addr],
+ *       [addr]:554, and [addr]:554/live regardless of what follows;
+ *    2. tokens split on whitespace + separators (colons kept inside,
+ *       zone-ids stripped, sentence punctuation trimmed) — catches bare
+ *       and punctuation-adjacent forms (endpoint=addr, (addr), addr.).
+ *  Shift times ("12:30"), ratios ("3:2"), and "12:30:45" are not
+ *  addresses to the parser and stay valid free text. */
+function containsIpv6Endpoint(note: string): boolean {
+  for (const bracketed of note.matchAll(/\[([^\]]*)\]/g)) {
+    if (isIP(bracketed[1].split('%')[0]) === 6) {
+      return true;
+    }
+  }
+  for (const raw of note.split(NOTE_TOKEN_SEPARATORS)) {
     if (!raw) {
       continue;
     }
-    const token = raw.split('%')[0];
+    // Zone-id off, then sentence punctuation off the ends — but never
+    // colons, which are structural in IPv6 ("::1" must stay intact).
+    const token = raw.split('%')[0].replace(/^[.!?]+|[.!?]+$/g, '');
     if (isIP(token) === 6) {
       return true;
     }
@@ -114,7 +154,8 @@ const CONNECTION_NOTE_REJECTED =
   'operator-managed slots)';
 
 /** Pure connectionNote screen — null = safe free text, else the
- *  controlled rejection message. */
+ *  controlled rejection message. Every create/update path routes through
+ *  screenNote → this helper; there is no second validation site. */
 export function connectionNoteViolation(note: string): string | null {
   if (
     URI_SCHEME.test(note) ||
@@ -124,7 +165,7 @@ export function connectionNoteViolation(note: string): string | null {
     IPV4_ADDRESS.test(note) ||
     SCHEME_RELATIVE.test(note) ||
     BRACKETED_IPV6.test(note) ||
-    containsBareIpv6(note)
+    containsIpv6Endpoint(note)
   ) {
     return CONNECTION_NOTE_REJECTED;
   }

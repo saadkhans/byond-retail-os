@@ -338,6 +338,33 @@ describe('connectionNoteViolation — free text only, no URLs or addresses', () 
       'all-numeric full-form IPv6 after an equals sign',
       assemble('endpoint=', '2001:0:0:0', ':0:0:0:1'),
     ],
+    // Codex P1 final round — the comprehensive matrix: scheme-relative
+    // after EVERY separator class, and IPv6 in prose/parenthesized/
+    // bracket-with-path positions (assembled at runtime as elsewhere).
+    [
+      'scheme-relative URL inside braces after a colon',
+      assemble('value:{', '//', 'camera/live', '}'),
+    ],
+    [
+      'scheme-relative URL after a comma and quote',
+      assemble("note,'", '//', 'camera/live', "'"),
+    ],
+    [
+      'all-numeric full-form IPv6 in prose',
+      assemble('camera at ', '2001:0:0:0', ':0:0:0:1'),
+    ],
+    [
+      'all-numeric full-form IPv6 in parentheses',
+      assemble('endpoint=(', '2001:0:0:0', ':0:0:0:1', ')'),
+    ],
+    [
+      'compressed IPv6 at a sentence end',
+      assemble('reachable on fd00:', ':1', '.'),
+    ],
+    [
+      'bracketed IPv6 with port and path',
+      assemble('[', 'fd00::1', ']', ':554/live'),
+    ],
   ])('rejects a %s', (_label, note) => {
     expect(connectionNoteViolation(note)).not.toBeNull();
   });
@@ -363,18 +390,31 @@ describe('connectionNoteViolation — free text only, no URLs or addresses', () 
     expect(connectionNoteViolation('maintenance window 12:30:45 daily')).toBeNull();
   });
 
-  it('the service rejects a credential-free URL note on create AND update', async () => {
+  it('accepts placeholder prose with plain colons and ordinary text', () => {
+    expect(
+      connectionNoteViolation('camera placeholder: north shelf'),
+    ).toBeNull();
+    expect(connectionNoteViolation('installed near shelf A')).toBeNull();
+    expect(
+      connectionNoteViolation('edge camera slot assigned by ops'),
+    ).toBeNull();
+  });
+
+  it('the service rejects unsafe notes on create AND update — every class through the ONE helper', async () => {
     const { service } = buildService();
-    await expect(
-      service.create(
-        TENANT,
-        {
-          ...CREATE,
-          connectionNote: assemble('rtsp:/', '/camera.internal/live'),
-        },
-        'user-1',
-      ),
-    ).rejects.toBeInstanceOf(BadRequestException);
+    const unsafe = [
+      assemble('rtsp:/', '/camera.internal/live'),
+      assemble('endpoint=(', '//', 'camera/live', ')'),
+      assemble('endpoint=', '2001:0:0:0', ':0:0:0:1'),
+    ];
+    for (const connectionNote of unsafe) {
+      await expect(
+        service.create(TENANT, { ...CREATE, connectionNote }, 'user-1'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      await expect(
+        service.update(TENANT, 'cam-1', { connectionNote }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
     await expect(
       service.update(TENANT, 'cam-1', { connectionNote: 'camera.internal' }),
     ).rejects.toBeInstanceOf(BadRequestException);
