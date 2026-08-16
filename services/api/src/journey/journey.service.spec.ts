@@ -16,8 +16,26 @@ import {
   JourneyService,
   decideJourney,
   foldBasket,
+  normalizeReviewReason,
   validateAggregateBasket,
 } from './journey.service';
+
+describe('normalizeReviewReason', () => {
+  it('null, undefined, empty, and whitespace-only all normalize to null', () => {
+    expect(normalizeReviewReason(null)).toBeNull();
+    expect(normalizeReviewReason(undefined)).toBeNull();
+    expect(normalizeReviewReason('')).toBeNull();
+    expect(normalizeReviewReason('   ')).toBeNull();
+  });
+
+  it('trims surrounding whitespace and preserves the text', () => {
+    expect(normalizeReviewReason('  keep this  ')).toBe('keep this');
+  });
+
+  it('caps at the 500-char storage bound', () => {
+    expect(normalizeReviewReason('x'.repeat(600))).toHaveLength(500);
+  });
+});
 
 const TENANT = 'tenant-1';
 
@@ -304,6 +322,10 @@ function buildService(overrides: {
     tenantId: string | null;
     userType: 'PLATFORM' | 'TENANT';
   } | null;
+  /** Whether the journey's tenant is the VERIFIED platform sandbox
+   *  (isPlatformSandbox marker). Default false — an ordinary customer
+   *  tenant, on which platform reviewer attribution must be refused. */
+  verifiedSandbox?: boolean;
 } = {}) {
   const createdEvents: Record<string, unknown>[] = [];
   const createdReviews: Record<string, unknown>[] = [];
@@ -332,10 +354,57 @@ function buildService(overrides: {
       findFirst: jest.fn(async () => ({ sku: 'SKU-A', name: 'Product A' })),
     },
     user: {
-      findFirst: jest.fn(async () =>
-        overrides.reviewer === undefined
-          ? { id: 'user-1', tenantId: TENANT, userType: 'TENANT' }
-          : overrides.reviewer,
+      // Honors the where clause so the service's tenant-scoped and
+      // platform-scoped lookups behave like the real database: a global
+      // `{ id }` query would match rows these selectors must not.
+      findFirst: jest.fn(
+        async (args: {
+          where?: {
+            id?: string;
+            tenantId?: string | null;
+            userType?: string;
+          };
+        }) => {
+          const row =
+            overrides.reviewer === undefined
+              ? { id: 'user-1', tenantId: TENANT, userType: 'TENANT' }
+              : overrides.reviewer;
+          if (!row) {
+            return null;
+          }
+          const where = args?.where ?? {};
+          if (where.id !== undefined && row.id !== where.id) {
+            return null;
+          }
+          if ('tenantId' in where && row.tenantId !== where.tenantId) {
+            return null;
+          }
+          if (where.userType !== undefined && row.userType !== where.userType) {
+            return null;
+          }
+          return row;
+        },
+      ),
+    },
+    tenant: {
+      // The verified-sandbox identity check: only a row carrying the
+      // isPlatformSandbox marker (and ACTIVE status) resolves.
+      findFirst: jest.fn(
+        async (args: {
+          where?: { id?: string; isPlatformSandbox?: boolean };
+        }) => {
+          if (!overrides.verifiedSandbox) {
+            return null;
+          }
+          const where = args?.where ?? {};
+          if (where.id !== undefined && where.id !== TENANT) {
+            return null;
+          }
+          if (where.isPlatformSandbox !== true) {
+            return null;
+          }
+          return { id: TENANT };
+        },
       ),
     },
     inventoryLevel: {
@@ -1028,7 +1097,9 @@ describe('JourneyService.reviewEvent', () => {
       ACTOR,
     );
     expect(built.prisma.user.findFirst).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: ACTOR.id } }),
+      expect.objectContaining({
+        where: { id: ACTOR.id, tenantId: TENANT },
+      }),
     );
     expect(built.createdReviews[0]).toMatchObject({ reviewedById: ACTOR.id });
   });
@@ -1064,9 +1135,10 @@ describe('JourneyService.reviewEvent', () => {
     expect(built.createdReviews).toHaveLength(0);
   });
 
-  it('accepts a PLATFORM reviewer (tenantId null — acts via the server-resolved sandbox)', async () => {
+  it('accepts a PLATFORM reviewer ONLY on the VERIFIED platform sandbox tenant', async () => {
     const built = await withPickupEvent({
       reviewer: { id: 'user-1', tenantId: null, userType: 'PLATFORM' },
+      verifiedSandbox: true,
     });
     await built.service.reviewEvent(
       TENANT,
@@ -1075,7 +1147,35 @@ describe('JourneyService.reviewEvent', () => {
       { decision: JourneyEventReviewDecision.APPROVE },
       ACTOR,
     );
+    // The sandbox check is by the VERIFIED marker, never the slug alone.
+    expect(built.prisma.tenant.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          id: TENANT,
+          isPlatformSandbox: true,
+        }),
+      }),
+    );
     expect(built.createdReviews[0]).toMatchObject({ reviewedById: 'user-1' });
+  });
+
+  it('REJECTS a PLATFORM reviewer on an ordinary customer tenant (no cross-tenant attribution)', async () => {
+    const built = await withPickupEvent({
+      reviewer: { id: 'user-1', tenantId: null, userType: 'PLATFORM' },
+      verifiedSandbox: false,
+    });
+    await expect(
+      built.service.reviewEvent(
+        TENANT,
+        'j-1',
+        'e-1',
+        { decision: JourneyEventReviewDecision.APPROVE },
+        ACTOR,
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    // Neither the review nor its audit row may ever land cross-tenant.
+    expect(built.createdReviews).toHaveLength(0);
+    expect(built.audit.record).not.toHaveBeenCalled();
   });
 });
 
@@ -1153,6 +1253,109 @@ describe('JourneyService.reviewEvent idempotency (lost-response retries)', () =>
     ).rejects.toBeInstanceOf(ConflictException);
     expect(built.createdReviews).toHaveLength(1);
     expect(built.audit.record).toHaveBeenCalledTimes(1);
+  });
+
+  it('a retry with the same key, action, and reason replays with the audit reason unchanged', async () => {
+    const built = await withPickupEvent();
+    const body = {
+      decision: JourneyEventReviewDecision.APPROVE,
+      reason: 'shelf camera confirms the pickup',
+      idempotencyKey: KEY,
+    };
+    await built.service.reviewEvent(TENANT, 'j-1', 'e-1', body, ACTOR);
+    await built.service.reviewEvent(TENANT, 'j-1', 'e-1', { ...body }, ACTOR);
+    expect(built.createdReviews).toHaveLength(1);
+    expect(built.audit.record).toHaveBeenCalledTimes(1);
+    expect(built.audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'shelf camera confirms the pickup' }),
+      expect.anything(),
+    );
+    expect(built.createdReviews[0]).toMatchObject({
+      reason: 'shelf camera confirms the pickup',
+    });
+  });
+
+  it('the same key with a DIFFERENT reason conflicts — the immutable reason is part of the action', async () => {
+    const built = await withPickupEvent();
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-1',
+      {
+        decision: JourneyEventReviewDecision.APPROVE,
+        reason: 'first reason',
+        idempotencyKey: KEY,
+      },
+      ACTOR,
+    );
+    await expect(
+      built.service.reviewEvent(
+        TENANT,
+        'j-1',
+        'e-1',
+        {
+          decision: JourneyEventReviewDecision.APPROVE,
+          reason: 'second, different reason',
+          idempotencyKey: KEY,
+        },
+        ACTOR,
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(built.createdReviews).toHaveLength(1);
+    expect(built.audit.record).toHaveBeenCalledTimes(1);
+    expect(built.createdReviews[0]).toMatchObject({ reason: 'first reason' });
+  });
+
+  it('reason matching is NORMALIZED: surrounding whitespace does not break a replay', async () => {
+    const built = await withPickupEvent();
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-1',
+      {
+        decision: JourneyEventReviewDecision.APPROVE,
+        reason: 'same reason',
+        idempotencyKey: KEY,
+      },
+      ACTOR,
+    );
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-1',
+      {
+        decision: JourneyEventReviewDecision.APPROVE,
+        reason: '  same reason  ',
+        idempotencyKey: KEY,
+      },
+      ACTOR,
+    );
+    expect(built.createdReviews).toHaveLength(1);
+    expect(built.audit.record).toHaveBeenCalledTimes(1);
+  });
+
+  it('an absent reason and an empty/whitespace reason are the same fingerprint (both null)', async () => {
+    const built = await withPickupEvent();
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-1',
+      { decision: JourneyEventReviewDecision.APPROVE, idempotencyKey: KEY },
+      ACTOR,
+    );
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-1',
+      {
+        decision: JourneyEventReviewDecision.APPROVE,
+        reason: '   ',
+        idempotencyKey: KEY,
+      },
+      ACTOR,
+    );
+    expect(built.createdReviews).toHaveLength(1);
+    expect(built.createdReviews[0]).toMatchObject({ reason: null });
   });
 
   it('keyless reviews stay plain append-only: two calls append two rows', async () => {

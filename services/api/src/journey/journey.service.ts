@@ -14,6 +14,7 @@ import {
   FusionPolicyResult,
   JourneyEventReviewDecision,
   Prisma,
+  TenantStatus,
   UserType,
 } from '@prisma/client';
 import { AuditLogService } from '../common/audit/audit-log.service';
@@ -352,6 +353,16 @@ function vlmSummaryFromEvidence(
     reasonCodes: codes(record.reasonCodes),
     contradictions: codes(record.contradictions),
   };
+}
+
+/** Review reason as it is stored, audited, and fingerprint-matched:
+ *  trimmed, capped at the 500-char storage bound, empty → null. Exported
+ *  for direct testing. */
+export function normalizeReviewReason(
+  value: string | null | undefined,
+): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed.slice(0, 500) : null;
 }
 
 @Injectable()
@@ -845,16 +856,26 @@ export class JourneyService {
       }
     }
     const idempotencyKey = input.idempotencyKey?.trim() || null;
+    // Normalized ONCE and used for the insert, the audit row, and the
+    // idempotency fingerprint, so all three always agree: trimmed,
+    // capped at the storage bound, empty collapsing to null.
+    const normalizedReason = normalizeReviewReason(input.reason);
     // A stored review "is the same action" when decision + corrected
-    // payload all match; correctedEventType is compared only when the
-    // caller supplied one (product events default it server-side).
+    // payload + reason all match; correctedEventType is compared only
+    // when the caller supplied one (product events default it
+    // server-side). The reason is PART of the immutable record — a retry
+    // that changes it is a different action, and silently keeping the
+    // first reason while reporting success would misrepresent what the
+    // reviewer wrote.
     const matchesStored = (stored: {
       decision: JourneyEventReviewDecision;
       correctedEventType: CustomerJourneyEventType | null;
       correctedProductId: string | null;
       correctedQuantity: number | null;
+      reason: string | null;
     }) =>
       stored.decision === input.decision &&
+      normalizeReviewReason(stored.reason) === normalizedReason &&
       stored.correctedProductId ===
         (isCorrect ? input.correctedProductId! : null) &&
       stored.correctedQuantity ===
@@ -890,25 +911,46 @@ export class JourneyService {
               'observations are reviewable',
           );
         }
-        // REVIEWER ATTRIBUTION is resolved at the data-access boundary,
-        // not trusted from the request context: reviewedById must name a
-        // user of THIS tenant. Platform users (tenantId null) act through
-        // the server-resolved platform-sandbox tenant — the same reason
-        // the same-tenant-FK migrations deliberately exempt user
-        // attribution columns — so they pass on userType, never on a
-        // tenant match.
-        const reviewer = await tx.user.findFirst({
-          where: { id: actor.id },
-          select: { id: true, tenantId: true, userType: true },
+        // REVIEWER ATTRIBUTION is resolved at the data-access boundary
+        // with the SAME tenant scoping as every other read here — never a
+        // global lookup that could authorize a user against a tenant they
+        // do not belong to. A TENANT reviewer must be a user OF this
+        // tenant. A PLATFORM reviewer (tenantId null — the reason the
+        // same-tenant-FK migrations exempt user attribution columns) is
+        // accepted ONLY when this journey's tenant is the VERIFIED
+        // platform sandbox — the isPlatformSandbox marker introduced in
+        // Phase 10, mirroring AuthRepository.findPlatformSandboxTenantId;
+        // the reserved slug alone is not identity. Platform users act in
+        // the sandbox and nowhere else, so a customer-tenant review can
+        // never be attributed to a platform-only user.
+        let reviewerId: string;
+        const tenantReviewer = await tx.user.findFirst({
+          where: { id: actor.id, tenantId },
+          select: { id: true },
         });
-        if (
-          !reviewer ||
-          (reviewer.userType !== UserType.PLATFORM &&
-            reviewer.tenantId !== tenantId)
-        ) {
-          throw new ForbiddenException(
-            'reviewer does not belong to this tenant',
-          );
+        if (tenantReviewer) {
+          reviewerId = tenantReviewer.id;
+        } else {
+          const platformReviewer = await tx.user.findFirst({
+            where: { id: actor.id, userType: UserType.PLATFORM, tenantId: null },
+            select: { id: true },
+          });
+          const verifiedSandbox = platformReviewer
+            ? await tx.tenant.findFirst({
+                where: {
+                  id: tenantId,
+                  status: TenantStatus.ACTIVE,
+                  isPlatformSandbox: true,
+                },
+                select: { id: true },
+              })
+            : null;
+          if (!platformReviewer || !verifiedSandbox) {
+            throw new ForbiddenException(
+              'reviewer does not belong to this tenant',
+            );
+          }
+          reviewerId = platformReviewer.id;
         }
         // IDEMPOTENT reviews: a lost-response retry replays instead of
         // appending a second immutable record. Checked under the journey
@@ -966,8 +1008,8 @@ export class JourneyService {
             correctedSku: snapshot?.sku ?? null,
             correctedProductName: snapshot?.name ?? null,
             correctedQuantity: isCorrect ? input.correctedQuantity! : null,
-            reason: input.reason?.slice(0, 500) ?? null,
-            reviewedById: reviewer.id,
+            reason: normalizedReason,
+            reviewedById: reviewerId,
             idempotencyKey,
           },
         });
@@ -995,7 +1037,7 @@ export class JourneyService {
               correctedSku: snapshot?.sku ?? null,
               correctedQuantity: isCorrect ? input.correctedQuantity : null,
             },
-            reason: input.reason?.slice(0, 500),
+            reason: normalizedReason ?? undefined,
           },
           tx,
         );
