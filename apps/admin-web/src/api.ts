@@ -1101,6 +1101,14 @@ export interface EvaluationSummary {
     passed: number;
     passRate: number | null;
   }[];
+  /** Phase 12 — per-SKU confusion over ground-truthed clips with runs.
+   *  Rows = actual (GT sku or NONE), columns = predicted (top-1 fused sku
+   *  when a product event was detected, else NONE). */
+  confusion: {
+    labels: string[];
+    matrix: number[][];
+    samples: number;
+  };
   scoreNote: string;
 }
 
@@ -1134,4 +1142,108 @@ export interface EvaluationTestRunRow {
 export interface EvaluationTestRuns {
   rows: EvaluationTestRunRow[];
   scoreNote: string;
+}
+
+// Phase 12 — edge camera replay runtime (SHADOW pilot). Only FILE_REPLAY
+// is functional; RTSP/webcam are registered placeholders. Camera-source
+// responses NEVER carry a URL or a credential — only whether a secret
+// slot NAME is configured.
+export type CameraSourceType =
+  | 'FILE_REPLAY'
+  | 'RTSP_PLACEHOLDER'
+  | 'LOCAL_WEBCAM_PLACEHOLDER';
+
+export type CameraSourceStatus = 'ACTIVE' | 'DISABLED' | 'ERROR';
+
+export interface CameraSourceView {
+  id: string;
+  locationId: string;
+  unitId: string | null;
+  name: string;
+  shelfZone: string | null;
+  sourceType: CameraSourceType;
+  status: CameraSourceStatus;
+  connectionNote: string | null;
+  /** The secret itself is never stored or returned. */
+  hasCredentialRef: boolean;
+  replayVideoAssetId: string | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type PilotRunStatus = 'RUNNING' | 'SUCCEEDED' | 'FAILED';
+
+export interface PilotRunView {
+  runId: string;
+  cameraSourceId: string;
+  cameraSourceName: string;
+  sourceType: CameraSourceType;
+  videoAssetId: string;
+  journeyId: string | null;
+  status: PilotRunStatus;
+  frameIntervalMs: number;
+  framesProcessed: number;
+  /** Windows the heuristics detected vs windows the pipeline processed —
+   *  a failed window leaves the gap visible. */
+  eventWindowsDetected: number;
+  eventWindowsProcessed: number;
+  /** Crop FRAMES (pre/peak/post evidence) — not clips. Phase 12 generates
+   *  no clip artifacts, so that counter stays 0 honestly. */
+  cropFramesGenerated: number;
+  clipArtifactsGenerated: number;
+  fusionRunsCompleted: number;
+  vlmInvoked: number;
+  vlmSkipped: number;
+  vlmFailed: number;
+  journeyEventsCreated: number;
+  reviewNeeded: number;
+  decision: JourneyDecision | null;
+  errorCount: number;
+  startedAt: string;
+  finishedAt: string | null;
+}
+
+export interface PilotRunDetail extends PilotRunView {
+  /** Window confidence is an uncalibrated heuristic score. */
+  eventWindows: {
+    startMs: number;
+    peakMs: number;
+    endMs: number;
+    confidence: number;
+  }[];
+  stageTimings: { stage: string; ms: number }[];
+  /** Controlled error codes only — never provider/exception text. */
+  errors: { stage: string; code: string }[];
+}
+
+/** One journey observation awaiting human review (shadow pilot queue). */
+export interface ReviewQueueItem {
+  journeyId: string;
+  journeyStatus: string;
+  journeyDecision: JourneyDecision | null;
+  eventId: string;
+  eventType: JourneyEventType;
+  occurredAt: string;
+  sourceType: string;
+  videoAssetId: string | null;
+  fusionRunId: string | null;
+  candidateSku: string | null;
+  /** Uncalibrated ranking score, not a probability. */
+  fusedTopScore: number | null;
+  vlm: {
+    status: string | null;
+    verdict: string | null;
+    selectedSku: string | null;
+    requiresHumanReview: boolean;
+  } | null;
+  /** Controlled vocabulary — never event free text. */
+  reason:
+    | 'REVIEW_REQUIRED observation'
+    | 'unknown product'
+    | 'RETURN_WITHOUT_PICKUP'
+    | 'NEGATIVE_QUANTITY';
+  /** Always null in queue responses (only zero-review events are
+   *  returned); kept for shape stability. */
+  latestReview: { decision: JourneyReviewDecision; createdAt: string } | null;
 }

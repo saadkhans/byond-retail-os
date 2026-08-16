@@ -101,7 +101,19 @@ export interface EvaluationSummary {
     passed: number;
     passRate: number | null;
   }[];
+  confusion: ConfusionMatrix;
   scoreNote: typeof SCORE_NOTE;
+}
+
+/** Per-SKU confusion over ground-truthed clips WITH a run: rows = actual
+ *  (ground-truth SKU, or NONE for no-event clips), columns = predicted
+ *  (top-1 fused SKU when the run detected a product event, else NONE). */
+export interface ConfusionMatrix {
+  /** Catalog SKUs present in the scored clips (sorted) + 'NONE' last. */
+  labels: string[];
+  /** matrix[actualIndex][predictedIndex] = clip count. */
+  matrix: number[][];
+  samples: number;
 }
 
 export interface ScenarioEvaluation {
@@ -369,6 +381,49 @@ export function evaluateScenario(
   }
 }
 
+/** Pure confusion-matrix builder — see ConfusionMatrix. 'NONE' is always
+ *  the last label so the "nothing detected / nothing happened" cell sits
+ *  in a stable corner for rendering. Only clips with a run are counted.
+ *
+ *  This is the FUSED TOP-1 matrix, exactly as the interface documents:
+ *  the predicted column comes from the fusion ranking's first candidate
+ *  (top3Skus[0]) after the event-kind gate — never from the VLM-selected
+ *  SKU. A VLM MATCH that rescues a mis-ranked candidate must still show
+ *  here as fusion ranking the wrong product first; a separate
+ *  VLM-adjusted matrix would be a different metric and is deliberately
+ *  not mixed into this one. */
+export function buildConfusion(pairs: EvaluatedClip[]): ConfusionMatrix {
+  const scored = pairs.filter(({ clip }) => clip.hasRun);
+  const NONE = 'NONE';
+  const actualOf = (gt: EvalGroundTruth) => gt.sku ?? NONE;
+  const predictedOf = (clip: ClipEvaluation) =>
+    clip.predictedKind !== null && clip.top3Skus.length > 0
+      ? clip.top3Skus[0]
+      : NONE;
+  const skus = new Set<string>();
+  for (const { gt, clip } of scored) {
+    const actual = actualOf(gt);
+    const predicted = predictedOf(clip);
+    if (actual !== NONE) {
+      skus.add(actual);
+    }
+    if (predicted !== NONE) {
+      skus.add(predicted);
+    }
+  }
+  const labels = [...skus].sort((a, b) => a.localeCompare(b)).concat(NONE);
+  const index = new Map(labels.map((label, i) => [label, i]));
+  const matrix = labels.map(() => labels.map(() => 0));
+  for (const { gt, clip } of scored) {
+    const row = index.get(actualOf(gt));
+    const column = index.get(predictedOf(clip));
+    if (row !== undefined && column !== undefined) {
+      matrix[row][column] += 1;
+    }
+  }
+  return { labels, matrix, samples: scored.length };
+}
+
 export function summarize(pairs: EvaluatedClip[]): EvaluationSummary {
   const withRun = pairs.filter(({ clip }) => clip.hasRun);
 
@@ -522,6 +577,7 @@ export function summarize(pairs: EvaluatedClip[]): EvaluationSummary {
     latency,
     perSku,
     perTestType,
+    confusion: buildConfusion(pairs),
     scoreNote: SCORE_NOTE,
   };
 }

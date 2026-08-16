@@ -8,6 +8,7 @@ import {
   useLocation,
 } from 'react-router-dom';
 import { AuthProvider, useAuth } from './auth';
+import { CamerasPage } from './pages/CamerasPage';
 import { CatalogPage } from './pages/CatalogPage';
 import {
   CheckoutSessionDetailPage,
@@ -31,10 +32,15 @@ import {
 } from './pages/PaymentsPage';
 import { PickupValidationPage } from './pages/PickupValidationPage';
 import {
+  PilotRunDetailPage,
+  PilotRunsPage,
+} from './pages/PilotRunsPage';
+import {
   ReconciliationDetailPage,
   ReconciliationPage,
 } from './pages/ReconciliationPage';
 import { ReferenceLibraryPage } from './pages/ReferenceLibraryPage';
+import { ReviewQueuePage } from './pages/ReviewQueuePage';
 import { StoreDetailPage, StoresPage } from './pages/StoresPage';
 import { UnitDetailPage, UnitsPage } from './pages/UnitsPage';
 import {
@@ -84,6 +90,9 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/pickup-validation">Pickup validation</NavLink>
         <NavLink to="/cv-evaluation">CV Evaluation</NavLink>
         <NavLink to="/journeys">Journeys</NavLink>
+        <NavLink to="/cameras">Cameras</NavLink>
+        <NavLink to="/pilot-runs">Pilot runs</NavLink>
+        <NavLink to="/review-queue">Review queue</NavLink>
         <div className="spacer" />
         <div className="who">{user?.email}</div>
         <button onClick={() => void logout()}>Sign out</button>
@@ -172,6 +181,16 @@ export function App() {
                     <Route
                       path="journeys/:id"
                       element={<JourneyDetailPage />}
+                    />
+                    <Route path="cameras" element={<CamerasPage />} />
+                    <Route path="pilot-runs" element={<PilotRunsPage />} />
+                    <Route
+                      path="pilot-runs/:id"
+                      element={<PilotRunDetailPage />}
+                    />
+                    <Route
+                      path="review-queue"
+                      element={<ReviewQueuePage />}
                     />
                     <Route path="*" element={<Navigate to="/" replace />} />
                   </Routes>

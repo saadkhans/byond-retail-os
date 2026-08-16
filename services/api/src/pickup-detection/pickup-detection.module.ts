@@ -68,6 +68,8 @@ import { PickupReferenceLibrary } from './reference-library';
     PickupAnalysisFrameDecoder,
     PickupReferenceLibrary,
     PickupDetectionConfig,
+    // Phase 12: the camera replay runtime triggers the v1 baseline pass.
+    PickupDetectionService,
   ],
 })
 export class PickupDetectionModule implements OnModuleInit {

@@ -2,6 +2,7 @@ import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AccessControlModule } from './access-control/access-control.module';
 import { AuthModule } from './auth/auth.module';
+import { CameraModule } from './camera/camera.module';
 import { CatalogModule } from './catalog/catalog.module';
 import { CheckoutModule } from './checkout/checkout.module';
 import { RequestIdMiddleware } from './common/request-id.middleware';
@@ -50,6 +51,7 @@ import { VisionModule } from './vision/vision.module';
     PickupFusionModule,
     CvEvaluationModule,
     JourneyModule,
+    CameraModule,
   ],
 })
 export class AppModule implements NestModule {

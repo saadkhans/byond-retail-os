@@ -915,6 +915,138 @@ describe('JourneyService.reviewEvent', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 
+  async function withLoneReturnEvent() {
+    // A KNOWN-product return with no prior pickup: the fold flags
+    // RETURN_WITHOUT_PICKUP anchored to this observation.
+    const built = buildService();
+    built.journeyRow.events.push({
+      id: 'e-return',
+      eventType: CustomerJourneyEventType.PRODUCT_RETURN,
+      productId: 'prod-a',
+      sku: 'SKU-A',
+      productName: 'Product A',
+      quantity: 1,
+    });
+    return built;
+  }
+
+  it('APPROVE on a known-product event implicated in a fold inconsistency is rejected (Codex P1)', async () => {
+    const built = await withLoneReturnEvent();
+    await expect(
+      built.service.reviewEvent(
+        TENANT,
+        'j-1',
+        'e-return',
+        { decision: JourneyEventReviewDecision.APPROVE },
+        ACTOR,
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(built.createdReviews).toHaveLength(0);
+    expect(built.audit.record).not.toHaveBeenCalled();
+  });
+
+  it('REJECT on the implicated event still lands (and resolves the fold)', async () => {
+    const built = await withLoneReturnEvent();
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-return',
+      { decision: JourneyEventReviewDecision.REJECT },
+      ACTOR,
+    );
+    expect(built.createdReviews).toHaveLength(1);
+    expect(built.createdReviews[0]).toMatchObject({
+      decision: JourneyEventReviewDecision.REJECT,
+    });
+  });
+
+  it('APPROVE on a CLEAN known-product event is still allowed', async () => {
+    const built = await withPickupEvent();
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-1',
+      { decision: JourneyEventReviewDecision.APPROVE },
+      ACTOR,
+    );
+    expect(built.createdReviews).toHaveLength(1);
+  });
+
+  it('APPROVE on an unidentified product event is rejected (400, no review, no audit)', async () => {
+    const built = buildService();
+    built.journeyRow.events.push({
+      id: 'e-unknown',
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: null,
+      sku: null,
+      productName: null,
+      quantity: 1,
+    });
+    await expect(
+      built.service.reviewEvent(
+        TENANT,
+        'j-1',
+        'e-unknown',
+        { decision: JourneyEventReviewDecision.APPROVE },
+        ACTOR,
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(built.createdReviews).toHaveLength(0);
+    expect(built.audit.record).not.toHaveBeenCalled();
+  });
+
+  it('REJECT and CORRECT stay available for unidentified product events', async () => {
+    const built = buildService();
+    built.journeyRow.events.push({
+      id: 'e-unknown',
+      eventType: CustomerJourneyEventType.PRODUCT_RETURN,
+      productId: null,
+      sku: null,
+      productName: null,
+      quantity: 1,
+    });
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-unknown',
+      { decision: JourneyEventReviewDecision.REJECT },
+      ACTOR,
+    );
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-unknown',
+      {
+        decision: JourneyEventReviewDecision.CORRECT,
+        correctedEventType: CustomerJourneyEventType.PRODUCT_RETURN,
+        correctedProductId: 'prod-a',
+        correctedQuantity: 1,
+      },
+      ACTOR,
+    );
+    expect(built.createdReviews).toHaveLength(2);
+  });
+
+  it('APPROVE on a REVIEW_REQUIRED observation remains allowed (resolves as non-event)', async () => {
+    const built = buildService();
+    built.journeyRow.events.push({
+      id: 'e-rr',
+      eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+      productId: null,
+      sku: null,
+      productName: null,
+      quantity: 1,
+    });
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-rr',
+      { decision: JourneyEventReviewDecision.APPROVE },
+      ACTOR,
+    );
+    expect(built.createdReviews).toHaveLength(1);
+  });
+
   it('404s an event id that does not resolve within this tenant + journey', async () => {
     const built = await withPickupEvent();
     await expect(

@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { FusionRunScope } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   EVALUATION_MAX_CLIPS,
@@ -107,7 +108,15 @@ export class CvEvaluationService {
       assetIds.length === 0
         ? []
         : await this.prisma.pickupFusionRun.findMany({
-            where: { tenantId, videoAssetId: { in: assetIds } },
+            // WHOLE_CLIP only: ground truth describes the entire clip, so
+            // a camera replay's REPLAY_WINDOW runs of the same video must
+            // never displace the whole-clip result these metrics score
+            // (Codex P1 — pilot runs contaminating evaluation).
+            where: {
+              tenantId,
+              videoAssetId: { in: assetIds },
+              runScope: FusionRunScope.WHOLE_CLIP,
+            },
             orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
             select: {
               id: true,

@@ -7,6 +7,7 @@ import {
   CvTestScenario,
   EvidenceSourceType,
   FusionPolicyResult,
+  FusionRunScope,
   GroundTruthEventKind,
   InferenceJobStatus,
 } from '@prisma/client';
@@ -344,6 +345,11 @@ export class PickupValidationService {
               tenantId,
               videoAssetId: { in: assetIds },
               policy: { not: FusionPolicyResult.FAILED },
+              // WHOLE_CLIP only: window-scoped replay runs analyze one
+              // extracted interaction, not the clip the ground truth
+              // describes — they must not displace the whole-clip result
+              // this dashboard scores (Codex P1).
+              runScope: FusionRunScope.WHOLE_CLIP,
             },
             orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
             select: {

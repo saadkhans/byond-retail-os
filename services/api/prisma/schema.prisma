@@ -246,6 +246,8 @@ model Tenant {
   customerJourneyEvents   CustomerJourneyEvent[]
   customerJourneyEventReviews CustomerJourneyEventReview[]
   videoExtractionRequests VideoExtractionRequest[]
+  cameraSources           CameraSource[]
+  cameraPilotRuns         CameraPilotRun[]
 }
 
 model User {
@@ -381,6 +383,7 @@ model Location {
   inferenceJobs      InferenceJob[]
   videoAssets        VideoAsset[]
   customerJourneys   CustomerJourney[]
+  cameraSources      CameraSource[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -675,6 +678,7 @@ model CustomerJourney {
   unit     RetailUnit? @relation(fields: [unitId], references: [id], onDelete: Restrict)
   events   CustomerJourneyEvent[]
   eventReviews CustomerJourneyEventReview[]
+  cameraPilotRuns CameraPilotRun[]
 
   // Anchor for hand-written same-tenant composite FKs
   // (20260811110000_cv_same_tenant_fks).
@@ -765,6 +769,16 @@ enum FusionPolicyResult {
   FAILED
 }
 
+// Phase 12 — what a fusion run analyzed. WHOLE_CLIP runs are the unit of
+// ground-truthed evaluation (validation dashboard, accuracy, confusion);
+// REPLAY_WINDOW runs analyze one extracted event window of a camera
+// replay and are EXCLUDED from whole-clip metrics so a pilot replay can
+// never displace the evaluation result of its underlying test video.
+enum FusionRunScope {
+  WHOLE_CLIP
+  REPLAY_WINDOW
+}
+
 // One pickup-fusion-v2 SHADOW run over a test video: full per-stage
 // evidence (timeline/tracks, crops + quality, barcode, OCR, retrieval,
 // classical, context, fused candidates, VLM exchange, per-stage timings)
@@ -775,6 +789,7 @@ model PickupFusionRun {
   tenantId        String
   videoAssetId    String
   pipelineVersion String
+  runScope        FusionRunScope     @default(WHOLE_CLIP)
   policy          FusionPolicyResult
   fusedTopSku     String?
   fusedTopScore   Float?
@@ -834,6 +849,127 @@ model VideoGroundTruth {
   @@index([tenantId, productId])
 }
 
+// ---------------------------------------------------------------------------
+// Phase 12 — edge camera replay runtime (SHADOW pilot).
+//
+// A CameraSource names where footage comes from; a CameraPilotRun records
+// one auditable replay of a video asset through the existing shadow
+// pipeline (event windows → crops → pickup detection → fusion → VLM →
+// journey import → reconciliation). Only FILE_REPLAY is functional; RTSP
+// and webcam are registered placeholders. NOTHING here touches checkout,
+// order, payment, or inventory tables.
+// ---------------------------------------------------------------------------
+
+enum CameraSourceType {
+  FILE_REPLAY
+  RTSP_PLACEHOLDER
+  LOCAL_WEBCAM_PLACEHOLDER
+}
+
+enum CameraSourceStatus {
+  ACTIVE
+  DISABLED
+  ERROR
+}
+
+enum CameraPilotRunStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+model CameraSource {
+  id         String             @id @default(cuid())
+  tenantId   String
+  locationId String
+  unitId     String?
+  name       String
+  shelfZone  String?
+  sourceType CameraSourceType
+  status     CameraSourceStatus @default(ACTIVE)
+  // SAFE metadata only. connectionNote is screened free text (reject-on-
+  // write, same policy as journey notes) — a URL with embedded
+  // credentials never passes. credentialRef is the NAME of an
+  // operator-managed secret slot (validated identifier), NEVER the
+  // secret itself; responses expose only whether one is configured.
+  connectionNote     String?
+  credentialRef      String?
+  // FILE_REPLAY: the default video asset this source replays.
+  replayVideoAssetId String?
+  lastError          String?
+  createdById        String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  tenant           Tenant      @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location         Location    @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit             RetailUnit? @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  replayVideoAsset VideoAsset? @relation("CameraReplayAsset", fields: [replayVideoAssetId], references: [id], onDelete: SetNull)
+  pilotRuns        CameraPilotRun[]
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, locationId, name])
+  @@index([tenantId, status])
+}
+
+// One auditable replay run. Counters and stage timings are written by the
+// runtime as it advances; eventWindows/errors hold controlled descriptor
+// JSON only (timestamps, scores, stage names — never media bytes, OCR
+// text, or free text from evidence).
+model CameraPilotRun {
+  id             String               @id @default(cuid())
+  tenantId       String
+  cameraSourceId String
+  videoAssetId   String
+  journeyId      String?
+  status         CameraPilotRunStatus @default(RUNNING)
+  frameIntervalMs      Int
+  framesProcessed      Int @default(0)
+  // Windows the heuristics DETECTED vs windows the pipeline PROCESSED —
+  // a failed window leaves the gap visible. Crop FRAMES (pre/peak/post
+  // evidence) are counted separately from clip ARTIFACTS; Phase 12
+  // generates no clip artifacts, so that counter stays 0 honestly.
+  eventWindowsDetected   Int @default(0)
+  eventWindowsProcessed  Int @default(0)
+  cropFramesGenerated    Int @default(0)
+  clipArtifactsGenerated Int @default(0)
+  fusionRunsCompleted  Int @default(0)
+  vlmInvoked           Int @default(0)
+  vlmSkipped           Int @default(0)
+  vlmFailed            Int @default(0)
+  journeyEventsCreated Int @default(0)
+  reviewNeeded         Int @default(0)
+  // Snapshot of the linked journey's final SHADOW decision at run end.
+  decision     CustomerJourneyDecision?
+  eventWindows Json?
+  stageTimings Json?
+  errors       Json?
+  // Client replay token: a retried run request with the same key returns
+  // the existing run instead of replaying the footage twice.
+  idempotencyKey String?
+  startedAt      DateTime  @default(now())
+  // Lease heartbeat + owner: the heartbeat is bumped PERIODICALLY while a
+  // stage runs (not merely between stages), and every heartbeat and
+  // finalization write is conditional on status=RUNNING AND the owner
+  // token — a reclaimed or completed row can never be overwritten by an
+  // attempt that lost its lease.
+  heartbeatAt    DateTime?
+  leaseOwner     String?
+  finishedAt     DateTime?
+  createdById    String?
+  createdAt      DateTime  @default(now())
+
+  tenant       Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  cameraSource CameraSource     @relation(fields: [cameraSourceId], references: [id], onDelete: Restrict)
+  videoAsset   VideoAsset       @relation(fields: [videoAssetId], references: [id], onDelete: Cascade)
+  journey      CustomerJourney? @relation(fields: [journeyId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, createdAt(sort: Desc)])
+  @@index([tenantId, cameraSourceId, createdAt(sort: Desc)])
+}
+
 // DERIVED stock projection — never written directly from user input. The
 // quantity changes exclusively via atomic increments inside the same
 // transaction that appends the InventoryMovement ledger row (the ledger is
@@ -885,6 +1021,7 @@ model RetailUnit {
   inferenceJobs    InferenceJob[]
   videoAssets      VideoAsset[]
   customerJourneys CustomerJourney[]
+  cameraSources    CameraSource[]
 
   @@unique([tenantId, code])
   // Enables composite same-tenant FKs (devices must reference a unit of the
@@ -2063,6 +2200,8 @@ model VideoAsset {
   extractionRequests VideoExtractionRequest[]
   groundTruth VideoGroundTruth?
   fusionRuns  PickupFusionRun[]
+  replayCameraSources CameraSource[] @relation("CameraReplayAsset")
+  cameraPilotRuns     CameraPilotRun[]
 
   @@unique([id, tenantId])
   @@index([tenantId, createdAt(sort: Desc), id(sort: Desc)])

@@ -12,6 +12,7 @@ import {
   CustomerJourneyEventType,
   CustomerJourneyStatus,
   FusionPolicyResult,
+  FusionRunScope,
   JourneyEventReviewDecision,
   Prisma,
   TenantStatus,
@@ -116,6 +117,54 @@ export interface JourneyDetail {
   fusionRuns: JourneyFusionRunSummary[];
 }
 
+/** One uncertain observation awaiting a reviewer — the review-queue row.
+ *  Descriptor fields only: evidence stays behind the video-asset routes. */
+export interface ReviewQueueItem {
+  journeyId: string;
+  journeyStatus: CustomerJourneyStatus;
+  journeyDecision: CustomerJourneyDecision | null;
+  eventId: string;
+  eventType: CustomerJourneyEventType;
+  occurredAt: Date;
+  sourceType: string;
+  videoAssetId: string | null;
+  fusionRunId: string | null;
+  /** Fusion's best candidate when a run is linked, else the event's own
+   *  SKU snapshot. */
+  candidateSku: string | null;
+  /** Uncalibrated ranking score, not a probability. */
+  fusedTopScore: number | null;
+  vlm: {
+    status: string | null;
+    verdict: string | null;
+    selectedSku: string | null;
+    requiresHumanReview: boolean;
+  } | null;
+  /** Controlled vocabulary — never event free text. The two issue kinds
+   *  cover known-product events flagged by unresolved journey-level fold
+   *  inconsistencies (Codex P1: those need review too). */
+  reason:
+    | 'REVIEW_REQUIRED observation'
+    | 'unknown product'
+    | 'RETURN_WITHOUT_PICKUP'
+    | 'NEGATIVE_QUANTITY';
+  latestReview: {
+    decision: JourneyEventReviewDecision;
+    createdAt: Date;
+  } | null;
+}
+
+/** Queue page bound: oldest-first so long-waiting observations surface. */
+export const REVIEW_QUEUE_MAX_ITEMS = 100;
+
+/** Issue-scan paging: candidate journeys are walked in batches and the
+ *  queue cap applies to MATCHING rows, never to journeys scanned — a
+ *  backlog of non-queueable review journeys must not hide later genuine
+ *  fold inconsistencies. The ceiling bounds the walk (safety, not a
+ *  visibility limit; ~10× the queue cap). */
+export const REVIEW_QUEUE_JOURNEY_BATCH = 50;
+export const REVIEW_QUEUE_JOURNEY_SCAN_CEILING = 1000;
+
 /** The review fields the fold needs — a subset of the stored row. */
 export interface FoldReview {
   id: string;
@@ -166,6 +215,10 @@ export function foldBasket(
   }
   const lines = new Map<string, ProvisionalBasketLine>();
   const issues: JourneyIssue[] = [];
+  // Last effective RETURN event per product — a NEGATIVE_QUANTITY issue
+  // is anchored to the observation that drove the line negative so the
+  // review queue has a concrete event to put in front of a human.
+  const lastReturnEvent = new Map<string, string>();
   for (const original of events) {
     const review = latestReview.get(original.id);
     if (review?.decision === JourneyEventReviewDecision.REJECT) {
@@ -236,6 +289,7 @@ export function foldBasket(
         });
       }
       line.quantity -= event.quantity;
+      lastReturnEvent.set(event.productId, event.id);
     }
     lines.set(event.productId, line);
   }
@@ -244,6 +298,9 @@ export function foldBasket(
       issues.push({
         kind: 'NEGATIVE_QUANTITY',
         detail: `${line.sku ?? line.productId} folded to ${line.quantity}`,
+        eventId: line.productId
+          ? lastReturnEvent.get(line.productId)
+          : undefined,
       });
     }
   }
@@ -378,6 +435,13 @@ export class JourneyService {
     tenantId: string,
     input: { locationId: string; unitId?: string | null },
     actorId?: string,
+    options?: {
+      /** Source-time ENTRY stamp. The camera replay runtime anchors the
+       *  whole journey timeline to the pilot run's start so ENTRY ≤ every
+       *  replayed observation ≤ EXIT regardless of when the footage was
+       *  originally uploaded or how fast processing runs. */
+      entryAt?: Date;
+    },
   ) {
     const location = await this.prisma.location.findFirst({
       where: { tenantId, id: input.locationId },
@@ -404,12 +468,14 @@ export class JourneyService {
     // together. If the ENTRY insert failed after the journey committed,
     // an OPEN journey with no ENTRY event would remain and a retry would
     // open a SECOND journey for the same shopper.
+    const entryAt = options?.entryAt ?? new Date();
     const journey = await this.prisma.$transaction(async (tx) => {
       const created = await tx.customerJourney.create({
         data: {
           tenantId,
           locationId: input.locationId,
           unitId: input.unitId ?? null,
+          startedAt: entryAt,
         },
       });
       await tx.customerJourneyEvent.create({
@@ -417,7 +483,7 @@ export class JourneyService {
           tenantId,
           journeyId: created.id,
           eventType: CustomerJourneyEventType.ENTRY,
-          occurredAt: new Date(),
+          occurredAt: entryAt,
           sourceType: 'MANUAL',
           createdById: actorId ?? null,
         },
@@ -494,7 +560,7 @@ export class JourneyService {
     tenantId: string,
     journeyId: string,
     locationId: string,
-    options: { setEndedAt: boolean },
+    options: { setEndedAt: boolean; endedAt?: Date },
   ): Promise<void> {
     let decision: CustomerJourneyDecision;
     let reason: string;
@@ -554,7 +620,9 @@ export class JourneyService {
         decision,
         decisionReason: reason,
         decidedAt: new Date(),
-        ...(options.setEndedAt ? { endedAt: new Date() } : {}),
+        ...(options.setEndedAt
+          ? { endedAt: options.endedAt ?? new Date() }
+          : {}),
       },
     });
   }
@@ -572,6 +640,8 @@ export class JourneyService {
       videoAssetId?: string | null;
       fusionRunId?: string | null;
       note?: string | null;
+      /** Fusion-import idempotency scope — see the dedup comment below. */
+      dedupScope?: 'video' | 'run';
     },
     actorId?: string,
   ) {
@@ -600,22 +670,28 @@ export class JourneyService {
       );
     }
     await this.withOpenJourney(tenantId, journeyId, async (tx) => {
-      // IDEMPOTENT fusion imports: one VIDEO may contribute at most one
-      // fusion observation per journey. The dedup keys on (journeyId,
-      // videoAssetId) rather than the run id because fusion runs are
-      // append-only and freely re-runnable — after a re-run, the "latest
-      // run" indirection hands a repeated import a FRESH run id that a
-      // run-id-only check would wave through, double-counting one physical
-      // observation. Checked under the journey lock, in the same
-      // transaction as the insert, so a retry replays instead of doubling
-      // the provisional basket.
+      // IDEMPOTENT fusion imports. Default ('video') scope: one VIDEO may
+      // contribute at most one fusion observation per journey — dedup keys
+      // on (journeyId, videoAssetId) rather than the run id because fusion
+      // runs are append-only and freely re-runnable; the "latest run"
+      // indirection would hand a repeated import a FRESH run id that a
+      // run-id-only check waves through, double-counting one physical
+      // observation. The camera replay runtime instead imports SEVERAL
+      // window-scoped fusion runs of one video into one fresh journey it
+      // owns — there the physical observation is the RUN ('run' scope),
+      // and cross-run double-counting cannot occur because each replay
+      // opens its own journey. Checked under the journey lock, in the
+      // same transaction as the insert, so a retry replays instead of
+      // doubling the provisional basket.
       if (input.sourceType === 'FUSION_SHADOW' && input.videoAssetId) {
         const existing = await tx.customerJourneyEvent.findFirst({
           where: {
             tenantId,
             journeyId,
-            videoAssetId: input.videoAssetId,
             sourceType: 'FUSION_SHADOW',
+            ...(input.dedupScope === 'run' && input.fusionRunId
+              ? { fusionRunId: input.fusionRunId }
+              : { videoAssetId: input.videoAssetId }),
           },
           select: { id: true },
         });
@@ -676,6 +752,26 @@ export class JourneyService {
     journeyId: string,
     videoAssetId: string,
     actorId?: string,
+    options?: {
+      /** Import THIS run (tenant-scoped, must belong to the video) instead
+       *  of the newest one — the camera replay runtime binds each window's
+       *  observation to the exact run it created, never a latest-row
+       *  lookup a concurrent replay could race. Switches dedup to 'run'
+       *  scope so several window runs of one video can land in one
+       *  replay-owned journey. */
+      fusionRunId?: string;
+      /** Source-time base for occurredAt (replay runs stamp relative to
+       *  the RUN start, not the original upload's createdAt — an old
+       *  asset replayed today must not predate the journey's ENTRY). */
+      sourceTimeBase?: Date;
+      /** Deterministic offset used when the run's evidence has NO
+       *  detector peak (a no-detection window): with a sourceTimeBase the
+       *  observation must still land on the replay timeline — never on
+       *  the wall clock, which can drift past the source-time EXIT when
+       *  processing outruns the footage. Callers pass the replay window's
+       *  peak (or midpoint/start); absent, the base itself is used. */
+      fallbackPeakMs?: number;
+    },
   ) {
     const journey = await this.prisma.customerJourney.findFirst({
       where: { tenantId, id: journeyId },
@@ -706,10 +802,17 @@ export class JourneyService {
         "the video's unit does not match this journey's unit",
       );
     }
-    const run = await this.prisma.pickupFusionRun.findFirst({
-      where: { tenantId, videoAssetId },
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-    });
+    const run = options?.fusionRunId
+      ? await this.prisma.pickupFusionRun.findFirst({
+          where: { tenantId, id: options.fusionRunId, videoAssetId },
+        })
+      : await this.prisma.pickupFusionRun.findFirst({
+          // The "latest run" convenience path means the latest WHOLE_CLIP
+          // analysis — a camera replay's window-scoped runs of the same
+          // video must never be what a manual import silently picks up.
+          where: { tenantId, videoAssetId, runScope: FusionRunScope.WHOLE_CLIP },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        });
     if (!run) {
       throw new NotFoundException('No fusion run exists for that video');
     }
@@ -725,10 +828,17 @@ export class JourneyService {
     // return clip imports before the pickup clip). Missing/garbage peakMs
     // falls back to append-time stamping, the pre-existing behavior.
     const peakMs = evidence.detector?.events?.[0]?.peakMs;
-    const occurredAt =
+    const sourceTimeBase = options?.sourceTimeBase ?? asset.createdAt;
+    const effectivePeakMs =
       typeof peakMs === 'number' && Number.isFinite(peakMs)
+        ? peakMs
+        : options?.sourceTimeBase !== undefined
+          ? Math.max(0, options.fallbackPeakMs ?? 0)
+          : null;
+    const occurredAt =
+      effectivePeakMs !== null
         ? new Date(
-            asset.createdAt.getTime() + Math.max(0, Math.round(peakMs)),
+            sourceTimeBase.getTime() + Math.max(0, Math.round(effectivePeakMs)),
           ).toISOString()
         : undefined;
     const top = evidence.fused?.[0];
@@ -748,6 +858,7 @@ export class JourneyService {
           videoAssetId,
           fusionRunId: run.id,
           note: `policy ${run.policy}`,
+          dedupScope: options?.fusionRunId ? 'run' : 'video',
         },
         actorId,
       );
@@ -763,6 +874,7 @@ export class JourneyService {
         fusionRunId: run.id,
         matchScore: run.fusedTopScore,
         note: `policy ${run.policy}${run.fusedTopSku ? ` · top ${run.fusedTopSku}` : ''}`,
+        dedupScope: options?.fusionRunId ? 'run' : 'video',
       },
       actorId,
     );
@@ -774,14 +886,26 @@ export class JourneyService {
    *  under the per-journey lock so no append can land between the fold
    *  and the status transition. The decision mutates ONLY the journey
    *  row — never checkout, order, payment, or inventory state. */
-  async exit(tenantId: string, journeyId: string, actorId?: string) {
+  async exit(
+    tenantId: string,
+    journeyId: string,
+    actorId?: string,
+    options?: {
+      /** Source-time EXIT stamp (see create's entryAt) — the replay
+       *  runtime sets entry + duration + a margin so a replay processed
+       *  FASTER than the footage's own timeline can never place an
+       *  observation after EXIT. */
+      exitAt?: Date;
+    },
+  ) {
+    const exitAt = options?.exitAt ?? new Date();
     await this.withOpenJourney(tenantId, journeyId, async (tx, journey) => {
       await tx.customerJourneyEvent.create({
         data: {
           tenantId,
           journeyId,
           eventType: CustomerJourneyEventType.EXIT,
-          occurredAt: new Date(),
+          occurredAt: exitAt,
           sourceType: 'MANUAL',
           createdById: actorId ?? null,
         },
@@ -792,6 +916,48 @@ export class JourneyService {
       // isolation).
       await this.reconcile(tx, tenantId, journeyId, journey.locationId, {
         setEndedAt: true,
+        endedAt: exitAt,
+      });
+    });
+    return this.detail(tenantId, journeyId);
+  }
+
+  /**
+   * Failure cleanup for runtime-owned journeys (camera replay): when a
+   * replay pipeline fails after opening its journey, the journey must not
+   * linger OPEN with only an ENTRY event. Records a source-time EXIT and
+   * settles the journey as FAILED with a CONTROLLED reason code — never
+   * pipeline free text. Shadow mode: mutates only the journey tables.
+   */
+  async abortShadowJourney(
+    tenantId: string,
+    journeyId: string,
+    reasonCode: string,
+    actorId?: string,
+    options?: { exitAt?: Date },
+  ) {
+    const exitAt = options?.exitAt ?? new Date();
+    await this.withOpenJourney(tenantId, journeyId, async (tx) => {
+      await tx.customerJourneyEvent.create({
+        data: {
+          tenantId,
+          journeyId,
+          eventType: CustomerJourneyEventType.EXIT,
+          occurredAt: exitAt,
+          sourceType: 'SYSTEM',
+          note: `aborted: ${reasonCode}`.slice(0, 500),
+          createdById: actorId ?? null,
+        },
+      });
+      await tx.customerJourney.update({
+        where: { id_tenantId: { id: journeyId, tenantId } },
+        data: {
+          status: CustomerJourneyStatus.REVIEW_REQUIRED,
+          decision: CustomerJourneyDecision.FAILED,
+          decisionReason: `replay aborted: ${reasonCode}`.slice(0, 500),
+          decidedAt: new Date(),
+          endedAt: exitAt,
+        },
       });
     });
     return this.detail(tenantId, journeyId);
@@ -910,6 +1076,59 @@ export class JourneyService {
             'only PRODUCT_PICKUP / PRODUCT_RETURN / REVIEW_REQUIRED ' +
               'observations are reviewable',
           );
+        }
+        // An unidentified product event cannot be APPROVEd: approval
+        // changes nothing in the fold (UNKNOWN_PRODUCT_EVENT stays), yet
+        // any landed review removes the row from the review queue — the
+        // unresolved work would silently vanish. The reviewer must either
+        // CORRECT it with a product or REJECT it. (APPROVE on a
+        // REVIEW_REQUIRED observation stays allowed — that decision
+        // resolves it as a non-event by design.)
+        if (
+          input.decision === JourneyEventReviewDecision.APPROVE &&
+          event.eventType !== CustomerJourneyEventType.REVIEW_REQUIRED &&
+          event.productId === null
+        ) {
+          throw new BadRequestException(
+            'an unidentified product cannot be approved — CORRECT it ' +
+              'with a product or REJECT it',
+          );
+        }
+        // A KNOWN-product event implicated in an unresolved journey-level
+        // fold inconsistency (RETURN_WITHOUT_PICKUP / NEGATIVE_QUANTITY)
+        // cannot be APPROVEd either: approval changes nothing in the fold
+        // — the observation would count exactly as before, the issue
+        // would persist, and the journey would stay review-required while
+        // the queue row vanished. The reviewer must CORRECT the
+        // observation (fixing the arithmetic) or REJECT it (Codex P1).
+        if (
+          input.decision === JourneyEventReviewDecision.APPROVE &&
+          (event.eventType === CustomerJourneyEventType.PRODUCT_PICKUP ||
+            event.eventType === CustomerJourneyEventType.PRODUCT_RETURN)
+        ) {
+          const journeyEvents = await tx.customerJourneyEvent.findMany({
+            where: { tenantId, journeyId },
+            orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
+          });
+          const journeyReviews = await tx.customerJourneyEventReview.findMany(
+            {
+              where: { tenantId, journeyId },
+              orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+            },
+          );
+          const { issues } = foldBasket(journeyEvents, journeyReviews);
+          const implicated = issues.some(
+            (issue) =>
+              (issue.kind === 'RETURN_WITHOUT_PICKUP' ||
+                issue.kind === 'NEGATIVE_QUANTITY') &&
+              issue.eventId === eventId,
+          );
+          if (implicated) {
+            throw new BadRequestException(
+              'this observation is part of an unresolved journey ' +
+                'inconsistency — CORRECT or REJECT it',
+            );
+          }
         }
         // REVIEWER ATTRIBUTION is resolved at the data-access boundary
         // with the SAME tenant scoping as every other read here — never a
@@ -1092,6 +1311,269 @@ export class JourneyService {
       endedAt: journey.endedAt,
       eventCount: journey._count.events,
     }));
+  }
+
+  /**
+   * The review queue: every observation in this tenant that still needs a
+   * human decision, oldest first. Direct rows (REVIEW_REQUIRED /
+   * unknown-product observations) leave the queue when a review lands
+   * (unidentified products cannot be APPROVEd — see reviewEvent — so what
+   * leaves is genuinely handled). Issue rows (RETURN_WITHOUT_PICKUP /
+   * NEGATIVE_QUANTITY) are governed by FOLD RESOLUTION instead: they stay
+   * queued — even past a historical APPROVE — until the review-aware fold
+   * stops flagging them. Both streams are collected in full (within their
+   * own scan bounds), merged and deduped by event id (issue reason wins),
+   * sorted oldest-first, and ONLY THEN capped — direct rows can never
+   * starve inconsistency rows out of the page. READ-ONLY:
+   * approve/reject/correct continue through the existing review endpoint;
+   * no second mutation path exists here.
+   */
+  async reviewQueue(tenantId: string): Promise<ReviewQueueItem[]> {
+    // TENANT SCOPE at every nesting level (repo rule): the event query,
+    // the nested review read, and every follow-up lookup each carry their
+    // own tenantId predicate.
+    //
+    // UNRESOLVED IS A DATABASE PREDICATE, applied BEFORE the page bound
+    // (Codex P1): `reviews: { none: … }` — post-fetch filtering must
+    // never decide visibility, or a backlog of older resolved rows would
+    // crowd newer unresolved observations out of the scan window.
+    const unresolvedDirect = await this.prisma.customerJourneyEvent.findMany({
+      where: {
+        tenantId,
+        reviews: { none: { tenantId } },
+        OR: [
+          { eventType: CustomerJourneyEventType.REVIEW_REQUIRED },
+          {
+            eventType: {
+              in: [
+                CustomerJourneyEventType.PRODUCT_PICKUP,
+                CustomerJourneyEventType.PRODUCT_RETURN,
+              ],
+            },
+            productId: null,
+          },
+        ],
+      },
+      orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
+      take: REVIEW_QUEUE_MAX_ITEMS,
+      include: {
+        reviews: {
+          where: { tenantId },
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+          select: { decision: true, createdAt: true },
+        },
+      },
+    });
+    type QueueEvent = (typeof unresolvedDirect)[number];
+    const candidates = new Map<
+      string,
+      { event: QueueEvent; reason: ReviewQueueItem['reason'] }
+    >();
+    for (const event of unresolvedDirect) {
+      candidates.set(event.id, {
+        event,
+        reason:
+          event.eventType === CustomerJourneyEventType.REVIEW_REQUIRED
+            ? 'REVIEW_REQUIRED observation'
+            : 'unknown product',
+      });
+    }
+    // KNOWN-PRODUCT events flagged by unresolved journey-level fold
+    // issues (RETURN_WITHOUT_PICKUP / NEGATIVE_QUANTITY) belong in the
+    // queue too (Codex P1): a pilot run can report review-needed work
+    // that the type/product predicate above would never surface.
+    //
+    // Membership is decided by FOLD RESOLUTION, never by mere review
+    // existence: an APPROVEd inconsistency stays queued (approval changes
+    // nothing in the fold — reviewEvent rejects it going forward, and
+    // historical approvals must not have buried the work), and a CORRECT
+    // that does not fix the arithmetic keeps the row too. The event
+    // leaves the queue only when the review-aware fold stops flagging it
+    // (REJECT drops the observation; an arithmetic-fixing CORRECT clears
+    // the issue).
+    //
+    // Candidate journeys are PAGED and the cap applies to MATCHING rows,
+    // not to the journeys scanned (Codex P1): a backlog of older
+    // review-decision journeys without queueable fold issues must not
+    // hide a newer journey's genuine inconsistency. A hard scan ceiling
+    // keeps the walk bounded.
+    //
+    // The scan runs to the ceiling REGARDLESS of how many direct rows
+    // were collected (Codex P1, round 3): both streams are gathered IN
+    // FULL (within their own bounds), merged, and only the MERGED result
+    // is capped below — 100 direct unresolved rows must never starve the
+    // inconsistency stream, whose rows may be older than every direct
+    // row and therefore sort ahead of them.
+    let scannedJourneys = 0;
+    while (scannedJourneys < REVIEW_QUEUE_JOURNEY_SCAN_CEILING) {
+      const batch = await this.prisma.customerJourney.findMany({
+        where: {
+          tenantId,
+          decision: {
+            in: [
+              CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+              CustomerJourneyDecision.NEEDS_JOURNEY_REVIEW,
+            ],
+          },
+        },
+        orderBy: [{ startedAt: 'asc' }, { id: 'asc' }],
+        skip: scannedJourneys,
+        take: REVIEW_QUEUE_JOURNEY_BATCH,
+        select: { id: true },
+      });
+      if (batch.length === 0) {
+        break;
+      }
+      scannedJourneys += batch.length;
+      const flaggedEvents = await this.prisma.customerJourneyEvent.findMany({
+        where: {
+          tenantId,
+          journeyId: { in: batch.map((journey) => journey.id) },
+        },
+        orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
+        include: {
+          reviews: {
+            where: { tenantId },
+            orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+          },
+        },
+      });
+      const byJourney = new Map<string, typeof flaggedEvents>();
+      for (const event of flaggedEvents) {
+        const list = byJourney.get(event.journeyId) ?? [];
+        list.push(event);
+        byJourney.set(event.journeyId, list);
+      }
+      for (const journeyEvents of byJourney.values()) {
+        const { issues } = foldBasket(
+          journeyEvents,
+          journeyEvents.flatMap((event) => event.reviews ?? []),
+        );
+        for (const issue of issues) {
+          if (
+            (issue.kind !== 'RETURN_WITHOUT_PICKUP' &&
+              issue.kind !== 'NEGATIVE_QUANTITY') ||
+            !issue.eventId
+          ) {
+            continue;
+          }
+          // MERGE + DEDUPE by event id: one row per event. When an event
+          // qualifies through both streams the ISSUE reason wins — the
+          // fold inconsistency is the more specific, more actionable
+          // finding, and its resolution rule (fold-driven) is the
+          // stricter of the two.
+          const existing = candidates.get(issue.eventId);
+          if (
+            existing &&
+            (existing.reason === 'RETURN_WITHOUT_PICKUP' ||
+              existing.reason === 'NEGATIVE_QUANTITY')
+          ) {
+            continue;
+          }
+          const event =
+            existing?.event ??
+            journeyEvents.find((row) => row.id === issue.eventId);
+          if (!event) {
+            continue;
+          }
+          candidates.set(event.id, { event, reason: issue.kind });
+        }
+      }
+      if (batch.length < REVIEW_QUEUE_JOURNEY_BATCH) {
+        break;
+      }
+    }
+    // Final page: sort the MERGED set (occurredAt asc, event id for
+    // stability) and apply the cap only now — after both streams landed.
+    const unresolved = [...candidates.values()]
+      .sort(
+        (a, b) =>
+          a.event.occurredAt.getTime() - b.event.occurredAt.getTime() ||
+          (a.event.id < b.event.id ? -1 : 1),
+      )
+      .slice(0, REVIEW_QUEUE_MAX_ITEMS);
+    const reasonByEventId = new Map(
+      unresolved.map(({ event, reason }) => [event.id, reason]),
+    );
+    const unresolvedEvents = unresolved.map(({ event }) => event);
+    // Journeys re-read tenant-scoped rather than included through the
+    // to-one relation (which cannot carry its own where clause).
+    const journeyIds = [
+      ...new Set(unresolvedEvents.map((event) => event.journeyId)),
+    ];
+    const journeys =
+      journeyIds.length === 0
+        ? []
+        : await this.prisma.customerJourney.findMany({
+            where: { tenantId, id: { in: journeyIds } },
+            select: { id: true, status: true, decision: true },
+          });
+    const journeyById = new Map(journeys.map((row) => [row.id, row]));
+    const runIds = [
+      ...new Set(
+        unresolvedEvents
+          .map((event) => event.fusionRunId)
+          .filter((id): id is string => id !== null),
+      ),
+    ];
+    const runs =
+      runIds.length === 0
+        ? []
+        : await this.prisma.pickupFusionRun.findMany({
+            where: { tenantId, id: { in: runIds } },
+            select: {
+              id: true,
+              fusedTopSku: true,
+              fusedTopScore: true,
+              evidence: true,
+            },
+          });
+    const runById = new Map(runs.map((run) => [run.id, run]));
+    const items: ReviewQueueItem[] = [];
+    for (const event of unresolvedEvents) {
+      const journey = journeyById.get(event.journeyId);
+      if (!journey) {
+        // The tenant-scoped journey re-read found no owner — never render
+        // an orphan (defense in depth; the composite FK makes this
+        // unreachable in a healthy database).
+        continue;
+      }
+      const run = event.fusionRunId
+        ? (runById.get(event.fusionRunId) ?? null)
+        : null;
+      const vlm = run ? vlmSummaryFromEvidence(run.evidence) : null;
+      const latest = (event.reviews ?? [])[event.reviews.length - 1] ?? null;
+      items.push({
+        journeyId: event.journeyId,
+        journeyStatus: journey.status,
+        journeyDecision: journey.decision,
+        eventId: event.id,
+        eventType: event.eventType,
+        occurredAt: event.occurredAt,
+        sourceType: event.sourceType,
+        videoAssetId: event.videoAssetId,
+        fusionRunId: event.fusionRunId,
+        candidateSku: run?.fusedTopSku ?? event.sku,
+        fusedTopScore: run?.fusedTopScore ?? event.matchScore,
+        vlm: vlm
+          ? {
+              status: vlm.status,
+              verdict: vlm.verdict,
+              selectedSku: vlm.selectedSku,
+              requiresHumanReview: vlm.requiresHumanReview,
+            }
+          : null,
+        reason:
+          reasonByEventId.get(event.id) ??
+          (event.eventType === CustomerJourneyEventType.REVIEW_REQUIRED
+            ? 'REVIEW_REQUIRED observation'
+            : 'unknown product'),
+        latestReview: latest
+          ? { decision: latest.decision, createdAt: latest.createdAt }
+          : null,
+      });
+    }
+    return items;
   }
 
   async detail(tenantId: string, journeyId: string): Promise<JourneyDetail> {

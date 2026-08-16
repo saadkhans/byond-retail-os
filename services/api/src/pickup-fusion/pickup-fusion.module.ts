@@ -181,5 +181,9 @@ export class FusionOpsController {
     },
     PickupFusionService,
   ],
+  // Phase 12: the camera replay runtime drives fusion (and reuses the
+  // storage-key media decoder) — service and adapter only, never the VLM
+  // verifier or its token.
+  exports: [PickupFusionService, LocalStorageMediaDecoder],
 })
 export class PickupFusionModule {}
