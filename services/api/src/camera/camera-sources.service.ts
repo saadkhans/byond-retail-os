@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import {
   BadRequestException,
   ConflictException,
@@ -75,29 +76,32 @@ const CONNECTION_KEY_VALUE =
 const DOTTED_HOSTNAME = /\b(?=[a-z])[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}\b/i;
 const IPV4_ADDRESS = /\b\d{1,3}(\.\d{1,3}){3}\b/;
 /** Scheme-relative URL (//host/…): a source address with the scheme
- *  merely omitted — "//" immediately followed by a non-space is never
- *  prose. */
-const SCHEME_RELATIVE = /(^|\s)\/\/\S/;
+ *  merely omitted. "//" immediately followed by a non-space is never
+ *  prose — ANYWHERE in the note, including after punctuation and
+ *  separators (endpoint=(//host/live), see [//host/live]), not only at
+ *  the start or after whitespace. */
+const SCHEME_RELATIVE = /\/\/\S/;
 /** Bracketed IPv6 literal, with or without :port — [fd00::1]:554. */
 const BRACKETED_IPV6 = /\[[0-9a-f:.]+\](:\d+)?/i;
 
-/** Bare IPv6 literal detection over whitespace-split tokens: an address
- *  has ≥2 colons AND either a compressed "::" or a hex LETTER — so shift
- *  times ("12:30"), ratios ("3:2"), and even "12:30:45" stay valid free
- *  text, while fd00::1, ::1, fe80::1%eth0, and full-form addresses with
- *  hex groups are rejected. (An all-digit full-form address with no "::"
- *  is not caught here — the bracketed form above still is.) */
+/** Bare IPv6 literal detection, PARSER-based (Codex P1): tokens are
+ *  split on whitespace and punctuation (brackets, '=', quotes, …) with
+ *  colons kept inside tokens, zone-ids stripped, and each candidate is
+ *  judged by Node's own address parser — `isIP(token) === 6`. This
+ *  catches what shape heuristics missed: all-numeric FULL-FORM addresses
+ *  with no "::" and no hex letters (2001:0:0:0:0:0:0:1), compressed
+ *  forms (fd00::1, ::1), and zone-id forms (fe80::1%eth0) — while shift
+ *  times ("12:30"), ratios ("3:2"), and "12:30:45" are not addresses to
+ *  the parser and stay valid free text. Bracketed [addr](:port) forms
+ *  are rejected by BRACKETED_IPV6 above, and their bracket-stripped
+ *  tokens land here as well. */
 function containsBareIpv6(note: string): boolean {
-  for (const raw of note.split(/[\s,;()]+/)) {
-    const token = raw.replace(/^\[+|\]+$/g, '').split('%')[0];
-    if (!/^[0-9a-f:]+$/i.test(token)) {
+  for (const raw of note.split(/[\s,;()=<>"'`{}[\]]+/)) {
+    if (!raw) {
       continue;
     }
-    const colons = (token.match(/:/g) ?? []).length;
-    if (colons < 2) {
-      continue;
-    }
-    if (token.includes('::') || /[a-f]/i.test(token)) {
+    const token = raw.split('%')[0];
+    if (isIP(token) === 6) {
       return true;
     }
   }

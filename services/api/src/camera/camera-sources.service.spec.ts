@@ -306,8 +306,49 @@ describe('connectionNoteViolation — free text only, no URLs or addresses', () 
       'full-form IPv6 with hex groups',
       assemble('2001:db8:85a3', ':0:0:8a2e', ':370:7334'),
     ],
+    // Codex P1 round 4 — scheme-relative after punctuation/separators, and
+    // ALL-NUMERIC full-form IPv6 (no "::", no hex letters) that only a
+    // real address parser recognizes.
+    [
+      'scheme-relative URL after an equals sign',
+      assemble('endpoint=', '//', 'camera/live'),
+    ],
+    [
+      'scheme-relative URL inside parentheses',
+      assemble('endpoint=(', '//', 'camera/live', ')'),
+    ],
+    [
+      'scheme-relative URL inside brackets',
+      assemble('see [', '//', 'camera/live', ']'),
+    ],
+    ['bare scheme-relative URL', assemble('//', 'camera/live')],
+    [
+      'all-numeric full-form IPv6',
+      assemble('2001:0:0:0', ':0:0:0:1'),
+    ],
+    [
+      'bracketed all-numeric full-form IPv6',
+      assemble('[', '2001:0:0:0', ':0:0:0:1', ']'),
+    ],
+    [
+      'bracketed all-numeric full-form IPv6 with port',
+      assemble('[', '2001:0:0:0', ':0:0:0:1', ']', ':554'),
+    ],
+    [
+      'all-numeric full-form IPv6 after an equals sign',
+      assemble('endpoint=', '2001:0:0:0', ':0:0:0:1'),
+    ],
   ])('rejects a %s', (_label, note) => {
     expect(connectionNoteViolation(note)).not.toBeNull();
+  });
+
+  it('accepts placeholder prose (no URL, no endpoint)', () => {
+    expect(
+      connectionNoteViolation('north shelf camera placeholder only'),
+    ).toBeNull();
+    expect(
+      connectionNoteViolation('camera placeholder, credentials stored separately'),
+    ).toBeNull();
   });
 
   it('accepts benign human notes (measurements are not hostnames)', () => {
