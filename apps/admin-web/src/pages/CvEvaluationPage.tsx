@@ -176,6 +176,49 @@ export function CvEvaluationPage() {
             <p className="muted">No ground-truthed clips with a SKU yet.</p>
           )}
 
+          <h2>
+            Per-SKU confusion — fused top-1 (ground-truthed clips with runs)
+          </h2>
+          {data.confusion.samples > 0 ? (
+            <>
+              <div style={{ overflowX: 'auto' }}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>actual ↓ / predicted →</th>
+                      {data.confusion.labels.map((label) => (
+                        <th key={label}>{label}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.confusion.labels.map((rowLabel, rowIndex) => (
+                      <tr key={rowLabel}>
+                        <td>{rowLabel}</td>
+                        {data.confusion.matrix[rowIndex].map(
+                          (cell, columnIndex) => (
+                            <td
+                              key={`${rowLabel}-${columnIndex}`}
+                              className={cell === 0 ? 'muted' : undefined}
+                            >
+                              {cell === 0 ? '·' : cell}
+                            </td>
+                          ),
+                        )}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="muted">
+                {data.confusion.samples} ground-truthed clip
+                {data.confusion.samples === 1 ? '' : 's'} counted.
+              </p>
+            </>
+          ) : (
+            <p className="muted">No ground-truthed clips with runs yet.</p>
+          )}
+
           <h2>Per-test-type breakdown</h2>
           {data.perTestType.length > 0 ? (
             <table>

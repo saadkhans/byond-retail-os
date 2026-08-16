@@ -9,6 +9,7 @@ import { ConfigService } from '@nestjs/config';
 import {
   EvidenceSourceType,
   FusionPolicyResult,
+  FusionRunScope,
   ProductStatus,
   VideoAssetStatus,
 } from '@prisma/client';
@@ -36,6 +37,7 @@ import {
   ObjectDetector,
   OcrExecutionStatus,
   OcrReader,
+  PickupDetectionOutput,
   PickupEventDetector,
   PickupMediaDecoder,
   QualifiedCrop,
@@ -67,6 +69,14 @@ import {
 } from './primitives';
 
 export const FUSION_PIPELINE_VERSION = 'pickup-fusion-v2';
+
+/** Quiet lead-in prepended to a replay window's detector slice: the
+ *  classical detector models background from its earliest frames, so a
+ *  slice starting mid-motion would see the burst as baseline and detect
+ *  nothing. One second of warm-up before startMs (or one analysis-frame
+ *  interval, whichever is larger); the tail stays tight so a later
+ *  interaction cannot bleed into this window's detection. */
+export const WINDOW_BASELINE_LEAD_IN_MS = 1000;
 
 /**
  * Classified markers persisted IN PLACE of frame-derived text that trips
@@ -378,6 +388,10 @@ export interface FusionEvidence {
     v1Verdict: string | null;
     v2Verdict: string | null;
   };
+  /** Phase 12: set when the camera replay runtime scoped this run to ONE
+   *  extracted event window — recorded so the run is auditable as "this
+   *  window's interaction", never the whole clip. Timestamps only. */
+  replayWindow?: { startMs: number; endMs: number; peakMs: number };
 }
 
 @Injectable()
@@ -570,7 +584,18 @@ export class PickupFusionService {
    * Records a PickupFusionRun row and NOTHING else — no vision events, no
    * inventory writes, no session/billing coupling (requirements 13/15).
    */
-  async run(tenantId: string, videoAssetId: string): Promise<{ runId: string }> {
+  async run(
+    tenantId: string,
+    videoAssetId: string,
+    options?: {
+      /** Phase 12 camera replay: scope this run to ONE extracted event
+       *  window. Detection still runs normally; its events are then
+       *  filtered to the window (best overlap first) so the pipeline —
+       *  crops, signals, VLM, policy — describes that window's
+       *  interaction. No window ⇒ behavior is byte-for-byte unchanged. */
+      window?: { startMs: number; endMs: number; peakMs: number };
+    },
+  ): Promise<{ runId: string }> {
     const startedAt = Date.now();
     const stages: StageTiming[] = [];
     const timed = async <T>(
@@ -693,11 +718,76 @@ export class PickupFusionService {
       );
 
       // ---- detection + tracking ---------------------------------------
-      const detection = await timed('event-detection', this.detector, () =>
-        this.detector.detect(framesSmall, geometrySmall, source),
+      // Phase 12 replay-window scoping, part 1 (Codex P1): the DETECTOR
+      // INPUT is constrained to the window BEFORE detection runs, so each
+      // window finds its own LOCAL motion peak. Without this, a clip with
+      // two interactions would hand every window the same global peak.
+      // The slice is ASYMMETRIC: the classical detector models background
+      // from its earliest frames, so a slice that begins mid-motion sees
+      // the burst AS the baseline and reports nothing — the window gets a
+      // quiet LEAD-IN for warm-up, while the tail keeps only one frame
+      // interval so a later interaction never bleeds in. The overlap
+      // filter below still binds the chosen event to the window itself.
+      const window = options?.window ?? null;
+      if (window) {
+        evidence.replayWindow = { ...window };
+      }
+      const frameMarginMs = 1000 / this.detectionConfig.analysisFps;
+      const leadInMs = Math.max(WINDOW_BASELINE_LEAD_IN_MS, frameMarginMs);
+      const framesForDetection = window
+        ? framesSmall.filter(
+            (frame) =>
+              frame.timestampMs >= window.startMs - leadInMs &&
+              frame.timestampMs <= window.endMs + frameMarginMs,
+          )
+        : framesSmall;
+      let detection = await timed('event-detection', this.detector, () =>
+        this.detector.detect(framesForDetection, geometrySmall, source),
       );
       evidence.detector.warnings = detection.warnings;
-      evidence.detector.events = detection.events.map((event) => ({
+      // Part 2, belt-and-braces: keep only detector events that overlap
+      // the window, best overlap first (ties: earliest). A non-overlapping
+      // window leaves an empty list and follows the existing no-event path
+      // below unchanged.
+      const overlapWith = (event: { startMs: number; endMs: number }): number =>
+        Math.min(event.endMs, window!.endMs) -
+        Math.max(event.startMs, window!.startMs);
+      const scopeToWindow = (
+        events: PickupDetectionOutput['events'],
+      ): PickupDetectionOutput['events'] =>
+        events
+          .filter((event) => overlapWith(event) >= 0)
+          .sort(
+            (a, b) => overlapWith(b) - overlapWith(a) || a.startMs - b.startMs,
+          );
+      let scopedEvents = window ? scopeToWindow(detection.events) : detection.events;
+      if (
+        window &&
+        scopedEvents.length === 0 &&
+        framesForDetection.length < framesSmall.length
+      ) {
+        // The classical detector rates a burst against the QUIET context
+        // around it (background windows, peak-to-baseline ratio) — a tight
+        // slice that is mostly burst can rate as no-event even though the
+        // interaction is real. Fall back to full-clip detection while the
+        // overlap filter above KEEPS the window binding: only an event
+        // overlapping THIS window can be chosen, so a second window can
+        // never inherit another window's peak. The fallback is recorded in
+        // the evidence for auditability.
+        const fallback = await timed(
+          'event-detection-fallback',
+          this.detector,
+          () => this.detector.detect(framesSmall, geometrySmall, source),
+        );
+        evidence.detector.warnings = [
+          ...detection.warnings,
+          'WINDOW_LOCAL_DETECTION_EMPTY',
+          ...fallback.warnings,
+        ];
+        detection = fallback;
+        scopedEvents = scopeToWindow(fallback.events);
+      }
+      evidence.detector.events = scopedEvents.map((event) => ({
         ...event,
         box: scaleBoxToSource(event.box, geometrySmall, source),
       }));
@@ -710,7 +800,7 @@ export class PickupFusionService {
         })),
       }));
 
-      if (detection.events.length === 0) {
+      if (scopedEvents.length === 0) {
         const cameraMotion = detection.warnings.includes('CAMERA_MOTION_SUSPECTED');
         evidence.policy = cameraMotion
           ? {
@@ -724,7 +814,7 @@ export class PickupFusionService {
         return this.persist(tenantId, videoAssetId, evidence, startedAt);
       }
 
-      const primary = detection.events[0];
+      const primary = scopedEvents[0];
 
       // ---- multi-frame crop selection (req 4) --------------------------
       // Only the instants the pipeline actually consumes are decoded at
@@ -1260,6 +1350,12 @@ export class PickupFusionService {
         tenantId,
         videoAssetId,
         pipelineVersion: FUSION_PIPELINE_VERSION,
+        // Scope from the audit marker itself: a window-scoped replay run
+        // must never masquerade as (or displace) the whole-clip analysis
+        // that evaluation metrics are built on.
+        runScope: evidence.replayWindow
+          ? FusionRunScope.REPLAY_WINDOW
+          : FusionRunScope.WHOLE_CLIP,
         policy: evidence.policy.result,
         fusedTopSku: top?.sku ?? null,
         fusedTopScore: top?.fusedScore ?? null,

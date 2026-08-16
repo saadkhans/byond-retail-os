@@ -1,5 +1,10 @@
 import { ConfigService } from '@nestjs/config';
-import { FusionPolicyResult, ProductStatus, VideoAssetStatus } from '@prisma/client';
+import {
+  FusionPolicyResult,
+  FusionRunScope,
+  ProductStatus,
+  VideoAssetStatus,
+} from '@prisma/client';
 import { WeightedCandidateFusion } from './adapters/context-fusion-inventory';
 import { HogLabVisualRetriever } from './adapters/visual-signals';
 import { EMBEDDING_MODEL_KEY, EMBEDDING_MODEL_VERSION } from './primitives';
@@ -173,7 +178,7 @@ function buildService(options: {
    *  requested candidate (the gate FAILS CLOSED on anything else). */
   inventoryValidate?: jest.Mock;
 }) {
-  const createdRuns: { data: { policy: FusionPolicyResult; fusedTopSku: string | null; evidence: FusionEvidence } }[] = [];
+  const createdRuns: { data: { policy: FusionPolicyResult; fusedTopSku: string | null; evidence: FusionEvidence; runScope: FusionRunScope } }[] = [];
   // Behaves like the DB: honors the status filter the service sends.
   const productFindMany = jest.fn(
     async (args: { where: { status?: ProductStatus } }) =>
@@ -251,7 +256,7 @@ function buildService(options: {
   const detector = {
     adapterKey: 'stub-detector',
     version: '1.0.0',
-    detect: jest.fn(async () => ({
+    detect: jest.fn(async (_frames: { timestampMs: number }[]) => ({
       events: [
         {
           kind: 'PICKUP' as const,
@@ -353,7 +358,7 @@ function buildService(options: {
     (() => ({})) as never,
     { get: (key: string) => options.config?.[key] } as unknown as ConfigService,
   );
-  return { service, productFindMany, createdRuns, decoder };
+  return { service, productFindMany, createdRuns, decoder, detector };
 }
 
 describe('fusion catalog is constrained to ACTIVE products', () => {
@@ -948,5 +953,116 @@ describe('reference-index rebuild swaps atomically (old index intact until commi
     // The rejection propagates OUT of $transaction (Prisma rolls back) —
     // the live client never deleted the old generation.
     expect(prisma.productReferenceEmbedding.deleteMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('Phase 12 replay-window scoping (camera runtime)', () => {
+  const NO_CANDIDATES = {
+    catalog: [] as CatalogFixture[],
+    barcodeSeen: '6281000000002',
+    classicalSignals: [] as CandidateSignal[],
+  };
+
+  it('a window overlapping the detected event keeps it and records replayWindow', async () => {
+    const { service, createdRuns } = buildService(NO_CANDIDATES);
+    await service.run('tenant-1', 'asset-1', {
+      window: { startMs: 1000, endMs: 2000, peakMs: 1600 },
+    });
+    const { data } = createdRuns[0];
+    expect(data.evidence.replayWindow).toEqual({
+      startMs: 1000,
+      endMs: 2000,
+      peakMs: 1600,
+    });
+    // The stub detector's 1500–2500 event overlaps 1000–2000 and survives.
+    expect(data.evidence.detector.events).toHaveLength(1);
+  });
+
+  it('a NON-overlapping window follows the existing no-event path', async () => {
+    const { service, createdRuns } = buildService(NO_CANDIDATES);
+    await service.run('tenant-1', 'asset-1', {
+      window: { startMs: 4000, endMs: 5000, peakMs: 4500 },
+    });
+    const { data } = createdRuns[0];
+    // The 1500–2500 detector event does NOT overlap 4000–5000: filtered
+    // out, so this window's run records no event and no crops.
+    expect(data.evidence.detector.events).toHaveLength(0);
+    expect(data.evidence.crops).toHaveLength(0);
+    expect(data.policy).toBe(FusionPolicyResult.UNKNOWN_PRODUCT);
+  });
+
+  it('no options → whole-clip behavior unchanged, no replayWindow recorded', async () => {
+    const { service, createdRuns } = buildService(NO_CANDIDATES);
+    await service.run('tenant-1', 'asset-1');
+    const { data } = createdRuns[0];
+    expect(data.evidence.replayWindow).toBeUndefined();
+    expect(data.evidence.detector.events).toHaveLength(1);
+    expect(data.runScope).toBe(FusionRunScope.WHOLE_CLIP);
+  });
+
+  it('the DETECTOR INPUT is constrained to the window (baseline lead-in before, one frame margin after)', async () => {
+    const { service, detector } = buildService(NO_CANDIDATES);
+    // Decoder frames land at 0/1000/2000/3000/4000ms; analysisFps 2 →
+    // tail margin 500ms, lead-in WINDOW_BASELINE_LEAD_IN_MS (1s — the
+    // classical detector needs quiet warm-up frames or it models the
+    // burst itself as background). A 1000–2000 window therefore admits
+    // [0 (lead-in), 1000, 2000] and NOTHING after 2500ms — the later
+    // clip content stays invisible to this window's detection.
+    await service.run('tenant-1', 'asset-1', {
+      window: { startMs: 1000, endMs: 2000, peakMs: 1600 },
+    });
+    const framesSeen = detector.detect.mock.calls[0][0].map(
+      (frame) => frame.timestampMs,
+    );
+    expect(framesSeen).toEqual([0, 1000, 2000]);
+  });
+
+  it('TWO windows each detect their OWN local peak — never the global one', async () => {
+    const { service, createdRuns, detector } = buildService(NO_CANDIDATES);
+    // A detector that (like the real one) derives its event from the
+    // frames it is GIVEN: peak = the middle frame it received. If the
+    // whole clip leaked in, both windows would report the same peak.
+    detector.detect.mockImplementation(
+      async (frames: { timestampMs: number }[]) => {
+        const peakMs = frames[Math.floor(frames.length / 2)].timestampMs;
+        return {
+          events: [
+            {
+              kind: 'PICKUP' as const,
+              startMs: frames[0].timestampMs,
+              peakMs,
+              endMs: frames[frames.length - 1].timestampMs,
+              trackId: 't1',
+              shelfZoneId: 'z-1-1',
+              box: { x: 4, y: 4, width: 12, height: 12 },
+            },
+          ],
+          tracks: [],
+          warnings: [],
+        };
+      },
+    );
+    await service.run('tenant-1', 'asset-1', {
+      window: { startMs: 500, endMs: 1500, peakMs: 1000 },
+    });
+    await service.run('tenant-1', 'asset-1', {
+      window: { startMs: 2500, endMs: 3500, peakMs: 3000 },
+    });
+    expect(createdRuns).toHaveLength(2);
+    const firstPeak = createdRuns[0].data.evidence.detector.events[0].peakMs;
+    const secondPeak = createdRuns[1].data.evidence.detector.events[0].peakMs;
+    expect(firstPeak).not.toBe(secondPeak);
+    expect(firstPeak).toBeGreaterThanOrEqual(500 - 500);
+    expect(firstPeak).toBeLessThanOrEqual(1500 + 500);
+    expect(secondPeak).toBeGreaterThanOrEqual(2500 - 500);
+    expect(secondPeak).toBeLessThanOrEqual(3500 + 500);
+  });
+
+  it('a window-scoped run persists as REPLAY_WINDOW — whole-clip evaluation never sees it', async () => {
+    const { service, createdRuns } = buildService(NO_CANDIDATES);
+    await service.run('tenant-1', 'asset-1', {
+      window: { startMs: 1000, endMs: 2000, peakMs: 1600 },
+    });
+    expect(createdRuns[0].data.runScope).toBe(FusionRunScope.REPLAY_WINDOW);
   });
 });

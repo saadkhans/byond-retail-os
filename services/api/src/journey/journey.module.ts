@@ -48,6 +48,19 @@ export class JourneyController {
     return this.journeys.list(tenantId);
   }
 
+  // Declared BEFORE ':id' — Nest matches routes in declaration order, and
+  // 'review-queue' must never be captured as a journey id.
+  @Get('review-queue')
+  @RequirePermissions('vision:read')
+  @ApiOperation({
+    summary:
+      'Uncertain observations awaiting review (oldest first) — read-only; ' +
+      'decisions go through the per-event review endpoint',
+  })
+  reviewQueue(@CurrentTenantId() tenantId: string) {
+    return this.journeys.reviewQueue(tenantId);
+  }
+
   @Get(':id')
   @RequirePermissions('vision:read')
   @ApiOperation({
@@ -167,5 +180,8 @@ export class JourneyController {
   imports: [PlatformModulesModule],
   controllers: [JourneyController],
   providers: [JourneyService],
+  // Phase 12: the camera replay runtime opens/imports/exits shadow
+  // journeys through the SAME service (same locks, same guarantees).
+  exports: [JourneyService],
 })
 export class JourneyModule {}

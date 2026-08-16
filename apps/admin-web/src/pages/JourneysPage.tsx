@@ -12,6 +12,11 @@ import {
 } from '../api';
 import { Page, StatusBadge, formatDate, useLoad } from '../components';
 import { decisionTone } from '../cv-evaluation-utils';
+import {
+  CorrectionDraft,
+  newCorrectionDraft,
+  validateCorrectionDraft,
+} from '../review-correction';
 
 function errorMessage(err: unknown): string {
   return err instanceof ApiError ? err.message : 'Unexpected error';
@@ -131,12 +136,10 @@ export function JourneyDetailPage() {
   const [productId, setProductId] = useState('');
   const [eventType, setEventType] = useState('PRODUCT_PICKUP');
   const [assetId, setAssetId] = useState('');
-  // Inline CORRECT form state (one event at a time).
-  const [correctingId, setCorrectingId] = useState<string | null>(null);
-  const [correctProductId, setCorrectProductId] = useState('');
-  const [correctQuantity, setCorrectQuantity] = useState('1');
-  const [correctEventType, setCorrectEventType] = useState('PRODUCT_PICKUP');
-  const [reviewReason, setReviewReason] = useState('');
+  // Inline CORRECT form state: ONE draft object keyed by its event,
+  // replaced whole on row switch — reason/product/quantity can never
+  // leak from one observation's form into another's audited review.
+  const [draft, setDraft] = useState<CorrectionDraft | null>(null);
 
   const journey = useLoad<JourneyDetail>(() => api(`/journeys/${id}`), [id, reload]);
   const products = useLoad<Paginated<Product>>(
@@ -156,8 +159,7 @@ export function JourneyDetailPage() {
     setError(null);
     try {
       await api(`/journeys/${id}${path}`, { method: 'POST', body });
-      setCorrectingId(null);
-      setReviewReason('');
+      setDraft(null);
       setReload((n) => n + 1);
     } catch (err) {
       setError(errorMessage(err));
@@ -178,8 +180,7 @@ export function JourneyDetailPage() {
         body: { ...body, idempotencyKey },
       });
       reviewKeys.current.delete(eventId);
-      setCorrectingId(null);
-      setReviewReason('');
+      setDraft(null);
       setReload((n) => n + 1);
     } catch (err) {
       setError(errorMessage(err));
@@ -193,34 +194,26 @@ export function JourneyDetailPage() {
     productId: string | null;
     quantity: number;
   }) {
-    setCorrectingId(eventId);
-    setCorrectProductId(original.productId ?? '');
-    setCorrectQuantity(String(original.quantity));
-    setCorrectEventType(
-      original.eventType === 'PRODUCT_RETURN'
-        ? 'PRODUCT_RETURN'
-        : 'PRODUCT_PICKUP',
-    );
+    // Whole-draft swap — a fresh draft per event, seeded only from that
+    // event's own observation.
+    setDraft(newCorrectionDraft(eventId, original));
   }
 
   function submitCorrect(eventId: string) {
-    const quantity = Number(correctQuantity.trim());
-    if (
-      !correctProductId ||
-      correctQuantity.trim() === '' ||
-      !Number.isInteger(quantity) ||
-      quantity < 1 ||
-      quantity > 100
-    ) {
-      setError('A correction needs a product and a whole quantity 1..100.');
+    if (!draft || draft.eventId !== eventId) {
+      return;
+    }
+    const validation = validateCorrectionDraft(draft);
+    if (!validation.ok) {
+      setError(validation.error);
       return;
     }
     void submitReview(eventId, {
       decision: 'CORRECT',
-      correctedEventType: correctEventType,
-      correctedProductId: correctProductId,
-      correctedQuantity: quantity,
-      ...(reviewReason.trim() ? { reason: reviewReason.trim() } : {}),
+      correctedEventType: draft.eventType,
+      correctedProductId: draft.productId,
+      correctedQuantity: validation.quantity,
+      ...(draft.reason.trim() ? { reason: draft.reason.trim() } : {}),
     });
   }
 
@@ -408,21 +401,31 @@ export function JourneyDetailPage() {
                         )}
                       </td>
                     </tr>
-                    {correctingId === event.id ? (
+                    {draft?.eventId === event.id ? (
                       <tr>
                         <td colSpan={10}>
                           <div className="toolbar" style={{ flexWrap: 'wrap' }}>
                             <span className="muted">Correction:</span>
                             <select
-                              value={correctEventType}
-                              onChange={(e) => setCorrectEventType(e.target.value)}
+                              value={draft.eventType}
+                              onChange={(e) =>
+                                setDraft({
+                                  ...draft,
+                                  eventType:
+                                    e.target.value === 'PRODUCT_RETURN'
+                                      ? 'PRODUCT_RETURN'
+                                      : 'PRODUCT_PICKUP',
+                                })
+                              }
                             >
                               <option value="PRODUCT_PICKUP">PRODUCT_PICKUP</option>
                               <option value="PRODUCT_RETURN">PRODUCT_RETURN</option>
                             </select>
                             <select
-                              value={correctProductId}
-                              onChange={(e) => setCorrectProductId(e.target.value)}
+                              value={draft.productId}
+                              onChange={(e) =>
+                                setDraft({ ...draft, productId: e.target.value })
+                              }
                             >
                               <option value="">Actual product…</option>
                               {(products.data?.items ?? []).map((product) => (
@@ -437,15 +440,19 @@ export function JourneyDetailPage() {
                               max={100}
                               step={1}
                               style={{ width: '5rem' }}
-                              value={correctQuantity}
-                              onChange={(e) => setCorrectQuantity(e.target.value)}
+                              value={draft.quantity}
+                              onChange={(e) =>
+                                setDraft({ ...draft, quantity: e.target.value })
+                              }
                             />
                             <input
                               type="text"
                               style={{ minWidth: '14rem' }}
                               placeholder="Reason (optional)"
-                              value={reviewReason}
-                              onChange={(e) => setReviewReason(e.target.value)}
+                              value={draft.reason}
+                              onChange={(e) =>
+                                setDraft({ ...draft, reason: e.target.value })
+                              }
                             />
                             <button
                               className="primary"
@@ -456,7 +463,7 @@ export function JourneyDetailPage() {
                             </button>
                             <button
                               disabled={busy}
-                              onClick={() => setCorrectingId(null)}
+                              onClick={() => setDraft(null)}
                             >
                               Cancel
                             </button>

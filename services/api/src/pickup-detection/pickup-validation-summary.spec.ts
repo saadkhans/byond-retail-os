@@ -33,6 +33,10 @@ interface FusionRunFixture {
   id: string;
   tenantId: string;
   videoAssetId: string;
+  /** Defaults to WHOLE_CLIP in fixtures — REPLAY_WINDOW rows model a
+   *  camera replay's window-scoped runs, which the dashboard must never
+   *  score (Codex P1). */
+  runScope?: 'WHOLE_CLIP' | 'REPLAY_WINDOW';
   policy: FusionPolicyResult;
   fusedTopSku: string | null;
   fusedTopScore: number | null;
@@ -146,6 +150,7 @@ function buildService(overrides: {
         tenantId: string;
         videoAssetId: { in: string[] };
         policy?: { not: FusionPolicyResult };
+        runScope?: string;
       };
     }) =>
       (overrides.fusionRuns ?? [])
@@ -154,7 +159,11 @@ function buildService(overrides: {
             run.tenantId === args.where.tenantId &&
             args.where.videoAssetId.in.includes(run.videoAssetId) &&
             (args.where.policy === undefined ||
-              run.policy !== args.where.policy.not),
+              run.policy !== args.where.policy.not) &&
+            // Honors the scope predicate like the real database — a query
+            // missing it would surface REPLAY_WINDOW rows here.
+            (args.where.runScope === undefined ||
+              (run.runScope ?? 'WHOLE_CLIP') === args.where.runScope),
         )
         .sort(byNewest),
   );
@@ -263,6 +272,43 @@ describe('summary — FAILED fusion runs are not results', () => {
     expect(row.fusionVerdict).toBe('correct');
     // Fusion-only row: v1 stays unscored per the either-pipeline rule.
     expect(row.outcome).toBe('unscored');
+  });
+
+  it('a NEWER replay-window run does not displace the whole-clip result (Codex P1)', async () => {
+    const { service, fusionFindMany } = buildService({
+      fusionRuns: [
+        {
+          id: 'run-whole',
+          tenantId: TENANT,
+          videoAssetId: ASSET,
+          runScope: 'WHOLE_CLIP',
+          policy: FusionPolicyResult.AUTO_PROPOSE,
+          fusedTopSku: SKU,
+          fusedTopScore: 0.8,
+          createdAt: new Date('2026-08-10T01:00:00Z'),
+        },
+        {
+          id: 'run-window',
+          tenantId: TENANT,
+          videoAssetId: ASSET,
+          runScope: 'REPLAY_WINDOW',
+          policy: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
+          fusedTopSku: 'SKU-WRONG',
+          fusedTopScore: 0.1,
+          createdAt: new Date('2026-08-16T02:00:00Z'),
+        },
+      ],
+      jobs: [],
+    });
+    const summary = await service.summary(TENANT);
+    expect(summary.rows[0].fusionTopSku).toBe(SKU);
+    expect(summary.rows[0].fusionVerdict).toBe('correct');
+    // The scope predicate lives in the QUERY, not post-filtering.
+    expect(fusionFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ runScope: 'WHOLE_CLIP' }),
+      }),
+    );
   });
 });
 

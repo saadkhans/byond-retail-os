@@ -4,6 +4,7 @@ import {
   EvalRun,
   SCORE_NOTE,
   basketDeltasEqual,
+  buildConfusion,
   evaluateClip,
   evaluateScenario,
   expectedBasketDelta,
@@ -602,5 +603,87 @@ describe('vlm agreement over answered verdicts', () => {
     expect(summary.vlmAgreement.vlmAnsweredCount).toBe(0);
     expect(summary.vlmAgreement.vlmAbstentionCount).toBe(10);
     expect(summary.vlmAgreement.vlmAbstentionRate).toBe(1);
+  });
+});
+
+describe('buildConfusion (per-SKU actual × predicted)', () => {
+  const pair = (g: EvalGroundTruth, r: EvalRun | null) => ({
+    gt: g,
+    clip: evaluateClip(g, r),
+  });
+
+  it('counts correct predictions on the diagonal', () => {
+    const confusion = buildConfusion([
+      pair(gt({ sku: 'WATER-500' }), run({ fused: ['WATER-500'] })),
+      pair(gt({ sku: 'WATER-500' }), run({ fused: ['WATER-500'] })),
+      pair(gt({ sku: 'COLA-330' }), run({ fused: ['COLA-330'] })),
+    ]);
+    expect(confusion.labels).toEqual(['COLA-330', 'WATER-500', 'NONE']);
+    const water = confusion.labels.indexOf('WATER-500');
+    const cola = confusion.labels.indexOf('COLA-330');
+    expect(confusion.matrix[water][water]).toBe(2);
+    expect(confusion.matrix[cola][cola]).toBe(1);
+    expect(confusion.samples).toBe(3);
+  });
+
+  it('a false pickup on a NONE clip lands in the NONE row / predicted column', () => {
+    const confusion = buildConfusion([
+      pair(
+        gt({ eventKind: GroundTruthEventKind.NONE, sku: null }),
+        run({ fused: ['COLA-330'] }),
+      ),
+    ]);
+    const none = confusion.labels.indexOf('NONE');
+    const cola = confusion.labels.indexOf('COLA-330');
+    expect(confusion.matrix[none][cola]).toBe(1);
+  });
+
+  it('a missed pickup lands in the actual row / NONE column', () => {
+    const confusion = buildConfusion([
+      pair(gt({ sku: 'WATER-500' }), run({ kind: null, fused: [] })),
+    ]);
+    const water = confusion.labels.indexOf('WATER-500');
+    const none = confusion.labels.indexOf('NONE');
+    expect(confusion.matrix[water][none]).toBe(1);
+  });
+
+  it('clips without a run are excluded; empty input degrades cleanly', () => {
+    const withoutRun = buildConfusion([pair(gt(), null)]);
+    expect(withoutRun.samples).toBe(0);
+    const empty = buildConfusion([]);
+    expect(empty).toEqual({ labels: ['NONE'], matrix: [[0]], samples: 0 });
+  });
+
+  it('is FUSED TOP-1: a VLM MATCH rescuing a mis-ranked candidate still records the wrong top-1 (Codex P1)', () => {
+    // Fusion ranked COLA-330 first; the VLM MATCHed the true WATER-500.
+    // The fused-top-1 matrix must show actual WATER-500 → predicted
+    // COLA-330 — the VLM-adjusted pick is a different metric and never
+    // bleeds into this one.
+    const confusion = buildConfusion([
+      pair(
+        gt({ sku: 'WATER-500' }),
+        run({
+          fused: ['COLA-330', 'WATER-500'],
+          vlm: {
+            invoked: true,
+            status: 'VERDICT',
+            verdict: 'MATCH',
+            selectedSku: 'WATER-500',
+          },
+        }),
+      ),
+    ]);
+    const water = confusion.labels.indexOf('WATER-500');
+    const cola = confusion.labels.indexOf('COLA-330');
+    expect(confusion.matrix[water][cola]).toBe(1);
+    expect(confusion.matrix[water][water]).toBe(0);
+  });
+
+  it('summarize exposes the confusion matrix', () => {
+    const summary = summarize([
+      pair(gt({ sku: 'WATER-500' }), run({ fused: ['WATER-500'] })),
+    ]);
+    expect(summary.confusion.samples).toBe(1);
+    expect(summary.confusion.labels).toContain('WATER-500');
   });
 });
