@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import {
   RTSP_SAMPLE_ERROR_CODES,
   RtspFrameSampler,
+  urlCarriesCredentials,
 } from './rtsp-frame-sampler';
 
 jest.mock('node:child_process', () => ({
@@ -22,7 +23,9 @@ const childProcess = { spawn: spawn as unknown as jest.Mock };
  */
 
 const SLOT = 'CAMERA_SECRET_SLOT_TEST';
-const ENV_KEY = 'CAMERA_RTSP_SOURCE_' + SLOT;
+const TENANT = 'tenanta1b2c3';
+// Tenant-BOUND env key (Codex P1): the tenant id is part of the name.
+const ENV_KEY = 'CAMERA_RTSP_SOURCE_' + TENANT.toUpperCase() + '_' + SLOT;
 // Sentinel assembled at runtime; recognizable, not URL- or secret-shaped.
 const SENTINEL = ['sentinel', 'source', 'value'].join('-');
 
@@ -48,16 +51,16 @@ describe('RtspFrameSampler', () => {
 
   it('resolveSource reports presence only — never the value', () => {
     const sampler = buildSampler();
-    expect(sampler.resolveSource(SLOT)).toEqual({ configured: false });
+    expect(sampler.resolveSource(TENANT, SLOT)).toEqual({ configured: false });
     process.env[ENV_KEY] = SENTINEL;
-    const resolved = sampler.resolveSource(SLOT);
+    const resolved = sampler.resolveSource(TENANT, SLOT);
     expect(resolved).toEqual({ configured: true });
     expect(JSON.stringify(resolved)).not.toContain(SENTINEL);
   });
 
   it('missing configuration fails safely with RTSP_SOURCE_NOT_CONFIGURED (no spawn)', async () => {
     const sampler = buildSampler();
-    const result = await sampler.sampleFrame(SLOT, {
+    const result = await sampler.sampleFrame(TENANT, SLOT, {
       width: 4,
       height: 4,
       timeoutMs: 2000,
@@ -68,7 +71,7 @@ describe('RtspFrameSampler', () => {
 
   it('a malformed slot name resolves to not-configured (no env interpolation risk)', async () => {
     const sampler = buildSampler();
-    const result = await sampler.sampleFrame('not a slot!', {
+    const result = await sampler.sampleFrame(TENANT, 'not a slot!', {
       width: 4,
       height: 4,
       timeoutMs: 2000,
@@ -81,7 +84,7 @@ describe('RtspFrameSampler', () => {
     const child = new FakeChild();
     childProcess.spawn.mockReturnValue(child);
     const sampler = buildSampler();
-    const pending = sampler.sampleFrame(SLOT, {
+    const pending = sampler.sampleFrame(TENANT, SLOT, {
       width: 4,
       height: 4,
       timeoutMs: 2000,
@@ -96,7 +99,7 @@ describe('RtspFrameSampler', () => {
     const child = new FakeChild();
     childProcess.spawn.mockReturnValue(child);
     const sampler = buildSampler();
-    const pending = sampler.sampleFrame(SLOT, {
+    const pending = sampler.sampleFrame(TENANT, SLOT, {
       width: 4,
       height: 4,
       timeoutMs: 2000,
@@ -114,7 +117,7 @@ describe('RtspFrameSampler', () => {
     const child = new FakeChild();
     childProcess.spawn.mockReturnValue(child);
     const sampler = buildSampler();
-    const pending = sampler.sampleFrame(SLOT, {
+    const pending = sampler.sampleFrame(TENANT, SLOT, {
       width: 4,
       height: 4,
       timeoutMs: 2000,
@@ -130,7 +133,7 @@ describe('RtspFrameSampler', () => {
     const child = new FakeChild();
     childProcess.spawn.mockReturnValue(child);
     const sampler = buildSampler();
-    const pending = sampler.sampleFrame(SLOT, {
+    const pending = sampler.sampleFrame(TENANT, SLOT, {
       width: 4,
       height: 4,
       timeoutMs: 2000,
@@ -155,7 +158,7 @@ describe('RtspFrameSampler', () => {
       const child = new FakeChild();
       childProcess.spawn.mockReturnValue(child);
       const sampler = buildSampler();
-      const pending = sampler.sampleFrame(SLOT, {
+      const pending = sampler.sampleFrame(TENANT, SLOT, {
         width: 4,
         height: 4,
         timeoutMs: 1500,
@@ -174,7 +177,7 @@ describe('RtspFrameSampler', () => {
     const child = new FakeChild();
     childProcess.spawn.mockReturnValue(child);
     const sampler = buildSampler();
-    const pending = sampler.sampleFrame(SLOT, {
+    const pending = sampler.sampleFrame(TENANT, SLOT, {
       width: 4,
       height: 4,
       timeoutMs: 2000,
@@ -189,10 +192,117 @@ describe('RtspFrameSampler', () => {
     expect(JSON.stringify(options)).not.toContain('shell');
   });
 
+
+  it('resolution is TENANT-BOUND: another tenant with the same slot resolves nothing', async () => {
+    process.env[ENV_KEY] = SENTINEL;
+    const sampler = buildSampler();
+    // Tenant A (whose key exists) resolves.
+    expect(sampler.resolveSource(TENANT, SLOT)).toEqual({ configured: true });
+    // Tenant B registering the SAME public slot name resolves only its
+    // own (absent) configuration — never tenant A's feed.
+    const other = 'tenantz9y8x7';
+    expect(sampler.resolveSource(other, SLOT)).toEqual({ configured: false });
+    const result = await sampler.sampleFrame(other, SLOT, {
+      width: 4,
+      height: 4,
+      timeoutMs: 2000,
+    });
+    expect(result).toEqual({ ok: false, code: 'RTSP_SOURCE_NOT_CONFIGURED' });
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain(SENTINEL);
+  });
+
+  it('a malformed tenant id resolves to not-configured (no env interpolation risk)', () => {
+    process.env[ENV_KEY] = SENTINEL;
+    const sampler = buildSampler();
+    expect(sampler.resolveSource('not a tenant!', SLOT)).toEqual({
+      configured: false,
+    });
+  });
+
+  it('a credential-bearing URL (userinfo) is rejected BEFORE any spawn', async () => {
+    // Assembled at runtime — no URL-shaped literal lives in this file.
+    process.env[ENV_KEY] =
+      'rtsp' + '://' + ['user', 'pw'].join(':') + '@' + 'cam-host/live';
+    const sampler = buildSampler();
+    const result = await sampler.sampleFrame(TENANT, SLOT, {
+      width: 4,
+      height: 4,
+      timeoutMs: 2000,
+    });
+    expect(result).toEqual({
+      ok: false,
+      code: 'RTSP_CREDENTIALS_IN_URL_UNSUPPORTED',
+    });
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain('cam-host');
+  });
+
+  it('a token-like query parameter is rejected BEFORE any spawn', async () => {
+    process.env[ENV_KEY] =
+      'rtsp' + '://' + 'cam-host/live' + '?' + 'to' + 'ken=' + 'sentinelvalue';
+    const sampler = buildSampler();
+    const result = await sampler.sampleFrame(TENANT, SLOT, {
+      width: 4,
+      height: 4,
+      timeoutMs: 2000,
+    });
+    expect(result).toEqual({
+      ok: false,
+      code: 'RTSP_CREDENTIALS_IN_URL_UNSUPPORTED',
+    });
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain('sentinelvalue');
+  });
+
+  it('a credential-free rtsp value still reaches spawn; an @ in a plain path does not trip the gate', async () => {
+    process.env[ENV_KEY] = 'rtsp' + '://' + 'cam-host/live';
+    const child = new FakeChild();
+    childProcess.spawn.mockReturnValue(child);
+    const sampler = buildSampler();
+    const pending = sampler.sampleFrame(TENANT, SLOT, {
+      width: 4,
+      height: 4,
+      timeoutMs: 2000,
+    });
+    child.emit('close', 1);
+    await pending;
+    expect(childProcess.spawn).toHaveBeenCalledTimes(1);
+    jest.clearAllMocks();
+    // A scheme-less path with an '@' is a file, not a URL — unaffected.
+    process.env[ENV_KEY] = 'feeds' + '@' + 'shelf.png';
+    const child2 = new FakeChild();
+    childProcess.spawn.mockReturnValue(child2);
+    const pending2 = sampler.sampleFrame(TENANT, SLOT, {
+      width: 4,
+      height: 4,
+      timeoutMs: 2000,
+    });
+    child2.emit('close', 1);
+    const result2 = await pending2;
+    expect(childProcess.spawn).toHaveBeenCalledTimes(1);
+    expect(result2).toEqual({ ok: false, code: 'RTSP_CONNECT_FAILED' });
+  });
+
+  it('urlCarriesCredentials: pure gate covers userinfo, token keys, unparseable authority @, and skips paths', () => {
+    const scheme = 'rtsp' + '://';
+    expect(urlCarriesCredentials(scheme + 'user@host/live')).toBe(true);
+    expect(urlCarriesCredentials(scheme + 'u:p@host/live')).toBe(true);
+    expect(urlCarriesCredentials(scheme + 'host/live?apikey=v')).toBe(true);
+    expect(urlCarriesCredentials(scheme + 'host/live?Access_Token=v')).toBe(
+      true,
+    );
+    expect(urlCarriesCredentials(scheme + 'host/live?fps=5')).toBe(false);
+    expect(urlCarriesCredentials(scheme + 'host/live')).toBe(false);
+    expect(urlCarriesCredentials('C:/dev/feed.png')).toBe(false);
+    expect(urlCarriesCredentials('feed@home.png')).toBe(false);
+  });
+
   it('exports exactly the controlled error-code vocabulary', () => {
     expect([...RTSP_SAMPLE_ERROR_CODES].sort()).toEqual(
       [
         'RTSP_CONNECT_FAILED',
+        'RTSP_CREDENTIALS_IN_URL_UNSUPPORTED',
         'RTSP_FRAME_SAMPLE_FAILED',
         'RTSP_SOURCE_NOT_CONFIGURED',
         'RTSP_TIMEOUT',

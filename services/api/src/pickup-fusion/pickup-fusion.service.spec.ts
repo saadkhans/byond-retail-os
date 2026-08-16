@@ -14,6 +14,7 @@ import {
   CROP_ARTIFACT_FAILED,
   FUSION_PIPELINE_VERSION,
   FusionEvidence,
+  LIVE_SENSITIVE_SCREEN_BLOCKED,
   OCR_TEXT_SUPPRESSED,
   PickupFusionService,
   applyVlmVerdictToEvidence,
@@ -1387,5 +1388,114 @@ describe('fusion crop idempotency keys are collision-safe (Codex P2)', () => {
     const { data } = createdRuns[0];
     expect(data.evidence.cropArtifactId).toBeNull();
     expect(data.evidence.detector.warnings).toContain(CROP_ARTIFACT_FAILED);
+  });
+});
+
+describe('LIVE frames are screened before any VLM invocation (Codex P1)', () => {
+  const ACTIVE: CatalogFixture = {
+    id: 'p-live',
+    sku: 'SKU-LIVE',
+    name: 'Live Product',
+    status: ProductStatus.ACTIVE,
+    barcode: '6281000000099',
+  };
+  /** classical 1.0 alone fuses into the uncertain band -> NEEDS_VLM, so
+   *  the pipeline WANTS to invoke the verifier in every case below. */
+  const VLM_WANTED = {
+    catalog: [ACTIVE],
+    barcodeSeen: '6281000000002',
+    classicalSignals: [
+      { productId: ACTIVE.id, sku: ACTIVE.sku, score: 1 },
+    ] as CandidateSignal[],
+    config: { PICKUP_VLM_ENABLED: 'true' },
+  };
+  const stubVerdict = (): jest.Mock =>
+    jest.fn(async () => ({
+      status: 'TIMEOUT' as const,
+      result: null,
+      modelKey: 'stub-vlm',
+      modelVersion: 'stub-vlm',
+      latencyMs: 1,
+      errorDetail: null,
+      rawPreview: null,
+    }));
+  function liveFrames() {
+    return Array.from({ length: 5 }, (_unused, index) => ({
+      timestampMs: index * 1000,
+      image: { width: 48, height: 36, rgb: Buffer.alloc(48 * 36 * 3, 100) },
+    }));
+  }
+  const LIVE_INPUT = {
+    liveSessionId: 'live-1',
+    locationId: 'store-1',
+    unitId: null,
+    window: { startMs: 1000, endMs: 2600, peakMs: 2000 },
+  };
+
+  it('a live crop whose OCR screen TRIPPED never reaches the VLM — review with a controlled reason', async () => {
+    const vlmVerify = stubVerdict();
+    const { service, createdRuns } = buildService({
+      ...VLM_WANTED,
+      ocrSeen: { rawText: `CVV 987 ${PAN}`, normalizedText: `cvv 987 ${PAN}` },
+      vlmVerify,
+    });
+    await service.runLiveWindow('tenant-1', {
+      ...LIVE_INPUT,
+      frames: liveFrames(),
+    });
+    expect(vlmVerify).not.toHaveBeenCalled();
+    const { data } = createdRuns[0];
+    expect(data.policy).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+    expect(data.evidence.vlm.invoked).toBe(false);
+    expect(data.evidence.vlm.status).toBe('UNAVAILABLE');
+    expect(data.evidence.vlm.reason).toBe(LIVE_SENSITIVE_SCREEN_BLOCKED);
+    expect(JSON.stringify(data.evidence)).not.toContain(PAN);
+  });
+
+  it('a live crop whose OCR stage did NOT complete never reaches the VLM either', async () => {
+    for (const status of ['UNAVAILABLE', 'TIMEOUT', 'EXECUTION_FAILED'] as const) {
+      const vlmVerify = stubVerdict();
+      const { service, createdRuns } = buildService({
+        ...VLM_WANTED,
+        ocrStatus: status,
+        vlmVerify,
+      });
+      await service.runLiveWindow('tenant-1', {
+        ...LIVE_INPUT,
+        frames: liveFrames(),
+      });
+      expect(vlmVerify).not.toHaveBeenCalled();
+      const { data } = createdRuns[0];
+      expect(data.policy).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+      expect(data.evidence.vlm.reason).toBe(LIVE_SENSITIVE_SCREEN_BLOCKED);
+    }
+  });
+
+  it('a live crop with a CLEAN completed screen invokes the VLM as before', async () => {
+    const vlmVerify = stubVerdict();
+    const { service, createdRuns } = buildService({
+      ...VLM_WANTED,
+      ocrSeen: { rawText: 'shelf label', normalizedText: 'shelf label' },
+      vlmVerify,
+    });
+    await service.runLiveWindow('tenant-1', {
+      ...LIVE_INPUT,
+      frames: liveFrames(),
+    });
+    expect(vlmVerify).toHaveBeenCalledTimes(1);
+    expect(createdRuns[0].data.evidence.vlm.invoked).toBe(true);
+  });
+
+  it('ASSET-path behavior is unchanged: a tripped screen still invokes the VLM with nulled text', async () => {
+    const vlmVerify = stubVerdict();
+    const { service } = buildService({
+      ...VLM_WANTED,
+      ocrSeen: { rawText: `CVV 987 ${PAN}`, normalizedText: `cvv 987 ${PAN}` },
+      vlmVerify,
+    });
+    await service.run('tenant-1', 'asset-1');
+    expect(vlmVerify).toHaveBeenCalledTimes(1);
+    const request = vlmVerify.mock.calls[0][0] as { ocrText: string | null };
+    expect(request.ocrText).toBeNull();
   });
 });

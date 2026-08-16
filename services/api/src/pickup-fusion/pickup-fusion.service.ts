@@ -140,6 +140,14 @@ export const LIVE_FRAME_MAX_DIMENSION = 640;
  * too: the recognized text itself is never stored, only the marker.
  */
 export const OCR_TEXT_SUPPRESSED = 'SENSITIVE_TEXT_SUPPRESSED';
+
+/** Controlled reason recorded when a LIVE run's VLM invocation is
+ *  blocked by the frame screen (Codex P1): FILE_REPLAY assets were
+ *  pixel-screened at upload, but live RTSP frames are vetted only by
+ *  this pipeline's own OCR sensitive-text pass — if that pass tripped
+ *  or did not complete, the crop pixels are unvetted and must not be
+ *  sent to any VLM (local included; MVP fails closed). */
+export const LIVE_SENSITIVE_SCREEN_BLOCKED = 'LIVE_SENSITIVE_SCREEN_BLOCKED';
 export const BARCODE_VALUE_SUPPRESSED = 'UNMATCHED_SCREENED';
 
 /**
@@ -1312,6 +1320,31 @@ export class PickupFusionService {
       ctx.evidence.vlm.mode = this.vlmMode;
 
       const invokeVlm = async (reason: string) => {
+        // LIVE-FRAME SCREEN GATE (Codex P1): a live-origin run's crop
+        // pixels were never screened at upload the way FILE_REPLAY
+        // assets were — the only vetting is this pipeline's own OCR
+        // sensitive-text pass. The VLM (which receives crop pixels as
+        // base64) may therefore run for a LIVE run only when that pass
+        // COMPLETED (status OK) and found nothing sensitive. A tripped
+        // screen or an OCR stage that did not finish blocks the
+        // invocation entirely — regardless of provider, local included
+        // (MVP fails closed) — and routes the run to human review with
+        // a controlled reason. Asset-origin behavior is unchanged.
+        if (
+          ctx.evidence.liveSessionId !== undefined &&
+          (ctx.evidence.ocr.status !== 'OK' ||
+            ctx.evidence.ocr.screened === OCR_TEXT_SUPPRESSED)
+        ) {
+          ctx.evidence.vlm.invoked = false;
+          ctx.evidence.vlm.reason = LIVE_SENSITIVE_SCREEN_BLOCKED;
+          ctx.evidence.vlm.status = 'UNAVAILABLE';
+          ctx.evidence.policy = {
+            result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
+            reason:
+              'live frame screening blocked VLM invocation — routed to review',
+          };
+          return;
+        }
         ctx.evidence.vlm.invoked = true;
         ctx.evidence.vlm.reason = reason;
         if (!this.vlmEnabled) {
