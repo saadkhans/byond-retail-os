@@ -1,3 +1,4 @@
+import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   FusionPolicyResult,
@@ -206,6 +207,16 @@ function buildService(options: {
     inferenceJob: { findFirst: jest.fn(async () => null) },
     videoGroundTruth: { findFirst: jest.fn(async () => null) },
     productReferenceImage: { findMany: jest.fn(async () => []) },
+    // Phase 13 — tenant-scoped live-session existence check for
+    // runLiveWindow ('live-1' is the one session this stub knows).
+    liveCameraSession: {
+      findFirst: jest.fn(
+        async (args: { where: { tenantId: string; id: string } }) =>
+          args.where.id === 'live-1' && args.where.tenantId === 'tenant-1'
+            ? { id: 'live-1' }
+            : null,
+      ),
+    },
   };
   const asset = {
     deletedAt: null,
@@ -272,10 +283,13 @@ function buildService(options: {
       warnings: [],
     })),
   };
+  const videoAssets = {
+    createCrop: jest.fn(async () => ({ artifact: { id: 'crop-1' } })),
+  };
   const service = new PickupFusionService(
     prisma as never,
     { findByIdInternal: jest.fn(async () => asset) } as never,
-    { createCrop: jest.fn(async () => ({ artifact: { id: 'crop-1' } })) } as never,
+    videoAssets as never,
     { analysisWidth: 48, analysisFps: 2 } as never,
     decoder as never,
     detector as never,
@@ -358,7 +372,7 @@ function buildService(options: {
     (() => ({})) as never,
     { get: (key: string) => options.config?.[key] } as unknown as ConfigService,
   );
-  return { service, productFindMany, createdRuns, decoder, detector };
+  return { service, productFindMany, createdRuns, decoder, detector, videoAssets, prisma };
 }
 
 describe('fusion catalog is constrained to ACTIVE products', () => {
@@ -1131,5 +1145,147 @@ describe('Phase 12 replay-window scoping (camera runtime)', () => {
         }),
       }),
     );
+  });
+});
+
+describe('Phase 13 runLiveWindow (live RTSP shadow sessions)', () => {
+  const NO_CANDIDATES = {
+    catalog: [] as CatalogFixture[],
+    barcodeSeen: '6281000000002',
+    classicalSignals: [] as CandidateSignal[],
+  };
+
+  /** Five flat-gray sampled frames at 0..4000ms, one shared geometry —
+   *  the live twin of the decoder stub's analysis stream. */
+  function liveFrames(): { timestampMs: number; image: { width: number; height: number; rgb: Buffer } }[] {
+    return Array.from({ length: 5 }, (_unused, index) => ({
+      timestampMs: index * 1000,
+      image: { width: 48, height: 36, rgb: Buffer.alloc(48 * 36 * 3, 100) },
+    }));
+  }
+
+  const LIVE_INPUT = {
+    liveSessionId: 'live-1',
+    locationId: 'store-1',
+    unitId: null,
+    window: { startMs: 1000, endMs: 2600, peakMs: 2000 },
+  };
+
+  it('persists a LIVE_WINDOW run with the session origin and NO video asset', async () => {
+    const { service, createdRuns } = buildService(NO_CANDIDATES);
+    const { runId } = await service.runLiveWindow('tenant-1', {
+      ...LIVE_INPUT,
+      frames: liveFrames(),
+    });
+    expect(runId).toBe('run-1');
+    expect(createdRuns).toHaveLength(1);
+    const { data } = createdRuns[0] as unknown as {
+      data: {
+        runScope: FusionRunScope;
+        videoAssetId: string | null;
+        liveSessionId: string;
+        evidence: FusionEvidence;
+      };
+    };
+    expect(data.runScope).toBe(FusionRunScope.LIVE_WINDOW);
+    expect(data.videoAssetId).toBeNull();
+    expect(data.liveSessionId).toBe('live-1');
+    expect(data.evidence.liveSessionId).toBe('live-1');
+    expect(data.evidence.replayWindow).toEqual(LIVE_INPUT.window);
+    // The stub detector's 1500-2500 event overlaps the window: the full
+    // pipeline ran and recorded crops + a policy.
+    expect(data.evidence.detector.events).toHaveLength(1);
+    expect(data.evidence.crops.length).toBeGreaterThan(0);
+  });
+
+  it('an unknown or foreign-tenant session is NotFound with no run row', async () => {
+    const { service, createdRuns } = buildService(NO_CANDIDATES);
+    await expect(
+      service.runLiveWindow('tenant-1', {
+        ...LIVE_INPUT,
+        liveSessionId: 'live-elsewhere',
+        frames: liveFrames(),
+      }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    await expect(
+      service.runLiveWindow('tenant-2', {
+        ...LIVE_INPUT,
+        frames: liveFrames(),
+      }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(createdRuns).toHaveLength(0);
+  });
+
+  it('bounds are enforced: frame count, shared geometry, ascending timestamps, dimension cap', async () => {
+    const { service, createdRuns } = buildService(NO_CANDIDATES);
+    await expect(
+      service.runLiveWindow('tenant-1', {
+        ...LIVE_INPUT,
+        frames: liveFrames().slice(0, 1),
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    const mixed = liveFrames();
+    mixed[2] = {
+      timestampMs: 2000,
+      image: { width: 24, height: 36, rgb: Buffer.alloc(24 * 36 * 3, 100) },
+    };
+    await expect(
+      service.runLiveWindow('tenant-1', { ...LIVE_INPUT, frames: mixed }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    const unordered = liveFrames();
+    unordered[3] = { ...unordered[3], timestampMs: unordered[2].timestampMs };
+    await expect(
+      service.runLiveWindow('tenant-1', { ...LIVE_INPUT, frames: unordered }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    const huge = liveFrames().map((frame) => ({
+      timestampMs: frame.timestampMs,
+      image: { width: 1024, height: 36, rgb: Buffer.alloc(1024 * 36 * 3, 100) },
+    }));
+    await expect(
+      service.runLiveWindow('tenant-1', { ...LIVE_INPUT, frames: huge }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(createdRuns).toHaveLength(0);
+  });
+
+  it('runs the IDENTICAL shared pipeline as the asset path: same fused answer and policy on the same frames', async () => {
+    const assetSide = buildService(NO_CANDIDATES);
+    await assetSide.service.run('tenant-1', 'asset-1', {
+      window: LIVE_INPUT.window,
+    });
+    const liveSide = buildService(NO_CANDIDATES);
+    await liveSide.service.runLiveWindow('tenant-1', {
+      ...LIVE_INPUT,
+      frames: liveFrames(),
+    });
+    const assetRun = assetSide.createdRuns[0].data;
+    const liveRun = liveSide.createdRuns[0].data;
+    expect(liveRun.policy).toBe(assetRun.policy);
+    expect(liveRun.evidence.fused).toEqual(assetRun.evidence.fused);
+    expect(liveRun.evidence.detector.events.map((event) => event.kind)).toEqual(
+      assetRun.evidence.detector.events.map((event) => event.kind),
+    );
+  });
+
+  it('a non-overlapping window is a controlled no-event run — and no crop ARTIFACT is ever written for live', async () => {
+    const { service, createdRuns, videoAssets } = buildService(NO_CANDIDATES);
+    await service.runLiveWindow('tenant-1', {
+      ...LIVE_INPUT,
+      window: { startMs: 3800, endMs: 4000, peakMs: 3900 },
+      frames: liveFrames(),
+    });
+    const { data } = createdRuns[0];
+    expect(data.policy).toBe(FusionPolicyResult.UNKNOWN_PRODUCT);
+    expect(data.evidence.crops).toHaveLength(0);
+    expect(videoAssets.createCrop).not.toHaveBeenCalled();
+  });
+
+  it('a successful live run also never writes a crop artifact (no asset exists)', async () => {
+    const { service, videoAssets, createdRuns } = buildService(NO_CANDIDATES);
+    await service.runLiveWindow('tenant-1', {
+      ...LIVE_INPUT,
+      frames: liveFrames(),
+    });
+    expect(createdRuns[0].data.evidence.cropArtifactId).toBeNull();
+    expect(videoAssets.createCrop).not.toHaveBeenCalled();
   });
 });

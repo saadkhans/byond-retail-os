@@ -9,6 +9,10 @@ import {
 } from 'react-router-dom';
 import { AuthProvider, useAuth } from './auth';
 import { CamerasPage } from './pages/CamerasPage';
+import {
+  LiveSessionDetailPage,
+  LiveSessionsPage,
+} from './pages/LiveSessionsPage';
 import { CatalogPage } from './pages/CatalogPage';
 import {
   CheckoutSessionDetailPage,
@@ -92,6 +96,7 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/journeys">Journeys</NavLink>
         <NavLink to="/cameras">Cameras</NavLink>
         <NavLink to="/pilot-runs">Pilot runs</NavLink>
+        <NavLink to="/live-sessions">Live sessions</NavLink>
         <NavLink to="/review-queue">Review queue</NavLink>
         <div className="spacer" />
         <div className="who">{user?.email}</div>
@@ -187,6 +192,14 @@ export function App() {
                     <Route
                       path="pilot-runs/:id"
                       element={<PilotRunDetailPage />}
+                    />
+                    <Route
+                      path="live-sessions"
+                      element={<LiveSessionsPage />}
+                    />
+                    <Route
+                      path="live-sessions/:id"
+                      element={<LiveSessionDetailPage />}
                     />
                     <Route
                       path="review-queue"

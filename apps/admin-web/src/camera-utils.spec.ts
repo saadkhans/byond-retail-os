@@ -3,6 +3,7 @@ import {
   SOURCE_TYPE_LABEL,
   formatClipOffset,
   isPlaceholderType,
+  liveSessionStatusTone,
   runStatusTone,
   sourceStatusTone,
   vlmCounterLabel,
@@ -13,12 +14,23 @@ describe('camera-utils', () => {
     expect(SOURCE_TYPE_LABEL.FILE_REPLAY).toBe('File replay');
     expect(SOURCE_TYPE_LABEL.RTSP_PLACEHOLDER).toContain('not enabled');
     expect(SOURCE_TYPE_LABEL.LOCAL_WEBCAM_PLACEHOLDER).toContain('not enabled');
+    expect(SOURCE_TYPE_LABEL.RTSP_SHADOW).toBe('RTSP (shadow)');
+    expect(SOURCE_TYPE_LABEL.RTSP_SHADOW).not.toContain('not enabled');
   });
 
-  it('only FILE_REPLAY is non-placeholder', () => {
+  it('FILE_REPLAY and RTSP_SHADOW are functional; only *_PLACEHOLDER are placeholders', () => {
     expect(isPlaceholderType('FILE_REPLAY')).toBe(false);
+    expect(isPlaceholderType('RTSP_SHADOW')).toBe(false);
     expect(isPlaceholderType('RTSP_PLACEHOLDER')).toBe(true);
     expect(isPlaceholderType('LOCAL_WEBCAM_PLACEHOLDER')).toBe(true);
+  });
+
+  it('maps live session status to badge tones (STOPPED stays neutral)', () => {
+    expect(liveSessionStatusTone('RUNNING')).toBe('ok');
+    expect(liveSessionStatusTone('STARTING')).toBe('warn');
+    expect(liveSessionStatusTone('STOPPING')).toBe('warn');
+    expect(liveSessionStatusTone('STOPPED')).toBe('');
+    expect(liveSessionStatusTone('ERROR')).toBe('down');
   });
 
   it('maps source status to badge tones', () => {

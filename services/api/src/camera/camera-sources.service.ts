@@ -37,6 +37,12 @@ export const PLACEHOLDER_SOURCE_TYPES: readonly CameraSourceType[] = [
   CameraSourceType.LOCAL_WEBCAM_PLACEHOLDER,
 ];
 
+/** Phase 13 — RTSP_SHADOW activation gate: a live source without a
+ *  server-recognized credential slot has no way to resolve a stream and
+ *  must stay DISABLED. */
+export const RTSP_NEEDS_CREDENTIAL_SLOT =
+  'RTSP shadow source needs a credential slot before activation';
+
 export const SOURCE_TYPE_NOT_ENABLED =
   'source type not enabled in shadow pilot';
 
@@ -294,11 +300,16 @@ export class CameraSourcesService {
         throw new NotFoundException('Video asset not found in this tenant');
       }
     }
-    // Placeholders register DISABLED and stay that way (MVP: FILE_REPLAY
-    // is the only runnable source).
-    const status = PLACEHOLDER_SOURCE_TYPES.includes(input.sourceType)
-      ? CameraSourceStatus.DISABLED
-      : CameraSourceStatus.ACTIVE;
+    // Placeholders register DISABLED and stay that way. An RTSP_SHADOW
+    // source registers DISABLED until it carries a credential slot
+    // (Phase 13) — without one there is nothing to resolve a stream
+    // from. FILE_REPLAY (and slot-carrying RTSP_SHADOW) register ACTIVE.
+    const status =
+      PLACEHOLDER_SOURCE_TYPES.includes(input.sourceType) ||
+      (input.sourceType === CameraSourceType.RTSP_SHADOW &&
+        input.credentialRef === undefined)
+        ? CameraSourceStatus.DISABLED
+        : CameraSourceStatus.ACTIVE;
     try {
       const created = await this.prisma.cameraSource.create({
         data: {
@@ -367,6 +378,16 @@ export class CameraSourcesService {
       PLACEHOLDER_SOURCE_TYPES.includes(source.sourceType)
     ) {
       throw new ConflictException(SOURCE_TYPE_NOT_ENABLED);
+    }
+    // Phase 13: RTSP_SHADOW may activate only WITH a credential slot —
+    // either one already stored or one arriving in this same PATCH.
+    if (
+      input.status === CameraSourceStatus.ACTIVE &&
+      source.sourceType === CameraSourceType.RTSP_SHADOW &&
+      source.credentialRef === null &&
+      input.credentialRef === undefined
+    ) {
+      throw new ConflictException(RTSP_NEEDS_CREDENTIAL_SLOT);
     }
     if (input.replayVideoAssetId) {
       const asset = await this.prisma.videoAsset.findFirst({

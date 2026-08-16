@@ -248,6 +248,7 @@ model Tenant {
   videoExtractionRequests VideoExtractionRequest[]
   cameraSources           CameraSource[]
   cameraPilotRuns         CameraPilotRun[]
+  liveCameraSessions      LiveCameraSession[]
 }
 
 model User {
@@ -679,6 +680,7 @@ model CustomerJourney {
   events   CustomerJourneyEvent[]
   eventReviews CustomerJourneyEventReview[]
   cameraPilotRuns CameraPilotRun[]
+  liveCameraSessions LiveCameraSession[]
 
   // Anchor for hand-written same-tenant composite FKs
   // (20260811110000_cv_same_tenant_fks).
@@ -777,6 +779,10 @@ enum FusionPolicyResult {
 enum FusionRunScope {
   WHOLE_CLIP
   REPLAY_WINDOW
+  // Phase 13 — one live-sampled event window of an RTSP shadow session.
+  // Like REPLAY_WINDOW, excluded from every whole-clip evaluation
+  // surface (those filter WHOLE_CLIP explicitly).
+  LIVE_WINDOW
 }
 
 // One pickup-fusion-v2 SHADOW run over a test video: full per-stage
@@ -787,7 +793,11 @@ enum FusionRunScope {
 model PickupFusionRun {
   id              String             @id @default(cuid())
   tenantId        String
-  videoAssetId    String
+  // Nullable since Phase 13: a LIVE_WINDOW run analyzes frames sampled
+  // straight from a live session — there is no video asset. Exactly one
+  // of videoAssetId / liveSessionId is set (CHECK in migration SQL).
+  videoAssetId    String?
+  liveSessionId   String?
   pipelineVersion String
   runScope        FusionRunScope     @default(WHOLE_CLIP)
   policy          FusionPolicyResult
@@ -798,10 +808,12 @@ model PickupFusionRun {
   processingMs    Int
   createdAt       DateTime           @default(now())
 
-  tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  videoAsset VideoAsset @relation(fields: [videoAssetId], references: [id], onDelete: Cascade)
+  tenant      Tenant             @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  videoAsset  VideoAsset?        @relation(fields: [videoAssetId], references: [id], onDelete: Cascade)
+  liveSession LiveCameraSession? @relation(fields: [liveSessionId], references: [id], onDelete: Restrict)
 
   @@index([tenantId, videoAssetId, createdAt(sort: Desc)])
+  @@index([tenantId, liveSessionId, createdAt(sort: Desc)])
 }
 
 // What ACTUALLY happened in one controlled test video — operator-entered
@@ -864,6 +876,13 @@ enum CameraSourceType {
   FILE_REPLAY
   RTSP_PLACEHOLDER
   LOCAL_WEBCAM_PLACEHOLDER
+  // Phase 13 — the first LIVE source type, still shadow-only. Activation
+  // requires a server-recognized credential slot; the actual stream URL
+  // lives ONLY in operator-managed runtime configuration
+  // (CAMERA_RTSP_SOURCE_<SLOT>), never in this database and never in an
+  // API response. The two _PLACEHOLDER types keep their Phase 12
+  // can-never-activate rule unchanged.
+  RTSP_SHADOW
 }
 
 enum CameraSourceStatus {
@@ -906,6 +925,7 @@ model CameraSource {
   unit             RetailUnit? @relation(fields: [unitId], references: [id], onDelete: Restrict)
   replayVideoAsset VideoAsset? @relation("CameraReplayAsset", fields: [replayVideoAssetId], references: [id], onDelete: SetNull)
   pilotRuns        CameraPilotRun[]
+  liveSessions     LiveCameraSession[]
 
   @@unique([id, tenantId])
   @@unique([tenantId, locationId, name])
@@ -968,6 +988,68 @@ model CameraPilotRun {
   @@unique([tenantId, idempotencyKey])
   @@index([tenantId, createdAt(sort: Desc)])
   @@index([tenantId, cameraSourceId, createdAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 13 — live RTSP shadow sessions.
+//
+// One row per start of a live camera: an auditable record of what the
+// sampler saw and what the shadow pipeline made of it. The session owns
+// ONE shadow journey (ENTRY at start, EXIT at stop, decision on
+// reconcile); LIVE_WINDOW fusion runs link back via
+// PickupFusionRun.liveSessionId. At most one non-terminal session per
+// camera source (partial unique index in migration SQL). errorCode is a
+// CONTROLLED code only — raw exception text is never persisted. NOTHING
+// here touches checkout, order, payment, or inventory tables.
+// ---------------------------------------------------------------------------
+
+enum LiveCameraSessionStatus {
+  STARTING
+  RUNNING
+  STOPPING
+  STOPPED
+  ERROR
+}
+
+model LiveCameraSession {
+  id             String                  @id @default(cuid())
+  tenantId       String
+  cameraSourceId String
+  journeyId      String?
+  status         LiveCameraSessionStatus @default(STARTING)
+  frameIntervalMs Int
+  startedAt      DateTime  @default(now())
+  stoppedAt      DateTime?
+  // Lease heartbeat + owner, same discipline as CameraPilotRun: bumped
+  // periodically while sampling; every heartbeat and finalization write
+  // is conditional on (non-terminal status AND owner token).
+  heartbeatAt DateTime?
+  leaseOwner  String?
+  lastFrameAt DateTime?
+  framesSampled         Int @default(0)
+  eventWindowsDetected  Int @default(0)
+  eventWindowsProcessed Int @default(0)
+  fusionRunsCompleted   Int @default(0)
+  journeyEventsCreated  Int @default(0)
+  vlmInvoked            Int @default(0)
+  vlmSkipped            Int @default(0)
+  vlmFailed             Int @default(0)
+  reviewNeeded          Int @default(0)
+  // Snapshot of the linked journey's final SHADOW decision at stop.
+  decision  CustomerJourneyDecision?
+  errorCode String?
+  eventWindows Json?
+  createdById  String?
+  createdAt    DateTime @default(now())
+
+  tenant       Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  cameraSource CameraSource     @relation(fields: [cameraSourceId], references: [id], onDelete: Restrict)
+  journey      CustomerJourney? @relation(fields: [journeyId], references: [id], onDelete: Restrict)
+  fusionRuns   PickupFusionRun[]
+
+  @@unique([id, tenantId])
+  @@index([tenantId, cameraSourceId, createdAt(sort: Desc)])
+  @@index([tenantId, status])
 }
 
 // DERIVED stock projection — never written directly from user input. The

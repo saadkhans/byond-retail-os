@@ -69,7 +69,9 @@ export interface JourneyEventReviewView {
  *  evidence JSON's rawPreview/errorDetail/OCR text never leave the API. */
 export interface JourneyFusionRunSummary {
   runId: string;
-  videoAssetId: string;
+  /** Null for LIVE_WINDOW runs (Phase 13) — those carry a live session
+   *  instead of a video asset. */
+  videoAssetId: string | null;
   pipelineVersion: string;
   policy: FusionPolicyResult;
   fusedTopSku: string | null;
@@ -699,6 +701,23 @@ export class JourneyService {
           return;
         }
       }
+      // LIVE imports (Phase 13) have NO video asset — the run itself is
+      // the physical observation, and a live session imports each of its
+      // window runs exactly once into the journey it owns.
+      if (input.sourceType === 'LIVE_SHADOW' && input.fusionRunId) {
+        const existing = await tx.customerJourneyEvent.findFirst({
+          where: {
+            tenantId,
+            journeyId,
+            sourceType: 'LIVE_SHADOW',
+            fusionRunId: input.fusionRunId,
+          },
+          select: { id: true },
+        });
+        if (existing) {
+          return;
+        }
+      }
       let snapshot: { sku: string; name: string } | null = null;
       if (input.productId) {
         const product = await tx.product.findFirst({
@@ -875,6 +894,115 @@ export class JourneyService {
         matchScore: run.fusedTopScore,
         note: `policy ${run.policy}${run.fusedTopSku ? ` · top ${run.fusedTopSku}` : ''}`,
         dedupScope: options?.fusionRunId ? 'run' : 'video',
+      },
+      actorId,
+    );
+  }
+
+  /**
+   * Import ONE live-window fusion run (Phase 13) as a journey
+   * observation. Live runs have no video asset: the run is resolved
+   * tenant-scoped by exact id, its owning live session supplies the
+   * store context (the session's camera must sit in the journey's
+   * store), and observations stamp on the session's source timeline —
+   * sourceTimeBase (the session start) + the detector peak, falling back
+   * to the sampler window's peak so a no-detection import never lands on
+   * the wall clock. Idempotent per run id. Shadow only, like every other
+   * journey write.
+   */
+  async appendFromLiveFusionRun(
+    tenantId: string,
+    journeyId: string,
+    fusionRunId: string,
+    actorId?: string,
+    options?: { sourceTimeBase?: Date; fallbackPeakMs?: number },
+  ) {
+    const journey = await this.prisma.customerJourney.findFirst({
+      where: { tenantId, id: journeyId },
+      select: { locationId: true, unitId: true },
+    });
+    if (!journey) {
+      throw new NotFoundException('Journey not found');
+    }
+    const run = await this.prisma.pickupFusionRun.findFirst({
+      where: {
+        tenantId,
+        id: fusionRunId,
+        runScope: FusionRunScope.LIVE_WINDOW,
+        liveSessionId: { not: null },
+      },
+    });
+    if (!run || !run.liveSessionId) {
+      throw new NotFoundException('Live fusion run not found in this tenant');
+    }
+    const session = await this.prisma.liveCameraSession.findFirst({
+      where: { tenantId, id: run.liveSessionId },
+      select: { cameraSourceId: true, startedAt: true },
+    });
+    if (!session) {
+      throw new NotFoundException('Live session not found in this tenant');
+    }
+    const camera = await this.prisma.cameraSource.findFirst({
+      where: { tenantId, id: session.cameraSourceId },
+      select: { locationId: true, unitId: true },
+    });
+    // STORE-CONTEXT MATCH, same rule as the video import: an observation
+    // captured by one store's camera must not land in a journey opened
+    // in another.
+    if (!camera || camera.locationId !== journey.locationId) {
+      throw new ConflictException(
+        "the camera's store context does not match this journey's store",
+      );
+    }
+    if (journey.unitId && camera.unitId && camera.unitId !== journey.unitId) {
+      throw new ConflictException(
+        "the camera's unit does not match this journey's unit",
+      );
+    }
+    const evidence = run.evidence as {
+      detector?: { events?: { kind?: string; peakMs?: number }[] };
+      fused?: { productId: string; sku: string; productName: string }[];
+    };
+    const detectedKind = evidence.detector?.events?.[0]?.kind;
+    const peakMs = evidence.detector?.events?.[0]?.peakMs;
+    const sourceTimeBase = options?.sourceTimeBase ?? session.startedAt;
+    const effectivePeakMs =
+      typeof peakMs === 'number' && Number.isFinite(peakMs)
+        ? peakMs
+        : Math.max(0, options?.fallbackPeakMs ?? 0);
+    const occurredAt = new Date(
+      sourceTimeBase.getTime() + Math.max(0, Math.round(effectivePeakMs)),
+    ).toISOString();
+    const top = evidence.fused?.[0];
+    if (run.policy === FusionPolicyResult.AUTO_PROPOSE && top) {
+      return this.appendEvent(
+        tenantId,
+        journeyId,
+        {
+          eventType:
+            detectedKind === 'RETURN'
+              ? CustomerJourneyEventType.PRODUCT_RETURN
+              : CustomerJourneyEventType.PRODUCT_PICKUP,
+          occurredAt,
+          productId: top.productId,
+          matchScore: run.fusedTopScore,
+          sourceType: 'LIVE_SHADOW',
+          fusionRunId: run.id,
+          note: `policy ${run.policy}`,
+        },
+        actorId,
+      );
+    }
+    return this.appendEvent(
+      tenantId,
+      journeyId,
+      {
+        eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+        occurredAt,
+        sourceType: 'LIVE_SHADOW',
+        fusionRunId: run.id,
+        matchScore: run.fusedTopScore,
+        note: `policy ${run.policy}${run.fusedTopSku ? ` · top ${run.fusedTopSku}` : ''}`,
       },
       actorId,
     );
