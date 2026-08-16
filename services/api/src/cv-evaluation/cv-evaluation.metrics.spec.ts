@@ -3,9 +3,12 @@ import {
   EvalGroundTruth,
   EvalRun,
   SCORE_NOTE,
+  basketDeltasEqual,
   evaluateClip,
   evaluateScenario,
+  expectedBasketDelta,
   median,
+  predictedBasketDelta,
   summarize,
 } from './cv-evaluation.metrics';
 
@@ -397,12 +400,15 @@ describe('summarize', () => {
       denominator: 3,
       rate: 1,
     });
+    // Agreement is over ANSWERED verdicts (agree + disagree) only; the
+    // abstention is reported separately, never diluting the rate.
     expect(summary.vlmAgreement).toEqual({
       agree: 1,
       disagree: 1,
-      abstain: 1,
-      denominator: 3,
-      rate: 1 / 3,
+      vlmAnsweredCount: 2,
+      vlmAbstentionCount: 1,
+      vlmAgreementRate: 0.5,
+      vlmAbstentionRate: 1 / 3,
     });
     // a3 is review-flagged (policy + requiresHumanReview).
     expect(summary.humanReviewRate).toEqual({
@@ -410,12 +416,13 @@ describe('summarize', () => {
       denominator: 4,
       rate: 0.25,
     });
-    // basket: a1 exact match; a2 predicted wrong line; a3 predicted [] but
-    // truth is RETURN → expected [] ✓; a4 [] vs [] ✓.
+    // basket DELTAS: a1 {+1} vs {+1} ✓; a2 predicted wrong sku ✗; a3 truth
+    // is RETURN {-1} but nothing was proposed (missed return) ✗; a4 {} vs
+    // {} ✓. The old empty-basket representation wrongly passed a3.
     expect(summary.basketExactMatchRate).toEqual({
-      numerator: 3,
+      numerator: 2,
       denominator: 4,
-      rate: 0.75,
+      rate: 0.5,
     });
     const stages = Object.fromEntries(
       summary.latency.map((entry) => [entry.stage, entry]),
@@ -453,7 +460,147 @@ describe('summarize', () => {
     const summary = summarize([]);
     expect(summary.totals.groundTruthedClips).toBe(0);
     expect(summary.pickupAccuracy.rate).toBeNull();
-    expect(summary.vlmAgreement.rate).toBeNull();
+    expect(summary.vlmAgreement.vlmAgreementRate).toBeNull();
+    expect(summary.vlmAgreement.vlmAbstentionRate).toBeNull();
     expect(summary.latency).toEqual([]);
+  });
+});
+
+describe('basket delta exact match (return deltas)', () => {
+  const returnGt = (overrides: Partial<EvalGroundTruth> = {}) =>
+    gt({ eventKind: GroundTruthEventKind.RETURN, ...overrides });
+
+  it('correct return SKU (AUTO_PROPOSE RETURN) is an exact match', () => {
+    const clip = evaluateClip(returnGt(), run({ kind: 'RETURN' }));
+    expect(expectedBasketDelta(returnGt())).toEqual({ 'WATER-500': -1 });
+    expect(predictedBasketDelta(clip)).toEqual({ 'WATER-500': -1 });
+    expect(
+      basketDeltasEqual(
+        expectedBasketDelta(returnGt()),
+        predictedBasketDelta(clip),
+      ),
+    ).toBe(true);
+    const summary = summarize([{ gt: returnGt(), clip }]);
+    expect(summary.basketExactMatchRate).toEqual({
+      numerator: 1,
+      denominator: 1,
+      rate: 1,
+    });
+  });
+
+  it('a MISSED return (review policy, nothing proposed) fails exact match', () => {
+    const clip = evaluateClip(
+      returnGt(),
+      run({ kind: 'RETURN', policy: 'NEEDS_HUMAN_REVIEW' }),
+    );
+    expect(predictedBasketDelta(clip)).toEqual({});
+    const summary = summarize([{ gt: returnGt(), clip }]);
+    expect(summary.basketExactMatchRate.numerator).toBe(0);
+  });
+
+  it('a WRONG returned SKU fails exact match', () => {
+    const clip = evaluateClip(
+      returnGt(),
+      run({ kind: 'RETURN', fused: ['COLA-330', 'WATER-500'] }),
+    );
+    expect(predictedBasketDelta(clip)).toEqual({ 'COLA-330': -1 });
+    const summary = summarize([{ gt: returnGt(), clip }]);
+    expect(summary.basketExactMatchRate.numerator).toBe(0);
+  });
+
+  it('an arbitrary non-pickup policy never counts as return success', () => {
+    const clip = evaluateClip(
+      returnGt(),
+      run({ kind: null, fused: [], policy: 'UNKNOWN_PRODUCT' }),
+    );
+    expect(predictedBasketDelta(clip)).toEqual({});
+    const summary = summarize([{ gt: returnGt(), clip }]);
+    expect(summary.basketExactMatchRate.numerator).toBe(0);
+  });
+
+  it('NONE truth with no auto-propose still matches (empty vs empty)', () => {
+    const noneGt = gt({ eventKind: GroundTruthEventKind.NONE, sku: null });
+    const clip = evaluateClip(
+      noneGt,
+      run({ kind: null, fused: [], policy: 'UNKNOWN_PRODUCT' }),
+    );
+    const summary = summarize([{ gt: noneGt, clip }]);
+    expect(summary.basketExactMatchRate).toEqual({
+      numerator: 1,
+      denominator: 1,
+      rate: 1,
+    });
+  });
+
+  it('pickup quantity mismatch fails (gt qty 2 vs proposed 1)', () => {
+    const clip = evaluateClip(gt({ quantity: 2 }), run());
+    const summary = summarize([{ gt: gt({ quantity: 2 }), clip }]);
+    expect(summary.basketExactMatchRate.numerator).toBe(0);
+  });
+});
+
+describe('vlm agreement over answered verdicts', () => {
+  const matchClip = (selectedSku: string) =>
+    evaluateClip(
+      gt(),
+      run({
+        vlm: {
+          invoked: true,
+          status: 'VERDICT',
+          verdict: 'MATCH',
+          selectedSku,
+          requiresHumanReview: false,
+        },
+      }),
+    );
+  const abstainClip = () =>
+    evaluateClip(
+      gt(),
+      run({
+        policy: 'NEEDS_HUMAN_REVIEW',
+        vlm: {
+          invoked: true,
+          status: 'VERDICT',
+          verdict: 'AMBIGUOUS',
+          requiresHumanReview: true,
+        },
+      }),
+    );
+  const pair = (clip: ReturnType<typeof evaluateClip>) => ({ gt: gt(), clip });
+
+  it('1 correct MATCH + 9 abstentions → agreement 100%, abstention 90%', () => {
+    const pairs = [
+      pair(matchClip('WATER-500')),
+      ...Array.from({ length: 9 }, () => pair(abstainClip())),
+    ];
+    const summary = summarize(pairs);
+    expect(summary.vlmAgreement).toEqual({
+      agree: 1,
+      disagree: 0,
+      vlmAnsweredCount: 1,
+      vlmAbstentionCount: 9,
+      vlmAgreementRate: 1,
+      vlmAbstentionRate: 0.9,
+    });
+  });
+
+  it('1 wrong MATCH + 9 abstentions → agreement 0%, abstention 90%', () => {
+    const pairs = [
+      pair(matchClip('COLA-330')),
+      ...Array.from({ length: 9 }, () => pair(abstainClip())),
+    ];
+    const summary = summarize(pairs);
+    expect(summary.vlmAgreement.vlmAgreementRate).toBe(0);
+    expect(summary.vlmAgreement.vlmAnsweredCount).toBe(1);
+    expect(summary.vlmAgreement.vlmAbstentionRate).toBe(0.9);
+  });
+
+  it('all abstentions → agreement null with answeredCount 0, abstention 100%', () => {
+    const pairs = Array.from({ length: 10 }, () => pair(abstainClip()));
+    const summary = summarize(pairs);
+    expect(summary.vlmAgreement.vlmAgreementRate).toBeNull();
+    expect(summary.vlmAgreement.vlmAnsweredCount).toBe(0);
+    expect(summary.vlmAgreement.vlmAbstentionCount).toBe(10);
+    expect(summary.vlmAgreement.vlmAbstentionRate).toBe(1);
   });
 });

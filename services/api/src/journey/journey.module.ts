@@ -141,6 +141,7 @@ export class JourneyController {
         correctedEventType: body.correctedEventType,
         correctedProductId: body.correctedProductId,
         correctedQuantity: body.correctedQuantity,
+        idempotencyKey: body.idempotencyKey,
       },
       { id: actor.userId, email: actor.email },
     );

@@ -50,6 +50,52 @@ export interface UpsertGroundTruthInput {
 }
 
 /**
+ * Which ground-truth event kinds each CONTROLLED test scenario is allowed
+ * to pair with. An incompatible pair (e.g. FALSE_TOUCH labeled on a PICKUP
+ * clip) would silently corrupt the per-test-type pass rates on the
+ * evaluation dashboard, so it is rejected at write time. The two VLM fault
+ * drills require a product event — the VLM stage is only ever exercised
+ * when a pickup/return exists, so NONE can never be a valid pairing.
+ */
+export const TEST_SCENARIO_ALLOWED_KINDS: Record<
+  CvTestScenario,
+  readonly GroundTruthEventKind[]
+> = {
+  [CvTestScenario.PICKUP_SINGLE]: [GroundTruthEventKind.PICKUP],
+  [CvTestScenario.RETURN_SINGLE]: [GroundTruthEventKind.RETURN],
+  [CvTestScenario.FALSE_TOUCH]: [GroundTruthEventKind.NONE],
+  [CvTestScenario.TWO_SIMILAR_PICK_ONE]: [GroundTruthEventKind.PICKUP],
+  [CvTestScenario.TWO_VISIBLE_PICK_ONE]: [GroundTruthEventKind.PICKUP],
+  [CvTestScenario.VLM_UNAVAILABLE]: [
+    GroundTruthEventKind.PICKUP,
+    GroundTruthEventKind.RETURN,
+  ],
+  [CvTestScenario.VLM_INVALID_SKU]: [
+    GroundTruthEventKind.PICKUP,
+    GroundTruthEventKind.RETURN,
+  ],
+};
+
+/** Pure compatibility check — null message means the pair is valid. The
+ *  message is built ONLY from enum names, never caller free text. */
+export function scenarioKindMismatch(
+  testType: CvTestScenario | null | undefined,
+  eventKind: GroundTruthEventKind,
+): string | null {
+  if (testType === null || testType === undefined) {
+    return null;
+  }
+  const allowed = TEST_SCENARIO_ALLOWED_KINDS[testType];
+  if (allowed.includes(eventKind)) {
+    return null;
+  }
+  return (
+    `testType ${testType} requires eventKind ` +
+    `${allowed.join(' or ')} (got ${eventKind})`
+  );
+}
+
+/**
  * One reviewed video's validation row. `outcome` vocabulary:
  * - correct:        truth PICKUP, predicted === actual AND the claimed
  *                   quantity matches the ground-truth quantity
@@ -151,6 +197,15 @@ export class PickupValidationService {
     });
     if (!asset) {
       throw new NotFoundException('Video asset not found');
+    }
+    // Scenario labels and event kinds must agree BEFORE anything persists —
+    // an incompatible pair corrupts per-test-type pass rates (Codex P1).
+    const scenarioMismatch = scenarioKindMismatch(
+      input.testType,
+      input.eventKind,
+    );
+    if (scenarioMismatch) {
+      throw new BadRequestException(scenarioMismatch);
     }
     if (input.eventKind !== GroundTruthEventKind.NONE) {
       if (!input.productId) {

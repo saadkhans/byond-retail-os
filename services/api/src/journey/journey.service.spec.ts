@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   NotFoundException,
 } from '@nestjs/common';
 import {
@@ -8,12 +9,14 @@ import {
   CustomerJourneyEventType,
   CustomerJourneyStatus,
   JourneyEventReviewDecision,
+  Prisma,
 } from '@prisma/client';
 import {
   FoldReview,
   JourneyService,
   decideJourney,
   foldBasket,
+  validateAggregateBasket,
 } from './journey.service';
 
 const TENANT = 'tenant-1';
@@ -188,6 +191,62 @@ describe('foldBasket with reviews (append-only corrections)', () => {
   });
 });
 
+describe('validateAggregateBasket (pure aggregate stock check)', () => {
+  const line = (productId: string, quantity: number) => ({
+    productId,
+    sku: `SKU-${productId}`,
+    productName: `Product ${productId}`,
+    quantity,
+  });
+
+  it('passes when every folded line fits the on-hand projection', () => {
+    const result = validateAggregateBasket(
+      [line('a', 1)],
+      new Map([['a', 1]]),
+    );
+    expect(result).toEqual({ ok: true, reason: null });
+  });
+
+  it('fails when a folded quantity exceeds on-hand stock', () => {
+    const result = validateAggregateBasket(
+      [line('a', 2)],
+      new Map([['a', 1]]),
+    );
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('SKU-a');
+    expect(result.reason).toContain('on-hand');
+  });
+
+  it('fails when the product has no inventory row at this location', () => {
+    const result = validateAggregateBasket([line('a', 1)], new Map());
+    expect(result.ok).toBe(false);
+  });
+
+  it('validates per SKU and names every shortfall', () => {
+    const result = validateAggregateBasket(
+      [line('a', 1), line('b', 3)],
+      new Map([
+        ['a', 5],
+        ['b', 2],
+      ]),
+    );
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('SKU-b');
+    expect(result.reason).not.toContain('SKU-a');
+  });
+
+  it('ignores non-positive lines and unknown-product lines (issues cover those)', () => {
+    const result = validateAggregateBasket(
+      [
+        { productId: null, sku: null, productName: null, quantity: 4 },
+        line('a', 0),
+      ],
+      new Map(),
+    );
+    expect(result.ok).toBe(true);
+  });
+});
+
 describe('decideJourney (final shadow decision)', () => {
   it('clean journeys are READY_TO_SETTLE_SHADOW', () => {
     const { decision } = decideJourney([]);
@@ -234,6 +293,17 @@ function buildService(overrides: {
     createdAt?: Date;
   } | null;
   unit?: { id: string } | null;
+  /** Per-product on-hand quantities for the aggregate stock check.
+   *  undefined = plentiful stock for everything (999); a record = only
+   *  the listed products have level rows, at the listed quantities. */
+  stock?: Record<string, number>;
+  /** The resolved reviewer row (null = unknown user id). undefined =
+   *  a TENANT user of the journey's tenant. */
+  reviewer?: {
+    id: string;
+    tenantId: string | null;
+    userType: 'PLATFORM' | 'TENANT';
+  } | null;
 } = {}) {
   const createdEvents: Record<string, unknown>[] = [];
   const createdReviews: Record<string, unknown>[] = [];
@@ -260,6 +330,27 @@ function buildService(overrides: {
     },
     product: {
       findFirst: jest.fn(async () => ({ sku: 'SKU-A', name: 'Product A' })),
+    },
+    user: {
+      findFirst: jest.fn(async () =>
+        overrides.reviewer === undefined
+          ? { id: 'user-1', tenantId: TENANT, userType: 'TENANT' }
+          : overrides.reviewer,
+      ),
+    },
+    inventoryLevel: {
+      // READ-ONLY on-hand projection for the aggregate basket check —
+      // deliberately no create/update/delete methods: an inventory WRITE
+      // from this module would throw immediately (shadow-mode guarantee).
+      findFirst: jest.fn(
+        async (args: { where?: { productId?: string } }) => {
+          if (overrides.stock === undefined) {
+            return { quantity: 999 };
+          }
+          const quantity = overrides.stock[args.where?.productId ?? ''];
+          return quantity === undefined ? null : { quantity };
+        },
+      ),
     },
     videoAsset: {
       findFirst: jest.fn(async () =>
@@ -316,6 +407,17 @@ function buildService(overrides: {
         createdReviews.push(row);
         return row;
       }),
+      findFirst: jest.fn(
+        async (args: {
+          where?: { eventId?: string; idempotencyKey?: string };
+        }) =>
+          createdReviews.find(
+            (row) =>
+              args.where?.idempotencyKey !== undefined &&
+              row.idempotencyKey === args.where.idempotencyKey &&
+              row.eventId === args.where.eventId,
+          ) ?? null,
+      ),
       findMany: jest.fn(async () => createdReviews),
     },
     pickupFusionRun: {
@@ -914,5 +1016,331 @@ describe('JourneyService.reviewEvent', () => {
     );
     expect(built.createdReviews).toHaveLength(1);
     expect(built.journeyRow.decision).toBeNull();
+  });
+
+  it('resolves the reviewer within the tenant at the data-access boundary', async () => {
+    const built = await withPickupEvent();
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-1',
+      { decision: JourneyEventReviewDecision.APPROVE },
+      ACTOR,
+    );
+    expect(built.prisma.user.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: ACTOR.id } }),
+    );
+    expect(built.createdReviews[0]).toMatchObject({ reviewedById: ACTOR.id });
+  });
+
+  it("rejects a reviewer belonging to ANOTHER tenant (attribution can't cross tenants)", async () => {
+    const built = await withPickupEvent({
+      reviewer: { id: 'user-1', tenantId: 'tenant-OTHER', userType: 'TENANT' },
+    });
+    await expect(
+      built.service.reviewEvent(
+        TENANT,
+        'j-1',
+        'e-1',
+        { decision: JourneyEventReviewDecision.APPROVE },
+        ACTOR,
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(built.createdReviews).toHaveLength(0);
+    expect(built.audit.record).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown reviewer id', async () => {
+    const built = await withPickupEvent({ reviewer: null });
+    await expect(
+      built.service.reviewEvent(
+        TENANT,
+        'j-1',
+        'e-1',
+        { decision: JourneyEventReviewDecision.APPROVE },
+        ACTOR,
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(built.createdReviews).toHaveLength(0);
+  });
+
+  it('accepts a PLATFORM reviewer (tenantId null — acts via the server-resolved sandbox)', async () => {
+    const built = await withPickupEvent({
+      reviewer: { id: 'user-1', tenantId: null, userType: 'PLATFORM' },
+    });
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-1',
+      { decision: JourneyEventReviewDecision.APPROVE },
+      ACTOR,
+    );
+    expect(built.createdReviews[0]).toMatchObject({ reviewedById: 'user-1' });
+  });
+});
+
+describe('JourneyService.reviewEvent idempotency (lost-response retries)', () => {
+  const ACTOR = { id: 'user-1', email: 'reviewer@example.com' };
+  const KEY = 'retry-key-12345678';
+
+  async function withPickupEvent(
+    overrides: Parameters<typeof buildService>[0] = {},
+  ) {
+    const built = buildService(overrides);
+    built.journeyRow.events.push({
+      id: 'e-1',
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+      sku: 'SKU-A',
+      productName: 'Product A',
+      quantity: 1,
+    });
+    return built;
+  }
+
+  it('a retry with the same key and action REPLAYS: one review row, one audit record', async () => {
+    const built = await withPickupEvent();
+    const body = {
+      decision: JourneyEventReviewDecision.APPROVE,
+      idempotencyKey: KEY,
+    };
+    await built.service.reviewEvent(TENANT, 'j-1', 'e-1', body, ACTOR);
+    await built.service.reviewEvent(TENANT, 'j-1', 'e-1', body, ACTOR);
+    expect(built.createdReviews).toHaveLength(1);
+    expect(built.audit.record).toHaveBeenCalledTimes(1);
+    expect(built.createdReviews[0]).toMatchObject({ idempotencyKey: KEY });
+  });
+
+  it('the idempotency lookup is tenant-scoped', async () => {
+    const built = await withPickupEvent();
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-1',
+      { decision: JourneyEventReviewDecision.APPROVE, idempotencyKey: KEY },
+      ACTOR,
+    );
+    expect(
+      built.prisma.customerJourneyEventReview.findFirst,
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          tenantId: TENANT,
+          eventId: 'e-1',
+          idempotencyKey: KEY,
+        }),
+      }),
+    );
+  });
+
+  it('the same key with a DIFFERENT action conflicts instead of silently replaying', async () => {
+    const built = await withPickupEvent();
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-1',
+      { decision: JourneyEventReviewDecision.APPROVE, idempotencyKey: KEY },
+      ACTOR,
+    );
+    await expect(
+      built.service.reviewEvent(
+        TENANT,
+        'j-1',
+        'e-1',
+        { decision: JourneyEventReviewDecision.REJECT, idempotencyKey: KEY },
+        ACTOR,
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(built.createdReviews).toHaveLength(1);
+    expect(built.audit.record).toHaveBeenCalledTimes(1);
+  });
+
+  it('keyless reviews stay plain append-only: two calls append two rows', async () => {
+    const built = await withPickupEvent();
+    const body = { decision: JourneyEventReviewDecision.APPROVE };
+    await built.service.reviewEvent(TENANT, 'j-1', 'e-1', body, ACTOR);
+    await built.service.reviewEvent(TENANT, 'j-1', 'e-1', body, ACTOR);
+    expect(built.createdReviews).toHaveLength(2);
+    expect(built.audit.record).toHaveBeenCalledTimes(2);
+  });
+
+  it('a P2002 race on the unique key re-reads OUTSIDE the aborted tx and replays', async () => {
+    const built = await withPickupEvent();
+    // Seed the winner's committed row, but make the in-tx pre-check miss
+    // it (the loser read before the winner committed)...
+    built.createdReviews.push({
+      id: 'r-winner',
+      eventId: 'e-1',
+      decision: JourneyEventReviewDecision.APPROVE,
+      correctedEventType: null,
+      correctedProductId: null,
+      correctedQuantity: null,
+      idempotencyKey: KEY,
+      createdAt: new Date(),
+    });
+    built.prisma.customerJourneyEventReview.findFirst.mockResolvedValueOnce(
+      null,
+    );
+    // ...so the loser's insert hits the unique index.
+    built.prisma.customerJourneyEventReview.create.mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError('unique violation', {
+        code: 'P2002',
+        clientVersion: 'test',
+      }),
+    );
+    await built.service.reviewEvent(
+      TENANT,
+      'j-1',
+      'e-1',
+      { decision: JourneyEventReviewDecision.APPROVE, idempotencyKey: KEY },
+      ACTOR,
+    );
+    // Replay: no second row beyond the winner's, and no loser audit record.
+    expect(built.createdReviews).toHaveLength(1);
+    expect(built.audit.record).not.toHaveBeenCalled();
+  });
+});
+
+describe('JourneyService reconcile — aggregate basket vs on-hand stock', () => {
+  it('one on-hand, one pickup: READY_TO_SETTLE_SHADOW stands', async () => {
+    const built = buildService({ stock: { 'prod-a': 1 } });
+    await built.service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+    });
+    await built.service.exit(TENANT, 'j-1');
+    expect(built.journeyRow.decision).toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+    expect(built.journeyRow.status).toBe(CustomerJourneyStatus.RECONCILED);
+  });
+
+  it('one on-hand, two pickups: the folded aggregate demotes to NEEDS_JOURNEY_REVIEW', async () => {
+    const built = buildService({ stock: { 'prod-a': 1 } });
+    await built.service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+    });
+    await built.service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+    });
+    await built.service.exit(TENANT, 'j-1');
+    expect(built.journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_JOURNEY_REVIEW,
+    );
+    expect(built.journeyRow.status).toBe(
+      CustomerJourneyStatus.REVIEW_REQUIRED,
+    );
+    expect(built.journeyRow.decisionReason).toContain('on-hand');
+  });
+
+  it('mixed SKUs validate per SKU: one fitting line cannot excuse another exceeding one', async () => {
+    const built = buildService({ stock: { 'prod-a': 5 } });
+    // prod-b has NO level row at this location.
+    built.prisma.product.findFirst.mockImplementation(
+      async (args: { where: { id: string } }) => ({
+        sku: `SKU-${args.where.id}`,
+        name: `Product ${args.where.id}`,
+      }),
+    );
+    await built.service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+    });
+    await built.service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-b',
+    });
+    await built.service.exit(TENANT, 'j-1');
+    expect(built.journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_JOURNEY_REVIEW,
+    );
+    expect(built.journeyRow.decisionReason).toContain('SKU-prod-b');
+    expect(built.journeyRow.decisionReason).not.toContain('SKU-prod-a');
+  });
+
+  it('returns reduce the aggregate: pickup 2 + return 1 fits 1 on hand', async () => {
+    const built = buildService({ stock: { 'prod-a': 1 } });
+    await built.service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+      quantity: 2,
+    });
+    await built.service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_RETURN,
+      productId: 'prod-a',
+      quantity: 1,
+    });
+    await built.service.exit(TENANT, 'j-1');
+    expect(built.journeyRow.decision).toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+  });
+
+  it('a missing inventory row demotes (nothing on hand can satisfy the line)', async () => {
+    const built = buildService({ stock: {} });
+    await built.service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+    });
+    await built.service.exit(TENANT, 'j-1');
+    expect(built.journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_JOURNEY_REVIEW,
+    );
+  });
+
+  it('the on-hand lookup is READ-ONLY and scoped to tenant + store', async () => {
+    const built = buildService({ stock: { 'prod-a': 1 } });
+    await built.service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+    });
+    await built.service.exit(TENANT, 'j-1');
+    expect(built.prisma.inventoryLevel.findFirst).toHaveBeenCalledWith({
+      where: { tenantId: TENANT, locationId: 'store-1', productId: 'prod-a' },
+      select: { quantity: true },
+    });
+    // The stub deliberately exposes NO write methods — reaching for one
+    // would have thrown before this assertion.
+  });
+});
+
+describe('JourneyService tenant scoping of nested reads', () => {
+  it('detail() carries an explicit tenantId predicate on nested events AND reviews', async () => {
+    const built = buildService();
+    await built.service.detail(TENANT, 'j-1');
+    expect(built.prisma.customerJourney.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { tenantId: TENANT, id: 'j-1' },
+        include: expect.objectContaining({
+          events: expect.objectContaining({
+            where: { tenantId: TENANT },
+            include: expect.objectContaining({
+              reviews: expect.objectContaining({
+                where: { tenantId: TENANT },
+              }),
+            }),
+          }),
+        }),
+      }),
+    );
+  });
+
+  it('reconcile reads events and reviews with explicit tenant scope', async () => {
+    const built = buildService();
+    await built.service.exit(TENANT, 'j-1');
+    expect(built.prisma.customerJourneyEvent.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ tenantId: TENANT, journeyId: 'j-1' }),
+      }),
+    );
+    expect(
+      built.prisma.customerJourneyEventReview.findMany,
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ tenantId: TENANT, journeyId: 'j-1' }),
+      }),
+    );
   });
 });

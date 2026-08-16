@@ -1,6 +1,9 @@
 import { BadRequestException } from '@nestjs/common';
-import { GroundTruthEventKind } from '@prisma/client';
-import { PickupValidationService } from './pickup-validation.service';
+import { CvTestScenario, GroundTruthEventKind } from '@prisma/client';
+import {
+  PickupValidationService,
+  scenarioKindMismatch,
+} from './pickup-validation.service';
 import {
   fusionPredictedSku,
   shadowVerdict,
@@ -161,6 +164,69 @@ describe('upsertGroundTruth', () => {
     };
     expect(args.update).toMatchObject({
       note: 'approved: shelf occlusion acceptable, retest cam3',
+    });
+  });
+
+  describe('testType ↔ eventKind compatibility (Codex P1)', () => {
+    const validPairs: [CvTestScenario, GroundTruthEventKind][] = [
+      [CvTestScenario.PICKUP_SINGLE, GroundTruthEventKind.PICKUP],
+      [CvTestScenario.RETURN_SINGLE, GroundTruthEventKind.RETURN],
+      [CvTestScenario.FALSE_TOUCH, GroundTruthEventKind.NONE],
+      [CvTestScenario.TWO_SIMILAR_PICK_ONE, GroundTruthEventKind.PICKUP],
+      [CvTestScenario.TWO_VISIBLE_PICK_ONE, GroundTruthEventKind.PICKUP],
+      [CvTestScenario.VLM_UNAVAILABLE, GroundTruthEventKind.PICKUP],
+      [CvTestScenario.VLM_UNAVAILABLE, GroundTruthEventKind.RETURN],
+      [CvTestScenario.VLM_INVALID_SKU, GroundTruthEventKind.PICKUP],
+      [CvTestScenario.VLM_INVALID_SKU, GroundTruthEventKind.RETURN],
+    ];
+    it.each(validPairs)('%s + %s is accepted', async (testType, eventKind) => {
+      const { service, upsert } = buildService();
+      const input =
+        eventKind === GroundTruthEventKind.NONE
+          ? { eventKind, testType }
+          : { ...valid, eventKind, testType };
+      await service.upsertGroundTruth(TENANT, ASSET, input);
+      expect(upsert).toHaveBeenCalledTimes(1);
+    });
+
+    const invalidPairs: [CvTestScenario, GroundTruthEventKind][] = [
+      [CvTestScenario.FALSE_TOUCH, GroundTruthEventKind.PICKUP],
+      [CvTestScenario.RETURN_SINGLE, GroundTruthEventKind.PICKUP],
+      [CvTestScenario.PICKUP_SINGLE, GroundTruthEventKind.NONE],
+      [CvTestScenario.TWO_SIMILAR_PICK_ONE, GroundTruthEventKind.NONE],
+      [CvTestScenario.VLM_UNAVAILABLE, GroundTruthEventKind.NONE],
+      [CvTestScenario.VLM_INVALID_SKU, GroundTruthEventKind.NONE],
+    ];
+    it.each(invalidPairs)(
+      '%s + %s is rejected (400, no write)',
+      async (testType, eventKind) => {
+        const { service, upsert } = buildService();
+        const input =
+          eventKind === GroundTruthEventKind.NONE
+            ? { eventKind, testType }
+            : { ...valid, eventKind, testType };
+        await expect(
+          service.upsertGroundTruth(TENANT, ASSET, input),
+        ).rejects.toBeInstanceOf(BadRequestException);
+        expect(upsert).not.toHaveBeenCalled();
+      },
+    );
+
+    it('null/undefined testType is always accepted (unlabeled clip)', () => {
+      expect(scenarioKindMismatch(null, GroundTruthEventKind.PICKUP)).toBeNull();
+      expect(
+        scenarioKindMismatch(undefined, GroundTruthEventKind.NONE),
+      ).toBeNull();
+    });
+
+    it('the rejection message names only enum values, never free text', () => {
+      const message = scenarioKindMismatch(
+        CvTestScenario.FALSE_TOUCH,
+        GroundTruthEventKind.PICKUP,
+      );
+      expect(message).toBe(
+        'testType FALSE_TOUCH requires eventKind NONE (got PICKUP)',
+      );
     });
   });
 

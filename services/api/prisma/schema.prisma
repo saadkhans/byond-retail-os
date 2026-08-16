@@ -739,6 +739,11 @@ model CustomerJourneyEventReview {
   correctedQuantity    Int?
   reason               String?
   reviewedById         String?
+  // Client-supplied replay token: a retried POST with the same key returns
+  // the existing review instead of appending a second immutable record of
+  // the same human action. Unique per (tenant, event); NULLs (no key) are
+  // distinct, preserving plain append-only behavior.
+  idempotencyKey       String?
   createdAt            DateTime @default(now())
 
   tenant           Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
@@ -747,6 +752,7 @@ model CustomerJourneyEventReview {
   correctedProduct Product?             @relation("JourneyReviewCorrectedProduct", fields: [correctedProductId], references: [id], onDelete: Restrict)
 
   @@unique([id, tenantId])
+  @@unique([tenantId, eventId, idempotencyKey])
   @@index([tenantId, journeyId, createdAt])
   @@index([tenantId, eventId, createdAt])
 }

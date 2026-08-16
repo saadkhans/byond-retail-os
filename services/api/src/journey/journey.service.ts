@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
@@ -13,6 +14,7 @@ import {
   FusionPolicyResult,
   JourneyEventReviewDecision,
   Prisma,
+  UserType,
 } from '@prisma/client';
 import { AuditLogService } from '../common/audit/audit-log.service';
 import { journeyAdvisoryLockKey } from '../common/locks';
@@ -287,6 +289,44 @@ export function decideJourney(issues: JourneyIssue[]): {
   };
 }
 
+/**
+ * Pure AGGREGATE stock check — exported for direct testing. Fusion
+ * validates each observation independently, and shadow mode reserves
+ * nothing: with one unit on hand, two individually-PLAUSIBLE pickups can
+ * fold to a basket inventory cannot satisfy. Before a journey is declared
+ * READY_TO_SETTLE_SHADOW, the FOLDED per-SKU totals are compared against
+ * the on-hand projection (returns already reduced the fold). Read-only by
+ * construction: the caller passes quantities it READ — nothing here (or
+ * anywhere in this module) writes or reserves inventory.
+ *
+ * `onHandByProductId` has an entry per basket product that HAS a level
+ * row; a missing entry means the product is not stocked at this location
+ * and cannot satisfy any quantity. Reasons are built from SKU snapshots
+ * and counts only — never event free text.
+ */
+export function validateAggregateBasket(
+  basket: ProvisionalBasketLine[],
+  onHandByProductId: Map<string, number>,
+): { ok: boolean; reason: string | null } {
+  const short: string[] = [];
+  for (const line of basket) {
+    if (!line.productId || line.quantity <= 0) {
+      continue;
+    }
+    const onHand = onHandByProductId.get(line.productId);
+    if (onHand === undefined || line.quantity > onHand) {
+      short.push(line.sku ?? line.productId);
+    }
+  }
+  if (short.length === 0) {
+    return { ok: true, reason: null };
+  }
+  return {
+    ok: false,
+    reason: `aggregate basket exceeds on-hand stock for ${short.join(', ')}`,
+  };
+}
+
 /** SAFE extraction of the VLM block from a run's evidence JSON: named
  *  descriptor fields only — rawPreview / errorDetail / OCR text are
  *  deliberately not read, let alone returned. */
@@ -442,11 +482,15 @@ export class JourneyService {
     tx: Prisma.TransactionClient,
     tenantId: string,
     journeyId: string,
+    locationId: string,
     options: { setEndedAt: boolean },
   ): Promise<void> {
     let decision: CustomerJourneyDecision;
     let reason: string;
     try {
+      // TENANT SCOPE on every read, including the nested/derived ones:
+      // relation and composite-FK integrity are the backstop, never the
+      // predicate (repo rule: every tenant-data query carries tenantId).
       const events = await tx.customerJourneyEvent.findMany({
         where: { tenantId, journeyId },
         orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
@@ -455,8 +499,32 @@ export class JourneyService {
         where: { tenantId, journeyId },
         orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       });
-      const { issues } = foldBasket(events, reviews);
+      const { basket, issues } = foldBasket(events, reviews);
       ({ decision, reason } = decideJourney(issues));
+      if (decision === CustomerJourneyDecision.READY_TO_SETTLE_SHADOW) {
+        // AGGREGATE stock check before declaring the shadow basket
+        // settleable — READ-ONLY lookups of the on-hand projection at the
+        // journey's store; no inventory write or reservation exists in
+        // shadow mode.
+        const onHand = new Map<string, number>();
+        for (const line of basket) {
+          if (!line.productId || line.quantity <= 0) {
+            continue;
+          }
+          const level = await tx.inventoryLevel.findFirst({
+            where: { tenantId, locationId, productId: line.productId },
+            select: { quantity: true },
+          });
+          if (level) {
+            onHand.set(line.productId, level.quantity);
+          }
+        }
+        const aggregate = validateAggregateBasket(basket, onHand);
+        if (!aggregate.ok) {
+          decision = CustomerJourneyDecision.NEEDS_JOURNEY_REVIEW;
+          reason = aggregate.reason!;
+        }
+      }
     } catch (error) {
       this.logger.error(
         `journey ${journeyId} reconciliation failed`,
@@ -696,7 +764,7 @@ export class JourneyService {
    *  and the status transition. The decision mutates ONLY the journey
    *  row — never checkout, order, payment, or inventory state. */
   async exit(tenantId: string, journeyId: string, actorId?: string) {
-    await this.withOpenJourney(tenantId, journeyId, async (tx) => {
+    await this.withOpenJourney(tenantId, journeyId, async (tx, journey) => {
       await tx.customerJourneyEvent.create({
         data: {
           tenantId,
@@ -711,7 +779,9 @@ export class JourneyService {
       // alone must never address another tenant's journey, even after
       // withOpenJourney's scoped lookup (the write itself enforces
       // isolation).
-      await this.reconcile(tx, tenantId, journeyId, { setEndedAt: true });
+      await this.reconcile(tx, tenantId, journeyId, journey.locationId, {
+        setEndedAt: true,
+      });
     });
     return this.detail(tenantId, journeyId);
   }
@@ -735,6 +805,7 @@ export class JourneyService {
       correctedEventType?: CustomerJourneyEventType | null;
       correctedProductId?: string | null;
       correctedQuantity?: number | null;
+      idempotencyKey?: string | null;
     },
     actor: { id: string; email: string },
   ) {
@@ -773,103 +844,192 @@ export class JourneyService {
         );
       }
     }
-    await this.withJourney(tenantId, journeyId, async (tx, journey) => {
-      const event = await tx.customerJourneyEvent.findFirst({
-        where: { tenantId, journeyId, id: eventId },
-      });
-      if (!event) {
-        throw new NotFoundException('Event not found in this journey');
-      }
-      if (
-        event.eventType !== CustomerJourneyEventType.PRODUCT_PICKUP &&
-        event.eventType !== CustomerJourneyEventType.PRODUCT_RETURN &&
-        event.eventType !== CustomerJourneyEventType.REVIEW_REQUIRED
-      ) {
-        throw new BadRequestException(
-          'only PRODUCT_PICKUP / PRODUCT_RETURN / REVIEW_REQUIRED ' +
-            'observations are reviewable',
+    const idempotencyKey = input.idempotencyKey?.trim() || null;
+    // A stored review "is the same action" when decision + corrected
+    // payload all match; correctedEventType is compared only when the
+    // caller supplied one (product events default it server-side).
+    const matchesStored = (stored: {
+      decision: JourneyEventReviewDecision;
+      correctedEventType: CustomerJourneyEventType | null;
+      correctedProductId: string | null;
+      correctedQuantity: number | null;
+    }) =>
+      stored.decision === input.decision &&
+      stored.correctedProductId ===
+        (isCorrect ? input.correctedProductId! : null) &&
+      stored.correctedQuantity ===
+        (isCorrect ? input.correctedQuantity! : null) &&
+      (!isCorrect ||
+        input.correctedEventType == null ||
+        stored.correctedEventType === input.correctedEventType);
+    const replayOrConflict = (stored: Parameters<typeof matchesStored>[0]) => {
+      if (!matchesStored(stored)) {
+        throw new ConflictException(
+          'idempotency key was already used for a different review action',
         );
       }
-      let correctedEventType: CustomerJourneyEventType | null = null;
-      let snapshot: { sku: string; name: string } | null = null;
-      if (isCorrect) {
-        // A REVIEW_REQUIRED original has no product kind of its own — the
-        // reviewer must say whether it was a pickup or a return. Product
-        // events default to their observed kind.
-        correctedEventType =
-          input.correctedEventType ??
-          (event.eventType === CustomerJourneyEventType.REVIEW_REQUIRED
-            ? null
-            : event.eventType);
+      // REPLAY: the first attempt committed (review + audit); a retry
+      // whose response was lost gets the same outcome with no second
+      // immutable record of the same human action.
+    };
+    try {
+      await this.withJourney(tenantId, journeyId, async (tx, journey) => {
+        const event = await tx.customerJourneyEvent.findFirst({
+          where: { tenantId, journeyId, id: eventId },
+        });
+        if (!event) {
+          throw new NotFoundException('Event not found in this journey');
+        }
         if (
-          correctedEventType !== CustomerJourneyEventType.PRODUCT_PICKUP &&
-          correctedEventType !== CustomerJourneyEventType.PRODUCT_RETURN
+          event.eventType !== CustomerJourneyEventType.PRODUCT_PICKUP &&
+          event.eventType !== CustomerJourneyEventType.PRODUCT_RETURN &&
+          event.eventType !== CustomerJourneyEventType.REVIEW_REQUIRED
         ) {
           throw new BadRequestException(
-            'CORRECT on a REVIEW_REQUIRED observation requires ' +
-              'correctedEventType PRODUCT_PICKUP or PRODUCT_RETURN',
+            'only PRODUCT_PICKUP / PRODUCT_RETURN / REVIEW_REQUIRED ' +
+              'observations are reviewable',
           );
         }
-        // TENANT ISOLATION: the corrected product is resolved within this
-        // tenant before anything is written — a known foreign product id
-        // must never enter another tenant's journey.
-        const product = await tx.product.findFirst({
-          where: { tenantId, id: input.correctedProductId! },
-          select: { sku: true, name: true },
+        // REVIEWER ATTRIBUTION is resolved at the data-access boundary,
+        // not trusted from the request context: reviewedById must name a
+        // user of THIS tenant. Platform users (tenantId null) act through
+        // the server-resolved platform-sandbox tenant — the same reason
+        // the same-tenant-FK migrations deliberately exempt user
+        // attribution columns — so they pass on userType, never on a
+        // tenant match.
+        const reviewer = await tx.user.findFirst({
+          where: { id: actor.id },
+          select: { id: true, tenantId: true, userType: true },
         });
-        if (!product) {
-          throw new BadRequestException('Product not found in this tenant');
+        if (
+          !reviewer ||
+          (reviewer.userType !== UserType.PLATFORM &&
+            reviewer.tenantId !== tenantId)
+        ) {
+          throw new ForbiddenException(
+            'reviewer does not belong to this tenant',
+          );
         }
-        snapshot = { sku: product.sku, name: product.name };
-      }
-      const review = await tx.customerJourneyEventReview.create({
-        data: {
-          tenantId,
-          journeyId,
-          eventId,
-          decision: input.decision,
-          correctedEventType,
-          correctedProductId: isCorrect ? input.correctedProductId! : null,
-          correctedSku: snapshot?.sku ?? null,
-          correctedProductName: snapshot?.name ?? null,
-          correctedQuantity: isCorrect ? input.correctedQuantity! : null,
-          reason: input.reason?.slice(0, 500) ?? null,
-          reviewedById: actor.id,
-        },
-      });
-      // Audit commits or rolls back WITH the review (fail closed). CORRECT
-      // maps to OVERRIDE — AuditAction's existing reviewer vocabulary.
-      await this.audit.record(
-        {
-          tenantId,
-          actorId: actor.id,
-          actorEmail: actor.email,
-          action:
-            input.decision === JourneyEventReviewDecision.APPROVE
-              ? AuditAction.APPROVE
-              : input.decision === JourneyEventReviewDecision.REJECT
-                ? AuditAction.REJECT
-                : AuditAction.OVERRIDE,
-          entityType: 'CustomerJourneyEvent',
-          entityId: eventId,
-          after: {
-            reviewId: review.id,
+        // IDEMPOTENT reviews: a lost-response retry replays instead of
+        // appending a second immutable record. Checked under the journey
+        // lock, in the same transaction as the insert; tenant-scoped like
+        // every read here.
+        if (idempotencyKey) {
+          const existing = await tx.customerJourneyEventReview.findFirst({
+            where: { tenantId, eventId, idempotencyKey },
+          });
+          if (existing) {
+            replayOrConflict(existing);
+            return;
+          }
+        }
+        let correctedEventType: CustomerJourneyEventType | null = null;
+        let snapshot: { sku: string; name: string } | null = null;
+        if (isCorrect) {
+          // A REVIEW_REQUIRED original has no product kind of its own — the
+          // reviewer must say whether it was a pickup or a return. Product
+          // events default to their observed kind.
+          correctedEventType =
+            input.correctedEventType ??
+            (event.eventType === CustomerJourneyEventType.REVIEW_REQUIRED
+              ? null
+              : event.eventType);
+          if (
+            correctedEventType !== CustomerJourneyEventType.PRODUCT_PICKUP &&
+            correctedEventType !== CustomerJourneyEventType.PRODUCT_RETURN
+          ) {
+            throw new BadRequestException(
+              'CORRECT on a REVIEW_REQUIRED observation requires ' +
+                'correctedEventType PRODUCT_PICKUP or PRODUCT_RETURN',
+            );
+          }
+          // TENANT ISOLATION: the corrected product is resolved within this
+          // tenant before anything is written — a known foreign product id
+          // must never enter another tenant's journey.
+          const product = await tx.product.findFirst({
+            where: { tenantId, id: input.correctedProductId! },
+            select: { sku: true, name: true },
+          });
+          if (!product) {
+            throw new BadRequestException('Product not found in this tenant');
+          }
+          snapshot = { sku: product.sku, name: product.name };
+        }
+        const review = await tx.customerJourneyEventReview.create({
+          data: {
+            tenantId,
+            journeyId,
+            eventId,
             decision: input.decision,
             correctedEventType,
-            correctedProductId: isCorrect ? input.correctedProductId : null,
+            correctedProductId: isCorrect ? input.correctedProductId! : null,
             correctedSku: snapshot?.sku ?? null,
-            correctedQuantity: isCorrect ? input.correctedQuantity : null,
+            correctedProductName: snapshot?.name ?? null,
+            correctedQuantity: isCorrect ? input.correctedQuantity! : null,
+            reason: input.reason?.slice(0, 500) ?? null,
+            reviewedById: reviewer.id,
+            idempotencyKey,
           },
-          reason: input.reason?.slice(0, 500),
-        },
-        tx,
-      );
-      // A review on a CLOSED journey re-settles the final decision in the
-      // same transaction; an OPEN journey decides at exit.
-      if (journey.status !== CustomerJourneyStatus.OPEN) {
-        await this.reconcile(tx, tenantId, journeyId, { setEndedAt: false });
+        });
+        // Audit commits or rolls back WITH the review (fail closed). CORRECT
+        // maps to OVERRIDE — AuditAction's existing reviewer vocabulary.
+        // Written only for genuinely NEW reviews — a replay records nothing.
+        await this.audit.record(
+          {
+            tenantId,
+            actorId: actor.id,
+            actorEmail: actor.email,
+            action:
+              input.decision === JourneyEventReviewDecision.APPROVE
+                ? AuditAction.APPROVE
+                : input.decision === JourneyEventReviewDecision.REJECT
+                  ? AuditAction.REJECT
+                  : AuditAction.OVERRIDE,
+            entityType: 'CustomerJourneyEvent',
+            entityId: eventId,
+            after: {
+              reviewId: review.id,
+              decision: input.decision,
+              correctedEventType,
+              correctedProductId: isCorrect ? input.correctedProductId : null,
+              correctedSku: snapshot?.sku ?? null,
+              correctedQuantity: isCorrect ? input.correctedQuantity : null,
+            },
+            reason: input.reason?.slice(0, 500),
+          },
+          tx,
+        );
+        // A review on a CLOSED journey re-settles the final decision in the
+        // same transaction; an OPEN journey decides at exit.
+        if (journey.status !== CustomerJourneyStatus.OPEN) {
+          await this.reconcile(tx, tenantId, journeyId, journey.locationId, {
+            setEndedAt: false,
+          });
+        }
+      });
+    } catch (error) {
+      // RACE BACKSTOP for the unique (tenantId, eventId, idempotencyKey)
+      // index: two concurrent retries both miss the pre-check; the loser's
+      // transaction aborts on P2002 and must re-read OUTSIDE it (the
+      // aborted tx cannot serve queries) to replay or conflict.
+      if (
+        idempotencyKey &&
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        const existing =
+          await this.prisma.customerJourneyEventReview.findFirst({
+            where: { tenantId, eventId, idempotencyKey },
+          });
+        if (existing) {
+          replayOrConflict(existing);
+        } else {
+          throw error;
+        }
+      } else {
+        throw error;
       }
-    });
+    }
     return this.detail(tenantId, journeyId);
   }
 
@@ -893,13 +1053,21 @@ export class JourneyService {
   }
 
   async detail(tenantId: string, journeyId: string): Promise<JourneyDetail> {
+    // TENANT SCOPE at every nesting level, not just the root: the nested
+    // event and review reads carry their own tenantId predicate rather
+    // than leaning on relation/composite-FK integrity (repo rule — the
+    // database constraints are the backstop, never the query filter).
     const journey = await this.prisma.customerJourney.findFirst({
       where: { tenantId, id: journeyId },
       include: {
         events: {
+          where: { tenantId },
           orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
           include: {
-            reviews: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] },
+            reviews: {
+              where: { tenantId },
+              orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+            },
           },
         },
       },

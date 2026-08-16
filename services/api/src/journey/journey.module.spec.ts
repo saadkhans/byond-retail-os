@@ -71,6 +71,7 @@ describe('JourneyController.reviewEvent', () => {
       correctedProductId: 'prod-a',
       correctedQuantity: 2,
       reason: 'mislabeled',
+      idempotencyKey: 'retry-key-12345678',
       // Forged snapshot/attribution a caller might try to smuggle in.
       correctedSku: 'FORGED-SKU',
       correctedProductName: 'Forged Product',
@@ -91,6 +92,7 @@ describe('JourneyController.reviewEvent', () => {
         correctedEventType: CustomerJourneyEventType.PRODUCT_PICKUP,
         correctedProductId: 'prod-a',
         correctedQuantity: 2,
+        idempotencyKey: 'retry-key-12345678',
       },
       { id: 'user-1', email: 'reviewer@example.com' },
     );

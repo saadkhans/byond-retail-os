@@ -80,9 +80,16 @@ export interface EvaluationSummary {
   vlmAgreement: {
     agree: number;
     disagree: number;
-    abstain: number;
-    denominator: number;
-    rate: number | null;
+    /** Answered verdicts only: agree + disagree. Abstentions (AMBIGUOUS /
+     *  UNKNOWN / INVALID_INPUT) are honest non-answers and never dilute
+     *  the agreement denominator — they are reported separately. */
+    vlmAnsweredCount: number;
+    vlmAbstentionCount: number;
+    /** agree / (agree + disagree); null when nothing was answered. */
+    vlmAgreementRate: number | null;
+    /** abstentions / (answered + abstentions); null when the VLM never
+     *  reached a verdict at all. */
+    vlmAbstentionRate: number | null;
   };
   humanReviewRate: RateMetric;
   basketExactMatchRate: RateMetric;
@@ -107,6 +114,53 @@ export interface ScenarioEvaluation {
 export interface EvaluatedClip {
   gt: EvalGroundTruth;
   clip: ClipEvaluation;
+}
+
+/** Signed per-SKU basket delta: +N picked up, -N returned. */
+export type BasketDelta = Record<string, number>;
+
+/** What the ground truth says the basket DELTA of the clip is. A RETURN
+ *  is a NEGATIVE delta — representing it as an empty basket would let a
+ *  missed return (or a wrong returned SKU) score as an exact match. */
+export function expectedBasketDelta(gt: EvalGroundTruth): BasketDelta {
+  if (gt.sku === null) {
+    return {};
+  }
+  if (gt.eventKind === GroundTruthEventKind.PICKUP) {
+    return { [gt.sku]: gt.quantity };
+  }
+  if (gt.eventKind === GroundTruthEventKind.RETURN) {
+    return { [gt.sku]: -gt.quantity };
+  }
+  return {};
+}
+
+/** What the run's policy actually proposes as a basket delta. Only an
+ *  AUTO_PROPOSE run proposes anything; review/unknown/failed policies are
+ *  non-answers and propose an empty delta (which can only exact-match a
+ *  NONE ground truth — never a pickup or a return). */
+export function predictedBasketDelta(clip: ClipEvaluation): BasketDelta {
+  if (!clip.autoProposed || clip.predictedSku === null) {
+    return {};
+  }
+  if (clip.predictedKind === 'PICKUP') {
+    return { [clip.predictedSku]: 1 };
+  }
+  if (clip.predictedKind === 'RETURN') {
+    return { [clip.predictedSku]: -1 };
+  }
+  return {};
+}
+
+/** Deep equality over signed deltas (missing key ≡ 0). */
+export function basketDeltasEqual(a: BasketDelta, b: BasketDelta): boolean {
+  const skus = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const sku of skus) {
+    if ((a[sku] ?? 0) !== (b[sku] ?? 0)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -371,24 +425,9 @@ export function summarize(pairs: EvaluatedClip[]): EvaluationSummary {
       clip.vlm.requiresHumanReview === true,
   ).length;
 
-  const basketMatches = withRun.filter(({ gt, clip }) => {
-    const expected =
-      gt.eventKind === GroundTruthEventKind.PICKUP
-        ? [{ sku: gt.sku, quantity: gt.quantity }]
-        : [];
-    const predicted =
-      clip.autoProposed && clip.predictedKind === 'PICKUP'
-        ? [{ sku: clip.predictedSku, quantity: 1 }]
-        : [];
-    if (expected.length !== predicted.length) {
-      return false;
-    }
-    return expected.every(
-      (line, index) =>
-        line.sku === predicted[index].sku &&
-        line.quantity === predicted[index].quantity,
-    );
-  }).length;
+  const basketMatches = withRun.filter(({ gt, clip }) =>
+    basketDeltasEqual(expectedBasketDelta(gt), predictedBasketDelta(clip)),
+  ).length;
 
   const stageSamples = new Map<string, number[]>();
   for (const { clip } of withRun) {
@@ -471,9 +510,12 @@ export function summarize(pairs: EvaluatedClip[]): EvaluationSummary {
     vlmAgreement: {
       agree,
       disagree,
-      abstain,
-      denominator: vlmJudged.length,
-      rate: vlmJudged.length > 0 ? agree / vlmJudged.length : null,
+      vlmAnsweredCount: agree + disagree,
+      vlmAbstentionCount: abstain,
+      vlmAgreementRate:
+        agree + disagree > 0 ? agree / (agree + disagree) : null,
+      vlmAbstentionRate:
+        vlmJudged.length > 0 ? abstain / vlmJudged.length : null,
     },
     humanReviewRate: ratio(humanReview, withRun.length),
     basketExactMatchRate: ratio(basketMatches, withRun.length),

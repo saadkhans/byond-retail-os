@@ -1,4 +1,4 @@
-import { Fragment, useState } from 'react';
+import { Fragment, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import {
   ApiError,
@@ -144,11 +144,40 @@ export function JourneyDetailPage() {
     [],
   );
 
+  // One idempotency key per event, created on the first review attempt and
+  // dropped only after a CONFIRMED success — a retry after a lost response
+  // resends the same key and the server replays the stored review instead
+  // of appending a duplicate immutable record (same rotate-on-success
+  // idiom as the upload idempotency key in VideoAssetsPage).
+  const reviewKeys = useRef(new Map<string, string>());
+
   async function act(path: string, body: Record<string, unknown>) {
     setBusy(true);
     setError(null);
     try {
       await api(`/journeys/${id}${path}`, { method: 'POST', body });
+      setCorrectingId(null);
+      setReviewReason('');
+      setReload((n) => n + 1);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitReview(eventId: string, body: Record<string, unknown>) {
+    const existing = reviewKeys.current.get(eventId);
+    const idempotencyKey = existing ?? crypto.randomUUID();
+    reviewKeys.current.set(eventId, idempotencyKey);
+    setBusy(true);
+    setError(null);
+    try {
+      await api(`/journeys/${id}/events/${eventId}/review`, {
+        method: 'POST',
+        body: { ...body, idempotencyKey },
+      });
+      reviewKeys.current.delete(eventId);
       setCorrectingId(null);
       setReviewReason('');
       setReload((n) => n + 1);
@@ -186,7 +215,7 @@ export function JourneyDetailPage() {
       setError('A correction needs a product and a whole quantity 1..100.');
       return;
     }
-    void act(`/events/${eventId}/review`, {
+    void submitReview(eventId, {
       decision: 'CORRECT',
       correctedEventType: correctEventType,
       correctedProductId: correctProductId,
@@ -350,7 +379,7 @@ export function JourneyDetailPage() {
                             <button
                               disabled={busy}
                               onClick={() =>
-                                void act(`/events/${event.id}/review`, {
+                                void submitReview(event.id, {
                                   decision: 'APPROVE',
                                 })
                               }
@@ -360,7 +389,7 @@ export function JourneyDetailPage() {
                             <button
                               disabled={busy}
                               onClick={() =>
-                                void act(`/events/${event.id}/review`, {
+                                void submitReview(event.id, {
                                   decision: 'REJECT',
                                 })
                               }

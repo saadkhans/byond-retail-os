@@ -1078,9 +1078,13 @@ export interface EvaluationSummary {
   vlmAgreement: {
     agree: number;
     disagree: number;
-    abstain: number;
-    denominator: number;
-    rate: number | null;
+    /** Answered MATCH verdicts only (agree + disagree); abstentions
+     *  (AMBIGUOUS/UNKNOWN/INVALID_INPUT) are reported separately and never
+     *  dilute the agreement denominator. */
+    vlmAnsweredCount: number;
+    vlmAbstentionCount: number;
+    vlmAgreementRate: number | null;
+    vlmAbstentionRate: number | null;
   };
   humanReviewRate: RateMetric;
   basketExactMatchRate: RateMetric;

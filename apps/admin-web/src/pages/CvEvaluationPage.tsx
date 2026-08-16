@@ -71,11 +71,18 @@ export function CvEvaluationPage() {
         { label: 'SKU top-1', value: formatRate(data.skuTop1Accuracy) },
         { label: 'SKU top-3', value: formatRate(data.skuTop3Accuracy) },
         {
-          label: 'VLM agreement',
+          label: 'VLM agreement (answered)',
           value:
-            data.vlmAgreement.rate === null
+            data.vlmAgreement.vlmAgreementRate === null
+              ? '— · 0 answered'
+              : `${Math.round(data.vlmAgreement.vlmAgreementRate * 100)}% · ${data.vlmAgreement.agree}/${data.vlmAgreement.vlmAnsweredCount}`,
+        },
+        {
+          label: 'VLM abstention rate',
+          value:
+            data.vlmAgreement.vlmAbstentionRate === null
               ? '—'
-              : `${Math.round(data.vlmAgreement.rate * 100)}% · ${data.vlmAgreement.agree}/${data.vlmAgreement.denominator}`,
+              : `${Math.round(data.vlmAgreement.vlmAbstentionRate * 100)}% · ${data.vlmAgreement.vlmAbstentionCount} abstained`,
         },
         { label: 'Human-review rate', value: formatRate(data.humanReviewRate) },
         {
@@ -102,7 +109,8 @@ export function CvEvaluationPage() {
                   data.totals.clipsWithoutRun === 1 ? 'is' : 'are'
                 } excluded from accuracy`
               : ''}
-            . VLM abstains: {data.vlmAgreement.abstain} · disagreements:{' '}
+            . VLM agreement counts answered verdicts only — abstentions:{' '}
+            {data.vlmAgreement.vlmAbstentionCount} · disagreements:{' '}
             {data.vlmAgreement.disagree}.
           </p>
           <div className="cards">

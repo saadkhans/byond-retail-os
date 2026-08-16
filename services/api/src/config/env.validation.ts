@@ -500,6 +500,35 @@ export function assertTestMediaIngestNonProduction(
   );
 }
 
+/**
+ * Startup rule (same post-validate idiom as assertTestMediaIngestNonProduction):
+ * VLM fault injection is a SHADOW/TEST drill, never a production setting. A
+ * leaked PICKUP_VLM_FAULT in production would globally fabricate VLM
+ * failures (UNAVAILABLE) or invented-SKU responses (INVALID_SKU) for every
+ * fusion run, so any value other than NONE may only boot when NODE_ENV is
+ * EXPLICITLY development or test. An UNSET NODE_ENV is treated exactly like
+ * production — a deployment that forgets NODE_ENV must not silently become
+ * a fault-injecting environment. NONE (or unset) is fine everywhere.
+ */
+export function assertVlmFaultNonProduction(
+  fault: string | undefined,
+  nodeEnv: NodeEnv | undefined,
+): void {
+  if (fault === undefined || fault === 'NONE') {
+    return;
+  }
+  if (nodeEnv === NodeEnv.Development || nodeEnv === NodeEnv.Test) {
+    return;
+  }
+  const environment = nodeEnv === undefined ? 'unset' : nodeEnv;
+  throw new Error(
+    `PICKUP_VLM_FAULT=${fault} is not supported when NODE_ENV is ` +
+      `${environment} because VLM fault injection is a controlled-test ` +
+      'drill; it is allowed solely when NODE_ENV is explicitly ' +
+      'development or test.',
+  );
+}
+
 export function validateEnv(
   config: Record<string, unknown>,
 ): EnvironmentVariables {
@@ -523,5 +552,6 @@ export function validateEnv(
     validated.VIDEO_TEST_MEDIA_INGEST_ENABLED,
     validated.NODE_ENV,
   );
+  assertVlmFaultNonProduction(validated.PICKUP_VLM_FAULT, validated.NODE_ENV);
   return validated;
 }
