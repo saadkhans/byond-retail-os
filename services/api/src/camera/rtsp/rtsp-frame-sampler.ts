@@ -31,10 +31,11 @@ import { RgbImage } from '../../pickup-detection/analysis/product-matcher';
  * CREDENTIAL-FREE SOURCES ONLY (Codex P1): the input value lands in
  * ffmpeg's argv, which is visible to process listings and telemetry —
  * escaping shell injection is not enough. Phase 13 therefore supports
- * credential-free dev/local sources only (a URL carrying userinfo or a
- * token-like query parameter is refused BEFORE any spawn with
- * RTSP_CREDENTIALS_IN_URL_UNSUPPORTED) until a secure non-argv
- * transport exists.
+ * credential-free dev/local sources only: a scheme-shaped value must be
+ * scheme + host(+port) + path with NO userinfo, NO query string, and NO
+ * fragment (any of those is refused BEFORE any spawn with
+ * RTSP_CREDENTIALS_IN_URL_UNSUPPORTED — no credential-key allowlist to
+ * alias around) until a secure non-argv transport exists.
  *
  * Dev affordance (deliberate): the configured value may be ANY
  * ffmpeg-readable input — a credential-free rtsp:// URL on a real
@@ -54,50 +55,31 @@ export const RTSP_SAMPLE_ERROR_CODES = [
 ] as const;
 export type RtspSampleErrorCode = (typeof RTSP_SAMPLE_ERROR_CODES)[number];
 
-/** Query-parameter names that mark a URL as credential-bearing even
- *  without userinfo — matched case-insensitively on the KEY only (the
- *  value is never inspected, logged, or surfaced). */
-const TOKEN_QUERY_KEYS = new Set([
-  'token',
-  'access_token',
-  'apikey',
-  'api_key',
-  'password',
-  'passwd',
-  'auth',
-  'key',
-  'secret',
-]);
-
 /**
- * Pure pre-spawn gate (Codex P1): true when a SCHEME-shaped value
- * carries credentials — userinfo (user or user:pass before '@') or a
- * token-like query key. Plain file paths (no `scheme://`) skip the
- * check entirely. A scheme-shaped value `new URL` cannot parse is
- * judged conservatively: an '@' inside its authority section rejects.
- * The value itself never leaves the caller.
+ * Pure pre-spawn gate (Codex P1, STRICT MVP rule): a SCHEME-shaped value
+ * may consist of scheme + host(+port) + path ONLY. It is rejected when
+ * it carries ANY userinfo (anything before '@' in the authority), ANY
+ * query string ('?' anywhere), or ANY fragment ('#' anywhere) — no
+ * credential-key allowlist to sidestep with an alias like ?pwd= or
+ * ?u=/&p=. A legitimately query-bearing camera URL is simply out of
+ * scope for Phase 13 (credential-free dev/local sources only) until a
+ * secure non-argv transport exists.
+ *
+ * Plain file paths (no `scheme://`) skip the check entirely: they never
+ * enter a URL parser and carry no userinfo/query semantics — a Windows
+ * path is not a URL. The value itself never leaves the caller.
  */
-export function urlCarriesCredentials(value: string): boolean {
+export function urlViolatesCredentialFreeRule(value: string): boolean {
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
     return false;
   }
-  try {
-    const url = new URL(value);
-    if (url.username !== '' || url.password !== '') {
-      return true;
-    }
-    for (const key of url.searchParams.keys()) {
-      if (TOKEN_QUERY_KEYS.has(key.toLowerCase())) {
-        return true;
-      }
-    }
-    return false;
-  } catch {
-    const afterScheme = value.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
-    const slash = afterScheme.indexOf('/');
-    const authority = slash === -1 ? afterScheme : afterScheme.slice(0, slash);
-    return authority.includes('@');
+  if (value.includes('?') || value.includes('#')) {
+    return true;
   }
+  const afterScheme = value.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+  const slash = afterScheme.indexOf('/');
+  const authority = slash === -1 ? afterScheme : afterScheme.slice(0, slash);
+  return authority.includes('@');
 }
 
 export type RtspSampleResult =
@@ -163,9 +145,10 @@ export class RtspFrameSampler {
       return { ok: false, code: 'RTSP_SOURCE_NOT_CONFIGURED' };
     }
     // Pre-spawn credential gate (Codex P1): argv is visible to process
-    // telemetry, so a credential-bearing URL is refused before ffmpeg
-    // ever sees it. Phase 13 supports credential-free sources only.
-    if (urlCarriesCredentials(source)) {
+    // telemetry, so anything outside the strict credential-free URL form
+    // (scheme+host+path only — no userinfo, no query, no fragment) is
+    // refused before ffmpeg ever sees it.
+    if (urlViolatesCredentialFreeRule(source)) {
       return { ok: false, code: 'RTSP_CREDENTIALS_IN_URL_UNSUPPORTED' };
     }
     const timeoutMs = Math.max(

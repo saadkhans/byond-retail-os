@@ -1323,27 +1323,37 @@ export class PickupFusionService {
         // LIVE-FRAME SCREEN GATE (Codex P1): a live-origin run's crop
         // pixels were never screened at upload the way FILE_REPLAY
         // assets were — the only vetting is this pipeline's own OCR
-        // sensitive-text pass. The VLM (which receives crop pixels as
-        // base64) may therefore run for a LIVE run only when that pass
-        // COMPLETED (status OK) and found nothing sensitive. A tripped
-        // screen or an OCR stage that did not finish blocks the
+        // sensitive-text screening. The VLM request carries the bestPre
+        // crop AND every peak/post crop as base64 pixels, so EVERY one
+        // of those images must screen clean: bestPre via the evidence
+        // OCR that already ran (status OK, nothing suppressed), and each
+        // additional VLM-bound crop via its own OCR pass with the same
+        // predicate (liveVlmExtraCropsScreenClean). Any crop whose OCR
+        // did not complete or whose text trips the screen blocks the
         // invocation entirely — regardless of provider, local included
         // (MVP fails closed) — and routes the run to human review with
-        // a controlled reason. Asset-origin behavior is unchanged.
-        if (
-          ctx.evidence.liveSessionId !== undefined &&
-          (ctx.evidence.ocr.status !== 'OK' ||
-            ctx.evidence.ocr.screened === OCR_TEXT_SUPPRESSED)
-        ) {
-          ctx.evidence.vlm.invoked = false;
-          ctx.evidence.vlm.reason = LIVE_SENSITIVE_SCREEN_BLOCKED;
-          ctx.evidence.vlm.status = 'UNAVAILABLE';
-          ctx.evidence.policy = {
-            result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
-            reason:
-              'live frame screening blocked VLM invocation — routed to review',
-          };
-          return;
+        // a controlled reason. Asset-origin behavior is unchanged, and
+        // the extra passes never store or forward recognized text.
+        if (ctx.evidence.liveSessionId !== undefined) {
+          const bestPreClean =
+            ctx.evidence.ocr.status === 'OK' &&
+            ctx.evidence.ocr.screened !== OCR_TEXT_SUPPRESSED;
+          const allCropsClean =
+            bestPreClean &&
+            (await ctx.timed('live-crop-screen', this.ocrReader, () =>
+              this.liveVlmExtraCropsScreenClean(ctx.crops),
+            ));
+          if (!allCropsClean) {
+            ctx.evidence.vlm.invoked = false;
+            ctx.evidence.vlm.reason = LIVE_SENSITIVE_SCREEN_BLOCKED;
+            ctx.evidence.vlm.status = 'UNAVAILABLE';
+            ctx.evidence.policy = {
+              result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
+              reason:
+                'live frame screening blocked VLM invocation — routed to review',
+            };
+            return;
+          }
         }
         ctx.evidence.vlm.invoked = true;
         ctx.evidence.vlm.reason = reason;
@@ -1654,6 +1664,42 @@ export class PickupFusionService {
         startedAt,
       );
     }
+  }
+
+  /**
+   * PER-CROP live screen (Codex P1): buildAndVerify sends the bestPre
+   * crop plus EVERY peak/post crop to the VLM, so screening only the
+   * single evidence OCR (which ran on bestPre) is insufficient —
+   * sensitive content visible only at peak or post would still ship.
+   * Each additional VLM-bound crop gets its own OCR pass judged by the
+   * SAME sensitive predicate. A crop whose OCR did not complete (non-OK
+   * status, thrown) or whose text trips the screen fails the gate.
+   * Recognized text from these passes exists ONLY for this boolean —
+   * never stored, never forwarded, never logged. Reference images are
+   * catalog-owned assets, not live pixels — exempt by design.
+   */
+  private async liveVlmExtraCropsScreenClean(
+    crops: QualifiedCrop[],
+  ): Promise<boolean> {
+    // Exactly the extra frames buildAndVerify would send: every non-pre
+    // crop (bestPre itself is covered by the evidence OCR screen).
+    for (const crop of crops.filter((candidate) => candidate.phase !== 'pre')) {
+      try {
+        const ocr = await this.ocrReader.recognize(crop.image);
+        if (ocr.status !== 'OK') {
+          return false;
+        }
+        if (
+          containsSensitiveFreeText(ocr.rawText) ||
+          containsSensitiveFreeText(ocr.normalizedText)
+        ) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    }
+    return true;
   }
 
   private async buildAndVerify(

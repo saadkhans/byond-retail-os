@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import {
   RTSP_SAMPLE_ERROR_CODES,
   RtspFrameSampler,
-  urlCarriesCredentials,
+  urlViolatesCredentialFreeRule,
 } from './rtsp-frame-sampler';
 
 jest.mock('node:child_process', () => ({
@@ -238,9 +238,38 @@ describe('RtspFrameSampler', () => {
     expect(JSON.stringify(result)).not.toContain('cam-host');
   });
 
-  it('a token-like query parameter is rejected BEFORE any spawn', async () => {
-    process.env[ENV_KEY] =
-      'rtsp' + '://' + 'cam-host/live' + '?' + 'to' + 'ken=' + 'sentinelvalue';
+  it('ANY query string on a scheme-shaped value is rejected BEFORE any spawn — no key allowlist to alias around', async () => {
+    // Credential-alias keys AND innocuous-looking keys all reject: the
+    // strict MVP rule bans the query string itself.
+    const queryForms = [
+      'user=x',
+      'username=x',
+      'pwd=x',
+      'password=x',
+      'to' + 'ken=x',
+      'key=x',
+      'auth=x',
+      'secret=x',
+      'stream=1',
+    ];
+    const sampler = buildSampler();
+    for (const query of queryForms) {
+      process.env[ENV_KEY] = 'rtsp' + '://' + 'cam-host/live' + '?' + query;
+      const result = await sampler.sampleFrame(TENANT, SLOT, {
+        width: 4,
+        height: 4,
+        timeoutMs: 2000,
+      });
+      expect(result).toEqual({
+        ok: false,
+        code: 'RTSP_CREDENTIALS_IN_URL_UNSUPPORTED',
+      });
+    }
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+  });
+
+  it('a fragment on a scheme-shaped value is rejected BEFORE any spawn', async () => {
+    process.env[ENV_KEY] = 'rtsp' + '://' + 'cam-host/live' + '#' + 'part';
     const sampler = buildSampler();
     const result = await sampler.sampleFrame(TENANT, SLOT, {
       width: 4,
@@ -252,7 +281,7 @@ describe('RtspFrameSampler', () => {
       code: 'RTSP_CREDENTIALS_IN_URL_UNSUPPORTED',
     });
     expect(childProcess.spawn).not.toHaveBeenCalled();
-    expect(JSON.stringify(result)).not.toContain('sentinelvalue');
+    expect(JSON.stringify(result)).not.toContain('cam-host');
   });
 
   it('a credential-free rtsp value still reaches spawn; an @ in a plain path does not trip the gate', async () => {
@@ -284,18 +313,25 @@ describe('RtspFrameSampler', () => {
     expect(result2).toEqual({ ok: false, code: 'RTSP_CONNECT_FAILED' });
   });
 
-  it('urlCarriesCredentials: pure gate covers userinfo, token keys, unparseable authority @, and skips paths', () => {
+  it('urlViolatesCredentialFreeRule: STRICT — scheme+host+path only; userinfo, ANY query, ANY fragment reject; plain paths skip', () => {
     const scheme = 'rtsp' + '://';
-    expect(urlCarriesCredentials(scheme + 'user@host/live')).toBe(true);
-    expect(urlCarriesCredentials(scheme + 'u:p@host/live')).toBe(true);
-    expect(urlCarriesCredentials(scheme + 'host/live?apikey=v')).toBe(true);
-    expect(urlCarriesCredentials(scheme + 'host/live?Access_Token=v')).toBe(
-      true,
-    );
-    expect(urlCarriesCredentials(scheme + 'host/live?fps=5')).toBe(false);
-    expect(urlCarriesCredentials(scheme + 'host/live')).toBe(false);
-    expect(urlCarriesCredentials('C:/dev/feed.png')).toBe(false);
-    expect(urlCarriesCredentials('feed@home.png')).toBe(false);
+    // Userinfo forms.
+    expect(urlViolatesCredentialFreeRule(scheme + 'user@host/live')).toBe(true);
+    expect(urlViolatesCredentialFreeRule(scheme + 'u:p@host/live')).toBe(true);
+    // Credential-alias query keys — and EVERY other query string.
+    expect(urlViolatesCredentialFreeRule(scheme + 'host/live?apikey=v')).toBe(true);
+    expect(urlViolatesCredentialFreeRule(scheme + 'host/live?pwd=v')).toBe(true);
+    expect(urlViolatesCredentialFreeRule(scheme + 'host/live?u=a&p=b')).toBe(true);
+    expect(urlViolatesCredentialFreeRule(scheme + 'host/live?fps=5')).toBe(true);
+    expect(urlViolatesCredentialFreeRule(scheme + 'host/live?stream=1')).toBe(true);
+    // Fragments.
+    expect(urlViolatesCredentialFreeRule(scheme + 'host/live#frag')).toBe(true);
+    // The only accepted scheme-shaped form: scheme + host(:port) + path.
+    expect(urlViolatesCredentialFreeRule(scheme + 'host/live')).toBe(false);
+    expect(urlViolatesCredentialFreeRule(scheme + 'host:8554/live')).toBe(false);
+    // Plain file paths never enter a URL parser — unchecked by design.
+    expect(urlViolatesCredentialFreeRule('C:/dev/feed.png')).toBe(false);
+    expect(urlViolatesCredentialFreeRule('feed@home.png')).toBe(false);
   });
 
   it('exports exactly the controlled error-code vocabulary', () => {

@@ -133,6 +133,17 @@ const PENDING_MOTION_AT_STOP = 'PENDING_MOTION_AT_STOP';
 const STOP_INTENT_CODES: readonly string[] = [
   JOURNEY_FINALIZE_RETRY,
   WINDOW_PROCESS_FAILED,
+  PENDING_MOTION_AT_STOP,
+];
+
+/** errorCodes that require a durable REVIEW_REQUIRED journey marker to
+ *  exist BEFORE the journey may exit (Codex P1: a dropped or pending
+ *  interaction must be visible to reconciliation; the exit may only run
+ *  once the marker is in). finalizeStopped appends the marker
+ *  idempotently on every retry until it lands. */
+const MARKER_CODES: readonly string[] = [
+  WINDOW_PROCESS_FAILED,
+  PENDING_MOTION_AT_STOP,
 ];
 
 const ACTIVE_SESSION_STATUSES: LiveCameraSessionStatus[] = [
@@ -416,10 +427,28 @@ export class LiveSessionService {
           );
         } catch (abortError) {
           if (!(abortError instanceof ConflictException)) {
+            // The abort itself failed (Codex P1): the fresh journey must
+            // not float OPEN and detached. LINK it to the row anyway and
+            // park the row in the RETRYABLE state — a later stop() finds
+            // the journey through the link and re-runs the abort. The
+            // journeyId-null guard means a racing finalizer that already
+            // linked/closed something else is never overwritten.
             this.logger.warn(
               `live session ${session.id} could not abort its raced ` +
-                `startup journey (${classifyError(abortError)})`,
+                `startup journey (${classifyError(abortError)}) — linked ` +
+                `for retry`,
             );
+            await this.prisma.liveCameraSession
+              .updateMany({
+                where: { id: session.id, tenantId, journeyId: null },
+                data: {
+                  journeyId,
+                  status: LiveCameraSessionStatus.STOPPING,
+                  errorCode: STOPPED_DURING_START,
+                  leaseOwner: null,
+                },
+              })
+              .catch(() => null);
           }
         }
         return this.byId(tenantId, session.id);
@@ -448,10 +477,24 @@ export class LiveSessionService {
           );
         } catch (abortError) {
           if (!(abortError instanceof ConflictException)) {
+            // Journey linked but open and unabortable right now (Codex
+            // P1): park RETRYABLE — never leave a terminal row over an
+            // OPEN linked journey.
             this.logger.warn(
               `live session ${session.id} could not abort its raced ` +
-                `startup journey (${classifyError(abortError)})`,
+                `startup journey (${classifyError(abortError)}) — parked ` +
+                `for retry`,
             );
+            await this.prisma.liveCameraSession
+              .updateMany({
+                where: { id: session.id, tenantId },
+                data: {
+                  status: LiveCameraSessionStatus.STOPPING,
+                  errorCode: STOPPED_DURING_START,
+                  leaseOwner: null,
+                },
+              })
+              .catch(() => null);
           }
         }
         return this.byId(tenantId, session.id);
@@ -545,12 +588,21 @@ export class LiveSessionService {
     if (claimed.count === 0) {
       return false;
     }
+    // FRESH ROW, not the pre-claim snapshot (Codex P1): the original
+    // starter may have LINKED its journey between our read and the claim
+    // winning — deciding cleanup from the stale snapshot would skip the
+    // closure and orphan that journey.
+    const fresh = await this.prisma.liveCameraSession.findFirst({
+      where: { id: session.id, tenantId },
+      select: { journeyId: true },
+    });
+    const journeyId = fresh?.journeyId ?? null;
     let decision: CustomerJourneyDecision | null = null;
-    if (session.journeyId) {
+    if (journeyId) {
       try {
         const aborted = await this.journeys.abortShadowJourney(
           tenantId,
-          session.journeyId,
+          journeyId,
           STALE_RECLAIMED,
           actorId,
           { exitAt: this.now() },
@@ -560,7 +612,7 @@ export class LiveSessionService {
         if (error instanceof ConflictException) {
           // Already closed — read back whatever it settled on.
           const detail = await this.journeys
-            .detail(tenantId, session.journeyId)
+            .detail(tenantId, journeyId)
             .catch(() => null);
           decision = detail?.decision ?? null;
         } else {
@@ -577,6 +629,9 @@ export class LiveSessionService {
         id: session.id,
         tenantId,
         status: LiveCameraSessionStatus.STOPPING,
+        // CAS on the journey link: a link that lands after our re-read
+        // voids this terminal write, leaving the row STOPPING for retry.
+        journeyId,
       },
       data: {
         status: LiveCameraSessionStatus.ERROR,
@@ -687,6 +742,66 @@ export class LiveSessionService {
       }
     };
 
+    /** Process one CLOSED window: watermark, counters, fusion + import;
+     *  a failure fails CLOSED (durable code — finalization then marks the
+     *  journey review-required, so a dropped interaction can never end
+     *  READY_TO_SETTLE_SHADOW). Shared by the in-loop pass and the final
+     *  sweep at stop. */
+    const handleClosedWindow = async (window: EventWindow): Promise<void> => {
+      processedUpToMs = window.endMs;
+      counters.eventWindowsDetected += 1;
+      processedWindows.push(window);
+      await this.processWindow(
+        tenantId,
+        sessionId,
+        context,
+        buffer,
+        window,
+        counters,
+        actorId,
+      ).catch(async (error) => {
+        this.logger.warn(
+          `live session ${sessionId} window failed (${classifyError(error)})`,
+        );
+        await this.prisma.liveCameraSession
+          .updateMany({
+            where: {
+              id: sessionId,
+              tenantId,
+              status: { in: LOOP_WRITABLE_STATUSES },
+              leaseOwner,
+            },
+            data: { errorCode: WINDOW_PROCESS_FAILED },
+          })
+          .catch(() => null);
+      });
+      await persist();
+    };
+
+    /** Park the row in the RETRYABLE state (STOPPING + code) — stop() is
+     *  the retry entry that resumes marker append + journey closure. */
+    const parkForRetry = async (code: string): Promise<void> => {
+      await this.prisma.liveCameraSession
+        .updateMany({
+          where: {
+            id: sessionId,
+            tenantId,
+            status: { in: NON_TERMINAL_SESSION_STATUSES },
+            leaseOwner,
+          },
+          data: {
+            status: LiveCameraSessionStatus.STOPPING,
+            errorCode: code,
+            leaseOwner: null,
+          },
+        })
+        .catch(() => null);
+    };
+
+    // The CONTROLLER stays registered until finalization completes or
+    // parks retryable (Codex P1): a concurrent stop() during post-loop
+    // persist / sweep / marker / finalize must AWAIT this loop's own
+    // finalization, never take the dead-loop path and double-finalize.
     try {
       for (;;) {
         if (controller.stopRequested || leaseLost) {
@@ -705,10 +820,10 @@ export class LiveSessionService {
             timeoutMs: Math.min(context.frameIntervalMs * 2, 10_000),
           },
         );
-        if (controller.stopRequested || leaseLost) {
-          break;
-        }
         if (sampled.ok) {
+          // The sampled frame ALWAYS lands, even when a stop arrived while
+          // sampling (Codex P1): a quiet frame may be the one that CLOSES
+          // a motion burst — dropping it would vanish the interaction.
           consecutiveFailures = 0;
           const timestampMs = this.now().getTime() - startedAtMs;
           buffer.push({
@@ -727,13 +842,15 @@ export class LiveSessionService {
           // windows (quiet again before the newest sample) are processed;
           // the watermark is the cooldown — a window overlapping an
           // already-processed range is the same physical interaction.
+          // Closed windows are processed even under a stop request; only
+          // a LOST LEASE halts mid-pass (someone else owns the row).
           const samples = motionSamples(buffer, LIVE_ANALYSIS_GEOMETRY, zone);
           const lastSampleMs = samples[samples.length - 1]?.timestampMs ?? 0;
           for (const window of extractEventWindows(
             samples,
             DEFAULT_EVENT_WINDOW_CONFIG,
           )) {
-            if (leaseLost || controller.stopRequested) {
+            if (leaseLost) {
               break;
             }
             if (window.startMs <= processedUpToMs) {
@@ -742,39 +859,7 @@ export class LiveSessionService {
             if (window.endMs >= lastSampleMs) {
               continue; // still open — wait for the burst to end
             }
-            processedUpToMs = window.endMs;
-            counters.eventWindowsDetected += 1;
-            processedWindows.push(window);
-            await this.processWindow(
-              tenantId,
-              sessionId,
-              context,
-              buffer,
-              window,
-              counters,
-              actorId,
-            ).catch(async (error) => {
-              // One window's failure never ends the session, but it must
-              // FAIL CLOSED (Codex P1): a DETECTED interaction that could
-              // not be processed is recorded durably, and finalization
-              // marks the journey review-required so the session can
-              // never end READY_TO_SETTLE_SHADOW.
-              this.logger.warn(
-                `live session ${sessionId} window failed (${classifyError(error)})`,
-              );
-              await this.prisma.liveCameraSession
-                .updateMany({
-                  where: {
-                    id: sessionId,
-                    tenantId,
-                    status: { in: LOOP_WRITABLE_STATUSES },
-                    leaseOwner,
-                  },
-                  data: { errorCode: WINDOW_PROCESS_FAILED },
-                })
-                .catch(() => null);
-            });
-            await persist();
+            await handleClosedWindow(window);
           }
         } else {
           consecutiveFailures += 1;
@@ -783,69 +868,140 @@ export class LiveSessionService {
             break;
           }
         }
+        if (controller.stopRequested || leaseLost) {
+          break;
+        }
         await this.sleep(context.frameIntervalMs);
         await beat();
       }
+
+      if (leaseLost) {
+        this.logger.warn(
+          `live session ${sessionId} lost its lease — loop stopped without finalizing`,
+        );
+        return;
+      }
+      await persist();
+      if (leaseLost) {
+        this.logger.warn(
+          `live session ${sessionId} lost its lease — loop stopped without finalizing`,
+        );
+        return;
+      }
+      if (errorCode) {
+        await this.finalizeError(tenantId, sessionId, errorCode, actorId, {
+          leaseOwner,
+          journeyId: context.journeyId,
+        });
+        return;
+      }
+      // FINAL SWEEP (Codex P1): a window the newest quiet frame CLOSED
+      // just as the stop arrived must not be skipped — process every
+      // remaining closed window before finalization.
+      const exitSamples = motionSamples(buffer, LIVE_ANALYSIS_GEOMETRY, zone);
+      const trailing = exitSamples[exitSamples.length - 1];
+      const lastMs = trailing?.timestampMs ?? 0;
+      for (const window of extractEventWindows(
+        exitSamples,
+        DEFAULT_EVENT_WINDOW_CONFIG,
+      )) {
+        if (leaseLost) {
+          break;
+        }
+        if (window.startMs <= processedUpToMs) {
+          continue;
+        }
+        if (window.endMs >= lastMs) {
+          continue; // open at the newest sample — pending-motion below
+        }
+        await handleClosedWindow(window);
+      }
+      if (leaseLost) {
+        return;
+      }
+      // PENDING MOTION AT STOP (Codex P1): an interaction still in
+      // progress when the session ends (manual stop or auto-stop) has no
+      // closed window yet — it must not vanish. Fail closed: a DURABLE
+      // review-required marker lands on the journey BEFORE the exit, so
+      // reconciliation can never see READY_TO_SETTLE_SHADOW over a
+      // dropped burst. If the marker cannot be recorded, the session
+      // parks RETRYABLE — it never proceeds to a normal exit.
+      const openBurst =
+        (trailing !== undefined &&
+          trailing.motionScore >= DEFAULT_EVENT_WINDOW_CONFIG.minScore) ||
+        extractEventWindows(exitSamples, DEFAULT_EVENT_WINDOW_CONFIG).some(
+          (window) =>
+            window.endMs > processedUpToMs && window.endMs >= lastMs,
+        );
+      if (openBurst && context.journeyId) {
+        try {
+          const appended = await this.ensureReviewMarker(
+            tenantId,
+            context.journeyId,
+            PENDING_MOTION_AT_STOP,
+            new Date(startedAtMs + lastMs),
+            actorId,
+          );
+          if (appended) {
+            counters.reviewNeeded += 1;
+            await persist();
+          }
+        } catch (error) {
+          if (error instanceof ConflictException) {
+            // Journey already closed by a competing finalizer — the exit
+            // below reads its decision back.
+          } else {
+            this.logger.warn(
+              `live session ${sessionId} could not record pending motion ` +
+                `(${classifyError(error)}) — parked for retry`,
+            );
+            await parkForRetry(PENDING_MOTION_AT_STOP);
+            return;
+          }
+        }
+      }
+      await this.finalizeStopped(tenantId, sessionId, actorId, { leaseOwner });
     } finally {
       clearInterval(heartbeatTimer);
       this.loops.delete(sessionId);
     }
+  }
 
-    if (leaseLost) {
-      this.logger.warn(
-        `live session ${sessionId} lost its lease — loop stopped without finalizing`,
-      );
-      return;
+  /**
+   * Idempotently ensure a REVIEW_REQUIRED marker with the given code
+   * exists on the journey (tenant-scoped read through the journey
+   * service). Returns true when a NEW marker was appended. Throws when
+   * the append fails — callers park the session for stop()'s retry.
+   */
+  private async ensureReviewMarker(
+    tenantId: string,
+    journeyId: string,
+    code: string,
+    occurredAt: Date,
+    actorId?: string,
+  ): Promise<boolean> {
+    const detail = await this.journeys.detail(tenantId, journeyId);
+    const exists = detail.events.some(
+      (event) =>
+        event.eventType === CustomerJourneyEventType.REVIEW_REQUIRED &&
+        event.sourceType === 'LIVE_SHADOW' &&
+        event.note === code,
+    );
+    if (exists) {
+      return false;
     }
-    await persist();
-    if (errorCode) {
-      await this.finalizeError(tenantId, sessionId, errorCode, actorId, {
-        leaseOwner,
-        journeyId: context.journeyId,
-      });
-      return;
-    }
-    // PENDING MOTION AT STOP (Codex P1): an interaction still in progress
-    // when the session ends (manual stop or auto-stop) has no closed
-    // window yet — it must not vanish. Fail closed: record a
-    // review-required marker on the journey so reconciliation lands on
-    // NEEDS_EVENT_REVIEW, never READY_TO_SETTLE_SHADOW over a dropped
-    // burst. A quiet tail changes nothing.
-    const exitSamples = motionSamples(buffer, LIVE_ANALYSIS_GEOMETRY, zone);
-    const trailing = exitSamples[exitSamples.length - 1];
-    const lastMs = trailing?.timestampMs ?? 0;
-    const openBurst =
-      (trailing !== undefined &&
-        trailing.motionScore >= DEFAULT_EVENT_WINDOW_CONFIG.minScore) ||
-      extractEventWindows(exitSamples, DEFAULT_EVENT_WINDOW_CONFIG).some(
-        (window) =>
-          window.endMs > processedUpToMs && window.endMs >= lastMs,
-      );
-    if (openBurst && context.journeyId) {
-      try {
-        await this.journeys.appendEvent(
-          tenantId,
-          context.journeyId,
-          {
-            eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
-            occurredAt: new Date(startedAtMs + lastMs).toISOString(),
-            sourceType: 'LIVE_SHADOW',
-            note: PENDING_MOTION_AT_STOP,
-          },
-          actorId,
-        );
-        counters.reviewNeeded += 1;
-        await persist();
-      } catch (error) {
-        if (!(error instanceof ConflictException)) {
-          this.logger.warn(
-            `live session ${sessionId} could not record pending motion ` +
-              `(${classifyError(error)})`,
-          );
-        }
-      }
-    }
-    await this.finalizeStopped(tenantId, sessionId, actorId, { leaseOwner });
+    await this.journeys.appendEvent(
+      tenantId,
+      journeyId,
+      {
+        eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+        occurredAt: occurredAt.toISOString(),
+        sourceType: 'LIVE_SHADOW',
+        note: code,
+      },
+      actorId,
+    );
+    return true;
   }
 
   /** One closed window → window-scoped fusion → exact-run journey import.
@@ -962,30 +1118,47 @@ export class LiveSessionService {
     const stoppedAt = this.now();
     let decision: CustomerJourneyDecision | null = null;
     if (session.journeyId) {
-      // FAIL CLOSED for detected-but-unprocessed windows (Codex P1): the
-      // durable WINDOW_PROCESS_FAILED code means an interaction was seen
-      // and lost — mark the journey review-required BEFORE the exit so
-      // reconciliation can never land on READY_TO_SETTLE_SHADOW.
-      if (session.errorCode === WINDOW_PROCESS_FAILED) {
+      // FAIL CLOSED for detected-but-unprocessed windows and pending
+      // motion (Codex P1): a MARKER code means an interaction was seen
+      // and dropped — the review-required marker must be DURABLE on the
+      // journey BEFORE the exit runs, so reconciliation can never land on
+      // READY_TO_SETTLE_SHADOW. A failed append parks the session
+      // RETRYABLE (the exit is NOT attempted); the next stop() retries
+      // the marker first, then the closure. Idempotent across retries.
+      if (session.errorCode && MARKER_CODES.includes(session.errorCode)) {
         try {
-          await this.journeys.appendEvent(
+          await this.ensureReviewMarker(
             tenantId,
             session.journeyId,
-            {
-              eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
-              occurredAt: stoppedAt.toISOString(),
-              sourceType: 'LIVE_SHADOW',
-              note: WINDOW_PROCESS_FAILED,
-            },
+            session.errorCode,
+            stoppedAt,
             actorId,
           );
         } catch (error) {
           if (!(error instanceof ConflictException)) {
             this.logger.warn(
-              `live session ${sessionId} could not record failed window ` +
-                `(${classifyError(error)})`,
+              `live session ${sessionId} could not record its review ` +
+                `marker (${classifyError(error)}) — parked for retry`,
             );
+            await this.prisma.liveCameraSession.updateMany({
+              where: {
+                id: sessionId,
+                tenantId,
+                status: { in: NON_TERMINAL_SESSION_STATUSES },
+                ...(options?.leaseOwner
+                  ? { leaseOwner: options.leaseOwner }
+                  : {}),
+              },
+              data: {
+                status: LiveCameraSessionStatus.STOPPING,
+                errorCode: session.errorCode,
+                leaseOwner: null,
+              },
+            });
+            return;
           }
+          // Conflict: the journey is already closed — the exit below
+          // conflicts too and reads the settled decision back.
         }
       }
       try {
@@ -1035,6 +1208,11 @@ export class LiveSessionService {
         id: sessionId,
         tenantId,
         status: { in: NON_TERMINAL_SESSION_STATUSES },
+        // CAS on the journey link (Codex P1): if a startup race LINKS a
+        // journey after this finalizer read the row, the terminal write
+        // matches nothing and the row stays retryable — a terminal
+        // session can never sit over an OPEN journey it did not close.
+        journeyId: session.journeyId,
         ...(options?.leaseOwner ? { leaseOwner: options.leaseOwner } : {}),
       },
       data: {
@@ -1110,6 +1288,10 @@ export class LiveSessionService {
         id: sessionId,
         tenantId,
         status: { in: NON_TERMINAL_SESSION_STATUSES },
+        // CAS on the journey link — see finalizeStopped: a link that lands
+        // after this read voids the terminal write; the row stays
+        // retryable instead of terminalizing over an OPEN journey.
+        journeyId: session.journeyId,
         ...(options?.leaseOwner ? { leaseOwner: options.leaseOwner } : {}),
       },
       data: {
@@ -1184,10 +1366,13 @@ export class LiveSessionService {
     if (controller) {
       // DRAIN BEFORE STOPPED (Codex P1): signal the loop and WAIT for it
       // to finish its in-flight window processing and its own
-      // finalization (counters persisted, pending-motion checked, journey
-      // closed) — bounded. A drain timeout fails closed: the journey is
-      // aborted, never reported READY_TO_SETTLE_SHADOW over half-done
-      // work.
+      // finalization (counters persisted, closed windows swept, pending
+      // motion marked, journey closed) — bounded. The controller stays
+      // registered through the loop's finalization, so a concurrent
+      // stop() awaits the SAME finalization here instead of taking the
+      // dead-loop path and double-finalizing. A drain timeout fails
+      // closed: the journey is aborted, never reported
+      // READY_TO_SETTLE_SHADOW over half-done work.
       controller.stopRequested = true;
       const drained = await this.awaitWithTimeout(
         this.loopPromises.get(sessionId),
@@ -1200,14 +1385,29 @@ export class LiveSessionService {
           WINDOW_DRAIN_TIMEOUT,
           actorId,
         );
+        return this.byId(tenantId, sessionId);
+      }
+      // The loop may have PARKED a retryable finalization (marker or
+      // journey closure failed) — resume it now instead of handing the
+      // caller a STOPPING row that needs another stop().
+      const after = await this.prisma.liveCameraSession.findFirst({
+        where: { tenantId, id: sessionId },
+      });
+      if (after && after.status === LiveCameraSessionStatus.STOPPING) {
+        const parkedCode = after.errorCode;
+        if (parkedCode && !STOP_INTENT_CODES.includes(parkedCode)) {
+          await this.finalizeError(tenantId, sessionId, parkedCode, actorId);
+        } else {
+          await this.finalizeStopped(tenantId, sessionId, actorId);
+        }
       }
       return this.byId(tenantId, sessionId);
     }
     // Dead-loop takeover (process restarted, or a prior finalization left
     // the row STOPPING for retry): route by the stored code — abort-intent
     // codes re-run the abort; stop-intent codes (finalize-retry, failed
-    // window) re-run the normal exit path, which also appends the
-    // review-required marker for failed windows.
+    // window, pending motion) re-run the normal exit path, which appends
+    // the missing review-required marker FIRST, then exits.
     const code = session.errorCode;
     if (code && !STOP_INTENT_CODES.includes(code)) {
       await this.finalizeError(tenantId, sessionId, code, actorId);

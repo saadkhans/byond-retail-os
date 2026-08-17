@@ -267,6 +267,14 @@ function buildService(options: {
     ),
     decodeReferenceImage: jest.fn(),
   };
+  // Hoisted so specs can shape PER-CALL responses (the live per-crop
+  // screen re-invokes recognize for every extra VLM-bound crop).
+  const ocrRecognize = jest.fn(async () => ({
+    rawText: options.ocrSeen?.rawText ?? '',
+    normalizedText: options.ocrSeen?.normalizedText ?? '',
+    languages: options.ocrSeen ? ['eng'] : [],
+    status: options.ocrStatus ?? 'OK',
+  }));
   const detector = {
     adapterKey: 'stub-detector',
     version: '1.0.0',
@@ -311,12 +319,7 @@ function buildService(options: {
     {
       adapterKey: 'stub-ocr',
       version: '1.0.0',
-      recognize: jest.fn(async () => ({
-        rawText: options.ocrSeen?.rawText ?? '',
-        normalizedText: options.ocrSeen?.normalizedText ?? '',
-        languages: options.ocrSeen ? ['eng'] : [],
-        status: options.ocrStatus ?? 'OK',
-      })),
+      recognize: ocrRecognize,
     } as never,
     {
       adapterKey: 'stub-retriever',
@@ -375,7 +378,7 @@ function buildService(options: {
     (() => ({})) as never,
     { get: (key: string) => options.config?.[key] } as unknown as ConfigService,
   );
-  return { service, productFindMany, createdRuns, decoder, detector, videoAssets, prisma };
+  return { service, productFindMany, createdRuns, decoder, detector, videoAssets, prisma, ocrRecognize };
 }
 
 describe('fusion catalog is constrained to ACTIVE products', () => {
@@ -1486,9 +1489,106 @@ describe('LIVE frames are screened before any VLM invocation (Codex P1)', () => 
     expect(createdRuns[0].data.evidence.vlm.invoked).toBe(true);
   });
 
+  const CLEAN_OCR = {
+    rawText: 'shelf label',
+    normalizedText: 'shelf label',
+    languages: ['eng'],
+    status: 'OK' as const,
+  };
+
+  it('PER-CROP screen: bestPre clean but the PEAK crop sensitive → VLM not called', async () => {
+    const vlmVerify = stubVerdict();
+    const { service, createdRuns, ocrRecognize } = buildService({
+      ...VLM_WANTED,
+      vlmVerify,
+    });
+    // Call order: evidence OCR (bestPre), then the gate's extra passes
+    // (peak, post). Only the PEAK crop carries the sensitive text.
+    ocrRecognize
+      .mockResolvedValueOnce(CLEAN_OCR)
+      .mockResolvedValueOnce({
+        ...CLEAN_OCR,
+        rawText: `card ${PAN}`,
+        normalizedText: `card ${PAN}`,
+      })
+      .mockResolvedValue(CLEAN_OCR);
+    await service.runLiveWindow('tenant-1', {
+      ...LIVE_INPUT,
+      frames: liveFrames(),
+    });
+    expect(vlmVerify).not.toHaveBeenCalled();
+    const { data } = createdRuns[0];
+    expect(data.policy).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+    expect(data.evidence.vlm.invoked).toBe(false);
+    expect(data.evidence.vlm.reason).toBe(LIVE_SENSITIVE_SCREEN_BLOCKED);
+    // The peak crop's recognized text exists only for the boolean —
+    // never in the persisted evidence.
+    expect(JSON.stringify(data.evidence)).not.toContain(PAN);
+  });
+
+  it('PER-CROP screen: bestPre and peak clean but the POST crop sensitive → VLM not called', async () => {
+    const vlmVerify = stubVerdict();
+    const { service, createdRuns, ocrRecognize } = buildService({
+      ...VLM_WANTED,
+      vlmVerify,
+    });
+    ocrRecognize
+      .mockResolvedValueOnce(CLEAN_OCR)
+      .mockResolvedValueOnce(CLEAN_OCR)
+      .mockResolvedValue({
+        ...CLEAN_OCR,
+        rawText: `cvv 987 ${PAN}`,
+        normalizedText: `cvv 987 ${PAN}`,
+      });
+    await service.runLiveWindow('tenant-1', {
+      ...LIVE_INPUT,
+      frames: liveFrames(),
+    });
+    expect(vlmVerify).not.toHaveBeenCalled();
+    const { data } = createdRuns[0];
+    expect(data.evidence.vlm.reason).toBe(LIVE_SENSITIVE_SCREEN_BLOCKED);
+    expect(JSON.stringify(data.evidence)).not.toContain(PAN);
+  });
+
+  it('PER-CROP screen: an extra crop whose OCR did NOT complete blocks the VLM', async () => {
+    const vlmVerify = stubVerdict();
+    const { service, createdRuns, ocrRecognize } = buildService({
+      ...VLM_WANTED,
+      vlmVerify,
+    });
+    ocrRecognize
+      .mockResolvedValueOnce(CLEAN_OCR)
+      .mockResolvedValue({ ...CLEAN_OCR, status: 'UNAVAILABLE' as const });
+    await service.runLiveWindow('tenant-1', {
+      ...LIVE_INPUT,
+      frames: liveFrames(),
+    });
+    expect(vlmVerify).not.toHaveBeenCalled();
+    expect(createdRuns[0].data.evidence.vlm.reason).toBe(
+      LIVE_SENSITIVE_SCREEN_BLOCKED,
+    );
+  });
+
+  it('PER-CROP screen: every VLM-bound crop is OCRed before a clean run invokes the verifier', async () => {
+    const vlmVerify = stubVerdict();
+    const { service, ocrRecognize } = buildService({
+      ...VLM_WANTED,
+      ocrSeen: { rawText: 'shelf label', normalizedText: 'shelf label' },
+      vlmVerify,
+    });
+    await service.runLiveWindow('tenant-1', {
+      ...LIVE_INPUT,
+      frames: liveFrames(),
+    });
+    expect(vlmVerify).toHaveBeenCalledTimes(1);
+    // 1 evidence pass (bestPre) + one pass per extra VLM-bound crop
+    // (peak, post) — the gate screened them all.
+    expect(ocrRecognize.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+
   it('ASSET-path behavior is unchanged: a tripped screen still invokes the VLM with nulled text', async () => {
     const vlmVerify = stubVerdict();
-    const { service } = buildService({
+    const { service, ocrRecognize } = buildService({
       ...VLM_WANTED,
       ocrSeen: { rawText: `CVV 987 ${PAN}`, normalizedText: `cvv 987 ${PAN}` },
       vlmVerify,
@@ -1497,5 +1597,8 @@ describe('LIVE frames are screened before any VLM invocation (Codex P1)', () => 
     expect(vlmVerify).toHaveBeenCalledTimes(1);
     const request = vlmVerify.mock.calls[0][0] as { ocrText: string | null };
     expect(request.ocrText).toBeNull();
+    // No per-crop screening passes on the asset path — the single
+    // evidence OCR is the only recognize call (behavior byte-identical).
+    expect(ocrRecognize).toHaveBeenCalledTimes(1);
   });
 });

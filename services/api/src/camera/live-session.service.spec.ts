@@ -144,6 +144,14 @@ function buildHarness(
     ) {
       return false;
     }
+    // Honors the terminal-write CAS on the journey link: undefined skips,
+    // null demands an unlinked row, a string demands that exact journey.
+    if (
+      where.journeyId !== undefined &&
+      (row.journeyId ?? null) !== where.journeyId
+    ) {
+      return false;
+    }
     // Honors the stale-reclaim heartbeat predicate like the database:
     // OR branches, each with heartbeatAt/startedAt lt-cutoffs.
     if (where.heartbeatAt !== undefined) {
@@ -1101,3 +1109,233 @@ describe('LiveSessionService — pending motion at stop (Codex P1 fix 9)', () =>
     expect(harness.journeys.appendEvent).not.toHaveBeenCalled();
   });
 });
+
+describe('LiveSessionService — startup race abort failure stays retryable (Codex P1 round 2, fix 1)', () => {
+  it('an abort failure after the race LINKS the journey, parks STOPPING, and retry closes it', async () => {
+    const harness = buildHarness();
+    harness.journeys.create.mockImplementationOnce(async () => {
+      Object.assign(harness.sessions[0], {
+        status: LiveCameraSessionStatus.STOPPED,
+        stoppedAt: new Date(),
+        leaseOwner: null,
+      });
+      return { id: 'journey-race' };
+    });
+    harness.journeys.abortShadowJourney.mockRejectedValueOnce(
+      new Error('transient outage with a secret-shaped detail'),
+    );
+    const view = await harness.service.start(TENANT, 'cam-1', {}, 'user-1');
+    // Never a created journey that is neither closed nor linked: the
+    // failed abort left it OPEN, so it is LINKED with a retryable state.
+    expect(view.status).toBe(LiveCameraSessionStatus.STOPPING);
+    expect(view.journeyId).toBe('journey-race');
+    expect(view.errorCode).toBe('LIVE_SESSION_STOPPED_DURING_START');
+    expect(JSON.stringify(harness.sessions[0])).not.toContain('secret-shaped');
+    // Retry: stop() finds the linked journey and re-runs the abort.
+    const retried = await harness.service.stop(TENANT, view.sessionId, 'user-1');
+    expect(retried.status).toBe(LiveCameraSessionStatus.ERROR);
+    expect(retried.decision).toBe(CustomerJourneyDecision.FAILED);
+    expect(harness.journeys.abortShadowJourney).toHaveBeenCalledTimes(2);
+    const retryCall = (
+      harness.journeys.abortShadowJourney.mock.calls as unknown as [
+        string,
+        string,
+        string,
+      ][]
+    )[1];
+    expect(retryCall[1]).toBe('journey-race');
+  });
+});
+
+describe('LiveSessionService — stale reclaim uses the FRESH claimed row (Codex P1 round 2, fix 2)', () => {
+  it('a journey linked between the snapshot and the claim is still closed', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }],
+      existingSession: {
+        id: 'live-stale',
+        tenantId: TENANT,
+        cameraSourceId: 'cam-1',
+        status: LiveCameraSessionStatus.STARTING,
+        // Snapshot has NO journey — the original starter is mid-create.
+        journeyId: null,
+        leaseOwner: 'dead-process',
+        startedAt: new Date('2026-08-17T09:00:00.000Z'),
+        heartbeatAt: new Date('2026-08-17T09:30:00.000Z'),
+        eventWindows: [],
+      },
+    });
+    const original =
+      harness.prisma.liveCameraSession.updateMany.getMockImplementation() as (
+        args: unknown,
+      ) => Promise<{ count: number }>;
+    harness.prisma.liveCameraSession.updateMany.mockImplementationOnce(
+      async (args: unknown) => {
+        // The original starter LINKS its journey just before the claim
+        // lands — the pre-claim snapshot is now stale.
+        harness.sessions[0].journeyId = 'journey-late';
+        return original(args);
+      },
+    );
+    const view = await harness.service.start(TENANT, 'cam-1', {}, 'user-1');
+    // Cleanup used the FRESH row: the late-linked journey was aborted.
+    expect(harness.journeys.abortShadowJourney).toHaveBeenCalledWith(
+      TENANT,
+      'journey-late',
+      'LIVE_SESSION_STALE_RECLAIMED',
+      'user-1',
+      expect.anything(),
+    );
+    expect(harness.sessions[0].status).toBe(LiveCameraSessionStatus.ERROR);
+    // The replacement session started normally — no orphan remains.
+    expect(view.sessionId).not.toBe('live-stale');
+    expect(view.status).toBe(LiveCameraSessionStatus.RUNNING);
+    await harness.service.awaitLoop(view.sessionId);
+  });
+});
+
+describe('LiveSessionService — closed windows survive a stop request (Codex P1 round 2, fix 4)', () => {
+  it('a window CLOSED by the frame that arrived with the stop is still processed', async () => {
+    const harness = buildHarness({
+      script: [
+        { value: 40 },
+        { value: 200 },
+        { value: 40 },
+        {
+          value: 40,
+          onCall: () => {
+            // The stop arrives exactly as the frame whose quiet sample
+            // CLOSES the burst window is sampled: the frame must still
+            // land and its now-closed window must process before the
+            // loop exits.
+            const loops = (
+              harness.service as unknown as {
+                loops: Map<string, { stopRequested: boolean }>;
+              }
+            ).loops;
+            const controller = loops.get('live-1');
+            if (controller) {
+              controller.stopRequested = true;
+            }
+          },
+        },
+      ],
+    });
+    await startAndFinish(harness);
+    const row = harness.sessions[0];
+    expect(harness.fusion.runLiveWindow).toHaveBeenCalledTimes(1);
+    expect(row.eventWindowsDetected).toBe(1);
+    expect(row.eventWindowsProcessed).toBe(1);
+    expect(row.status).toBe(LiveCameraSessionStatus.STOPPED);
+    expect(row.decision).toBe(CustomerJourneyDecision.READY_TO_SETTLE_SHADOW);
+  });
+
+  it('the controller stays registered through finalization — a concurrent stop awaits it, never double-finalizes', async () => {
+    let releaseExit: () => void = () => undefined;
+    const exitGate = new Promise<void>((resolve) => {
+      releaseExit = resolve;
+    });
+    const harness = buildHarness({ script: [{ value: 40 }] });
+    harness.journeys.exit.mockImplementationOnce(async () => {
+      await exitGate;
+      return {
+        id: 'journey-1',
+        decision: CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+        events: [],
+        issues: [],
+      };
+    });
+    const view = await harness.service.start(TENANT, 'cam-1', {}, 'user-1');
+    // Wait for the loop's OWN finalization to be mid-exit.
+    await until(() => harness.journeys.exit.mock.calls.length === 1);
+    const stopPromise = harness.service.stop(TENANT, view.sessionId, 'user-1');
+    releaseExit();
+    const stopped = await stopPromise;
+    await harness.service.awaitLoop(view.sessionId);
+    expect(stopped.status).toBe(LiveCameraSessionStatus.STOPPED);
+    // ONE exit: the concurrent stop awaited the loop's finalization
+    // instead of taking the dead-loop path and exiting again.
+    expect(harness.journeys.exit).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('LiveSessionService — durable, retryable markers (Codex P1 round 2, fixes 5 + 6)', () => {
+  const OPEN_BURST_SCRIPT: SampleScriptEntry[] = [
+    ...Array.from({ length: 11 }, () => ({ value: 40 })),
+    { value: 200 },
+    { value: 40 },
+    { value: 200 },
+    { value: 40 },
+  ];
+
+  it('a pending-motion marker append failure parks STOPPING — the exit NEVER runs; retry completes to review', async () => {
+    const harness = buildHarness({ script: OPEN_BURST_SCRIPT });
+    harness.journeys.appendEvent.mockRejectedValueOnce(
+      new Error('transient append outage'),
+    );
+    await startAndFinish(harness);
+    const row = harness.sessions[0];
+    expect(row.status).toBe(LiveCameraSessionStatus.STOPPING);
+    expect(row.errorCode).toBe('PENDING_MOTION_AT_STOP');
+    // The journey was NOT exited over the missing marker.
+    expect(harness.journeys.exit).not.toHaveBeenCalled();
+    // Retry appends the marker FIRST, then exits — review, never READY.
+    const retried = await harness.service.stop(TENANT, 'live-1', 'user-1');
+    expect(retried.status).toBe(LiveCameraSessionStatus.STOPPED);
+    expect(retried.decision).toBe(CustomerJourneyDecision.NEEDS_EVENT_REVIEW);
+    expect(harness.journeys.appendEvent).toHaveBeenCalledWith(
+      TENANT,
+      'journey-1',
+      expect.objectContaining({ note: 'PENDING_MOTION_AT_STOP' }),
+      'user-1',
+    );
+  });
+
+  it('a failed-window marker append failure parks STOPPING — retry appends then exits to review', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }, { value: 200 }, { value: 40 }, { value: 40 }],
+      fusionError: new Error('window processing broke'),
+    });
+    harness.journeys.appendEvent.mockRejectedValueOnce(
+      new Error('transient append outage'),
+    );
+    await startAndFinish(harness);
+    const row = harness.sessions[0];
+    expect(row.status).toBe(LiveCameraSessionStatus.STOPPING);
+    expect(row.errorCode).toBe('LIVE_WINDOW_PROCESS_FAILED');
+    expect(harness.journeys.exit).not.toHaveBeenCalled();
+    // INVARIANT: detected > processed can never coexist with a session
+    // whose journey settled READY_TO_SETTLE_SHADOW.
+    expect(row.eventWindowsDetected).toBeGreaterThan(
+      row.eventWindowsProcessed as number,
+    );
+    expect(row.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+    const retried = await harness.service.stop(TENANT, 'live-1', 'user-1');
+    expect(retried.status).toBe(LiveCameraSessionStatus.STOPPED);
+    expect(retried.decision).toBe(CustomerJourneyDecision.NEEDS_EVENT_REVIEW);
+  });
+
+  it('the marker append is idempotent across retries — one marker, not one per stop()', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }, { value: 200 }, { value: 40 }, { value: 40 }],
+      fusionError: new Error('window processing broke'),
+    });
+    harness.journeys.appendEvent.mockRejectedValueOnce(
+      new Error('transient append outage'),
+    );
+    harness.journeys.exit.mockRejectedValueOnce(new Error('transient exit'));
+    await startAndFinish(harness);
+    // First retry: appends the marker, then the exit fails → still
+    // STOPPING (retryable), marker already durable.
+    await harness.service.stop(TENANT, 'live-1', 'user-1');
+    // Second retry: must NOT append a second marker.
+    const final = await harness.service.stop(TENANT, 'live-1', 'user-1');
+    expect(final.status).toBe(LiveCameraSessionStatus.STOPPED);
+    const markerAppends = harness.journeyEvents.filter(
+      (event) => event.note === 'LIVE_WINDOW_PROCESS_FAILED',
+    );
+    expect(markerAppends).toHaveLength(1);
+  });
+});
+
