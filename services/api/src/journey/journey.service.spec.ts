@@ -651,14 +651,39 @@ describe('JourneyService', () => {
     );
   });
 
-  it('the live-session FINALIZER bypass still exits a live-owned journey', async () => {
+  it('the live-session FINALIZER bypass still exits a live-owned journey — review-first, never READY (Phase 13 hard rule)', async () => {
     const { service, journeyRow } = buildService({
       liveOwnerSession: { id: 'live-1' },
     });
     await service.exit(TENANT, 'j-1', undefined, {
       viaLiveSessionFinalizer: true,
     });
-    expect(journeyRow.status).toBe(CustomerJourneyStatus.RECONCILED);
+    // The journey CLOSED (ended, decided) — but a live-owned journey
+    // never settles READY, so it lands in review.
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.REVIEW_REQUIRED);
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+    expect(journeyRow.endedAt).not.toBeNull();
+  });
+
+  it('HARD RULE: a live-owned journey with a CLEAN basket that would compute READY writes NEEDS_EVENT_REVIEW at the final update', async () => {
+    const { service, journeyRow } = buildService({
+      liveOwnerSession: { id: 'live-1' },
+    });
+    await service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+    });
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+    expect(journeyRow.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
   });
 
   it('REVIEW-FIRST FENCE: a live-owned journey with DETECTED work cannot commit READY even when the basket folds cleanly (Codex P1)', async () => {
@@ -798,7 +823,7 @@ describe('JourneyService', () => {
     );
   });
 
-  it('REVIEW-FIRST FENCE: a genuinely clean zero-motion live session may still settle its empty journey', async () => {
+  it('HARD RULE: even a clean ZERO-MOTION live session never settles its journey READY — ownership alone decides (Phase 13)', async () => {
     const { service, journeyRow } = buildService({
       liveOwnerSession: {
         id: 'live-1',
@@ -811,10 +836,14 @@ describe('JourneyService', () => {
     await service.exit(TENANT, 'j-1', undefined, {
       viaLiveSessionFinalizer: true,
     });
+    // No risky state at all — ownership is the whole predicate, which is
+    // what removes the fence race: no takeover timing can change it.
     expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+    expect(journeyRow.decision).not.toBe(
       CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
     );
-    expect(journeyRow.status).toBe(CustomerJourneyStatus.RECONCILED);
   });
 
   it('exit scopes the status update by the id_tenantId composite key (tenant isolation at the write)', async () => {

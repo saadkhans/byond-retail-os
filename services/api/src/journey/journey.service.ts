@@ -632,15 +632,14 @@ export class JourneyService {
       decision = CustomerJourneyDecision.FAILED;
       reason = 'reconciliation failed unexpectedly — see server logs';
     }
-    // PHASE 13 LIVE REVIEW-FIRST FENCE — COMMIT-POINT RECHECK (Codex P1):
-    // consulted as the LAST read before the deciding write, never a
-    // cached earlier verdict. The fold/stock reads above take time; a
-    // timeout takeover that stamps the owning live session (ERROR mode,
-    // error code, intents) while this exit is in flight must still block
-    // READY at the moment it commits. A journey owned by a live camera
-    // session that detected or processed shelf activity, carries a
-    // finalization error mode/code, or recorded any fail-closed intent
-    // never settles READY. A fence-read failure fails the journey closed.
+    // PHASE 13 LIVE HARD RULE — COMMIT-POINT CHECK (Codex P1): consulted
+    // as the LAST read before the deciding write, never a cached earlier
+    // verdict. A LIVE-OWNED journey never writes READY_TO_SETTLE_SHADOW,
+    // full stop — the check depends only on the stable journey link, so
+    // a timeout takeover committing at ANY point during this exit cannot
+    // flip the answer between this read and the update below (there is
+    // no mutable session state left in the predicate to race on). A
+    // fence-read failure fails the journey closed.
     if (decision === CustomerJourneyDecision.READY_TO_SETTLE_SHADOW) {
       try {
         const fence = await this.liveReviewFence(tx, tenantId, journeyId);
@@ -1106,18 +1105,15 @@ export class JourneyService {
   }
 
   /**
-   * Phase 13 review-first fence over the journey's OWN decision (Codex
-   * P1): returns a controlled reason when the journey belongs to a live
-   * camera session whose state forbids READY_TO_SETTLE_SHADOW —
-   * detected live work (even fully processed AUTO_PROPOSE windows),
-   * a finalization error mode or controlled error code (timeout
-   * takeover, stale reclaim, runtime failure), or ANY durable
-   * finalization intent (materialized or not). Deliberately NOT keyed
-   * on the session's status alone: a genuinely clean zero-motion live
-   * session may still settle its empty journey. The lookup ignores
-   * status so a fence stamped by a takeover still binds an in-flight
-   * exit that commits after the session terminalized. Reasons are
-   * controlled strings — never session/runtime free text.
+   * Phase 13 HARD RULE (Codex P1): a journey owned by ANY live camera
+   * session — terminal or not, evidence or none — never settles
+   * READY_TO_SETTLE_SHADOW. Live journeys are review-first for the
+   * WHOLE phase; making them settlement-ready is explicitly out of
+   * scope. This is what removes the timeout-fence race entirely: the
+   * verdict depends only on the journey LINK, a stable fact (journeyId
+   * never unlinks once set), so no takeover timing between this read
+   * and the update it guards can change the answer — there is no risky
+   * session state left to race on. Controlled reason string only.
    */
   private async liveReviewFence(
     tx: Prisma.TransactionClient,
@@ -1126,34 +1122,11 @@ export class JourneyService {
   ): Promise<string | null> {
     const live = await tx.liveCameraSession.findFirst({
       where: { tenantId, journeyId },
-      select: {
-        id: true,
-        eventWindowsDetected: true,
-        eventWindowsProcessed: true,
-        errorCode: true,
-        finalizationMode: true,
-      },
-    });
-    if (!live) {
-      return null;
-    }
-    if (
-      (live.eventWindowsDetected ?? 0) > 0 ||
-      (live.eventWindowsProcessed ?? 0) > 0
-    ) {
-      return 'live camera session detected shelf activity — review-first (Phase 13)';
-    }
-    if (live.errorCode != null || live.finalizationMode != null) {
-      return 'live camera session finalization was not clean — review-first (Phase 13)';
-    }
-    const intent = await tx.liveCameraSessionFinalizationIntent.findFirst({
-      where: { tenantId, liveSessionId: live.id },
       select: { id: true },
     });
-    if (intent) {
-      return 'live camera session recorded a fail-closed finalization intent — review-first (Phase 13)';
-    }
-    return null;
+    return live
+      ? 'live camera journeys are review-first in Phase 13 — settlement-ready is not permitted'
+      : null;
   }
 
   /** Reject a generic close of a journey owned by an ACTIVE (non-

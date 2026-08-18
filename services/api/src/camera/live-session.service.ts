@@ -318,16 +318,7 @@ export class LiveSessionService {
    *  the timeout path can REVOKE it — both atomically, owner-predicated. */
   private readonly loops = new Map<
     string,
-    {
-      stopRequested: boolean;
-      leaseOwner: string;
-      /** A PRE-LINK startup remnant whose durable retry park FAILED: no
-       *  sampling loop exists, but this process still owns the lease —
-       *  registered so a follow-up stop() takes the LOCAL path and can
-       *  finalize as the owner once writes recover (Codex P1: never a
-       *  fresh owned STOPPING row with no local handle). */
-      bareRemnant?: boolean;
-    }
+    { stopRequested: boolean; leaseOwner: string }
   >();
 
   /** Loop completion promises — awaited by stop()'s drain and by the
@@ -1002,19 +993,15 @@ export class LiveSessionService {
         });
       } catch (parkError) {
         // BOTH mandatory writes failed (Codex P1): NEVER report success
-        // over a fresh owned STOPPING remnant. Keep the remnant LOCALLY
-        // actionable — a synthetic controller makes the next stop() take
-        // the local path and finalize as the owner once writes recover —
-        // and fail THIS request visibly with a controlled error.
-        this.loops.set(sessionId, {
-          stopRequested: true,
-          leaseOwner,
-          bareRemnant: true,
-        });
+        // over a stuck remnant. The remnant stays retryable CROSS-
+        // PROCESS through stop()'s bare-remnant fast path (journeyId
+        // null + zero frames is atomically claimable by ANY process, no
+        // stale cutoff, no process-local state) — so this request only
+        // needs to fail visibly with a controlled error.
         this.logger.error(
           `live session ${sessionId} pre-link retry park failed ` +
-            `(${classifyError(parkError)}) — remnant kept locally ` +
-            `actionable; failing the request`,
+            `(${classifyError(parkError)}) — failing the request; the ` +
+            `bare remnant is claimable by any process's stop()`,
         );
         throw new ConflictException(
           'live session stop is pending finalization retry ' +
@@ -1301,6 +1288,10 @@ export class LiveSessionService {
       // pass), and normal finalization stays blocked (Invariant F).
       try {
         await this.addIntent(tenantId, sessionId, DETECTED_WORK_INTENT);
+        if (unpersistedIntent === DETECTED_WORK_INTENT) {
+          // A prior skip's pending fence just landed with this attempt.
+          unpersistedIntent = null;
+        }
       } catch {
         unpersistedIntent = DETECTED_WORK_INTENT;
         return;
@@ -1475,6 +1466,12 @@ export class LiveSessionService {
       const exitSamples = motionSamples(buffer, LIVE_ANALYSIS_GEOMETRY, zone);
       const trailing = exitSamples[exitSamples.length - 1];
       const lastMs = trailing?.timestampMs ?? 0;
+      /** A closed FINAL-SWEEP window skipped because the detection-time
+       *  fence could not land (Codex P1): the window must not vanish —
+       *  once the fence recovers below, it is durably represented by a
+       *  WINDOW_DETECTED_NOT_PROCESSED intent before finalization may
+       *  continue. */
+      let sweepWindowSkipped = false;
       for (const window of extractEventWindows(
         exitSamples,
         DEFAULT_EVENT_WINDOW_CONFIG,
@@ -1489,6 +1486,9 @@ export class LiveSessionService {
           continue; // open at the newest sample — pending-motion below
         }
         await handleClosedWindow(window);
+        if (unpersistedIntent === DETECTED_WORK_INTENT) {
+          sweepWindowSkipped = true;
+        }
       }
       if (leaseLost) {
         return;
@@ -1532,6 +1532,23 @@ export class LiveSessionService {
             `${unpersistedIntent} intent — left owned for stale reclaim`,
         );
         return;
+      }
+      if (sweepWindowSkipped) {
+        // The detection fence RECOVERED but a closed final-sweep window
+        // was never processed (no fusion run, no journey append). The
+        // generic detected-work marker alone must not stand in for it —
+        // the SPECIFIC unprocessed-window intent lands durably before
+        // finalization may continue; if it cannot, the row stays owned
+        // and non-terminal for stale reclaim (Invariant F).
+        try {
+          await this.addIntent(tenantId, sessionId, WINDOW_NOT_PROCESSED);
+        } catch {
+          this.logger.error(
+            `live session ${sessionId} could not persist its ` +
+              `unprocessed-window intent — left owned for stale reclaim`,
+          );
+          return;
+        }
       }
       try {
         await this.finalizeLiveSessionSafely(tenantId, sessionId, {
@@ -1727,6 +1744,64 @@ export class LiveSessionService {
     ) {
       return toDetail(session as SessionWithSource);
     }
+    // PRE-LINK BARE REMNANT — CROSS-PROCESS (Codex P1): a STARTING/
+    // STOPPING row with NO journey and NO sampled frames is a startup
+    // remnant. There is no sampler loop, no evidence, and no journey to
+    // protect, so ANY process may terminalize it IMMEDIATELY — treating
+    // its fresh lease as a remote owner would block the camera for the
+    // stale cutoff for nothing. Safe against an in-flight start: the
+    // atomic create+link transaction and the promote both CAS on
+    // (STARTING + owner), so this claim makes them miss and the startup
+    // rolls back journey-less. The claim itself CASes on the row as
+    // read; a miss means the row changed (linked, promoted, claimed) —
+    // return its current state, never finalize from the stale view.
+    if (
+      session.journeyId === null &&
+      session.framesSampled === 0 &&
+      (session.status === LiveCameraSessionStatus.STARTING ||
+        session.status === LiveCameraSessionStatus.STOPPING)
+    ) {
+      try {
+        // A count of 0 means the row changed under us (linked, promoted,
+        // or claimed elsewhere) — the reload below returns its current
+        // state either way; the claim is all-or-nothing.
+        await this.prisma.liveCameraSession.updateMany({
+          where: {
+            id: sessionId,
+            tenantId,
+            status: {
+              in: [
+                LiveCameraSessionStatus.STARTING,
+                LiveCameraSessionStatus.STOPPING,
+              ],
+            },
+            journeyId: null,
+            framesSampled: 0,
+            leaseOwner: session.leaseOwner,
+            stoppedAt: null,
+          },
+          data: {
+            status: LiveCameraSessionStatus.STOPPED,
+            stoppedAt: this.now(),
+            leaseOwner: null,
+            finalizationMode: null,
+            errorCode: session.errorCode ?? STOPPED_DURING_START,
+          },
+        });
+      } catch (error) {
+        // MANDATORY terminal write failed — never report success over a
+        // stuck remnant; the caller (any process) retries this same path.
+        this.logger.error(
+          `live session ${sessionId} bare-remnant finalization failed ` +
+            `(${classifyError(error)}) — failing the request for retry`,
+        );
+        throw new ConflictException(
+          'live session stop is pending finalization retry ' +
+            '(PRE_LINK_STOP_RETRY_REQUIRED)',
+        );
+      }
+      return this.byId(tenantId, sessionId);
+    }
     const controller = this.loops.get(sessionId);
     if (controller) {
       // ATOMIC DRAIN-LEASE ACQUISITION (Codex P1): the local loop may
@@ -1752,11 +1827,6 @@ export class LiveSessionService {
         .catch(() => null);
       if (!acquired || acquired.count === 0) {
         controller.stopRequested = true;
-        if (controller.bareRemnant) {
-          // The remnant's lease is gone (claimed or finalized elsewhere)
-          // — nothing local remains to act on.
-          this.loops.delete(sessionId);
-        }
         return this.byId(tenantId, sessionId);
       }
       // DRAIN BEFORE STOPPED (Codex P1): signal the loop and WAIT for it
@@ -1845,42 +1915,7 @@ export class LiveSessionService {
         where: { tenantId, id: sessionId },
       });
       if (after && after.status === LiveCameraSessionStatus.STOPPING) {
-        if (
-          controller.bareRemnant &&
-          after.leaseOwner === controller.leaseOwner
-        ) {
-          // PRE-LINK remnant whose durable park failed earlier: this
-          // process still owns the row (no journey, no loop) — finalize
-          // as the owner now that writes are landing again (Codex P1:
-          // immediately retryable, no five-minute stale wait).
-          try {
-            await this.finalizeLiveSessionSafely(tenantId, sessionId, {
-              ownerToken: controller.leaseOwner,
-              mode: 'stop',
-              code: STOPPED_DURING_START,
-              actorId,
-            });
-          } catch (error) {
-            this.logger.error(
-              `live session ${sessionId} remnant retry finalization ` +
-                `failed (${classifyError(error)}) — still retryable`,
-            );
-          }
-        } else {
-          await this.resumeFinalization(tenantId, sessionId, after, actorId);
-        }
-      }
-      if (controller.bareRemnant) {
-        const settled = await this.prisma.liveCameraSession.findFirst({
-          where: { tenantId, id: sessionId },
-          select: { status: true },
-        });
-        if (
-          settled?.status === LiveCameraSessionStatus.STOPPED ||
-          settled?.status === LiveCameraSessionStatus.ERROR
-        ) {
-          this.loops.delete(sessionId);
-        }
+        await this.resumeFinalization(tenantId, sessionId, after, actorId);
       }
       return this.byId(tenantId, sessionId);
     }

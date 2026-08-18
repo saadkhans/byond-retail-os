@@ -415,13 +415,14 @@ function buildHarness(
       },
     ),
   };
-  /** Journey decision mirrors the real fold's essential rule: any
-   *  REVIEW_REQUIRED event that remains ⇒ NEEDS_EVENT_REVIEW; a clean
-   *  event stream ⇒ READY_TO_SETTLE_SHADOW. */
+  /** Journey decision mirrors the REAL journey service's Phase 13 hard
+   *  rule (Codex P1): every journey these mocks serve is LIVE-OWNED, and
+   *  a live-owned journey NEVER settles READY_TO_SETTLE_SHADOW — clean
+   *  folds land NEEDS_EVENT_REVIEW too (review-first for the whole
+   *  phase). Tests that need a STALE pre-rule READY (the takeover CAS
+   *  races) stub journeys.exit explicitly. */
   const journeyDecision = (): CustomerJourneyDecision =>
-    journeyEvents.some((event) => event.eventType === 'REVIEW_REQUIRED')
-      ? CustomerJourneyDecision.NEEDS_EVENT_REVIEW
-      : CustomerJourneyDecision.READY_TO_SETTLE_SHADOW;
+    CustomerJourneyDecision.NEEDS_EVENT_REVIEW;
   const journeys = {
     create: jest.fn(async () => ({ id: 'journey-1' })),
     // The ATOMIC startup path (Codex P1): journey creation runs on the
@@ -841,7 +842,9 @@ describe('LiveSessionService — stop', () => {
     });
     const view = await harness.service.stop(TENANT, 'live-1', 'user-1');
     expect(view.status).toBe(LiveCameraSessionStatus.STOPPED);
-    expect(view.decision).toBe(CustomerJourneyDecision.READY_TO_SETTLE_SHADOW);
+    // Phase 13 hard rule: live-owned journeys are review-first — the
+    // journey's own decision (snapshotted here) is never READY.
+    expect(view.decision).toBe(CustomerJourneyDecision.NEEDS_EVENT_REVIEW);
     expect(harness.journeys.exit).toHaveBeenCalledWith(
       TENANT,
       'journey-1',
@@ -885,7 +888,7 @@ describe('LiveSessionService — stop', () => {
     );
     const view = await harness.service.stop(TENANT, 'live-1', 'user-1');
     expect(view.status).toBe(LiveCameraSessionStatus.STOPPED);
-    expect(view.decision).toBe(CustomerJourneyDecision.READY_TO_SETTLE_SHADOW);
+    expect(view.decision).toBe(CustomerJourneyDecision.NEEDS_EVENT_REVIEW);
   });
 });
 
@@ -1379,11 +1382,15 @@ describe('LiveSessionService — pending motion at stop (Codex P1 fix 9)', () =>
     await harness.service.awaitLoop(view.sessionId);
   });
 
-  it('a QUIET tail still finalizes clean — READY stays reachable', async () => {
+  it('a QUIET tail still finalizes clean — STOPPED with no markers, review-first journey decision', async () => {
     const harness = buildHarness({ script: [{ value: 40 }] });
     await startAndFinish(harness);
+    // No motion → no intents, no markers, clean STOPPED — and the
+    // journey's decision snapshot is review-first (Phase 13: live-owned
+    // journeys never settle READY).
+    expect(harness.sessions[0].status).toBe(LiveCameraSessionStatus.STOPPED);
     expect(harness.sessions[0].decision).toBe(
-      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
     );
     expect(harness.journeys.appendEvent).not.toHaveBeenCalled();
   });
@@ -1695,9 +1702,10 @@ describe('LiveSessionService — remote-owned loops (Codex P1 round 3, fix 1)', 
     await startAndFinish(harness);
     const row = harness.sessions[0];
     expect(row.status).toBe(LiveCameraSessionStatus.STOPPED);
-    // The owner itself finalized — one exit, decision snapshotted.
+    // The owner itself finalized — one exit, decision snapshotted
+    // (review-first: never READY for a live journey).
     expect(harness.journeys.exit).toHaveBeenCalledTimes(1);
-    expect(row.decision).toBe(CustomerJourneyDecision.READY_TO_SETTLE_SHADOW);
+    expect(row.decision).toBe(CustomerJourneyDecision.NEEDS_EVENT_REVIEW);
   });
 
   it('stop with a STALE remote owner claims + stamps ERROR mode atomically, then ABORTS — never a normal exit, never READY (Codex P1)', async () => {
@@ -2316,6 +2324,186 @@ describe('LiveSessionService — durable ADDITIVE intents (Codex P1, Invariant E
     const second = await harness.service.start(TENANT, 'cam-1', {}, 'user-1');
     expect(second.status).toBe(LiveCameraSessionStatus.RUNNING);
     await harness.service.awaitLoop(second.sessionId);
+  });
+
+  it('a BARE remnant (STOPPING, no journey, no frames) is claimable CROSS-PROCESS — no local loop, no stale wait (Codex P1)', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }],
+      existingSession: {
+        id: 'live-remnant',
+        tenantId: TENANT,
+        cameraSourceId: 'cam-1',
+        status: LiveCameraSessionStatus.STOPPING,
+        journeyId: null,
+        framesSampled: 0,
+        // ANOTHER process's fresh lease — a real remote loop would be
+        // protected, but a journey-less zero-frame remnant has nothing
+        // to protect.
+        leaseOwner: 'other-api-process',
+        startedAt: new Date('2026-08-17T09:59:30.000Z'),
+        heartbeatAt: new Date('2026-08-17T10:00:00.000Z'),
+        eventWindows: [],
+      },
+    });
+    const view = await harness.service.stop(TENANT, 'live-remnant', 'user-1');
+    // Terminal IMMEDIATELY — no five-minute stale cutoff, no journey
+    // close needed (none exists), lease and active slot released.
+    expect(view.status).toBe(LiveCameraSessionStatus.STOPPED);
+    expect(view.journeyId).toBeNull();
+    expect(harness.sessions[0].leaseOwner).toBeNull();
+    expect(harness.sessions[0].stoppedAt).not.toBeNull();
+    expect(harness.journeys.exit).not.toHaveBeenCalled();
+    expect(harness.journeys.abortShadowJourney).not.toHaveBeenCalled();
+    // The slot is free: a fresh start succeeds right away.
+    const second = await harness.service.start(TENANT, 'cam-1', {}, 'user-1');
+    expect(second.status).toBe(LiveCameraSessionStatus.RUNNING);
+    await harness.service.awaitLoop(second.sessionId);
+  });
+
+  it('a BARE-remnant claim that hits a DB outage fails the request — never success over a stuck remnant; retry works', async () => {
+    const harness = buildHarness({
+      existingSession: {
+        id: 'live-remnant',
+        tenantId: TENANT,
+        cameraSourceId: 'cam-1',
+        status: LiveCameraSessionStatus.STOPPING,
+        journeyId: null,
+        framesSampled: 0,
+        leaseOwner: 'other-api-process',
+        startedAt: new Date('2026-08-17T09:59:30.000Z'),
+        heartbeatAt: new Date('2026-08-17T10:00:00.000Z'),
+        eventWindows: [],
+      },
+    });
+    harness.prisma.liveCameraSession.updateMany.mockRejectedValueOnce(
+      new Error('db outage'),
+    );
+    await expect(
+      harness.service.stop(TENANT, 'live-remnant', 'user-1'),
+    ).rejects.toThrow(/PRE_LINK_STOP_RETRY_REQUIRED/);
+    // The very next stop (any process) retries the same claim.
+    const retried = await harness.service.stop(TENANT, 'live-remnant', 'user-1');
+    expect(retried.status).toBe(LiveCameraSessionStatus.STOPPED);
+  });
+
+  it('a FINAL-SWEEP window skipped by an unavailable detection fence gets a durable WINDOW_DETECTED_NOT_PROCESSED once the fence recovers (Codex P1)', async () => {
+    const harness = buildHarness({
+      script: [
+        { value: 40 },
+        { value: 200 },
+        { value: 40 },
+        {
+          value: 40,
+          onCall: () => {
+            // The stop arrives WITH the closing quiet frame — the
+            // in-loop pass and the final sweep both see the closed
+            // window while the detection fence is still failing.
+            const loops = (
+              harness.service as unknown as {
+                loops: Map<string, { stopRequested: boolean }>;
+              }
+            ).loops;
+            const controller = loops.get('live-1');
+            if (controller) {
+              controller.stopRequested = true;
+            }
+          },
+        },
+      ],
+    });
+    const originalIntent =
+      harness.prisma.liveCameraSessionFinalizationIntent.create.getMockImplementation() as (
+        args: { data: Record<string, unknown> },
+      ) => Promise<unknown>;
+    let detectedWorkFailures = 0;
+    harness.prisma.liveCameraSessionFinalizationIntent.create.mockImplementation(
+      async (args: { data: Record<string, unknown> }) => {
+        if (
+          args.data.reason === 'LIVE_SESSION_DETECTED_WORK_REQUIRES_REVIEW' &&
+          detectedWorkFailures < 2
+        ) {
+          // Fails for the in-loop attempt AND the final-sweep attempt,
+          // then recovers for retryUnpersistedIntent().
+          detectedWorkFailures += 1;
+          throw new Error('transient intent outage');
+        }
+        return originalIntent(args);
+      },
+    );
+    await startAndFinish(harness);
+    const row = harness.sessions[0];
+    // The window was never processed (no fusion run) — but it did NOT
+    // vanish behind the generic marker: the SPECIFIC unprocessed-window
+    // intent is durable and materialized as a review marker.
+    expect(harness.fusion.runLiveWindow).not.toHaveBeenCalled();
+    const reasons = harness.intents.map((intent) => intent.reason);
+    expect(reasons).toContain('LIVE_SESSION_DETECTED_WORK_REQUIRES_REVIEW');
+    expect(reasons).toContain('WINDOW_DETECTED_NOT_PROCESSED');
+    expect(harness.journeys.appendEvent).toHaveBeenCalledWith(
+      TENANT,
+      'journey-1',
+      expect.objectContaining({ note: 'WINDOW_DETECTED_NOT_PROCESSED' }),
+      'user-1',
+    );
+    expect(row.status).toBe(LiveCameraSessionStatus.STOPPED);
+    expect(row.decision).toBe(CustomerJourneyDecision.NEEDS_EVENT_REVIEW);
+    expect(row.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+  });
+
+  it('if the unprocessed-window intent ALSO fails after fence recovery, finalization stays retryable — no exit, no READY', async () => {
+    const harness = buildHarness({
+      script: [
+        { value: 40 },
+        { value: 200 },
+        { value: 40 },
+        {
+          value: 40,
+          onCall: () => {
+            const loops = (
+              harness.service as unknown as {
+                loops: Map<string, { stopRequested: boolean }>;
+              }
+            ).loops;
+            const controller = loops.get('live-1');
+            if (controller) {
+              controller.stopRequested = true;
+            }
+          },
+        },
+      ],
+    });
+    const originalIntent =
+      harness.prisma.liveCameraSessionFinalizationIntent.create.getMockImplementation() as (
+        args: { data: Record<string, unknown> },
+      ) => Promise<unknown>;
+    let detectedWorkFailures = 0;
+    harness.prisma.liveCameraSessionFinalizationIntent.create.mockImplementation(
+      async (args: { data: Record<string, unknown> }) => {
+        if (
+          args.data.reason === 'LIVE_SESSION_DETECTED_WORK_REQUIRES_REVIEW' &&
+          detectedWorkFailures < 2
+        ) {
+          detectedWorkFailures += 1;
+          throw new Error('transient intent outage');
+        }
+        if (args.data.reason === 'WINDOW_DETECTED_NOT_PROCESSED') {
+          throw new Error('persistent intent outage');
+        }
+        return originalIntent(args);
+      },
+    );
+    await startAndFinish(harness);
+    const row = harness.sessions[0];
+    // Owned, non-terminal, journey untouched: the dropped window cannot
+    // be papered over by the generic marker alone.
+    expect(harness.journeys.exit).not.toHaveBeenCalled();
+    expect(row.leaseOwner).not.toBeNull();
+    expect(row.status).not.toBe(LiveCameraSessionStatus.STOPPED);
+    expect(row.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
   });
 
   it('a counter gap (detected > processed) with a MISSING errorCode still adds an intent and never exits READY', async () => {
