@@ -65,11 +65,38 @@ export type RtspSampleErrorCode = (typeof RTSP_SAMPLE_ERROR_CODES)[number];
  * scope for Phase 13 (credential-free dev/local sources only) until a
  * secure non-argv transport exists.
  *
- * Plain file paths (no `scheme://`) skip the check entirely: they never
- * enter a URL parser and carry no userinfo/query semantics — a Windows
- * path is not a URL. The value itself never leaves the caller.
+ * Plain file paths (no `scheme://` and no embedded rtsp/rtsps URL) skip
+ * the start-anchored check: they never enter a URL parser and carry no
+ * userinfo/query semantics — a Windows path is not a URL. Any rtsp:// or
+ * rtsps:// occurrence ANYWHERE in the value, however, is always held to
+ * the strict rule — a prefix cannot smuggle a credential-bearing camera
+ * URL past the gate. The value itself never leaves the caller.
  */
 export function urlViolatesCredentialFreeRule(value: string): boolean {
+  // EMBEDDED RTSP SCAN (Codex P1): the gate must cover the WHOLE input,
+  // not only a start-anchored scheme — `input=rtsp://user:pass@cam/x` or
+  // `ffmpeg:rtsp://cam/x?token=abc` would otherwise slip a credential-
+  // bearing URL into ffmpeg argv behind a prefix. EVERY rtsp/rtsps
+  // occurrence anywhere in the string is held to the strict rule:
+  // any '?' or '#' AFTER it, or any '@' in its authority, rejects.
+  // Deliberately conservative — a '?' that "belongs to something else"
+  // later in the value still rejects; Phase 13 has no safe-query
+  // classification to alias around.
+  const embedded = /rtsps?:\/\//gi;
+  let match: RegExpExecArray | null;
+  while ((match = embedded.exec(value)) !== null) {
+    const rest = value.slice(match.index + match[0].length);
+    if (rest.includes('?') || rest.includes('#')) {
+      return true;
+    }
+    const slash = rest.indexOf('/');
+    const authority = slash === -1 ? rest : rest.slice(0, slash);
+    if (authority.includes('@')) {
+      return true;
+    }
+  }
+  // Start-anchored generic-scheme rule (any scheme, not just rtsp):
+  // scheme + host(:port) + path ONLY.
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
     return false;
   }

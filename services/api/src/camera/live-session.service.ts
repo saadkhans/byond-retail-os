@@ -158,7 +158,21 @@ export const LIVE_SESSION_ERROR_CODES = [
   'LIVE_WINDOW_DRAIN_TIMEOUT',
   'LIVE_WINDOW_PROCESS_FAILED',
   'PENDING_MOTION_AT_STOP',
+  'PRE_LINK_STOP_RETRY_REQUIRED',
 ] as const;
+
+/** Journey review marker for DETECTED live work (Phase 13 review-first,
+ *  Codex P1): every live session that detected ANY motion window —
+ *  including fully processed AUTO_PROPOSE windows — must carry this
+ *  REVIEW_REQUIRED marker on its journey BEFORE the exit, so the
+ *  JOURNEY's own fold (not just the session snapshot) lands in review. */
+export const DETECTED_WORK_REVIEW_MARKER =
+  'LIVE_SESSION_DETECTED_WORK_REQUIRES_REVIEW';
+
+/** Advisory code stamped when the bare pre-link remnant's terminal write
+ *  failed: the row parks unowned + mode STOP so the NEXT stop() claims
+ *  and terminalizes it immediately (no five-minute stale wait). */
+const PRE_LINK_STOP_RETRY = 'PRE_LINK_STOP_RETRY_REQUIRED';
 
 const STOPPED_DURING_START = 'LIVE_SESSION_STOPPED_DURING_START';
 const STALE_RECLAIMED = 'LIVE_SESSION_STALE_RECLAIMED';
@@ -346,9 +360,16 @@ export class LiveSessionService {
     tenantId: string,
     sessionId: string,
     reason: FinalizationIntentReason,
+    /** Optional transaction client — the takeover/claim paths write the
+     *  intent ATOMICALLY with the lease revocation + mode/code stamp
+     *  (Codex P1: no partial revocation may commit). */
+    db: Pick<
+      Prisma.TransactionClient,
+      'liveCameraSessionFinalizationIntent'
+    > = this.prisma,
   ): Promise<void> {
     try {
-      await this.prisma.liveCameraSessionFinalizationIntent.create({
+      await db.liveCameraSessionFinalizationIntent.create({
         data: { tenantId, liveSessionId: sessionId, reason },
       });
     } catch (error) {
@@ -492,6 +513,39 @@ export class LiveSessionService {
     // needed one never concludes clean, missing errorCode or not.
     if (intents.length > 0) {
       suppressReady = true;
+    }
+
+    // DETECTED-WORK MARKER (Phase 13 review-first, Codex P1): a live
+    // session that detected ANY window — including ones that processed
+    // cleanly to AUTO_PROPOSE — persists a review-required marker on the
+    // JOURNEY itself before the exit, so the journey's OWN fold decides
+    // review, not just the session's copied snapshot. A failed append
+    // parks the finalization retryably (mandatory write, never
+    // swallowed); an already-closed journey falls to the decision guard.
+    if (session.journeyId && session.eventWindowsDetected > 0) {
+      try {
+        await this.ensureReviewMarker(
+          tenantId,
+          session.journeyId,
+          DETECTED_WORK_REVIEW_MARKER,
+          stoppedAt,
+          options.actorId,
+        );
+      } catch (error) {
+        if (!(error instanceof ConflictException)) {
+          this.logger.warn(
+            `live session ${sessionId} could not persist its detected-` +
+              `work review marker (${classifyError(error)}) — parked`,
+          );
+          await park(
+            options.mode === 'stop'
+              ? JOURNEY_FINALIZE_RETRY
+              : (options.code ?? JOURNEY_FINALIZE_RETRY),
+          );
+          return;
+        }
+        suppressReady = true;
+      }
     }
 
     // MATERIALIZE every unmaterialized marker-class intent BEFORE the
@@ -906,10 +960,38 @@ export class LiveSessionService {
         actorId,
       });
     } catch (error) {
-      this.logger.warn(
+      // MANDATORY-failure fallback (Codex P1): never leave a FRESH owned
+      // STOPPING row with no local loop — a later stop() would read it as
+      // a fresh remote owner and wait out the five-minute stale cutoff.
+      // Park the bare row UNOWNED with mode STOP + a retry code so the
+      // very next stop() claims and terminalizes it immediately. If even
+      // this park cannot land, the failure is logged loudly and stale
+      // reclaim remains the backstop.
+      this.logger.error(
         `live session ${sessionId} startup-remnant finalization failed ` +
-          `(${classifyError(error)}) — left for stop()/stale reclaim`,
+          `(${classifyError(error)}) — parking for immediate retry`,
       );
+      try {
+        await this.prisma.liveCameraSession.updateMany({
+          where: {
+            id: sessionId,
+            tenantId,
+            status: { in: NON_TERMINAL_SESSION_STATUSES },
+            leaseOwner,
+          },
+          data: {
+            status: LiveCameraSessionStatus.STOPPING,
+            leaseOwner: null,
+            finalizationMode: 'STOP',
+            errorCode: PRE_LINK_STOP_RETRY,
+          },
+        });
+      } catch (parkError) {
+        this.logger.error(
+          `live session ${sessionId} pre-link retry park failed ` +
+            `(${classifyError(parkError)}) — stale reclaim is the backstop`,
+        );
+      }
     }
   }
 
@@ -929,30 +1011,47 @@ export class LiveSessionService {
     sessionId: string,
     actorId?: string,
   ): Promise<boolean> {
+    // ONE transaction: claim + finalizationMode=ERROR + code + durable
+    // intent (Codex P1) — the stamp is the journey-level fence, and a
+    // failed intent write rolls the whole claim back (nothing partial).
     const cutoff = new Date(this.now().getTime() - LIVE_SESSION_STALE_MS);
-    const claimed = await this.prisma.liveCameraSession.updateMany({
-      where: {
-        id: sessionId,
-        tenantId,
-        status: { in: ACTIVE_SESSION_STATUSES },
-        OR: [
-          { heartbeatAt: { lt: cutoff } },
-          { heartbeatAt: null, startedAt: { lt: cutoff } },
-        ],
-      },
-      data: {
-        status: LiveCameraSessionStatus.STOPPING,
-        errorCode: STALE_RECLAIMED,
-        leaseOwner: null,
-      },
-    });
-    if (claimed.count === 0) {
+    let claimed = false;
+    try {
+      claimed = await this.prisma.$transaction(async (tx) => {
+        const res = await tx.liveCameraSession.updateMany({
+          where: {
+            id: sessionId,
+            tenantId,
+            status: { in: ACTIVE_SESSION_STATUSES },
+            OR: [
+              { heartbeatAt: { lt: cutoff } },
+              { heartbeatAt: null, startedAt: { lt: cutoff } },
+            ],
+          },
+          data: {
+            status: LiveCameraSessionStatus.STOPPING,
+            errorCode: STALE_RECLAIMED,
+            finalizationMode: 'ERROR',
+            leaseOwner: null,
+          },
+        });
+        if (res.count === 0) {
+          return false;
+        }
+        await this.addIntent(tenantId, sessionId, STALE_RECLAIMED_INTENT, tx);
+        return true;
+      });
+    } catch (error) {
+      this.logger.warn(
+        `stale live session ${sessionId} claim failed ` +
+          `(${classifyError(error)}) — nothing claimed, retry later`,
+      );
+      return false;
+    }
+    if (!claimed) {
       return false;
     }
     try {
-      // MANDATORY durable intent — throws on failure, leaving the row
-      // claimed (STOPPING, unowned) for stop()'s retry.
-      await this.addIntent(tenantId, sessionId, STALE_RECLAIMED_INTENT);
       await this.finalizeLiveSessionSafely(tenantId, sessionId, {
         ownerToken: null,
         mode: 'error',
@@ -1608,35 +1707,57 @@ export class LiveSessionService {
         this.drainTimeoutMs(),
       );
       if (!drained) {
-        // ATOMIC LEASE REVOCATION FIRST (Codex P1): the stuck loop's
+        // ATOMIC LEASE REVOCATION + FENCE (Codex P1): the stuck loop's
         // finalizer may be blocked INSIDE journeys.exit — starting a
         // second finalizer while its lease stands would let whichever
-        // completes last win. Revoking the lease (owner-predicated CAS)
-        // guarantees the original owner's eventual terminal/park writes
-        // match NOTHING; only then does the fail-closed finalizer run,
-        // as the now-unowned row. A revocation miss means the loop
-        // already finalized/parked or a claimant won — reload, never
-        // finalize from this stale view.
-        const revoked = await this.prisma.liveCameraSession
-          .updateMany({
-            where: {
-              id: sessionId,
-              tenantId,
-              status: { in: NON_TERMINAL_SESSION_STATUSES },
-              leaseOwner: controller.leaseOwner,
-              stoppedAt: null,
-            },
-            data: {
-              status: LiveCameraSessionStatus.STOPPING,
-              leaseOwner: null,
-            },
-          })
-          .catch(() => null);
-        if (!revoked || revoked.count === 0) {
+        // completes last win. ONE transaction revokes the lease
+        // (owner-predicated CAS) AND stamps finalizationMode=ERROR +
+        // the timeout errorCode AND the durable DRAIN_TIMEOUT intent —
+        // the stamp is the journey-level fence: the journey's reconcile
+        // reads it before committing READY, so the blocked original
+        // exit can no longer settle the journey clean. All-or-nothing:
+        // a failed intent write rolls the revocation back and the
+        // previous owner keeps its lease (retry later); an unowned
+        // STOPPING row without mode/code can never exist. Only after
+        // the fence commits does the fail-closed finalizer run, as the
+        // now-unowned row.
+        let revoked = false;
+        try {
+          revoked = await this.prisma.$transaction(async (tx) => {
+            const res = await tx.liveCameraSession.updateMany({
+              where: {
+                id: sessionId,
+                tenantId,
+                status: { in: NON_TERMINAL_SESSION_STATUSES },
+                leaseOwner: controller.leaseOwner,
+                stoppedAt: null,
+              },
+              data: {
+                status: LiveCameraSessionStatus.STOPPING,
+                leaseOwner: null,
+                finalizationMode: 'ERROR',
+                errorCode: WINDOW_DRAIN_TIMEOUT,
+              },
+            });
+            if (res.count === 0) {
+              return false;
+            }
+            await this.addIntent(tenantId, sessionId, WINDOW_DRAIN_TIMEOUT, tx);
+            return true;
+          });
+        } catch (error) {
+          this.logger.error(
+            `live session ${sessionId} drain-timeout revocation failed ` +
+              `(${classifyError(error)}) — owner lease left intact for retry`,
+          );
+          return this.byId(tenantId, sessionId);
+        }
+        if (!revoked) {
+          // The loop already finalized/parked or a claimant won — never
+          // finalize from this stale view.
           return this.byId(tenantId, sessionId);
         }
         try {
-          await this.addIntent(tenantId, sessionId, WINDOW_DRAIN_TIMEOUT);
           await this.finalizeLiveSessionSafely(tenantId, sessionId, {
             ownerToken: null,
             mode: 'error',
@@ -1646,7 +1767,7 @@ export class LiveSessionService {
         } catch (error) {
           this.logger.error(
             `live session ${sessionId} drain-timeout finalization failed ` +
-              `(${classifyError(error)}) — row left non-terminal for retry`,
+              `(${classifyError(error)}) — row left ERROR-moded for retry`,
           );
         }
         return this.byId(tenantId, sessionId);
@@ -1687,23 +1808,50 @@ export class LiveSessionService {
       return this.byId(tenantId, sessionId);
     }
     if (owner !== null) {
-      // STALE remote owner: claim ATOMICALLY before touching anything —
-      // a loop that revived keeps beating and voids this claim.
+      // STALE remote owner: claim ATOMICALLY — a loop that revived keeps
+      // beating and voids this claim. ONE transaction claims the lease
+      // AND stamps finalizationMode=ERROR + the STALE_RECLAIMED code AND
+      // the durable intent (Codex P1): a reclaimed session with null
+      // mode/code could otherwise resume under normal stop semantics and
+      // let its abandoned journey reconcile clean. The stamp doubles as
+      // the journey-level fence (reconcile reads it before READY).
+      // All-or-nothing: a failed intent write rolls the claim back.
       const cutoff = new Date(this.now().getTime() - LIVE_SESSION_STALE_MS);
-      const claimed = await this.prisma.liveCameraSession.updateMany({
-        where: {
-          id: sessionId,
-          tenantId,
-          status: { in: NON_TERMINAL_SESSION_STATUSES },
-          leaseOwner: owner,
-          OR: [
-            { heartbeatAt: { lt: cutoff } },
-            { heartbeatAt: null, startedAt: { lt: cutoff } },
-          ],
-        },
-        data: { status: LiveCameraSessionStatus.STOPPING, leaseOwner: null },
-      });
-      if (claimed.count === 0) {
+      let claimed = false;
+      try {
+        claimed = await this.prisma.$transaction(async (tx) => {
+          const res = await tx.liveCameraSession.updateMany({
+            where: {
+              id: sessionId,
+              tenantId,
+              status: { in: NON_TERMINAL_SESSION_STATUSES },
+              leaseOwner: owner,
+              OR: [
+                { heartbeatAt: { lt: cutoff } },
+                { heartbeatAt: null, startedAt: { lt: cutoff } },
+              ],
+            },
+            data: {
+              status: LiveCameraSessionStatus.STOPPING,
+              leaseOwner: null,
+              finalizationMode: 'ERROR',
+              errorCode: STALE_RECLAIMED,
+            },
+          });
+          if (res.count === 0) {
+            return false;
+          }
+          await this.addIntent(tenantId, sessionId, STALE_RECLAIMED_INTENT, tx);
+          return true;
+        });
+      } catch (error) {
+        this.logger.warn(
+          `live session ${sessionId} stale claim failed ` +
+            `(${classifyError(error)}) — nothing claimed, retry later`,
+        );
+        return this.byId(tenantId, sessionId);
+      }
+      if (!claimed) {
         // The owner revived (or another claimer won) — downgrade to a
         // stop REQUEST and let the current owner drain.
         await this.prisma.liveCameraSession.updateMany({
@@ -1714,15 +1862,6 @@ export class LiveSessionService {
           },
           data: { status: LiveCameraSessionStatus.STOPPING },
         });
-        return this.byId(tenantId, sessionId);
-      }
-      try {
-        await this.addIntent(tenantId, sessionId, STALE_RECLAIMED_INTENT);
-      } catch (error) {
-        this.logger.warn(
-          `live session ${sessionId} stale-claim intent failed ` +
-            `(${classifyError(error)}) — row left STOPPING for retry`,
-        );
         return this.byId(tenantId, sessionId);
       }
     }

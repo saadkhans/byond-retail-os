@@ -339,6 +339,59 @@ describe('RtspFrameSampler', () => {
     expect(urlViolatesCredentialFreeRule('feed@home.png')).toBe(false);
   });
 
+  it('urlViolatesCredentialFreeRule: EMBEDDED rtsp/rtsps URLs after any prefix are held to the same strict rule (Codex P1)', () => {
+    const scheme = 'rtsp' + '://';
+    const secure = 'rtsps' + '://';
+    // Credential-bearing URL behind an option/prefix.
+    expect(
+      urlViolatesCredentialFreeRule('input=' + scheme + 'u:p@camera/live'),
+    ).toBe(true);
+    expect(
+      urlViolatesCredentialFreeRule('ffmpeg:' + scheme + 'u:p@camera/live'),
+    ).toBe(true);
+    expect(
+      urlViolatesCredentialFreeRule('source ' + scheme + 'camera/live?token=abc'),
+    ).toBe(true);
+    expect(
+      urlViolatesCredentialFreeRule('x=1 y=' + secure + 'camera/live?x=y z'),
+    ).toBe(true);
+    expect(
+      urlViolatesCredentialFreeRule('pre ' + secure + 'u:p@camera/live post'),
+    ).toBe(true);
+    expect(
+      urlViolatesCredentialFreeRule('input=' + scheme + 'camera/live?pwd=s'),
+    ).toBe(true);
+    // Embedded but credential-free and query-free: allowed.
+    expect(
+      urlViolatesCredentialFreeRule('input=' + scheme + 'camera/live'),
+    ).toBe(false);
+    expect(
+      urlViolatesCredentialFreeRule('input=' + secure + 'camera/live'),
+    ).toBe(false);
+    // Case variations do not slip past the scan.
+    expect(
+      urlViolatesCredentialFreeRule('input=' + 'RTSP' + '://' + 'u:p@cam/live'),
+    ).toBe(true);
+  });
+
+  it('an env value with an EMBEDDED credential-bearing RTSP URL never reaches spawn — controlled code only', async () => {
+    process.env[ENV_KEY] = 'input=' + 'rtsp' + '://' + 'user:secret@camera/live';
+    const sampler = buildSampler();
+    const result = await sampler.sampleFrame(TENANT, SLOT, {
+      width: 4,
+      height: 4,
+      timeoutMs: 2000,
+    });
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      ok: false,
+      code: 'RTSP_CREDENTIALS_IN_URL_UNSUPPORTED',
+    });
+    // The raw value never leaves the module.
+    expect(JSON.stringify(result)).not.toContain('secret');
+    expect(JSON.stringify(result)).not.toContain('camera');
+  });
+
   it('exports exactly the controlled error-code vocabulary', () => {
     expect([...RTSP_SAMPLE_ERROR_CODES].sort()).toEqual(
       [

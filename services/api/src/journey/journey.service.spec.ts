@@ -326,9 +326,19 @@ function buildService(overrides: {
    *  (isPlatformSandbox marker). Default false — an ordinary customer
    *  tenant, on which platform reviewer attribution must be refused. */
   verifiedSandbox?: boolean;
-  /** A non-terminal live camera session that OWNS the journey (Codex P1
-   *  exit guard). Default null — no live owner, generic exits allowed. */
-  liveOwnerSession?: { id: string } | null;
+  /** A live camera session that OWNS the journey (Codex P1 exit guard +
+   *  review-first fence). status defaults to RUNNING when omitted.
+   *  Default null — no live owner, generic exits allowed, no fence. */
+  liveOwnerSession?: {
+    id: string;
+    status?: string;
+    eventWindowsDetected?: number;
+    errorCode?: string | null;
+    finalizationMode?: string | null;
+  } | null;
+  /** A durable finalization intent row on the owning live session (the
+   *  fence's last check). Default null. */
+  liveIntent?: { id: string } | null;
 } = {}) {
   const createdEvents: Record<string, unknown>[] = [];
   const createdReviews: Record<string, unknown>[] = [];
@@ -347,11 +357,30 @@ function buildService(overrides: {
   };
   /* eslint-disable @typescript-eslint/no-explicit-any */
   const prisma: any = {
-    // Live-owned journey guard (Codex P1): a generic exit first asks
-    // whether an ACTIVE live camera session owns the journey. Default:
-    // none does.
+    // Live-owned journey guard + review-first fence (Codex P1): the
+    // generic-exit guard queries with a non-terminal status filter; the
+    // reconcile fence queries with NO status filter. The stub honors an
+    // `in` status predicate so a TERMINAL session row still fences the
+    // decision while no longer blocking the generic exit. Default: no
+    // live owner.
     liveCameraSession: {
-      findFirst: jest.fn(async () => overrides.liveOwnerSession ?? null),
+      findFirst: jest.fn(
+        async (args?: { where?: { status?: { in?: string[] } } }) => {
+          const row = overrides.liveOwnerSession ?? null;
+          if (!row) {
+            return null;
+          }
+          const statusIn = args?.where?.status?.in;
+          const rowStatus = (row as { status?: string }).status ?? 'RUNNING';
+          if (statusIn && !statusIn.includes(rowStatus)) {
+            return null;
+          }
+          return row;
+        },
+      ),
+    },
+    liveCameraSessionFinalizationIntent: {
+      findFirst: jest.fn(async () => overrides.liveIntent ?? null),
     },
     location: { findFirst: jest.fn(async () => ({ id: 'store-1' })) },
     retailUnit: {
@@ -628,6 +657,87 @@ describe('JourneyService', () => {
     await service.exit(TENANT, 'j-1', undefined, {
       viaLiveSessionFinalizer: true,
     });
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.RECONCILED);
+  });
+
+  it('REVIEW-FIRST FENCE: a live-owned journey with DETECTED work cannot commit READY even when the basket folds cleanly (Codex P1)', async () => {
+    const { service, journeyRow } = buildService({
+      liveOwnerSession: {
+        id: 'live-1',
+        status: 'STOPPING',
+        eventWindowsDetected: 1,
+      },
+    });
+    await service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+    });
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    // The JOURNEY's own decision is review — not just a session copy.
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+    expect(journeyRow.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.REVIEW_REQUIRED);
+  });
+
+  it('REVIEW-FIRST FENCE: a TERMINAL live session with a finalization error mode/code still fences the in-flight exit (timeout takeover race)', async () => {
+    // The takeover stamped mode+code and terminalized the session; the
+    // ORIGINAL exit, blocked until now, finally commits — the fence read
+    // inside its deciding transaction must refuse READY.
+    const { service, journeyRow } = buildService({
+      liveOwnerSession: {
+        id: 'live-1',
+        status: 'ERROR',
+        eventWindowsDetected: 0,
+        errorCode: 'LIVE_WINDOW_DRAIN_TIMEOUT',
+        finalizationMode: 'ERROR',
+      },
+    });
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+    expect(journeyRow.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+  });
+
+  it('REVIEW-FIRST FENCE: any durable finalization intent on the owning live session forbids READY', async () => {
+    const { service, journeyRow } = buildService({
+      liveOwnerSession: { id: 'live-1', status: 'STOPPING' },
+      liveIntent: { id: 'intent-1' },
+    });
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+  });
+
+  it('REVIEW-FIRST FENCE: a genuinely clean zero-motion live session may still settle its empty journey', async () => {
+    const { service, journeyRow } = buildService({
+      liveOwnerSession: {
+        id: 'live-1',
+        status: 'STOPPING',
+        eventWindowsDetected: 0,
+        errorCode: null,
+        finalizationMode: null,
+      },
+    });
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
     expect(journeyRow.status).toBe(CustomerJourneyStatus.RECONCILED);
   });
 

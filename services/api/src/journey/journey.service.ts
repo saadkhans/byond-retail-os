@@ -624,6 +624,22 @@ export class JourneyService {
           reason = aggregate.reason!;
         }
       }
+      if (decision === CustomerJourneyDecision.READY_TO_SETTLE_SHADOW) {
+        // PHASE 13 LIVE REVIEW-FIRST FENCE (Codex P1): checked INSIDE the
+        // deciding transaction, immediately before the decision commits.
+        // A journey owned by a live camera session that detected shelf
+        // activity, carries a finalization error mode/code, or recorded
+        // any fail-closed intent must NEVER settle READY — no matter how
+        // cleanly the basket folded, and no matter which exit path (the
+        // finalizer's own, or a takeover racing an in-flight exit) is
+        // committing. A fence-read failure lands in the catch below and
+        // fails the journey closed.
+        const fence = await this.liveReviewFence(tx, tenantId, journeyId);
+        if (fence !== null) {
+          decision = CustomerJourneyDecision.NEEDS_EVENT_REVIEW;
+          reason = fence;
+        }
+      }
     } catch (error) {
       this.logger.error(
         `journey ${journeyId} reconciliation failed`,
@@ -1078,6 +1094,53 @@ export class JourneyService {
       });
     });
     return this.detail(tenantId, journeyId);
+  }
+
+  /**
+   * Phase 13 review-first fence over the journey's OWN decision (Codex
+   * P1): returns a controlled reason when the journey belongs to a live
+   * camera session whose state forbids READY_TO_SETTLE_SHADOW —
+   * detected live work (even fully processed AUTO_PROPOSE windows),
+   * a finalization error mode or controlled error code (timeout
+   * takeover, stale reclaim, runtime failure), or ANY durable
+   * finalization intent (materialized or not). Deliberately NOT keyed
+   * on the session's status alone: a genuinely clean zero-motion live
+   * session may still settle its empty journey. The lookup ignores
+   * status so a fence stamped by a takeover still binds an in-flight
+   * exit that commits after the session terminalized. Reasons are
+   * controlled strings — never session/runtime free text.
+   */
+  private async liveReviewFence(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    journeyId: string,
+  ): Promise<string | null> {
+    const live = await tx.liveCameraSession.findFirst({
+      where: { tenantId, journeyId },
+      select: {
+        id: true,
+        eventWindowsDetected: true,
+        errorCode: true,
+        finalizationMode: true,
+      },
+    });
+    if (!live) {
+      return null;
+    }
+    if ((live.eventWindowsDetected ?? 0) > 0) {
+      return 'live camera session detected shelf activity — review-first (Phase 13)';
+    }
+    if (live.errorCode != null || live.finalizationMode != null) {
+      return 'live camera session finalization was not clean — review-first (Phase 13)';
+    }
+    const intent = await tx.liveCameraSessionFinalizationIntent.findFirst({
+      where: { tenantId, liveSessionId: live.id },
+      select: { id: true },
+    });
+    if (intent) {
+      return 'live camera session recorded a fail-closed finalization intent — review-first (Phase 13)';
+    }
+    return null;
   }
 
   /** Reject a generic close of a journey owned by an ACTIVE (non-
