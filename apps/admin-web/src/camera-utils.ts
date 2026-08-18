@@ -43,6 +43,26 @@ export function liveSessionStatusTone(
   return 'warn';
 }
 
+/** Phase 13 (Codex P1): a STOPPING session is RETRYABLE, not dead — the
+ *  service resumes a parked finalization only when another stop() call
+ *  arrives, so the UI must keep polling it and keep the stop action
+ *  visible. Terminal STOPPED/ERROR stay non-actionable. */
+export function liveSessionIsActionable(
+  status: LiveSessionStatus | string,
+): boolean {
+  return (
+    status === 'STARTING' || status === 'RUNNING' || status === 'STOPPING'
+  );
+}
+
+/** Stop-action label: a clearly-marked RETRY for a parked STOPPING
+ *  finalization; the plain stop otherwise. */
+export function liveSessionStopLabel(
+  status: LiveSessionStatus | string,
+): string {
+  return status === 'STOPPING' ? 'Retry stop' : 'Stop session';
+}
+
 export function sourceStatusTone(status: CameraSourceStatus | string): string {
   return status === 'ACTIVE' ? 'ok' : status === 'ERROR' ? 'down' : 'warn';
 }

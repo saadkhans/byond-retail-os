@@ -127,6 +127,7 @@ export const FINALIZATION_INTENT_REASONS = [
   'LIVE_FRAME_SCREENING_UNAVAILABLE',
   'LIVE_FRAME_SENSITIVE_CONTENT',
   'JOURNEY_FINALIZATION_RETRY_REQUIRED',
+  'LIVE_SESSION_DETECTED_WORK_REQUIRES_REVIEW',
 ] as const;
 
 export type FinalizationIntentReason =
@@ -143,6 +144,7 @@ const REVIEW_MARKER_REASONS: ReadonlySet<string> = new Set([
   'WINDOW_DETECTED_NOT_PROCESSED',
   'LIVE_FRAME_SCREENING_UNAVAILABLE',
   'LIVE_FRAME_SENSITIVE_CONTENT',
+  'LIVE_SESSION_DETECTED_WORK_REQUIRES_REVIEW',
 ]);
 
 /**
@@ -167,6 +169,11 @@ export const LIVE_SESSION_ERROR_CODES = [
  *  REVIEW_REQUIRED marker on its journey BEFORE the exit, so the
  *  JOURNEY's own fold (not just the session snapshot) lands in review. */
 export const DETECTED_WORK_REVIEW_MARKER =
+  'LIVE_SESSION_DETECTED_WORK_REQUIRES_REVIEW';
+/** The SAME string as a durable additive intent, written at DETECTION
+ *  TIME — before any fusion run or journey append — so review-first
+ *  never depends on the best-effort counter persist (Codex P1). */
+const DETECTED_WORK_INTENT: FinalizationIntentReason =
   'LIVE_SESSION_DETECTED_WORK_REQUIRES_REVIEW';
 
 /** Advisory code stamped when the bare pre-link remnant's terminal write
@@ -311,7 +318,16 @@ export class LiveSessionService {
    *  the timeout path can REVOKE it — both atomically, owner-predicated. */
   private readonly loops = new Map<
     string,
-    { stopRequested: boolean; leaseOwner: string }
+    {
+      stopRequested: boolean;
+      leaseOwner: string;
+      /** A PRE-LINK startup remnant whose durable retry park FAILED: no
+       *  sampling loop exists, but this process still owns the lease —
+       *  registered so a follow-up stop() takes the LOCAL path and can
+       *  finalize as the owner once writes recover (Codex P1: never a
+       *  fresh owned STOPPING row with no local handle). */
+      bareRemnant?: boolean;
+    }
   >();
 
   /** Loop completion promises — awaited by stop()'s drain and by the
@@ -964,9 +980,7 @@ export class LiveSessionService {
       // STOPPING row with no local loop — a later stop() would read it as
       // a fresh remote owner and wait out the five-minute stale cutoff.
       // Park the bare row UNOWNED with mode STOP + a retry code so the
-      // very next stop() claims and terminalizes it immediately. If even
-      // this park cannot land, the failure is logged loudly and stale
-      // reclaim remains the backstop.
+      // very next stop() claims and terminalizes it immediately.
       this.logger.error(
         `live session ${sessionId} startup-remnant finalization failed ` +
           `(${classifyError(error)}) — parking for immediate retry`,
@@ -987,9 +1001,24 @@ export class LiveSessionService {
           },
         });
       } catch (parkError) {
+        // BOTH mandatory writes failed (Codex P1): NEVER report success
+        // over a fresh owned STOPPING remnant. Keep the remnant LOCALLY
+        // actionable — a synthetic controller makes the next stop() take
+        // the local path and finalize as the owner once writes recover —
+        // and fail THIS request visibly with a controlled error.
+        this.loops.set(sessionId, {
+          stopRequested: true,
+          leaseOwner,
+          bareRemnant: true,
+        });
         this.logger.error(
           `live session ${sessionId} pre-link retry park failed ` +
-            `(${classifyError(parkError)}) — stale reclaim is the backstop`,
+            `(${classifyError(parkError)}) — remnant kept locally ` +
+            `actionable; failing the request`,
+        );
+        throw new ConflictException(
+          'live session stop is pending finalization retry ' +
+            '(PRE_LINK_STOP_RETRY_REQUIRED)',
         );
       }
     }
@@ -1238,12 +1267,44 @@ export class LiveSessionService {
       }
     };
 
+    /** Retry whatever mandatory intent is still unpersisted — the loop
+     *  may never finalize normally while one is pending (Invariant F). */
+    const retryUnpersistedIntent = async (): Promise<void> => {
+      if (unpersistedIntent === WINDOW_PROCESS_FAILED) {
+        await recordWindowFailure();
+        return;
+      }
+      if (unpersistedIntent) {
+        const pending = unpersistedIntent;
+        try {
+          await this.addIntent(tenantId, sessionId, pending);
+          if (unpersistedIntent === pending) {
+            unpersistedIntent = null;
+          }
+        } catch {
+          // still pending — retried next iteration / blocks finalization
+        }
+      }
+    };
+
     /** Process one CLOSED window: watermark, counters, fusion + import;
      *  a failure fails CLOSED (durable intent — finalization then marks
      *  the journey review-required, so a dropped interaction can never
      *  end READY_TO_SETTLE_SHADOW). Shared by the in-loop pass and the
      *  final sweep at stop. */
     const handleClosedWindow = async (window: EventWindow): Promise<void> => {
+      // MANDATORY DETECTION-TIME FENCE (Codex P1): the durable detected-
+      // work intent lands BEFORE any fusion run or journey append —
+      // review-first must never depend on the best-effort counter
+      // persist. If the intent cannot land, the window is NOT processed
+      // and NOT watermarked (the same closed window retries on the next
+      // pass), and normal finalization stays blocked (Invariant F).
+      try {
+        await this.addIntent(tenantId, sessionId, DETECTED_WORK_INTENT);
+      } catch {
+        unpersistedIntent = DETECTED_WORK_INTENT;
+        return;
+      }
       processedUpToMs = window.endMs;
       counters.eventWindowsDetected += 1;
       processedWindows.push(window);
@@ -1278,9 +1339,9 @@ export class LiveSessionService {
           break;
         }
         if (unpersistedIntent) {
-          // MANDATORY write retry (Invariant F): the failed-window state
-          // must land before this loop may ever finalize normally.
-          await recordWindowFailure();
+          // MANDATORY write retry (Invariant F): the pending intent must
+          // land before this loop may ever finalize normally.
+          await retryUnpersistedIntent();
         }
         const sampled = await this.sampler.sampleFrame(
           tenantId,
@@ -1460,15 +1521,15 @@ export class LiveSessionService {
         await persist({ errorCode: PENDING_MOTION_AT_STOP });
       }
       if (unpersistedIntent) {
-        // Last landing attempt for the failed-window intent — a normal
-        // exit over an unrecorded dropped interaction is forbidden
+        // Last landing attempt for the pending mandatory intent — a
+        // normal exit over an unrecorded interaction is forbidden
         // (Invariant F).
-        await recordWindowFailure();
+        await retryUnpersistedIntent();
       }
       if (unpersistedIntent) {
         this.logger.error(
-          `live session ${sessionId} could not persist its ` +
-            `failed-window intent — left owned for stale reclaim`,
+          `live session ${sessionId} could not persist its mandatory ` +
+            `${unpersistedIntent} intent — left owned for stale reclaim`,
         );
         return;
       }
@@ -1691,6 +1752,11 @@ export class LiveSessionService {
         .catch(() => null);
       if (!acquired || acquired.count === 0) {
         controller.stopRequested = true;
+        if (controller.bareRemnant) {
+          // The remnant's lease is gone (claimed or finalized elsewhere)
+          // — nothing local remains to act on.
+          this.loops.delete(sessionId);
+        }
         return this.byId(tenantId, sessionId);
       }
       // DRAIN BEFORE STOPPED (Codex P1): signal the loop and WAIT for it
@@ -1779,7 +1845,42 @@ export class LiveSessionService {
         where: { tenantId, id: sessionId },
       });
       if (after && after.status === LiveCameraSessionStatus.STOPPING) {
-        await this.resumeFinalization(tenantId, sessionId, after, actorId);
+        if (
+          controller.bareRemnant &&
+          after.leaseOwner === controller.leaseOwner
+        ) {
+          // PRE-LINK remnant whose durable park failed earlier: this
+          // process still owns the row (no journey, no loop) — finalize
+          // as the owner now that writes are landing again (Codex P1:
+          // immediately retryable, no five-minute stale wait).
+          try {
+            await this.finalizeLiveSessionSafely(tenantId, sessionId, {
+              ownerToken: controller.leaseOwner,
+              mode: 'stop',
+              code: STOPPED_DURING_START,
+              actorId,
+            });
+          } catch (error) {
+            this.logger.error(
+              `live session ${sessionId} remnant retry finalization ` +
+                `failed (${classifyError(error)}) — still retryable`,
+            );
+          }
+        } else {
+          await this.resumeFinalization(tenantId, sessionId, after, actorId);
+        }
+      }
+      if (controller.bareRemnant) {
+        const settled = await this.prisma.liveCameraSession.findFirst({
+          where: { tenantId, id: sessionId },
+          select: { status: true },
+        });
+        if (
+          settled?.status === LiveCameraSessionStatus.STOPPED ||
+          settled?.status === LiveCameraSessionStatus.ERROR
+        ) {
+          this.loops.delete(sessionId);
+        }
       }
       return this.byId(tenantId, sessionId);
     }

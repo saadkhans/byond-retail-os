@@ -3,7 +3,9 @@ import {
   SOURCE_TYPE_LABEL,
   formatClipOffset,
   isPlaceholderType,
+  liveSessionIsActionable,
   liveSessionStatusTone,
+  liveSessionStopLabel,
   runStatusTone,
   sourceStatusTone,
   vlmCounterLabel,
@@ -23,6 +25,22 @@ describe('camera-utils', () => {
     expect(isPlaceholderType('RTSP_SHADOW')).toBe(false);
     expect(isPlaceholderType('RTSP_PLACEHOLDER')).toBe(true);
     expect(isPlaceholderType('LOCAL_WEBCAM_PLACEHOLDER')).toBe(true);
+  });
+
+  it('STOPPING sessions stay ACTIONABLE (retryable finalization) — terminal STOPPED/ERROR do not (Codex P1)', () => {
+    expect(liveSessionIsActionable('STARTING')).toBe(true);
+    expect(liveSessionIsActionable('RUNNING')).toBe(true);
+    // A parked finalization resumes only on another stop() call — the UI
+    // must keep polling and keep the action visible.
+    expect(liveSessionIsActionable('STOPPING')).toBe(true);
+    expect(liveSessionIsActionable('STOPPED')).toBe(false);
+    expect(liveSessionIsActionable('ERROR')).toBe(false);
+  });
+
+  it('the stop action is labeled as a RETRY for a parked STOPPING session', () => {
+    expect(liveSessionStopLabel('STOPPING')).toBe('Retry stop');
+    expect(liveSessionStopLabel('RUNNING')).toBe('Stop session');
+    expect(liveSessionStopLabel('STARTING')).toBe('Stop session');
   });
 
   it('maps live session status to badge tones (STOPPED stays neutral)', () => {

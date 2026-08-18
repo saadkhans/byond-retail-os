@@ -2193,6 +2193,131 @@ describe('LiveSessionService — durable ADDITIVE intents (Codex P1, Invariant E
     await harness.service.awaitLoop(second.sessionId);
   });
 
+  it('DETECTED work is durable INDEPENDENTLY of counters: window processed but every counter persist fails — the intent still fences review (Codex P1)', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }, { value: 200 }, { value: 40 }, { value: 40 }],
+    });
+    const original =
+      harness.prisma.liveCameraSession.updateMany.getMockImplementation() as (
+        args: {
+          where: Record<string, unknown>;
+          data: Record<string, unknown>;
+        },
+      ) => Promise<{ count: number }>;
+    harness.prisma.liveCameraSession.updateMany.mockImplementation(
+      async (args: {
+        where: Record<string, unknown>;
+        data: Record<string, unknown>;
+      }) => {
+        if (args.data.eventWindowsDetected !== undefined) {
+          // EVERY best-effort counter persist fails — the DB row keeps
+          // eventWindowsDetected = 0 forever.
+          throw new Error('counter persist outage');
+        }
+        return original(args);
+      },
+    );
+    await startAndFinish(harness);
+    const row = harness.sessions[0];
+    // The window WAS processed (fusion + journey import ran) …
+    expect(harness.fusion.runLiveWindow).toHaveBeenCalledTimes(1);
+    // … the persisted counter is still zero …
+    expect(row.eventWindowsDetected).toBe(0);
+    // … but the DETECTION-TIME intent is durable, the journey marker
+    // landed, and the exit can only be review — never READY.
+    expect(
+      harness.intents.some(
+        (intent) =>
+          intent.reason === 'LIVE_SESSION_DETECTED_WORK_REQUIRES_REVIEW',
+      ),
+    ).toBe(true);
+    expect(harness.journeys.appendEvent).toHaveBeenCalledWith(
+      TENANT,
+      'journey-1',
+      expect.objectContaining({
+        eventType: 'REVIEW_REQUIRED',
+        note: 'LIVE_SESSION_DETECTED_WORK_REQUIRES_REVIEW',
+      }),
+      'user-1',
+    );
+    expect(row.status).toBe(LiveCameraSessionStatus.STOPPED);
+    expect(row.decision).toBe(CustomerJourneyDecision.NEEDS_EVENT_REVIEW);
+    expect(row.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+  });
+
+  it('when the detection-time intent can NEVER persist, the window is not processed and the loop stays owned — no fusion, no exit', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }, { value: 200 }, { value: 40 }, { value: 40 }],
+    });
+    harness.prisma.liveCameraSessionFinalizationIntent.create.mockRejectedValue(
+      new Error('persistent intent outage'),
+    );
+    await startAndFinish(harness);
+    const row = harness.sessions[0];
+    // No fusion run or journey append happened without the durable fence.
+    expect(harness.fusion.runLiveWindow).not.toHaveBeenCalled();
+    expect(harness.journeys.exit).not.toHaveBeenCalled();
+    expect(row.status).toBe(LiveCameraSessionStatus.RUNNING);
+    expect(row.leaseOwner).not.toBeNull();
+    expect(row.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+  });
+
+  it('pre-link park DOUBLE failure: the request fails visibly and the remnant stays LOCALLY actionable — next stop finalizes immediately (Codex P1)', async () => {
+    const harness = buildHarness({ script: [{ value: 40 }] });
+    harness.journeys.openJourneyInTransaction.mockImplementationOnce(
+      async () => {
+        harness.sessions[0].status = LiveCameraSessionStatus.STOPPING;
+        return { journeyId: 'journey-race' };
+      },
+    );
+    const original =
+      harness.prisma.liveCameraSession.updateMany.getMockImplementation() as (
+        args: {
+          where: Record<string, unknown>;
+          data: Record<string, unknown>;
+        },
+      ) => Promise<{ count: number }>;
+    let outage = true;
+    harness.prisma.liveCameraSession.updateMany.mockImplementation(
+      async (args: {
+        where: Record<string, unknown>;
+        data: Record<string, unknown>;
+      }) => {
+        if (
+          outage &&
+          (args.data.status === LiveCameraSessionStatus.STOPPED ||
+            args.data.errorCode === 'PRE_LINK_STOP_RETRY_REQUIRED')
+        ) {
+          // BOTH the terminal write AND the retry park fail.
+          throw new Error('write outage');
+        }
+        return original(args);
+      },
+    );
+    // The service does NOT return success over the stuck remnant.
+    await expect(
+      harness.service.start(TENANT, 'cam-1', {}, 'user-1'),
+    ).rejects.toThrow(/PRE_LINK_STOP_RETRY_REQUIRED/);
+    expect(harness.journeys.exit).not.toHaveBeenCalled();
+    expect(harness.journeys.abortShadowJourney).not.toHaveBeenCalled();
+    // Writes recover: the NEXT stop finds the local remnant handle and
+    // terminalizes IMMEDIATELY — no five-minute stale cutoff.
+    outage = false;
+    const sessionId = harness.sessions[0].id as string;
+    const stopped = await harness.service.stop(TENANT, sessionId, 'user-1');
+    expect(stopped.status).toBe(LiveCameraSessionStatus.STOPPED);
+    expect(stopped.journeyId).toBeNull();
+    expect(harness.sessions[0].leaseOwner).toBeNull();
+    // The slot is free: a fresh start succeeds.
+    const second = await harness.service.start(TENANT, 'cam-1', {}, 'user-1');
+    expect(second.status).toBe(LiveCameraSessionStatus.RUNNING);
+    await harness.service.awaitLoop(second.sessionId);
+  });
+
   it('a counter gap (detected > processed) with a MISSING errorCode still adds an intent and never exits READY', async () => {
     const harness = buildHarness({
       existingSession: {

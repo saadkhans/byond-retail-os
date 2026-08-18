@@ -5,7 +5,9 @@ import { Page, formatDate, useLoad } from '../components';
 import {
   SOURCE_TYPE_LABEL,
   formatClipOffset,
+  liveSessionIsActionable,
   liveSessionStatusTone,
+  liveSessionStopLabel,
   vlmCounterLabel,
 } from '../camera-utils';
 import { decisionTone } from '../cv-evaluation-utils';
@@ -119,10 +121,14 @@ export function LiveSessionDetailPage() {
     [id, tick],
   );
   const data = session.data;
-  const live = data?.status === 'STARTING' || data?.status === 'RUNNING';
+  // STOPPING is a RETRYABLE state (Codex P1): a parked finalization
+  // resumes only when another stop() arrives, so the session stays
+  // actionable — polling continues and the stop action stays visible
+  // (labeled as a retry). Only terminal STOPPED/ERROR go quiet.
+  const live = data ? liveSessionIsActionable(data.status) : false;
 
-  // Refresh a live session every 5s (PickupDetectionPanel polling idiom);
-  // terminal sessions stop polling.
+  // Refresh an actionable session every 5s (PickupDetectionPanel polling
+  // idiom); terminal sessions stop polling.
   useEffect(() => {
     if (!live) {
       return;
@@ -201,7 +207,7 @@ export function LiveSessionDetailPage() {
                 disabled={busy}
                 onClick={() => void stop()}
               >
-                Stop session
+                {liveSessionStopLabel(data.status)}
               </button>
             ) : null}
           </div>

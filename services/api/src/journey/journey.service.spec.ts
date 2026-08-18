@@ -333,6 +333,7 @@ function buildService(overrides: {
     id: string;
     status?: string;
     eventWindowsDetected?: number;
+    eventWindowsProcessed?: number;
     errorCode?: string | null;
     finalizationMode?: string | null;
   } | null;
@@ -713,6 +714,81 @@ describe('JourneyService', () => {
     const { service, journeyRow } = buildService({
       liveOwnerSession: { id: 'live-1', status: 'STOPPING' },
       liveIntent: { id: 'intent-1' },
+    });
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+  });
+
+  it('COMMIT-POINT RECHECK: a timeout fence stamped AFTER the fold reads but before the final update still blocks READY (Codex P1)', async () => {
+    const liveOwner: {
+      id: string;
+      status: string;
+      eventWindowsDetected: number;
+      errorCode: string | null;
+      finalizationMode: string | null;
+    } = {
+      id: 'live-1',
+      status: 'STOPPING',
+      eventWindowsDetected: 0,
+      errorCode: null,
+      finalizationMode: null,
+    };
+    const { service, prisma, journeyRow } = buildService({
+      liveOwnerSession: liveOwner,
+    });
+    const originalFindMany =
+      prisma.customerJourneyEvent.findMany.getMockImplementation() as (
+        args: unknown,
+      ) => Promise<unknown[]>;
+    prisma.customerJourneyEvent.findMany.mockImplementationOnce(
+      async (args: unknown) => {
+        // The ORIGINAL exit is mid-reconcile (fold reads done, decision
+        // not yet committed) when the timeout takeover stamps the owning
+        // session with ERROR mode + code. The fence recheck at the
+        // commit point must see it — no cached clean verdict.
+        liveOwner.finalizationMode = 'ERROR';
+        liveOwner.errorCode = 'LIVE_WINDOW_DRAIN_TIMEOUT';
+        return originalFindMany(args);
+      },
+    );
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+    expect(journeyRow.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.REVIEW_REQUIRED);
+  });
+
+  it('COMMIT-POINT RECHECK: a fence read that THROWS fails the journey closed — never READY on an unverifiable fence', async () => {
+    const { service, prisma, journeyRow } = buildService();
+    prisma.liveCameraSession.findFirst.mockRejectedValueOnce(
+      new Error('fence read outage'),
+    );
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    expect(journeyRow.decision).toBe(CustomerJourneyDecision.FAILED);
+    expect(journeyRow.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+  });
+
+  it('REVIEW-FIRST FENCE: a session with PROCESSED windows fences even when the detected counter reads zero', async () => {
+    const { service, journeyRow } = buildService({
+      liveOwnerSession: {
+        id: 'live-1',
+        status: 'STOPPING',
+        eventWindowsDetected: 0,
+        eventWindowsProcessed: 1,
+      },
     });
     await service.exit(TENANT, 'j-1', undefined, {
       viaLiveSessionFinalizer: true,

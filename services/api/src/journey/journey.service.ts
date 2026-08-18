@@ -624,22 +624,6 @@ export class JourneyService {
           reason = aggregate.reason!;
         }
       }
-      if (decision === CustomerJourneyDecision.READY_TO_SETTLE_SHADOW) {
-        // PHASE 13 LIVE REVIEW-FIRST FENCE (Codex P1): checked INSIDE the
-        // deciding transaction, immediately before the decision commits.
-        // A journey owned by a live camera session that detected shelf
-        // activity, carries a finalization error mode/code, or recorded
-        // any fail-closed intent must NEVER settle READY — no matter how
-        // cleanly the basket folded, and no matter which exit path (the
-        // finalizer's own, or a takeover racing an in-flight exit) is
-        // committing. A fence-read failure lands in the catch below and
-        // fails the journey closed.
-        const fence = await this.liveReviewFence(tx, tenantId, journeyId);
-        if (fence !== null) {
-          decision = CustomerJourneyDecision.NEEDS_EVENT_REVIEW;
-          reason = fence;
-        }
-      }
     } catch (error) {
       this.logger.error(
         `journey ${journeyId} reconciliation failed`,
@@ -647,6 +631,31 @@ export class JourneyService {
       );
       decision = CustomerJourneyDecision.FAILED;
       reason = 'reconciliation failed unexpectedly — see server logs';
+    }
+    // PHASE 13 LIVE REVIEW-FIRST FENCE — COMMIT-POINT RECHECK (Codex P1):
+    // consulted as the LAST read before the deciding write, never a
+    // cached earlier verdict. The fold/stock reads above take time; a
+    // timeout takeover that stamps the owning live session (ERROR mode,
+    // error code, intents) while this exit is in flight must still block
+    // READY at the moment it commits. A journey owned by a live camera
+    // session that detected or processed shelf activity, carries a
+    // finalization error mode/code, or recorded any fail-closed intent
+    // never settles READY. A fence-read failure fails the journey closed.
+    if (decision === CustomerJourneyDecision.READY_TO_SETTLE_SHADOW) {
+      try {
+        const fence = await this.liveReviewFence(tx, tenantId, journeyId);
+        if (fence !== null) {
+          decision = CustomerJourneyDecision.NEEDS_EVENT_REVIEW;
+          reason = fence;
+        }
+      } catch (error) {
+        this.logger.error(
+          `journey ${journeyId} live fence recheck failed`,
+          error instanceof Error ? error.stack : String(error),
+        );
+        decision = CustomerJourneyDecision.FAILED;
+        reason = 'live review fence recheck failed — journey failed closed';
+      }
     }
     await tx.customerJourney.update({
       where: { id_tenantId: { id: journeyId, tenantId } },
@@ -1120,6 +1129,7 @@ export class JourneyService {
       select: {
         id: true,
         eventWindowsDetected: true,
+        eventWindowsProcessed: true,
         errorCode: true,
         finalizationMode: true,
       },
@@ -1127,7 +1137,10 @@ export class JourneyService {
     if (!live) {
       return null;
     }
-    if ((live.eventWindowsDetected ?? 0) > 0) {
+    if (
+      (live.eventWindowsDetected ?? 0) > 0 ||
+      (live.eventWindowsProcessed ?? 0) > 0
+    ) {
       return 'live camera session detected shelf activity — review-first (Phase 13)';
     }
     if (live.errorCode != null || live.finalizationMode != null) {
