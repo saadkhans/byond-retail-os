@@ -14,6 +14,7 @@ import {
   FusionPolicyResult,
   FusionRunScope,
   JourneyEventReviewDecision,
+  LiveCameraSessionStatus,
   Prisma,
   TenantStatus,
   UserType,
@@ -1043,8 +1044,18 @@ export class JourneyService {
        *  FASTER than the footage's own timeline can never place an
        *  observation after EXIT. */
       exitAt?: Date;
+      /** INTERNAL bypass for the live-session finalizer ONLY (Codex P1):
+       *  a journey owned by an active live camera session may be closed
+       *  exclusively by that session's lease-aware finalizer — a generic
+       *  exit would settle the journey (possibly READY) while the live
+       *  loop still has windows, failures, or intents pending. Never
+       *  reachable from a request DTO. */
+      viaLiveSessionFinalizer?: boolean;
     },
   ) {
+    if (!options?.viaLiveSessionFinalizer) {
+      await this.assertNotLiveOwned(tenantId, journeyId);
+    }
     const exitAt = options?.exitAt ?? new Date();
     await this.withOpenJourney(tenantId, journeyId, async (tx, journey) => {
       await tx.customerJourneyEvent.create({
@@ -1067,6 +1078,36 @@ export class JourneyService {
       });
     });
     return this.detail(tenantId, journeyId);
+  }
+
+  /** Reject a generic close of a journey owned by an ACTIVE (non-
+   *  terminal) live camera session (Codex P1): only the lease-aware
+   *  live-session finalizer may exit/abort it. Tenant-scoped lookup;
+   *  controlled conflict code only. */
+  private async assertNotLiveOwned(
+    tenantId: string,
+    journeyId: string,
+  ): Promise<void> {
+    const liveOwner = await this.prisma.liveCameraSession.findFirst({
+      where: {
+        tenantId,
+        journeyId,
+        status: {
+          in: [
+            LiveCameraSessionStatus.STARTING,
+            LiveCameraSessionStatus.RUNNING,
+            LiveCameraSessionStatus.STOPPING,
+          ],
+        },
+      },
+      select: { id: true },
+    });
+    if (liveOwner) {
+      throw new ConflictException(
+        'journey is owned by an active live camera session — only its ' +
+          'finalizer may close it (LIVE_JOURNEY_EXIT_REQUIRES_SESSION_FINALIZER)',
+      );
+    }
   }
 
   /**

@@ -292,8 +292,13 @@ export class LiveSessionService {
   /** In-process loop controllers — stop() signals through here when the
    *  loop is alive in THIS process. The controller stays registered
    *  until the loop's FINALIZATION completes or parks (Invariant A/C):
-   *  a concurrent stop must await it, never double-finalize. */
-  private readonly loops = new Map<string, { stopRequested: boolean }>();
+   *  a concurrent stop must await it, never double-finalize. It carries
+   *  the loop's lease token so stop() can acquire the drain lease and
+   *  the timeout path can REVOKE it — both atomically, owner-predicated. */
+  private readonly loops = new Map<
+    string,
+    { stopRequested: boolean; leaseOwner: string }
+  >();
 
   /** Loop completion promises — awaited by stop()'s drain and by the
    *  awaitLoop test hook. */
@@ -371,10 +376,10 @@ export class LiveSessionService {
    *    caller is the loop / the starter); otherwise the lease was lost
    *    and NOTHING is touched.
    *  - `ownerToken` null → the row must be UNOWNED (parked or claimed);
-   *    a fresh foreign lease is only ever sent a STOPPING request.
-   *  - `takeover` → this process's OWN local loop is stuck past the
-   *    drain bound; the terminal-CAS still voids against concurrent
-   *    changes. Never used across processes.
+   *    a fresh foreign lease is only ever sent a STOPPING request. A
+   *    stuck local loop is handled by REVOKING its lease atomically
+   *    FIRST (stop()'s drain-timeout path) — there is no ownership
+   *    bypass, so every terminal/park write carries a lease predicate.
    *
    * Sequence: re-read → ownership → counter-gap intent → materialize
    * every unmaterialized intent as a REVIEW_REQUIRED journey marker →
@@ -392,7 +397,6 @@ export class LiveSessionService {
       mode: 'stop' | 'error';
       code?: string | null;
       actorId?: string;
-      takeover?: boolean;
     },
   ): Promise<void> {
     const session = await this.prisma.liveCameraSession.findFirst({
@@ -407,47 +411,46 @@ export class LiveSessionService {
     }
     // Ownership (Invariants B/C).
     const rowOwner = session.leaseOwner ?? null;
-    if (!options.takeover) {
-      if (options.ownerToken !== null) {
-        if (rowOwner !== options.ownerToken) {
-          this.logger.warn(
-            `live session ${sessionId} lease lost — finalization refused`,
-          );
-          return;
-        }
-      } else if (rowOwner !== null) {
-        const heartbeatMs = (
-          session.heartbeatAt ?? session.startedAt
-        ).getTime();
-        if (this.now().getTime() - heartbeatMs < LIVE_SESSION_STALE_MS) {
-          // FRESH remote owner: request the stop, never finalize here.
-          await this.prisma.liveCameraSession
-            .updateMany({
-              where: {
-                id: sessionId,
-                tenantId,
-                status: { in: ACTIVE_SESSION_STATUSES },
-                leaseOwner: rowOwner,
-              },
-              data: { status: LiveCameraSessionStatus.STOPPING },
-            })
-            .catch(() => null);
-          return;
-        }
-        // Stale but unclaimed — the caller must claim atomically first.
+    if (options.ownerToken !== null) {
+      if (rowOwner !== options.ownerToken) {
+        this.logger.warn(
+          `live session ${sessionId} lease lost — finalization refused`,
+        );
         return;
       }
+    } else if (rowOwner !== null) {
+      const heartbeatMs = (session.heartbeatAt ?? session.startedAt).getTime();
+      if (this.now().getTime() - heartbeatMs < LIVE_SESSION_STALE_MS) {
+        // FRESH remote owner: request the stop, never finalize here.
+        await this.prisma.liveCameraSession
+          .updateMany({
+            where: {
+              id: sessionId,
+              tenantId,
+              status: { in: ACTIVE_SESSION_STATUSES },
+              leaseOwner: rowOwner,
+            },
+            data: { status: LiveCameraSessionStatus.STOPPING },
+          })
+          .catch(() => null);
+        return;
+      }
+      // Stale but unclaimed — the caller must claim atomically first.
+      return;
     }
     const stoppedAt = this.now();
-    const ownershipWhere = options.takeover
-      ? {}
-      : options.ownerToken !== null
+    const ownershipWhere =
+      options.ownerToken !== null
         ? { leaseOwner: options.ownerToken }
         : { leaseOwner: null };
 
-    /** Park retryably (STOPPING + advisory code + FINALIZATION_RETRY
-     *  intent). A park that cannot persist its intent THROWS — the row
-     *  stays owned and non-terminal for stale reclaim (Invariant F). */
+    /** Park retryably: STOPPING + advisory code + DURABLE finalization
+     *  MODE + FINALIZATION_RETRY intent. The mode column (never the
+     *  advisory code, never an intent reason) is what the retry uses to
+     *  re-enter with the SAME closure semantics — a marker-append
+     *  failure during an ERROR finalization must not resume as a clean
+     *  STOP (Codex P1). A park that cannot persist its intent THROWS —
+     *  the row stays owned and non-terminal for stale reclaim. */
     const park = async (advisoryCode: string): Promise<void> => {
       await this.addIntent(tenantId, sessionId, FINALIZATION_RETRY);
       await this.prisma.liveCameraSession.updateMany({
@@ -460,6 +463,7 @@ export class LiveSessionService {
         data: {
           status: LiveCameraSessionStatus.STOPPING,
           errorCode: advisoryCode,
+          finalizationMode: options.mode === 'stop' ? 'STOP' : 'ERROR',
           leaseOwner: null,
         },
       });
@@ -467,11 +471,17 @@ export class LiveSessionService {
 
     // Counter-gap intent (Invariant D): a detected window that never
     // processed must be durably visible even when no path recorded it.
-    let suppressReady =
+    const counterGap =
       session.eventWindowsDetected > session.eventWindowsProcessed;
-    if (suppressReady) {
+    if (counterGap) {
       await this.addIntent(tenantId, sessionId, WINDOW_NOT_PROCESSED);
     }
+    // REVIEW-FIRST (Phase 13 correction): ANY detected live motion means
+    // the session's outcome is a review outcome — a live RTSP session may
+    // conclude READY_TO_SETTLE_SHADOW only when it detected NOTHING and
+    // carries no intent. Processed-and-clean is still review-first for
+    // this phase.
+    let suppressReady = counterGap || session.eventWindowsDetected > 0;
     const intents =
       await this.prisma.liveCameraSessionFinalizationIntent.findMany({
         where: { tenantId, liveSessionId: sessionId },
@@ -505,7 +515,14 @@ export class LiveSessionService {
                 `live session ${sessionId} could not materialize ` +
                   `${intent.reason} (${classifyError(error)}) — parked`,
               );
-              await park(intent.reason);
+              // Advisory code: keep the ORIGINAL error reason on error
+              // finalizations — the marker's reason lives durably in its
+              // intent row and must not mask what failed (Codex P1).
+              await park(
+                options.mode === 'stop'
+                  ? intent.reason
+                  : (options.code ?? intent.reason),
+              );
               return;
             }
             // Journey already closed — the marker can never land in the
@@ -532,7 +549,10 @@ export class LiveSessionService {
             tenantId,
             session.journeyId,
             options.actorId,
-            { exitAt: stoppedAt },
+            // The finalizer is the ONE caller allowed to close a
+            // live-owned journey — generic exits are rejected while the
+            // session is non-terminal (Codex P1).
+            { exitAt: stoppedAt, viaLiveSessionFinalizer: true },
           );
           decision = exited.decision;
         } else {
@@ -600,6 +620,7 @@ export class LiveSessionService {
         ...(options.code !== undefined ? { errorCode: options.code } : {}),
         stoppedAt,
         decision,
+        finalizationMode: null,
         leaseOwner: null,
       },
     });
@@ -760,6 +781,12 @@ export class LiveSessionService {
         return { raced: false as const, journeyId: opened.journeyId };
       });
       if (outcome.raced) {
+        // A stop landed BEFORE the journey existed (Codex P1): finalize
+        // the bare row NOW — releasing the lease and the one-active-per-
+        // source slot immediately — instead of abandoning a STOPPING row
+        // to the five-minute stale reclaim. No journey was created, so
+        // this is a stopped-before-start with zero events.
+        await this.finalizeStartupRemnant(tenantId, session.id, leaseOwner, actorId);
         return this.byId(tenantId, session.id);
       }
       journeyId = outcome.journeyId;
@@ -788,7 +815,9 @@ export class LiveSessionService {
       }
     } catch (error) {
       if (error instanceof StartupRaceRollback) {
-        // Rolled back inside the transaction: no journey exists.
+        // Rolled back inside the transaction: no journey exists. Same
+        // immediate bare-row finalization as the guard race above.
+        await this.finalizeStartupRemnant(tenantId, session.id, leaseOwner, actorId);
         return this.byId(tenantId, session.id);
       }
       // The transaction failed (journey creation rolled back with it) or
@@ -852,6 +881,36 @@ export class LiveSessionService {
     );
 
     return this.byId(tenantId, session.id);
+  }
+
+  /**
+   * Finalize a startup remnant: a session row whose start lost a race
+   * BEFORE any journey existed (stop landed pre-link, or the atomic
+   * create+link rolled back). Runs through the strict finalizer with the
+   * startup lease — if the lease is no longer ours (a claimant or the
+   * racing stop's own finalization won) the finalizer refuses and the
+   * row is left to its current owner. mode 'stop': this is a requested
+   * stop with ZERO events, not a runtime error.
+   */
+  private async finalizeStartupRemnant(
+    tenantId: string,
+    sessionId: string,
+    leaseOwner: string,
+    actorId?: string,
+  ): Promise<void> {
+    try {
+      await this.finalizeLiveSessionSafely(tenantId, sessionId, {
+        ownerToken: leaseOwner,
+        mode: 'stop',
+        code: STOPPED_DURING_START,
+        actorId,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `live session ${sessionId} startup-remnant finalization failed ` +
+          `(${classifyError(error)}) — left for stop()/stale reclaim`,
+      );
+    }
   }
 
   /**
@@ -933,7 +992,7 @@ export class LiveSessionService {
     },
     actorId?: string,
   ): Promise<void> {
-    const controller = { stopRequested: false };
+    const controller = { stopRequested: false, leaseOwner };
     this.loops.set(sessionId, controller);
     const zone = parseShelfZone(context.shelfZone);
     const buffer: AnalysisFrame[] = [];
@@ -1191,6 +1250,35 @@ export class LiveSessionService {
       if (leaseLost) {
         this.logger.warn(
           `live session ${sessionId} lost its lease — loop stopped without finalizing`,
+        );
+        return;
+      }
+      // ATOMIC DRAIN-LEASE VERIFICATION (Codex P1): everything below —
+      // counter persist, final sweep, pending-motion intent, journey
+      // finalization — mutates state this loop may touch ONLY while it
+      // still holds the lease. A refresh that matches nothing OR throws
+      // both mean ownership cannot be proven: treat as LOST, drain
+      // nothing, mutate nothing (staleness backstops the row).
+      try {
+        const held = await this.prisma.liveCameraSession.updateMany({
+          where: {
+            id: sessionId,
+            tenantId,
+            leaseOwner,
+            status: { in: LOOP_WRITABLE_STATUSES },
+            stoppedAt: null,
+          },
+          data: { heartbeatAt: this.now() },
+        });
+        if (held.count === 0) {
+          leaseLost = true;
+        }
+      } catch {
+        leaseLost = true;
+      }
+      if (leaseLost) {
+        this.logger.warn(
+          `live session ${sessionId} lost its drain lease — loop stopped without finalizing`,
         );
         return;
       }
@@ -1481,14 +1569,31 @@ export class LiveSessionService {
     }
     const controller = this.loops.get(sessionId);
     if (controller) {
-      await this.prisma.liveCameraSession.updateMany({
-        where: {
-          id: sessionId,
-          tenantId,
-          status: { in: NON_TERMINAL_SESSION_STATUSES },
-        },
-        data: { status: LiveCameraSessionStatus.STOPPING },
-      });
+      // ATOMIC DRAIN-LEASE ACQUISITION (Codex P1): the local loop may
+      // drain and finalize ONLY while its lease still stands. The
+      // predicate carries the owner token; a miss or a transport failure
+      // means the lease is gone (stale claim, park, terminal) — halt the
+      // zombie loop but drain nothing, mutate nothing, finalize nothing
+      // from the old owner.
+      const acquired = await this.prisma.liveCameraSession
+        .updateMany({
+          where: {
+            id: sessionId,
+            tenantId,
+            status: { in: NON_TERMINAL_SESSION_STATUSES },
+            leaseOwner: controller.leaseOwner,
+            stoppedAt: null,
+          },
+          data: {
+            status: LiveCameraSessionStatus.STOPPING,
+            heartbeatAt: this.now(),
+          },
+        })
+        .catch(() => null);
+      if (!acquired || acquired.count === 0) {
+        controller.stopRequested = true;
+        return this.byId(tenantId, sessionId);
+      }
       // DRAIN BEFORE STOPPED (Codex P1): signal the loop and WAIT for it
       // to finish its in-flight window processing and its own
       // finalization (counters persisted, closed windows swept, pending
@@ -1503,6 +1608,33 @@ export class LiveSessionService {
         this.drainTimeoutMs(),
       );
       if (!drained) {
+        // ATOMIC LEASE REVOCATION FIRST (Codex P1): the stuck loop's
+        // finalizer may be blocked INSIDE journeys.exit — starting a
+        // second finalizer while its lease stands would let whichever
+        // completes last win. Revoking the lease (owner-predicated CAS)
+        // guarantees the original owner's eventual terminal/park writes
+        // match NOTHING; only then does the fail-closed finalizer run,
+        // as the now-unowned row. A revocation miss means the loop
+        // already finalized/parked or a claimant won — reload, never
+        // finalize from this stale view.
+        const revoked = await this.prisma.liveCameraSession
+          .updateMany({
+            where: {
+              id: sessionId,
+              tenantId,
+              status: { in: NON_TERMINAL_SESSION_STATUSES },
+              leaseOwner: controller.leaseOwner,
+              stoppedAt: null,
+            },
+            data: {
+              status: LiveCameraSessionStatus.STOPPING,
+              leaseOwner: null,
+            },
+          })
+          .catch(() => null);
+        if (!revoked || revoked.count === 0) {
+          return this.byId(tenantId, sessionId);
+        }
         try {
           await this.addIntent(tenantId, sessionId, WINDOW_DRAIN_TIMEOUT);
           await this.finalizeLiveSessionSafely(tenantId, sessionId, {
@@ -1510,8 +1642,6 @@ export class LiveSessionService {
             mode: 'error',
             code: WINDOW_DRAIN_TIMEOUT,
             actorId,
-            // Our OWN stuck loop — takeover never crosses processes.
-            takeover: true,
           });
         } catch (error) {
           this.logger.error(
@@ -1608,18 +1738,29 @@ export class LiveSessionService {
     return this.byId(tenantId, sessionId);
   }
 
-  /** Retry entry: route a parked/claimed row into the finalizer by its
-   *  stored advisory code — stop-intent codes exit; everything else
-   *  aborts with the preserved code. */
+  /** Retry entry: route a parked/claimed row into the finalizer. The
+   *  DURABLE finalizationMode column decides exit-vs-abort whenever a
+   *  park recorded it — the advisory errorCode is only the legacy
+   *  fallback for rows parked without a mode (e.g. stale claims), never
+   *  an override (Codex P1: a marker reason must not convert an ERROR
+   *  finalization into a clean STOP). */
   private async resumeFinalization(
     tenantId: string,
     sessionId: string,
-    row: { errorCode: string | null },
+    row: { errorCode: string | null; finalizationMode?: string | null },
     actorId?: string,
   ): Promise<void> {
     const code = row.errorCode;
+    const mode: 'stop' | 'error' =
+      row.finalizationMode === 'ERROR'
+        ? 'error'
+        : row.finalizationMode === 'STOP'
+          ? 'stop'
+          : code && !STOP_INTENT_CODES.includes(code)
+            ? 'error'
+            : 'stop';
     try {
-      if (code && !STOP_INTENT_CODES.includes(code)) {
+      if (mode === 'error') {
         await this.finalizeLiveSessionSafely(tenantId, sessionId, {
           ownerToken: null,
           mode: 'error',

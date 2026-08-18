@@ -1039,6 +1039,12 @@ model LiveCameraSession {
   // Snapshot of the linked journey's final SHADOW decision at stop.
   decision  CustomerJourneyDecision?
   errorCode String?
+  // Parked-finalization MODE ('STOP' | 'ERROR', DB CHECK) — recorded when
+  // a finalization parks retryably so the retry re-enters with the SAME
+  // journey-closure semantics (exit vs abort). NEVER derived from an
+  // intent reason or the advisory errorCode (Codex P1: a marker-append
+  // failure must not convert an ERROR finalization into a clean STOP).
+  finalizationMode String?
   eventWindows Json?
   createdById  String?
   createdAt    DateTime @default(now())

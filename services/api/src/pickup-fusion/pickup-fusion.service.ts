@@ -155,6 +155,13 @@ export const OCR_TEXT_SUPPRESSED = 'SENSITIVE_TEXT_SUPPRESSED';
 export const LIVE_FRAME_SCREENING_UNAVAILABLE =
   'LIVE_FRAME_SCREENING_UNAVAILABLE';
 export const LIVE_FRAME_SENSITIVE_CONTENT = 'LIVE_FRAME_SENSITIVE_CONTENT';
+/** Phase 13 hard rule (Codex P1): live crops have NO pixel-level screen
+ *  (the FILE_REPLAY equivalent runs at upload under quarantine review),
+ *  and OCR-clean is not pixel-clean — so LIVE_WINDOW runs never invoke
+ *  any VLM at all and route to review under this reason when the OCR
+ *  passes found nothing more specific to report. */
+export const LIVE_FRAME_PIXEL_SCREEN_REQUIRED =
+  'LIVE_FRAME_PIXEL_SCREEN_REQUIRED';
 export const BARCODE_VALUE_SUPPRESSED = 'UNMATCHED_SCREENED';
 
 /**
@@ -1327,25 +1334,25 @@ export class PickupFusionService {
       ctx.evidence.vlm.mode = this.vlmMode;
 
       const invokeVlm = async (reason: string) => {
-        // LIVE-FRAME SCREEN GATE (Codex P1): a live-origin run's crop
-        // pixels were never screened at upload the way FILE_REPLAY
-        // assets were — the only vetting is this pipeline's own OCR
-        // sensitive-text screening. The VLM request carries the bestPre
-        // crop AND every peak/post crop as base64 pixels, so EVERY one
-        // of those images must screen clean: bestPre via the evidence
-        // OCR that already ran (status OK, nothing suppressed), and each
-        // additional VLM-bound crop via its own OCR pass with the same
-        // predicate (liveVlmExtraCropsScreenClean). Any crop whose OCR
-        // did not complete or whose text trips the screen blocks the
-        // invocation entirely — regardless of provider, local included
-        // (MVP fails closed) — and routes the run to human review with
-        // a controlled reason. Asset-origin behavior is unchanged, and
+        // LIVE-FRAME PIXEL GATE (Codex P1, Phase 13 HARD RULE): a
+        // live-origin run's crop pixels were never pixel-screened the
+        // way FILE_REPLAY assets are at upload (that screen decodes and
+        // inspects every frame under quarantine review), and this
+        // pipeline's OCR sensitive-text pass is NOT pixel-level proof —
+        // OCR can miss a PAN/CVV that is plainly visible in the pixels.
+        // Phase 13 therefore NEVER sends live pixels to any VLM, local
+        // included: every LIVE_WINDOW run routes to human review. The
+        // OCR passes still run first so the review reason is as specific
+        // as possible (sensitive found > screen unavailable > pixel
+        // screen required), but a CLEAN OCR result still blocks — it is
+        // reported as LIVE_FRAME_PIXEL_SCREEN_REQUIRED, never treated as
+        // safety. Asset-origin (FILE_REPLAY) behavior is unchanged, and
         // the extra passes never store or forward recognized text.
         if (ctx.evidence.liveSessionId !== undefined) {
-          let blockReason: string | null = null;
+          let blockReason: string = LIVE_FRAME_PIXEL_SCREEN_REQUIRED;
           if (ctx.evidence.ocr.status !== 'OK') {
             // The bestPre screen never completed — indistinguishable
-            // from unscreened pixels, so the gate fails closed.
+            // from unscreened pixels.
             blockReason = LIVE_FRAME_SCREENING_UNAVAILABLE;
           } else if (ctx.evidence.ocr.screened === OCR_TEXT_SUPPRESSED) {
             blockReason = LIVE_FRAME_SENSITIVE_CONTENT;
@@ -1360,18 +1367,18 @@ export class PickupFusionService {
             } else if (verdict === 'sensitive') {
               blockReason = LIVE_FRAME_SENSITIVE_CONTENT;
             }
+            // verdict === 'clean' keeps LIVE_FRAME_PIXEL_SCREEN_REQUIRED:
+            // OCR-clean is NOT pixel-clean.
           }
-          if (blockReason !== null) {
-            ctx.evidence.vlm.invoked = false;
-            ctx.evidence.vlm.reason = blockReason;
-            ctx.evidence.vlm.status = 'UNAVAILABLE';
-            ctx.evidence.policy = {
-              result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
-              reason:
-                'live frame screening blocked VLM invocation — routed to review',
-            };
-            return;
-          }
+          ctx.evidence.vlm.invoked = false;
+          ctx.evidence.vlm.reason = blockReason;
+          ctx.evidence.vlm.status = 'UNAVAILABLE';
+          ctx.evidence.policy = {
+            result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
+            reason:
+              'live frames require pixel-level screening before VLM — routed to review',
+          };
+          return;
         }
         ctx.evidence.vlm.invoked = true;
         ctx.evidence.vlm.reason = reason;

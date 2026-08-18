@@ -326,6 +326,9 @@ function buildService(overrides: {
    *  (isPlatformSandbox marker). Default false — an ordinary customer
    *  tenant, on which platform reviewer attribution must be refused. */
   verifiedSandbox?: boolean;
+  /** A non-terminal live camera session that OWNS the journey (Codex P1
+   *  exit guard). Default null — no live owner, generic exits allowed. */
+  liveOwnerSession?: { id: string } | null;
 } = {}) {
   const createdEvents: Record<string, unknown>[] = [];
   const createdReviews: Record<string, unknown>[] = [];
@@ -344,6 +347,12 @@ function buildService(overrides: {
   };
   /* eslint-disable @typescript-eslint/no-explicit-any */
   const prisma: any = {
+    // Live-owned journey guard (Codex P1): a generic exit first asks
+    // whether an ACTIVE live camera session owns the journey. Default:
+    // none does.
+    liveCameraSession: {
+      findFirst: jest.fn(async () => overrides.liveOwnerSession ?? null),
+    },
     location: { findFirst: jest.fn(async () => ({ id: 'store-1' })) },
     retailUnit: {
       findFirst: jest.fn(async () =>
@@ -589,6 +598,36 @@ describe('JourneyService', () => {
       productId: 'prod-a',
     });
     await service.exit(TENANT, 'j-1');
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.RECONCILED);
+  });
+
+  it('generic exit on a journey OWNED by an active live session is a controlled 409 — the journey stays OPEN (Codex P1)', async () => {
+    const { service, prisma, journeyRow } = buildService({
+      liveOwnerSession: { id: 'live-1' },
+    });
+    await expect(service.exit(TENANT, 'j-1')).rejects.toThrow(
+      /LIVE_JOURNEY_EXIT_REQUIRES_SESSION_FINALIZER/,
+    );
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.OPEN);
+    expect(journeyRow.decision).toBeNull();
+    // Tenant-scoped, status-bounded ownership lookup.
+    const call = prisma.liveCameraSession.findFirst.mock.calls[0][0] as {
+      where: { tenantId: string; journeyId: string; status: { in: string[] } };
+    };
+    expect(call.where.tenantId).toBe(TENANT);
+    expect(call.where.journeyId).toBe('j-1');
+    expect(call.where.status.in).toEqual(
+      expect.arrayContaining(['STARTING', 'RUNNING', 'STOPPING']),
+    );
+  });
+
+  it('the live-session FINALIZER bypass still exits a live-owned journey', async () => {
+    const { service, journeyRow } = buildService({
+      liveOwnerSession: { id: 'live-1' },
+    });
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
     expect(journeyRow.status).toBe(CustomerJourneyStatus.RECONCILED);
   });
 

@@ -162,6 +162,15 @@ function buildHarness(
     ) {
       return false;
     }
+    // Honors the drain-lease/revocation predicates: stoppedAt null
+    // demands a row with no terminal stamp.
+    if (
+      where.stoppedAt !== undefined &&
+      where.stoppedAt === null &&
+      (row.stoppedAt ?? null) !== null
+    ) {
+      return false;
+    }
     // Honors the stale-reclaim heartbeat predicate like the database:
     // OR branches, each with heartbeatAt/startedAt lt-cutoffs.
     if (where.heartbeatAt !== undefined) {
@@ -650,9 +659,14 @@ describe('LiveSessionService — sampling loop', () => {
     expect(row.journeyEventsCreated).toBe(1);
     expect(row.vlmInvoked).toBe(1);
     expect(row.vlmFailed).toBe(0);
-    // Auto-stop finalized the session normally with a decision snapshot.
+    // Auto-stop finalized the session normally — REVIEW-FIRST (Phase 13):
+    // a session that DETECTED live motion never concludes READY, even
+    // when every window processed cleanly and the fold itself was clean.
     expect(row.status).toBe(LiveCameraSessionStatus.STOPPED);
-    expect(row.decision).toBe(CustomerJourneyDecision.READY_TO_SETTLE_SHADOW);
+    expect(row.decision).toBe(CustomerJourneyDecision.NEEDS_EVENT_REVIEW);
+    expect(row.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
   });
 
   it('the cooldown watermark never reprocesses the same physical window', async () => {
@@ -995,6 +1009,34 @@ describe('LiveSessionService — atomic journey create + link (Codex P1 fix 1)',
     expect(view.status).toBe(LiveCameraSessionStatus.RUNNING);
     expect(view.journeyId).toBe('journey-1');
     await harness.service.awaitLoop(view.sessionId);
+  });
+
+  it('a stop marking the row STOPPING pre-link finalizes the bare session IMMEDIATELY — the active slot is released (Codex P1)', async () => {
+    const harness = buildHarness({ script: [{ value: 40 }] });
+    harness.journeys.openJourneyInTransaction.mockImplementationOnce(
+      async () => {
+        // A stop endpoint marked the STARTING row STOPPING (owner kept,
+        // NOT terminal) while the journey was being created — the link
+        // misses and the whole creation rolls back.
+        harness.sessions[0].status = LiveCameraSessionStatus.STOPPING;
+        return { journeyId: 'journey-race' };
+      },
+    );
+    const view = await harness.service.start(TENANT, 'cam-1', {}, 'user-1');
+    // Immediately terminal — no STOPPING row squatting on the
+    // one-active-per-source slot for five minutes of stale reclaim.
+    expect(view.status).toBe(LiveCameraSessionStatus.STOPPED);
+    expect(view.journeyId).toBeNull();
+    expect(view.errorCode).toBe('LIVE_SESSION_STOPPED_DURING_START');
+    expect(harness.sessions[0].leaseOwner).toBeNull();
+    // No journey exists to close: nothing exited, nothing aborted.
+    expect(harness.journeys.exit).not.toHaveBeenCalled();
+    expect(harness.journeys.abortShadowJourney).not.toHaveBeenCalled();
+    // The slot is free NOW: a fresh start succeeds without reclaim.
+    const second = await harness.service.start(TENANT, 'cam-1', {}, 'user-1');
+    expect(second.sessionId).not.toBe(view.sessionId);
+    expect(second.status).toBe(LiveCameraSessionStatus.RUNNING);
+    await harness.service.awaitLoop(second.sessionId);
   });
 
   it('a stop() racing between the atomic link and the promote finalizes the LINKED journey through the finalizer', async () => {
@@ -1450,7 +1492,8 @@ describe('LiveSessionService — closed windows survive a stop request (Codex P1
     expect(row.eventWindowsDetected).toBe(1);
     expect(row.eventWindowsProcessed).toBe(1);
     expect(row.status).toBe(LiveCameraSessionStatus.STOPPED);
-    expect(row.decision).toBe(CustomerJourneyDecision.READY_TO_SETTLE_SHADOW);
+    // Review-first: the detected window forbids READY (Phase 13).
+    expect(row.decision).toBe(CustomerJourneyDecision.NEEDS_EVENT_REVIEW);
   });
 
   it('the controller stays registered through finalization — a concurrent stop awaits it, never double-finalizes', async () => {
@@ -1662,6 +1705,27 @@ describe('LiveSessionService — remote-owned loops (Codex P1 round 3, fix 1)', 
     );
   });
 
+  it('stop() with a local loop whose lease is GONE acquires no drain lease — the old owner drains nothing and mutates nothing (Codex P1)', async () => {
+    const harness = buildHarness({
+      script: Array.from({ length: 40 }, () => ({ value: 40 })),
+      clockStepMs: 1000,
+    });
+    const view = await harness.service.start(TENANT, 'cam-1', {}, 'user-1');
+    await until(() => (harness.sessions[0].framesSampled as number) >= 2);
+    // A claimant in another process took the lease mid-flight.
+    harness.sessions[0].leaseOwner = 'someone-else';
+    const result = await harness.service.stop(TENANT, view.sessionId, 'user-1');
+    // The drain-lease acquisition missed: no drain, no journey mutation,
+    // no finalization by the old owner — the row is returned as-is.
+    expect(result.status).toBe(LiveCameraSessionStatus.RUNNING);
+    expect(harness.journeys.exit).not.toHaveBeenCalled();
+    expect(harness.journeys.abortShadowJourney).not.toHaveBeenCalled();
+    // The zombie loop was told to halt; it exits without finalizing.
+    await harness.service.awaitLoop(view.sessionId);
+    expect(harness.sessions[0].status).toBe(LiveCameraSessionStatus.RUNNING);
+    expect(harness.sessions[0].leaseOwner).toBe('someone-else');
+  });
+
   it('a lost stale-claim race downgrades to a stop request — never a double finalize', async () => {
     const harness = buildHarness({
       existingSession: {
@@ -1857,6 +1921,91 @@ describe('LiveSessionService — durable ADDITIVE intents (Codex P1, Invariant E
         ),
       ).toHaveLength(1);
     }
+  });
+
+  it('timeout takeover REVOKES the lease first — the blocked original finalizer can never terminalize after (Codex P1)', async () => {
+    let releaseExit: () => void = () => undefined;
+    const exitGate = new Promise<void>((resolve) => {
+      releaseExit = resolve;
+    });
+    const harness = buildHarness({ script: [{ value: 40 }], drainMs: 30 });
+    harness.journeys.exit.mockImplementationOnce(async () => {
+      // The loop's own finalizer is BLOCKED inside the journey exit —
+      // exactly the window Codex flagged: a second finalizer must not
+      // start until this owner's lease is revoked.
+      await exitGate;
+      return {
+        id: 'journey-1',
+        decision: CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+        events: [],
+        issues: [],
+      };
+    });
+    const view = await harness.service.start(TENANT, 'cam-1', {}, 'user-1');
+    await until(() => harness.journeys.exit.mock.calls.length === 1);
+    const stopped = await harness.service.stop(TENANT, view.sessionId, 'user-1');
+    // The takeover revoked the lease, then failed closed as the unowned
+    // row: ERROR + aborted journey, never READY.
+    expect(stopped.status).toBe(LiveCameraSessionStatus.ERROR);
+    expect(stopped.errorCode).toBe('LIVE_WINDOW_DRAIN_TIMEOUT');
+    expect(stopped.decision).toBe(CustomerJourneyDecision.FAILED);
+    expect(harness.sessions[0].leaseOwner).toBeNull();
+    expect(harness.journeys.abortShadowJourney).toHaveBeenCalledTimes(1);
+    // The blocked original completes LATER with a READY fold — its
+    // terminal CAS carries the revoked lease and must match NOTHING.
+    releaseExit();
+    await harness.service.awaitLoop(view.sessionId);
+    const after = harness.sessions[0];
+    expect(after.status).toBe(LiveCameraSessionStatus.ERROR);
+    expect(after.errorCode).toBe('LIVE_WINDOW_DRAIN_TIMEOUT');
+    expect(after.decision).toBe(CustomerJourneyDecision.FAILED);
+    expect(after.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+    expect(harness.journeys.exit).toHaveBeenCalledTimes(1);
+  });
+
+  it('an ERROR finalization whose marker append fails parks with its MODE preserved — retry aborts, never a clean STOP (Codex P1)', async () => {
+    const harness = buildHarness({
+      script: [
+        { value: 40 },
+        { value: 200 },
+        { value: 40 },
+        { value: 40 },
+        ...Array.from(
+          { length: LIVE_MAX_CONSECUTIVE_SAMPLE_FAILURES },
+          () => ({ fail: 'RTSP_CONNECT_FAILED' }),
+        ),
+      ],
+      fusionError: new Error('window processing broke'),
+    });
+    harness.journeys.appendEvent.mockRejectedValueOnce(
+      new Error('transient append outage'),
+    );
+    await startAndFinish(harness);
+    const row = harness.sessions[0];
+    // Parked retryably with the ORIGINAL error reason and a DURABLE
+    // ERROR mode — the marker's reason lives in its intent row, not in
+    // the advisory code, and the mode is not derived from either.
+    expect(row.status).toBe(LiveCameraSessionStatus.STOPPING);
+    expect(row.errorCode).toBe('RTSP_CONNECT_FAILED');
+    expect(row.finalizationMode).toBe('ERROR');
+    expect(harness.journeys.exit).not.toHaveBeenCalled();
+    // Retry: the stored mode routes to ABORT — the session becomes
+    // ERROR, never STOPPED, and the decision is never READY.
+    const retried = await harness.service.stop(TENANT, 'live-1', 'user-1');
+    expect(retried.status).toBe(LiveCameraSessionStatus.ERROR);
+    expect(retried.status).not.toBe(LiveCameraSessionStatus.STOPPED);
+    expect(retried.errorCode).toBe('RTSP_CONNECT_FAILED');
+    expect(retried.decision).toBe(CustomerJourneyDecision.FAILED);
+    expect(harness.journeys.exit).not.toHaveBeenCalled();
+    // The failed-window marker still materialized before the abort.
+    expect(harness.journeys.appendEvent).toHaveBeenCalledWith(
+      TENANT,
+      'journey-1',
+      expect.objectContaining({ note: 'LIVE_WINDOW_PROCESS_FAILED' }),
+      'user-1',
+    );
   });
 
   it('a counter gap (detected > processed) with a MISSING errorCode still adds an intent and never exits READY', async () => {

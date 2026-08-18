@@ -14,6 +14,7 @@ import {
   CROP_ARTIFACT_FAILED,
   FUSION_PIPELINE_VERSION,
   FusionEvidence,
+  LIVE_FRAME_PIXEL_SCREEN_REQUIRED,
   LIVE_FRAME_SCREENING_UNAVAILABLE,
   LIVE_FRAME_SENSITIVE_CONTENT,
   OCR_TEXT_SUPPRESSED,
@@ -1475,7 +1476,7 @@ describe('LIVE frames are screened before any VLM invocation (Codex P1)', () => 
     }
   });
 
-  it('a live crop with a CLEAN completed screen invokes the VLM as before', async () => {
+  it('a live crop with a CLEAN OCR screen STILL never reaches the VLM — OCR-clean is not pixel-clean (Phase 13 hard rule)', async () => {
     const vlmVerify = stubVerdict();
     const { service, createdRuns } = buildService({
       ...VLM_WANTED,
@@ -1486,8 +1487,12 @@ describe('LIVE frames are screened before any VLM invocation (Codex P1)', () => 
       ...LIVE_INPUT,
       frames: liveFrames(),
     });
-    expect(vlmVerify).toHaveBeenCalledTimes(1);
-    expect(createdRuns[0].data.evidence.vlm.invoked).toBe(true);
+    expect(vlmVerify).not.toHaveBeenCalled();
+    const { data } = createdRuns[0];
+    expect(data.policy).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+    expect(data.evidence.vlm.invoked).toBe(false);
+    expect(data.evidence.vlm.status).toBe('UNAVAILABLE');
+    expect(data.evidence.vlm.reason).toBe(LIVE_FRAME_PIXEL_SCREEN_REQUIRED);
   });
 
   const CLEAN_OCR = {
@@ -1590,9 +1595,9 @@ describe('LIVE frames are screened before any VLM invocation (Codex P1)', () => 
     expect(JSON.stringify(data.evidence)).not.toContain('recognizer crashed');
   });
 
-  it('PER-CROP screen: every VLM-bound crop is OCRed before a clean run invokes the verifier', async () => {
+  it('PER-CROP screen: every VLM-bound crop is OCRed for a specific reason, and even all-clean blocks the verifier', async () => {
     const vlmVerify = stubVerdict();
-    const { service, ocrRecognize } = buildService({
+    const { service, createdRuns, ocrRecognize } = buildService({
       ...VLM_WANTED,
       ocrSeen: { rawText: 'shelf label', normalizedText: 'shelf label' },
       vlmVerify,
@@ -1601,10 +1606,14 @@ describe('LIVE frames are screened before any VLM invocation (Codex P1)', () => 
       ...LIVE_INPUT,
       frames: liveFrames(),
     });
-    expect(vlmVerify).toHaveBeenCalledTimes(1);
     // 1 evidence pass (bestPre) + one pass per extra VLM-bound crop
-    // (peak, post) — the gate screened them all.
+    // (peak, post) — the gate screened them all for the most specific
+    // review reason, and the verifier was STILL not called.
     expect(ocrRecognize.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(vlmVerify).not.toHaveBeenCalled();
+    expect(createdRuns[0].data.evidence.vlm.reason).toBe(
+      LIVE_FRAME_PIXEL_SCREEN_REQUIRED,
+    );
   });
 
   it('ASSET-path behavior is unchanged: a tripped screen still invokes the VLM with nulled text', async () => {
