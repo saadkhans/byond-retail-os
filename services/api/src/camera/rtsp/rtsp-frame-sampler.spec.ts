@@ -326,6 +326,11 @@ describe('RtspFrameSampler', () => {
     expect(urlViolatesCredentialFreeRule(scheme + 'host/live?stream=1')).toBe(true);
     // Fragments.
     expect(urlViolatesCredentialFreeRule(scheme + 'host/live#frag')).toBe(true);
+    // rtsps (and any other scheme) follows the same strict rule.
+    const secure = 'rtsps' + '://';
+    expect(urlViolatesCredentialFreeRule(secure + 'u:p@host/live')).toBe(true);
+    expect(urlViolatesCredentialFreeRule(secure + 'host/live?user=a')).toBe(true);
+    expect(urlViolatesCredentialFreeRule(secure + 'host/live')).toBe(false);
     // The only accepted scheme-shaped form: scheme + host(:port) + path.
     expect(urlViolatesCredentialFreeRule(scheme + 'host/live')).toBe(false);
     expect(urlViolatesCredentialFreeRule(scheme + 'host:8554/live')).toBe(false);

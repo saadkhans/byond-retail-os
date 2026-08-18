@@ -249,6 +249,7 @@ model Tenant {
   cameraSources           CameraSource[]
   cameraPilotRuns         CameraPilotRun[]
   liveCameraSessions      LiveCameraSession[]
+  liveSessionFinalizationIntents LiveCameraSessionFinalizationIntent[]
 }
 
 model User {
@@ -1046,10 +1047,35 @@ model LiveCameraSession {
   cameraSource CameraSource     @relation(fields: [cameraSourceId], references: [id], onDelete: Restrict)
   journey      CustomerJourney? @relation(fields: [journeyId], references: [id], onDelete: Restrict)
   fusionRuns   PickupFusionRun[]
+  finalizationIntents LiveCameraSessionFinalizationIntent[]
 
   @@unique([id, tenantId])
   @@index([tenantId, cameraSourceId, createdAt(sort: Desc)])
   @@index([tenantId, status])
+}
+
+// Phase 13 — DURABLE, ADDITIVE finalization intents (Codex P1): a single
+// overwritable errorCode cannot carry several simultaneous fail-closed
+// reasons, and a lost write could let a risky session finalize clean.
+// One row per (session, reason); adding is idempotent via the unique
+// pair; the finalizer must MATERIALIZE every unmaterialized intent into
+// a review-required journey marker before the journey may exit, and a
+// session with any intent can never conclude READY_TO_SETTLE_SHADOW.
+// The reason vocabulary is CONTROLLED (service constant + DB CHECK).
+model LiveCameraSessionFinalizationIntent {
+  id             String    @id @default(cuid())
+  tenantId       String
+  liveSessionId  String
+  reason         String
+  createdAt      DateTime  @default(now())
+  materializedAt DateTime?
+
+  tenant      Tenant            @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  liveSession LiveCameraSession @relation(fields: [liveSessionId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@unique([liveSessionId, reason])
+  @@index([tenantId, liveSessionId])
 }
 
 // DERIVED stock projection — never written directly from user input. The

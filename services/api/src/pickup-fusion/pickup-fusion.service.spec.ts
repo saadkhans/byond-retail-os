@@ -14,7 +14,8 @@ import {
   CROP_ARTIFACT_FAILED,
   FUSION_PIPELINE_VERSION,
   FusionEvidence,
-  LIVE_SENSITIVE_SCREEN_BLOCKED,
+  LIVE_FRAME_SCREENING_UNAVAILABLE,
+  LIVE_FRAME_SENSITIVE_CONTENT,
   OCR_TEXT_SUPPRESSED,
   PickupFusionService,
   applyVlmVerdictToEvidence,
@@ -1451,7 +1452,7 @@ describe('LIVE frames are screened before any VLM invocation (Codex P1)', () => 
     expect(data.policy).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
     expect(data.evidence.vlm.invoked).toBe(false);
     expect(data.evidence.vlm.status).toBe('UNAVAILABLE');
-    expect(data.evidence.vlm.reason).toBe(LIVE_SENSITIVE_SCREEN_BLOCKED);
+    expect(data.evidence.vlm.reason).toBe(LIVE_FRAME_SENSITIVE_CONTENT);
     expect(JSON.stringify(data.evidence)).not.toContain(PAN);
   });
 
@@ -1470,7 +1471,7 @@ describe('LIVE frames are screened before any VLM invocation (Codex P1)', () => 
       expect(vlmVerify).not.toHaveBeenCalled();
       const { data } = createdRuns[0];
       expect(data.policy).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
-      expect(data.evidence.vlm.reason).toBe(LIVE_SENSITIVE_SCREEN_BLOCKED);
+      expect(data.evidence.vlm.reason).toBe(LIVE_FRAME_SCREENING_UNAVAILABLE);
     }
   });
 
@@ -1520,8 +1521,8 @@ describe('LIVE frames are screened before any VLM invocation (Codex P1)', () => 
     const { data } = createdRuns[0];
     expect(data.policy).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
     expect(data.evidence.vlm.invoked).toBe(false);
-    expect(data.evidence.vlm.reason).toBe(LIVE_SENSITIVE_SCREEN_BLOCKED);
-    // The peak crop's recognized text exists only for the boolean —
+    expect(data.evidence.vlm.reason).toBe(LIVE_FRAME_SENSITIVE_CONTENT);
+    // The peak crop's recognized text exists only for the verdict —
     // never in the persisted evidence.
     expect(JSON.stringify(data.evidence)).not.toContain(PAN);
   });
@@ -1546,7 +1547,7 @@ describe('LIVE frames are screened before any VLM invocation (Codex P1)', () => 
     });
     expect(vlmVerify).not.toHaveBeenCalled();
     const { data } = createdRuns[0];
-    expect(data.evidence.vlm.reason).toBe(LIVE_SENSITIVE_SCREEN_BLOCKED);
+    expect(data.evidence.vlm.reason).toBe(LIVE_FRAME_SENSITIVE_CONTENT);
     expect(JSON.stringify(data.evidence)).not.toContain(PAN);
   });
 
@@ -1565,8 +1566,28 @@ describe('LIVE frames are screened before any VLM invocation (Codex P1)', () => 
     });
     expect(vlmVerify).not.toHaveBeenCalled();
     expect(createdRuns[0].data.evidence.vlm.reason).toBe(
-      LIVE_SENSITIVE_SCREEN_BLOCKED,
+      LIVE_FRAME_SCREENING_UNAVAILABLE,
     );
+  });
+
+  it('PER-CROP screen: an extra crop whose OCR THROWS blocks the VLM as screening-unavailable', async () => {
+    const vlmVerify = stubVerdict();
+    const { service, createdRuns, ocrRecognize } = buildService({
+      ...VLM_WANTED,
+      vlmVerify,
+    });
+    ocrRecognize
+      .mockResolvedValueOnce(CLEAN_OCR)
+      .mockRejectedValue(new Error('recognizer crashed'));
+    await service.runLiveWindow('tenant-1', {
+      ...LIVE_INPUT,
+      frames: liveFrames(),
+    });
+    expect(vlmVerify).not.toHaveBeenCalled();
+    const { data } = createdRuns[0];
+    expect(data.evidence.vlm.reason).toBe(LIVE_FRAME_SCREENING_UNAVAILABLE);
+    // The thrown message never reaches the persisted evidence.
+    expect(JSON.stringify(data.evidence)).not.toContain('recognizer crashed');
   });
 
   it('PER-CROP screen: every VLM-bound crop is OCRed before a clean run invokes the verifier', async () => {

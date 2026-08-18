@@ -445,7 +445,33 @@ export class JourneyService {
       entryAt?: Date;
     },
   ) {
-    const location = await this.prisma.location.findFirst({
+    // ATOMIC open: the journey row and its ENTRY event become visible
+    // together. If the ENTRY insert failed after the journey committed,
+    // an OPEN journey with no ENTRY event would remain and a retry would
+    // open a SECOND journey for the same shopper.
+    const journey = await this.prisma.$transaction(async (tx) =>
+      this.openJourneyInTransaction(tx, tenantId, input, actorId, options),
+    );
+    return this.detail(tenantId, journey.journeyId);
+  }
+
+  /**
+   * Open a journey INSIDE a caller-owned transaction (Phase 13): the
+   * live-session runtime must create its journey and link it onto the
+   * session row ATOMICALLY — a journey existing without its session link
+   * is an orphan waiting to happen, so both writes commit or neither
+   * does. Validations run on the SAME transaction client; the caller
+   * performs its own linking write in the same transaction and lets the
+   * whole thing roll back on any failure.
+   */
+  async openJourneyInTransaction(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    input: { locationId: string; unitId?: string | null },
+    actorId?: string,
+    options?: { entryAt?: Date },
+  ): Promise<{ journeyId: string }> {
+    const location = await tx.location.findFirst({
       where: { tenantId, id: input.locationId },
       select: { id: true },
     });
@@ -458,7 +484,7 @@ export class JourneyService {
       // within BOTH this tenant and this location before it is written —
       // otherwise a known foreign unit id links a journey across tenants
       // (or across stores of the same tenant).
-      const unit = await this.prisma.retailUnit.findFirst({
+      const unit = await tx.retailUnit.findFirst({
         where: { tenantId, id: input.unitId, locationId: input.locationId },
         select: { id: true },
       });
@@ -466,33 +492,26 @@ export class JourneyService {
         throw new NotFoundException('Unit not found in this store');
       }
     }
-    // ATOMIC open: the journey row and its ENTRY event become visible
-    // together. If the ENTRY insert failed after the journey committed,
-    // an OPEN journey with no ENTRY event would remain and a retry would
-    // open a SECOND journey for the same shopper.
     const entryAt = options?.entryAt ?? new Date();
-    const journey = await this.prisma.$transaction(async (tx) => {
-      const created = await tx.customerJourney.create({
-        data: {
-          tenantId,
-          locationId: input.locationId,
-          unitId: input.unitId ?? null,
-          startedAt: entryAt,
-        },
-      });
-      await tx.customerJourneyEvent.create({
-        data: {
-          tenantId,
-          journeyId: created.id,
-          eventType: CustomerJourneyEventType.ENTRY,
-          occurredAt: entryAt,
-          sourceType: 'MANUAL',
-          createdById: actorId ?? null,
-        },
-      });
-      return created;
+    const created = await tx.customerJourney.create({
+      data: {
+        tenantId,
+        locationId: input.locationId,
+        unitId: input.unitId ?? null,
+        startedAt: entryAt,
+      },
     });
-    return this.detail(tenantId, journey.id);
+    await tx.customerJourneyEvent.create({
+      data: {
+        tenantId,
+        journeyId: created.id,
+        eventType: CustomerJourneyEventType.ENTRY,
+        occurredAt: entryAt,
+        sourceType: 'MANUAL',
+        createdById: actorId ?? null,
+      },
+    });
+    return { journeyId: created.id };
   }
 
   /**
