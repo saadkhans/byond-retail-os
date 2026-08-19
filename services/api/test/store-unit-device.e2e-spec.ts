@@ -376,9 +376,14 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
             matchScalar(row, where, ['tenantId', 'type', 'status']) &&
             matchSearchOr(row, where, ['name', 'code']),
         ).length,
+      // Destructive writes address rows through the id_tenantId composite
+      // key (repo tenancy invariant) — the stub resolves it like Prisma.
       update: async ({ where, data }: { where: Where; data: Where }) => {
+        const key = (where.id_tenantId ?? where) as Where;
         const row = store.locations.find(
-          (candidate) => candidate.id === where.id,
+          (candidate) =>
+            candidate.id === key.id &&
+            (key.tenantId === undefined || candidate.tenantId === key.tenantId),
         );
         if (!row) {
           throw { code: 'P2025' };
@@ -387,8 +392,11 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
         return row;
       },
       delete: async ({ where }: { where: Where }) => {
+        const key = (where.id_tenantId ?? where) as Where;
         const row = store.locations.find(
-          (candidate) => candidate.id === where.id,
+          (candidate) =>
+            candidate.id === key.id &&
+            (key.tenantId === undefined || candidate.tenantId === key.tenantId),
         );
         if (!row) {
           throw { code: 'P2025' };

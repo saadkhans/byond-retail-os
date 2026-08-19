@@ -39,14 +39,16 @@ export class PilotTestDto {
 
   @ApiPropertyOptional({
     minimum: 1,
-    maximum: 120,
+    maximum: 900,
     default: 60,
-    description: 'Stop after this many seconds regardless of frames',
+    description:
+      'Stop after this many seconds regardless of frames (ceiling matches ' +
+      'the 15-minute live session bound)',
   })
   @IsOptionalNonNull()
   @Transform(toNumberRejectingBlank)
   @IsInt()
   @Min(1)
-  @Max(120)
+  @Max(900)
   maxSeconds?: number;
 }
