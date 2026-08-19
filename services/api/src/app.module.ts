@@ -16,6 +16,7 @@ import { JourneyModule } from './journey/journey.module';
 import { LocationsModule } from './locations/locations.module';
 import { OrdersModule } from './orders/orders.module';
 import { PaymentsModule } from './payments/payments.module';
+import { PilotEvaluationModule } from './pilot-evaluation/pilot-evaluation.module';
 import { PlatformModulesModule } from './platform-modules/platform-modules.module';
 import { PickupDetectionModule } from './pickup-detection/pickup-detection.module';
 import { PickupFusionModule } from './pickup-fusion/pickup-fusion.module';
@@ -52,6 +53,7 @@ import { VisionModule } from './vision/vision.module';
     CvEvaluationModule,
     JourneyModule,
     CameraModule,
+    PilotEvaluationModule,
   ],
 })
 export class AppModule implements NestModule {
