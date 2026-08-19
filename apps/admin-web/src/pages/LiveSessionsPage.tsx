@@ -1,6 +1,12 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { ApiError, LiveSessionDetail, LiveSessionView, api } from '../api';
+import {
+  ApiError,
+  LiveSessionDetail,
+  LiveSessionPerformance,
+  LiveSessionView,
+  api,
+} from '../api';
 import { Page, formatDate, useLoad } from '../components';
 import {
   SOURCE_TYPE_LABEL,
@@ -120,6 +126,12 @@ export function LiveSessionDetailPage() {
     () => api(`/live-sessions/${id}`),
     [id, tick],
   );
+  // Phase 14 — timing/bottleneck report (controlled numeric aggregates
+  // only; refreshes with the same tick as the session itself).
+  const perf = useLoad<LiveSessionPerformance>(
+    () => api(`/live-sessions/${id}/performance`),
+    [id, tick],
+  );
   const data = session.data;
   // STOPPING is a RETRYABLE state (Codex P1): a parked finalization
   // resumes only when another stop() arrives, so the session stays
@@ -229,6 +241,67 @@ export function LiveSessionDetailPage() {
               </div>
             ))}
           </div>
+
+          <h2>Performance (Phase 14)</h2>
+          {perf.data ? (
+            <>
+              <p className="muted">
+                {perf.data.fastMode === true ? (
+                  <span className="badge ok">FAST MODE</span>
+                ) : perf.data.fastMode === false ? (
+                  <span className="badge">standard mode</span>
+                ) : (
+                  // Legacy session recorded before the fast-mode stamp —
+                  // never labeled from the CURRENT config.
+                  <span className="badge">mode unknown (legacy)</span>
+                )}{' '}
+                {perf.data.vlmInvoked ? 'VLM invoked' : 'VLM skipped'}
+                {perf.data.slowestStage
+                  ? ` · slowest stage: ${perf.data.slowestStage.stage} (p95 ${perf.data.slowestStage.p95Ms}ms)`
+                  : ''}
+                {' · '}mutations: orders {perf.data.safety.orders} · checkout{' '}
+                {perf.data.safety.checkoutSessions} · payment intents{' '}
+                {perf.data.safety.paymentIntents} · payment events{' '}
+                {perf.data.safety.paymentEvents} · inventory{' '}
+                {perf.data.safety.inventoryMovements}
+              </p>
+              {Object.keys(perf.data.timings).length > 0 ? (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Stage</th>
+                      <th>Count</th>
+                      <th>Avg</th>
+                      <th>p50</th>
+                      <th>p95</th>
+                      <th>Max</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.entries(perf.data.timings).map(
+                      ([stage, stats]) => (
+                        <tr key={stage}>
+                          <td>{stage}</td>
+                          <td>{stats.count}</td>
+                          <td>{stats.avgMs}ms</td>
+                          <td>{stats.p50Ms}ms</td>
+                          <td>{stats.p95Ms}ms</td>
+                          <td>{stats.maxMs}ms</td>
+                        </tr>
+                      ),
+                    )}
+                  </tbody>
+                </table>
+              ) : (
+                <p className="muted">No timing samples yet.</p>
+              )}
+            </>
+          ) : perf.error ? (
+            // Controlled message only — never the raw error payload.
+            <p className="muted">Performance report unavailable.</p>
+          ) : (
+            <p className="muted">Performance report loading…</p>
+          )}
 
           <h2>Candidate event windows ({data.eventWindows.length})</h2>
           {data.eventWindows.length > 0 ? (

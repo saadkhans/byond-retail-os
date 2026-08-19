@@ -26,6 +26,7 @@ import { VideoIngestModule } from '../video-ingest/video-ingest.module';
 import { CameraReplayService } from './camera-replay.service';
 import { CameraSourcesService } from './camera-sources.service';
 import { CreateCameraSourceDto } from './dto/create-camera-source.dto';
+import { PilotTestDto } from './dto/pilot-test.dto';
 import { ReplayRunDto } from './dto/replay-run.dto';
 import { StartLiveSessionDto } from './dto/start-live-session.dto';
 import { UpdateCameraSourceDto } from './dto/update-camera-source.dto';
@@ -148,6 +149,34 @@ export class CameraSourcesController {
       actor.userId,
     );
   }
+
+  @Post(':id/pilot-test')
+  @RequirePermissions('vision:ingest')
+  @ApiOperation({
+    summary:
+      'Phase 14 DEV/ADMIN pilot test: start a live session on this ' +
+      'source, sample up to the frame/time budget, stop, and return a ' +
+      'controlled speed summary (timings, review counts, zero-mutation ' +
+      'safety proof). Gated by CV_LIVE_PILOT_RUNNER_ENABLED; no URL or ' +
+      'credential material in the response.',
+  })
+  pilotTest(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Body() body: PilotTestDto,
+    @CurrentUser() actor: RequestContext,
+  ) {
+    return this.live.runPilotTest(
+      tenantId,
+      id,
+      {
+        frameIntervalMs: body.frameIntervalMs,
+        maxFrames: body.maxFrames,
+        maxSeconds: body.maxSeconds,
+      },
+      actor.userId,
+    );
+  }
 }
 
 @ApiTags('camera')
@@ -176,6 +205,19 @@ export class LiveSessionsController {
   })
   byId(@CurrentTenantId() tenantId: string, @Param('id') id: string) {
     return this.live.byId(tenantId, id);
+  }
+
+  @Get(':id/performance')
+  @RequirePermissions('vision:read')
+  @ApiOperation({
+    summary:
+      'Phase 14 performance report: per-stage timing statistics ' +
+      '(p50/p95/max), slowest stage, fast-mode flag, and a zero-mutation ' +
+      'safety summary. Controlled JSON only — no URL or credential ' +
+      'material.',
+  })
+  performance(@CurrentTenantId() tenantId: string, @Param('id') id: string) {
+    return this.live.performance(tenantId, id);
   }
 
   @Post(':id/stop')

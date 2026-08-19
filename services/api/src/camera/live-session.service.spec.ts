@@ -48,6 +48,12 @@ class TestLiveSessionService extends LiveSessionService {
   protected override drainTimeoutMs(): number {
     return this.drainMs;
   }
+
+  /** Pilot runner polls immediately — the virtual clock still advances
+   *  through sleep(), keeping the auto-stop bound reachable. */
+  protected override pilotPollMs(): number {
+    return 1;
+  }
 }
 
 function buildHarness(
@@ -63,6 +69,9 @@ function buildHarness(
     onFusionCall?: () => void;
     clockStepMs?: number;
     drainMs?: number;
+    /** Phase 14 — env flags served through the optional ConfigService
+     *  (CV_LIVE_FAST_MODE, CV_LIVE_PILOT_RUNNER_ENABLED). */
+    env?: Record<string, string>;
   } = {},
 ) {
   const sourceRow =
@@ -367,7 +376,11 @@ function buildHarness(
       configured: options.configured !== false,
     })),
     checkFfmpeg: jest.fn(async () => options.ffmpeg !== false),
-    sampleFrame: jest.fn(async (_tenantId: string, _ref: string) => {
+    sampleFrame: jest.fn(async (
+      _tenantId: string,
+      _ref: string,
+      _opts?: { seekMs?: number },
+    ) => {
       const entry = options.script?.[scriptIndex];
       scriptIndex += 1;
       if (!entry) {
@@ -488,6 +501,7 @@ function buildHarness(
     sampler as never,
     fusion as never,
     journeys as never,
+    { get: (key: string) => options.env?.[key] } as never,
   );
   if (options.clockStepMs !== undefined) {
     service.clockStepMs = options.clockStepMs;
@@ -2546,3 +2560,292 @@ describe('LiveSessionService — durable ADDITIVE intents (Codex P1, Invariant E
   });
 });
 
+
+describe('LiveSessionService — Phase 14 speed pilot testing', () => {
+  it('timing metrics are recorded and persisted: frame sample, window detection, fusion, journey import, event-to-review', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }, { value: 200 }, { value: 40 }, { value: 40 }],
+    });
+    await startAndFinish(harness);
+    const row = harness.sessions[0];
+    const perf = row.performance as {
+      fastMode: boolean;
+      stages: Record<string, { count: number; p50Ms: number; p95Ms: number; maxMs: number }>;
+    };
+    expect(perf).toBeTruthy();
+    expect(perf.fastMode).toBe(false);
+    for (const stage of [
+      'frameSample',
+      'windowDetection',
+      'fusion',
+      'journeyImport',
+      'eventToReview',
+    ]) {
+      expect(perf.stages[stage]).toBeTruthy();
+      expect(perf.stages[stage].count).toBeGreaterThanOrEqual(1);
+      expect(perf.stages[stage].p50Ms).toBeGreaterThanOrEqual(0);
+      expect(perf.stages[stage].p95Ms).toBeGreaterThanOrEqual(
+        perf.stages[stage].p50Ms,
+      );
+      expect(perf.stages[stage].maxMs).toBeGreaterThanOrEqual(
+        perf.stages[stage].p95Ms,
+      );
+    }
+  });
+
+  it('fast mode is stamped on the performance snapshot', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }],
+      env: { CV_LIVE_FAST_MODE: 'true' },
+    });
+    await startAndFinish(harness);
+    const perf = harness.sessions[0].performance as { fastMode: boolean };
+    expect(perf.fastMode).toBe(true);
+  });
+
+  it('the performance report returns controlled JSON: timings, slowest stage, zero-mutation safety — no URL or credential material', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }, { value: 200 }, { value: 40 }, { value: 40 }],
+    });
+    await startAndFinish(harness);
+    const report = await harness.service.performance(TENANT, 'live-1');
+    expect(report.sessionId).toBe('live-1');
+    expect(report.vlmInvoked).toBe(true); // stubbed fusion evidence says invoked
+    expect(report.slowestStage).toBeTruthy();
+    expect(
+      report.timings[report.slowestStage!.stage].p95Ms,
+    ).toBe(report.slowestStage!.p95Ms);
+    // Structural zeros: this module cannot address billing/payment/
+    // inventory tables at all (shadow-mode static guard fails CI on any
+    // reference), so the summary is zeros BY CONSTRUCTION.
+    expect(report.safety).toEqual({
+      orders: 0,
+      checkoutSessions: 0,
+      paymentIntents: 0,
+      paymentEvents: 0,
+      inventoryMovements: 0,
+      basis: 'SHADOW_MODE_STATIC_GUARD',
+    });
+    // Controlled JSON only — nothing URL- or credential-shaped.
+    const raw = JSON.stringify(report);
+    expect(raw).not.toContain('rtsp');
+    expect(raw).not.toContain('CAMERA_SECRET_SLOT');
+    expect(raw).not.toContain('://');
+  });
+
+  it('the performance report 404s across tenants', async () => {
+    const harness = buildHarness({ script: [{ value: 40 }] });
+    await startAndFinish(harness);
+    await expect(
+      harness.service.performance('tenant-B', 'live-1'),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('the pilot runner is REFUSED with a controlled 409 when CV_LIVE_PILOT_RUNNER_ENABLED is not true', async () => {
+    const harness = buildHarness({ script: [{ value: 40 }] });
+    await expect(
+      harness.service.runPilotTest(TENANT, 'cam-1', {}, 'user-1'),
+    ).rejects.toThrow(/CV_LIVE_PILOT_RUNNER_ENABLED/);
+    expect(harness.prisma.liveCameraSession.create).not.toHaveBeenCalled();
+  });
+
+  it('the pilot runner starts, samples, stops, and reports a zero-mutation review-first summary', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }, { value: 200 }, { value: 40 }, { value: 40 }],
+      env: { CV_LIVE_PILOT_RUNNER_ENABLED: 'true' },
+    });
+    const summary = await harness.service.runPilotTest(
+      TENANT,
+      'cam-1',
+      { maxFrames: 4, maxSeconds: 60 },
+      'user-1',
+    );
+    expect(summary.status).toBe(LiveCameraSessionStatus.STOPPED);
+    expect(summary.framesSampled).toBeGreaterThanOrEqual(4);
+    expect(summary.eventWindowsDetected).toBe(1);
+    expect(summary.eventWindowsProcessed).toBe(1);
+    expect(summary.reviewNeeded).toBeGreaterThanOrEqual(0);
+    // Review-first: a detected window can never summarize as READY.
+    expect(summary.decision).toBe(CustomerJourneyDecision.NEEDS_EVENT_REVIEW);
+    expect(summary.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+    // Zero billing/payment/inventory mutations — structural, enforced
+    // by the camera shadow-mode static guard.
+    expect(summary.safety).toEqual({
+      orders: 0,
+      checkoutSessions: 0,
+      paymentIntents: 0,
+      paymentEvents: 0,
+      inventoryMovements: 0,
+      basis: 'SHADOW_MODE_STATIC_GUARD',
+    });
+    expect(summary.eventToReviewMs).toBeTruthy();
+    const raw = JSON.stringify(summary);
+    expect(raw).not.toContain('rtsp');
+    expect(raw).not.toContain('CAMERA_SECRET_SLOT');
+    await harness.service.awaitLoop(summary.sessionId);
+  });
+});
+
+describe('LiveSessionService — Phase 14 Codex review fixes', () => {
+  it('eventToReview is measured from the WINDOW CLOSE, including the quiet-sample detection delay (Codex P1)', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }, { value: 200 }, { value: 40 }, { value: 40 }],
+    });
+    await startAndFinish(harness);
+    const perf = harness.sessions[0].performance as {
+      stages: Record<string, { count: number; p50Ms: number }>;
+    };
+    expect(perf.stages.eventToReview.count).toBe(1);
+    // The virtual clock steps 60s per sample: detection needs at least
+    // one quiet sample AFTER the window's endMs, so a close-anchored
+    // measurement is >= one full step. (The old processing-anchored
+    // measurement was ~0ms — mocked stages resolve instantly.)
+    expect(perf.stages.eventToReview.p50Ms).toBeGreaterThanOrEqual(60_000);
+  });
+
+  it('successive samples pass ADVANCING seek offsets to the sampler (file-backed pilot motion, Codex P1)', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }, { value: 40 }, { value: 40 }],
+    });
+    await startAndFinish(harness);
+    const seeks = harness.sampler.sampleFrame.mock.calls.map(
+      (call) => (call[2] as { seekMs?: number } | undefined)?.seekMs,
+    );
+    expect(seeks.length).toBeGreaterThanOrEqual(3);
+    expect(seeks[0]).toBe(0);
+    expect(seeks[1]).toBe(1000);
+    expect(seeks[2]).toBe(2000);
+  });
+
+  it('a fusion run that THROWS still lands in the fusion timing stats (Codex P2)', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }, { value: 200 }, { value: 40 }, { value: 40 }],
+      fusionError: new Error('window processing broke'),
+    });
+    await startAndFinish(harness);
+    const perf = harness.sessions[0].performance as {
+      stages: Record<string, { count: number }>;
+    };
+    expect(perf.stages.fusion.count).toBeGreaterThanOrEqual(1);
+  });
+
+  it('a journey import that THROWS still lands in the journeyImport timing stats (Codex P2)', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }, { value: 200 }, { value: 40 }, { value: 40 }],
+    });
+    harness.journeys.appendFromLiveFusionRun.mockRejectedValueOnce(
+      new Error('transient import failure'),
+    );
+    await startAndFinish(harness);
+    const perf = harness.sessions[0].performance as {
+      stages: Record<string, { count: number }>;
+    };
+    expect(perf.stages.journeyImport.count).toBeGreaterThanOrEqual(1);
+  });
+
+  it('a LEGACY session without a performance stamp reports fastMode null — never the CURRENT config (Codex P2)', async () => {
+    const harness = buildHarness({
+      env: { CV_LIVE_FAST_MODE: 'true' },
+      existingSession: {
+        id: 'live-legacy',
+        tenantId: TENANT,
+        cameraSourceId: 'cam-1',
+        status: LiveCameraSessionStatus.STOPPED,
+        journeyId: null,
+        stoppedAt: new Date(),
+        startedAt: new Date(),
+        performance: null,
+        eventWindows: [],
+      },
+    });
+    const report = await harness.service.performance(TENANT, 'live-legacy');
+    expect(report.fastMode).toBeNull();
+  });
+
+  it('fast mode is stamped at session CREATION — before any frame lands', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }],
+      env: { CV_LIVE_FAST_MODE: 'true' },
+    });
+    const view = await harness.service.start(TENANT, 'cam-1', {}, 'user-1');
+    const created = harness.prisma.liveCameraSession.create.mock
+      .calls[0][0] as { data: { performance?: { fastMode?: boolean } } };
+    expect(created.data.performance?.fastMode).toBe(true);
+    await harness.service.awaitLoop(view.sessionId);
+  });
+
+  it('the pilot runner REFUSES a source with an existing active session — and never stops it (Codex P2)', async () => {
+    const harness = buildHarness({
+      env: { CV_LIVE_PILOT_RUNNER_ENABLED: 'true' },
+      existingSession: {
+        id: 'live-operator',
+        tenantId: TENANT,
+        cameraSourceId: 'cam-1',
+        status: LiveCameraSessionStatus.RUNNING,
+        journeyId: 'journey-op',
+        leaseOwner: 'operator-process',
+        startedAt: new Date('2026-08-17T09:59:00.000Z'),
+        heartbeatAt: new Date('2026-08-17T10:00:00.000Z'),
+        eventWindows: [],
+      },
+    });
+    await expect(
+      harness.service.runPilotTest(TENANT, 'cam-1', {}, 'user-1'),
+    ).rejects.toThrow(/LIVE_PILOT_SESSION_ALREADY_ACTIVE/);
+    // The operator's session is untouched.
+    expect(harness.sessions[0].status).toBe(LiveCameraSessionStatus.RUNNING);
+    expect(harness.journeys.exit).not.toHaveBeenCalled();
+    expect(harness.journeys.abortShadowJourney).not.toHaveBeenCalled();
+  });
+
+  it('the pilot frame budget is enforced INSIDE the loop: maxFrames 1 persists exactly one frame (Codex P2)', async () => {
+    const harness = buildHarness({
+      script: Array.from({ length: 10 }, () => ({ value: 40 })),
+      env: { CV_LIVE_PILOT_RUNNER_ENABLED: 'true' },
+    });
+    const summary = await harness.service.runPilotTest(
+      TENANT,
+      'cam-1',
+      { maxFrames: 1, frameIntervalMs: 500 },
+      'user-1',
+    );
+    expect(summary.framesSampled).toBe(1);
+    expect(harness.sampler.sampleFrame).toHaveBeenCalledTimes(1);
+    expect(summary.status).toBe(LiveCameraSessionStatus.STOPPED);
+  });
+
+  it('a polling failure after start STOPS the pilot-owned session in finally (Codex P2)', async () => {
+    const harness = buildHarness({
+      script: Array.from({ length: 20 }, () => ({ value: 40 })),
+      env: { CV_LIVE_PILOT_RUNNER_ENABLED: 'true' },
+    });
+    const realById = harness.service.byId.bind(harness.service);
+    // Call 1 is start()'s own trailing read — the POLL's read is call 2,
+    // and that is the one that fails.
+    let byIdCalls = 0;
+    jest
+      .spyOn(harness.service, 'byId')
+      .mockImplementation(async (tenantId: string, sessionId: string) => {
+        byIdCalls += 1;
+        if (byIdCalls === 2) {
+          throw new Error('poll outage');
+        }
+        return realById(tenantId, sessionId);
+      });
+    await expect(
+      harness.service.runPilotTest(
+        TENANT,
+        'cam-1',
+        { maxFrames: 15 },
+        'user-1',
+      ),
+    ).rejects.toThrow('poll outage');
+    // The owned session was stopped in finally — it does not keep
+    // sampling to the 15-minute cap.
+    const row = harness.sessions[0];
+    expect(row.status).toBe(LiveCameraSessionStatus.STOPPED);
+    await harness.service.awaitLoop(row.id as string);
+  });
+});

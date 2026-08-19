@@ -1616,6 +1616,41 @@ describe('LIVE frames are screened before any VLM invocation (Codex P1)', () => 
     );
   });
 
+  it('FAST MODE (Phase 14): skips the reason-refining OCR passes for LIVE_WINDOW — still review-first, VLM never called', async () => {
+    const vlmVerify = stubVerdict();
+    const { service, createdRuns, ocrRecognize } = buildService({
+      ...VLM_WANTED,
+      ocrSeen: { rawText: 'shelf label', normalizedText: 'shelf label' },
+      config: { PICKUP_VLM_ENABLED: 'true', CV_LIVE_FAST_MODE: 'true' },
+      vlmVerify,
+    });
+    await service.runLiveWindow('tenant-1', {
+      ...LIVE_INPUT,
+      frames: liveFrames(),
+    });
+    expect(vlmVerify).not.toHaveBeenCalled();
+    const { data } = createdRuns[0];
+    // Same review-first outcome as standard mode …
+    expect(data.policy).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+    expect(data.evidence.vlm.invoked).toBe(false);
+    expect(data.evidence.vlm.reason).toBe(LIVE_FRAME_PIXEL_SCREEN_REQUIRED);
+    // … but ONLY the evidence OCR pass ran — the per-crop screening
+    // passes (peak/post) were skipped (that is the latency win).
+    expect(ocrRecognize).toHaveBeenCalledTimes(1);
+  });
+
+  it('FAST MODE leaves FILE_REPLAY/asset behavior untouched: the VLM still runs on the asset path', async () => {
+    const vlmVerify = stubVerdict();
+    const { service } = buildService({
+      ...VLM_WANTED,
+      ocrSeen: { rawText: 'shelf label', normalizedText: 'shelf label' },
+      config: { PICKUP_VLM_ENABLED: 'true', CV_LIVE_FAST_MODE: 'true' },
+      vlmVerify,
+    });
+    await service.run('tenant-1', 'asset-1');
+    expect(vlmVerify).toHaveBeenCalledTimes(1);
+  });
+
   it('ASSET-path behavior is unchanged: a tripped screen still invokes the VLM with nulled text', async () => {
     const vlmVerify = stubVerdict();
     const { service, ocrRecognize } = buildService({

@@ -1046,6 +1046,11 @@ model LiveCameraSession {
   // failure must not convert an ERROR finalization into a clean STOP).
   finalizationMode String?
   eventWindows Json?
+  // Phase 14 — per-stage timing statistics (p50/p95/max/avg/count per
+  // pipeline stage) written by the sampling loop. OBSERVABILITY ONLY:
+  // controlled numeric aggregates, never URLs, credentials, pixels, or
+  // free text; never read by any decision path.
+  performance Json?
   createdById  String?
   createdAt    DateTime @default(now())
 

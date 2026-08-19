@@ -117,6 +117,9 @@ const FFMPEG_BINARY = 'ffmpeg';
 /** Same conservative floor/ceiling band as the pilot replay. */
 export const RTSP_SAMPLE_MIN_TIMEOUT_MS = 1000;
 export const RTSP_SAMPLE_MAX_TIMEOUT_MS = 60_000;
+/** Bound on the file-backed seek position (Phase 14): live sessions cap
+ *  at 15 minutes, so no honest seek can exceed this. */
+export const MAX_FILE_SEEK_MS = 15 * 60_000;
 
 const ENV_PREFIX = 'CAMERA_RTSP_SOURCE_';
 
@@ -165,7 +168,19 @@ export class RtspFrameSampler {
   async sampleFrame(
     tenantId: string,
     credentialRef: string,
-    opts: { width: number; height: number; timeoutMs: number },
+    opts: {
+      width: number;
+      height: number;
+      timeoutMs: number;
+      /** Phase 14 — per-sample seek position for FILE-BACKED dev
+       *  sources: a fresh ffmpeg with `-frames:v 1` and no seek would
+       *  return frame ZERO on every call, so a file-backed pilot never
+       *  sees inter-frame motion. Applied as a bounded `-ss <seconds>`
+       *  BEFORE the input, file inputs only — a live RTSP stream has no
+       *  seekable timeline and takes its frames from the wire, so RTSP
+       *  sources ignore this entirely. */
+      seekMs?: number;
+    },
   ): Promise<RtspSampleResult> {
     const source = this.sourceFor(tenantId, credentialRef);
     if (source === null) {
@@ -182,6 +197,13 @@ export class RtspFrameSampler {
       RTSP_SAMPLE_MIN_TIMEOUT_MS,
       Math.min(opts.timeoutMs, RTSP_SAMPLE_MAX_TIMEOUT_MS),
     );
+    const isRtsp = source.startsWith('rtsp');
+    // Bounded numeric seek — always argv-safe (Number → fixed decimal
+    // string), never derived from or echoing the source value.
+    const seekSeconds =
+      !isRtsp && typeof opts.seekMs === 'number' && opts.seekMs > 0
+        ? Math.min(opts.seekMs, MAX_FILE_SEEK_MS) / 1000
+        : null;
     const expectedBytes = opts.width * opts.height * 3;
     const args = [
       '-hide_banner',
@@ -190,7 +212,8 @@ export class RtspFrameSampler {
       // TCP transport for real RTSP sources: UDP loss produces corrupt
       // frames on typical store networks. Non-RTSP inputs (the dev file
       // affordance) take no transport flag.
-      ...(source.startsWith('rtsp') ? ['-rtsp_transport', 'tcp'] : []),
+      ...(isRtsp ? ['-rtsp_transport', 'tcp'] : []),
+      ...(seekSeconds !== null ? ['-ss', seekSeconds.toFixed(3)] : []),
       '-i',
       source,
       '-frames:v',

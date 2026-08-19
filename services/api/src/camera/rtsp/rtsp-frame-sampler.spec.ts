@@ -392,6 +392,67 @@ describe('RtspFrameSampler', () => {
     expect(JSON.stringify(result)).not.toContain('camera');
   });
 
+  it('FILE-backed sources ADVANCE between samples (Phase 14): seekMs becomes a bounded -ss before the input', async () => {
+    process.env[ENV_KEY] = 'C:/dev/feed.mp4';
+    const sampler = buildSampler();
+    for (const seekMs of [1000, 2500]) {
+      const child = new FakeChild();
+      childProcess.spawn.mockReturnValue(child);
+      const pending = sampler.sampleFrame(TENANT, SLOT, {
+        width: 4,
+        height: 4,
+        timeoutMs: 2000,
+        seekMs,
+      });
+      child.emit('close', 1);
+      await pending;
+    }
+    const argLists = childProcess.spawn.mock.calls.map(
+      (call) => call[1] as string[],
+    );
+    expect(argLists).toHaveLength(2);
+    // Two successive samples carry DIFFERENT seek offsets — never the
+    // same frame-zero grab twice.
+    expect(argLists[0]).toContain('-ss');
+    expect(argLists[0][argLists[0].indexOf('-ss') + 1]).toBe('1.000');
+    expect(argLists[1][argLists[1].indexOf('-ss') + 1]).toBe('2.500');
+    // The seek precedes the input (input-level seek).
+    expect(argLists[0].indexOf('-ss')).toBeLessThan(argLists[0].indexOf('-i'));
+  });
+
+  it('seekMs is IGNORED for RTSP sources (a live stream has no seekable timeline) and bounded for files', async () => {
+    process.env[ENV_KEY] = 'rtsp' + '://' + 'cam-host/live';
+    const sampler = buildSampler();
+    const child = new FakeChild();
+    childProcess.spawn.mockReturnValue(child);
+    const pending = sampler.sampleFrame(TENANT, SLOT, {
+      width: 4,
+      height: 4,
+      timeoutMs: 2000,
+      seekMs: 5000,
+    });
+    child.emit('close', 1);
+    await pending;
+    expect(
+      (childProcess.spawn.mock.calls[0][1] as string[]).includes('-ss'),
+    ).toBe(false);
+    jest.clearAllMocks();
+    // File seek is clamped to the live-session bound.
+    process.env[ENV_KEY] = 'C:/dev/feed.mp4';
+    const child2 = new FakeChild();
+    childProcess.spawn.mockReturnValue(child2);
+    const pending2 = sampler.sampleFrame(TENANT, SLOT, {
+      width: 4,
+      height: 4,
+      timeoutMs: 2000,
+      seekMs: 99_999_999,
+    });
+    child2.emit('close', 1);
+    await pending2;
+    const args = childProcess.spawn.mock.calls[0][1] as string[];
+    expect(args[args.indexOf('-ss') + 1]).toBe('900.000');
+  });
+
   it('exports exactly the controlled error-code vocabulary', () => {
     expect([...RTSP_SAMPLE_ERROR_CODES].sort()).toEqual(
       [
