@@ -742,7 +742,14 @@ export class LiveSessionService {
   async start(
     tenantId: string,
     cameraSourceId: string,
-    input: { frameIntervalMs?: number | null },
+    input: {
+      frameIntervalMs?: number | null;
+      /** INTERNAL (pilot runner only, never DTO-reachable): hard frame
+       *  budget enforced INSIDE the sampling loop — the loop requests
+       *  its own stop the moment this many frames have been persisted,
+       *  so a polling cadence can never overshoot the budget. */
+      pilotFrameBudget?: number | null;
+    },
     actorId?: string,
   ): Promise<LiveSessionDetail> {
     const source = await this.sources.requireSource(tenantId, cameraSourceId);
@@ -823,6 +830,13 @@ export class LiveSessionService {
           leaseOwner,
           heartbeatAt: this.now(),
           createdById: actorId ?? null,
+          // Phase 14 (Codex P2): fast mode is a fact about THIS session,
+          // stamped at creation — never inferred later from the current
+          // environment (a legacy row without the stamp reads UNKNOWN).
+          performance: {
+            fastMode: this.liveFastMode(),
+            stages: {},
+          } as unknown as Prisma.InputJsonValue,
         },
       });
     } catch (error) {
@@ -975,6 +989,7 @@ export class LiveSessionService {
         journeyId,
         frameIntervalMs,
         startedAt: session.startedAt,
+        frameBudget: input.pilotFrameBudget ?? null,
       },
       actorId,
     ).catch((error) => {
@@ -1156,6 +1171,8 @@ export class LiveSessionService {
       journeyId: string | null;
       frameIntervalMs: number;
       startedAt: Date;
+      /** Pilot frame budget (null = unbounded normal session). */
+      frameBudget: number | null;
     },
     actorId?: string,
   ): Promise<void> {
@@ -1374,9 +1391,6 @@ export class LiveSessionService {
       processedUpToMs = window.endMs;
       counters.eventWindowsDetected += 1;
       processedWindows.push(window);
-      // event-to-review latency: window close → fusion + journey import
-      // (review markers/results included) complete.
-      const reviewStart = Date.now();
       await this.processWindow(
         tenantId,
         sessionId,
@@ -1392,7 +1406,16 @@ export class LiveSessionService {
         );
         await recordWindowFailure();
       });
-      perfSample('eventToReview', Date.now() - reviewStart);
+      // event-to-review latency (Codex P1): measured from the WINDOW
+      // CLOSE INSTANT (startedAt + endMs) to review-result completion —
+      // including the quiet-sample confirmation delay before the window
+      // was even detected, which is real pilot latency. Clamped at 0
+      // against clock skew. Uses now() so the whole subtraction shares
+      // one clock.
+      perfSample(
+        'eventToReview',
+        Math.max(0, this.now().getTime() - (startedAtMs + window.endMs)),
+      );
       await persist();
     };
 
@@ -1414,6 +1437,15 @@ export class LiveSessionService {
           // land before this loop may ever finalize normally.
           await retryUnpersistedIntent();
         }
+        // PILOT FRAME BUDGET (Codex P2): checked BEFORE scheduling the
+        // next sample — a budget of N never samples frame N+1, no matter
+        // how coarse any external polling is.
+        if (
+          context.frameBudget !== null &&
+          counters.framesSampled >= context.frameBudget
+        ) {
+          break;
+        }
         const sampleStart = Date.now();
         const sampled = await this.sampler.sampleFrame(
           tenantId,
@@ -1422,6 +1454,11 @@ export class LiveSessionService {
             width: LIVE_ANALYSIS_GEOMETRY.width,
             height: LIVE_ANALYSIS_GEOMETRY.height,
             timeoutMs: Math.min(context.frameIntervalMs * 2, 10_000),
+            // Phase 14 (Codex P1): FILE-BACKED dev sources must advance
+            // through the video — a per-sample seek position keyed to
+            // the sampling timeline. RTSP sources ignore this (a live
+            // stream has no seekable timeline).
+            seekMs: frameIndex * context.frameIntervalMs,
           },
         );
         perfSample('frameSample', Date.now() - sampleStart);
@@ -1477,6 +1514,14 @@ export class LiveSessionService {
           }
         }
         if (controller.stopRequested || leaseLost) {
+          break;
+        }
+        // Budget met exactly at this frame: break NOW (skipping the idle
+        // sleep) — the closed-window pass for this frame already ran.
+        if (
+          context.frameBudget !== null &&
+          counters.framesSampled >= context.frameBudget
+        ) {
           break;
         }
         await this.sleep(context.frameIntervalMs);
@@ -1732,19 +1777,26 @@ export class LiveSessionService {
           rgb: frame.rgb,
         },
       }));
+    // Timed in FINALLY (Codex P2): a fusion run that fails after a long
+    // stall must still land in the stage stats — hiding slow failures
+    // would understate p95/slowestStage exactly when it matters most.
     const fusionStart = Date.now();
-    const { runId } = await this.fusion.runLiveWindow(tenantId, {
-      liveSessionId: sessionId,
-      locationId: context.locationId,
-      unitId: context.unitId,
-      frames,
-      window: {
-        startMs: window.startMs,
-        endMs: window.endMs,
-        peakMs: window.peakMs,
-      },
-    });
-    perfSample?.('fusion', Date.now() - fusionStart);
+    let runId: string;
+    try {
+      ({ runId } = await this.fusion.runLiveWindow(tenantId, {
+        liveSessionId: sessionId,
+        locationId: context.locationId,
+        unitId: context.unitId,
+        frames,
+        window: {
+          startMs: window.startMs,
+          endMs: window.endMs,
+          peakMs: window.peakMs,
+        },
+      }));
+    } finally {
+      perfSample?.('fusion', Date.now() - fusionStart);
+    }
     counters.fusionRunsCompleted += 1;
     const runRow = await this.prisma.pickupFusionRun.findFirst({
       where: { tenantId, id: runId },
@@ -1777,17 +1829,24 @@ export class LiveSessionService {
     }
     if (context.journeyId) {
       const importStart = Date.now();
-      const detail = await this.journeys.appendFromLiveFusionRun(
-        tenantId,
-        context.journeyId,
-        runId,
-        actorId,
-        {
-          sourceTimeBase: context.startedAt,
-          fallbackPeakMs: window.peakMs,
-        },
-      );
-      perfSample?.('journeyImport', Date.now() - importStart);
+      let detail: Awaited<
+        ReturnType<JourneyService['appendFromLiveFusionRun']>
+      >;
+      try {
+        detail = await this.journeys.appendFromLiveFusionRun(
+          tenantId,
+          context.journeyId,
+          runId,
+          actorId,
+          {
+            sourceTimeBase: context.startedAt,
+            fallbackPeakMs: window.peakMs,
+          },
+        );
+      } finally {
+        // Failed imports count too (Codex P2) — see the fusion note.
+        perfSample?.('journeyImport', Date.now() - importStart);
+      }
       counters.journeyEventsCreated = detail.events.filter(
         (event) => event.sourceType === 'LIVE_SHADOW',
       ).length;
@@ -2221,7 +2280,11 @@ export class LiveSessionService {
       sessionId: session.id,
       status: session.status,
       decision: session.decision,
-      fastMode: snapshot?.fastMode ?? this.liveFastMode(),
+      // Fast mode is a stamped fact about the SESSION (written at
+      // creation). A legacy row without the stamp is UNKNOWN (null) —
+      // never inferred from the CURRENT environment, which may have
+      // changed since the session ran (Codex P2).
+      fastMode: snapshot?.fastMode ?? null,
       vlmInvoked: session.vlmInvoked > 0,
       frameIntervalMs: session.frameIntervalMs,
       framesSampled: session.framesSampled,
@@ -2282,35 +2345,88 @@ export class LiveSessionService {
     // long-running session (the 15-minute session bound still backstops).
     const maxFrames = Math.max(1, Math.min(input.maxFrames ?? 30, 300));
     const maxSeconds = Math.max(1, Math.min(input.maxSeconds ?? 60, 120));
+    // OWNERSHIP PRE-CHECK (Codex P2): start() is idempotent-safe and can
+    // hand back an EXISTING active session — one an operator or another
+    // pilot owns. A pilot may only ever stop a session it created, so an
+    // already-active source refuses up front with a controlled conflict.
+    const pilotStartedAt = this.now();
+    const preExisting = await this.prisma.liveCameraSession.findFirst({
+      where: {
+        tenantId,
+        cameraSourceId,
+        status: { in: NON_TERMINAL_SESSION_STATUSES },
+      },
+      select: { id: true },
+    });
+    if (preExisting) {
+      throw new ConflictException(
+        'camera source already has an active live session ' +
+          '(LIVE_PILOT_SESSION_ALREADY_ACTIVE)',
+      );
+    }
     const startedAtMs = Date.now();
     const started = await this.start(
       tenantId,
       cameraSourceId,
-      { frameIntervalMs: input.frameIntervalMs },
+      {
+        frameIntervalMs: input.frameIntervalMs,
+        // Enforced INSIDE the sampling loop (Codex P2): the loop stops
+        // itself at the budget — polling cadence can never overshoot.
+        pilotFrameBudget: maxFrames,
+      },
       actorId,
     );
     const sessionId = started.sessionId;
-    // Poll until the frame budget or the time budget is reached, or the
-    // session left RUNNING on its own (error / auto-stop / remote stop).
-    let current = started;
-    while (
-      current.status === LiveCameraSessionStatus.RUNNING ||
-      current.status === LiveCameraSessionStatus.STARTING
-    ) {
-      if (
-        current.framesSampled >= maxFrames ||
-        Date.now() - startedAtMs >= maxSeconds * 1000
-      ) {
-        break;
-      }
-      await this.sleep(this.pilotPollMs());
-      current = await this.byId(tenantId, sessionId);
+    // RACE BACKSTOP: a session that PRE-DATES this pilot call slipped in
+    // between the pre-check and start() (idempotent return) — it is NOT
+    // ours; refuse without touching it. (The residual same-instant race
+    // is closed by stop() being idempotent-safe and the frame budget
+    // living inside the loop, not in this runner.)
+    if (started.startedAt.getTime() < pilotStartedAt.getTime()) {
+      throw new ConflictException(
+        'camera source already has an active live session ' +
+          '(LIVE_PILOT_SESSION_ALREADY_ACTIVE)',
+      );
     }
-    let stopped = await this.stop(tenantId, sessionId, actorId);
-    if (stopped.status === LiveCameraSessionStatus.STOPPING) {
-      // One retry for a parked finalization — the pilot summary should
-      // reflect a settled session when possible.
+    // From here the session is PILOT-OWNED: whatever happens during
+    // polling, the finally below guarantees a stop request — a failed
+    // poll must never leave the sampler running to the 15-minute cap
+    // (Codex P2).
+    let stopped: LiveSessionDetail | null = null;
+    try {
+      let current = started;
+      while (
+        current.status === LiveCameraSessionStatus.RUNNING ||
+        current.status === LiveCameraSessionStatus.STARTING
+      ) {
+        if (
+          current.framesSampled >= maxFrames ||
+          Date.now() - startedAtMs >= maxSeconds * 1000
+        ) {
+          break;
+        }
+        await this.sleep(this.pilotPollMs());
+        current = await this.byId(tenantId, sessionId);
+      }
       stopped = await this.stop(tenantId, sessionId, actorId);
+      if (stopped.status === LiveCameraSessionStatus.STOPPING) {
+        // One retry for a parked finalization — the pilot summary should
+        // reflect a settled session when possible.
+        stopped = await this.stop(tenantId, sessionId, actorId);
+      }
+    } finally {
+      if (stopped === null) {
+        // The runner failed after start — stop the OWNED session now.
+        // Best-effort with a controlled log: the original error is the
+        // one that propagates; a cleanup failure leaves the session to
+        // the normal stop/stale-reclaim lifecycle.
+        await this.stop(tenantId, sessionId, actorId).catch((error) => {
+          this.logger.error(
+            `pilot session ${sessionId} cleanup stop failed ` +
+              `(${classifyError(error)}) — normal stop/reclaim applies`,
+          );
+        });
+      }
     }
     const report = await this.performance(tenantId, sessionId);
     const eventToReview = report.timings['eventToReview'] ?? null;

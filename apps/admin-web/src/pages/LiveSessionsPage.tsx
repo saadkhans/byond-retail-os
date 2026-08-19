@@ -246,10 +246,14 @@ export function LiveSessionDetailPage() {
           {perf.data ? (
             <>
               <p className="muted">
-                {perf.data.fastMode ? (
+                {perf.data.fastMode === true ? (
                   <span className="badge ok">FAST MODE</span>
-                ) : (
+                ) : perf.data.fastMode === false ? (
                   <span className="badge">standard mode</span>
+                ) : (
+                  // Legacy session recorded before the fast-mode stamp —
+                  // never labeled from the CURRENT config.
+                  <span className="badge">mode unknown (legacy)</span>
                 )}{' '}
                 {perf.data.vlmInvoked ? 'VLM invoked' : 'VLM skipped'}
                 {perf.data.slowestStage
@@ -292,6 +296,9 @@ export function LiveSessionDetailPage() {
                 <p className="muted">No timing samples yet.</p>
               )}
             </>
+          ) : perf.error ? (
+            // Controlled message only — never the raw error payload.
+            <p className="muted">Performance report unavailable.</p>
           ) : (
             <p className="muted">Performance report loading…</p>
           )}

@@ -1286,7 +1286,9 @@ export interface LiveSessionPerformance {
   sessionId: string;
   status: LiveSessionStatus;
   decision: JourneyDecision | null;
-  fastMode: boolean;
+  /** Stamped at session creation; null = legacy session recorded before
+   *  the stamp existed (never inferred from current config). */
+  fastMode: boolean | null;
   vlmInvoked: boolean;
   frameIntervalMs: number;
   framesSampled: number;
