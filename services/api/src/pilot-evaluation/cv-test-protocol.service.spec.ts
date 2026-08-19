@@ -773,7 +773,9 @@ describe('CvTestProtocolService — Codex round 2 (relink guard, relative paths,
     // Ordinary prose — including natural slash pairs — still passes.
     const created = await harness.service.createProtocol(TENANT, {
       name: 'ok',
-      description: 'test low light pickup near shelf, note pass/fail per item',
+      // NOTE: compact slash tokens (even "pass/fail") are rejected by
+      // the no-path contract — prose must spell them out.
+      description: 'test low light pickup near shelf, note pass or fail per item',
     });
     expect(created.protocolId).toBeTruthy();
   });
@@ -812,6 +814,83 @@ describe('CvTestProtocolService — Codex round 2 (relink guard, relative paths,
     // lock inside a transaction — the serialization primitive is pinned.
     expect(harness.prisma.$transaction).toHaveBeenCalled();
     expect(harness.prisma.$queryRaw).toHaveBeenCalled();
+  });
+
+  it('EVERY bare slash token is rejected — no length or character heuristics (Codex P1 round 3)', async () => {
+    const harness = buildHarness();
+    const cases = [
+      'feeds/camera',
+      'media/input',
+      'recordings/session',
+      'feeds\\camera',
+      'check clips/a then continue',
+    ];
+    for (const value of cases) {
+      const error = await harness.service
+        .createProtocol(TENANT, { name: 'ok', description: value })
+        .then(() => null)
+        .catch((err: Error) => err);
+      expect(error).toBeInstanceOf(BadRequestException);
+      expect(error!.message).not.toContain('feeds');
+      expect(error!.message).not.toContain('media');
+      expect(error!.message).not.toContain('clips');
+    }
+    expect(harness.protocols).toHaveLength(0);
+    // A slash-free sentence still passes.
+    const created = await harness.service.createProtocol(TENANT, {
+      name: 'ok',
+      description: 'test low light pickup near shelf',
+    });
+    expect(created.protocolId).toBeTruthy();
+  });
+
+  it('a relink COMMITTED before recordScenarioResult acquires the lock invalidates the old-run session (Codex P1 round 3)', async () => {
+    const harness = buildHarness();
+    const created = await harness.service.createProtocol(TENANT, {
+      name: 'p',
+      evaluationRunId: 'run-1',
+    });
+    const detail = await harness.service.addScenario(TENANT, created.protocolId, {
+      scenarioType: CvTestScenarioType.SINGLE_PICKUP,
+      expectedAction: PilotExpectedAction.PICKUP,
+    });
+    // The result recording validates the session INSIDE the lock against
+    // the protocol's CURRENT run. Simulate the race Codex described: a
+    // relink to run-2 wins the lock first and commits while this result
+    // call is still on its way in — the in-lock re-read then sees run-2,
+    // and live-1 (attached only to run-1) must be refused.
+    const original =
+      harness.prisma.cvTestProtocol.findFirst.getMockImplementation() as (
+        args: unknown,
+      ) => Promise<Record<string, unknown> | null>;
+    let flipped = false;
+    harness.prisma.cvTestProtocol.findFirst.mockImplementation(
+      async (args: unknown) => {
+        const row = await original(args);
+        if (row && !flipped) {
+          flipped = true;
+          // The concurrent relink committed run-2 just before our lock
+          // acquisition succeeded.
+          harness.protocols[0].evaluationRunId = 'run-2';
+          return { ...row, evaluationRunId: 'run-2' };
+        }
+        return row;
+      },
+    );
+    await expect(
+      harness.service.recordScenarioResult(
+        TENANT,
+        created.protocolId,
+        detail.scenarios[0].scenarioId,
+        { result: CvTestScenarioResult.PASS, liveSessionId: 'live-1' },
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+    // No stale evidence persisted: the scenario has no result and no
+    // session binding from the OLD run.
+    expect(harness.scenarios[0].result).toBeNull();
+    expect(harness.scenarios[0].liveSessionId).toBeNull();
+    // The completion gate therefore cannot trust stale evidence either:
+    // the scenario is unresolved.
   });
 
   it('UNKNOWN_PRODUCT accepts UNKNOWN/PICKUP/RETURN and rejects NO_OP (Codex P2)', async () => {

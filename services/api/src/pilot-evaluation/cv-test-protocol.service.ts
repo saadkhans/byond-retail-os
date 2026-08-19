@@ -9,6 +9,7 @@ import {
   CvTestScenarioResult,
   CvTestScenarioType,
   PilotExpectedAction,
+  Prisma,
 } from '@prisma/client';
 import { cvTestProtocolAdvisoryLockKey } from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
@@ -38,40 +39,26 @@ import {
  * and obvious media filenames. Exported for direct testing.
  */
 export function containsSourceOrPathText(value: string): boolean {
-  if (
+  return (
     // Any URI scheme (stream, http, file, s3, …) — scheme-agnostic.
     /[a-z][a-z0-9+.-]*:\/\//i.test(value) ||
     // Windows drive path (C:\… or C:/…).
     /\b[a-z]:[\\/]/i.test(value) ||
-    // Any backslash separator (UNC and relative Windows paths alike —
-    // backslashes have no place in operator prose).
+    // Any backslash separator (UNC, drive-less, and relative Windows
+    // paths alike — backslashes have no place in operator prose).
     /\\/.test(value) ||
     // Absolute Unix path at start or after whitespace/punctuation.
     /(?:^|[\s"'(=])\/(?:[\w.-]+\/)*[\w.-]+/.test(value) ||
     // Relative / home-relative prefixes (./x, ../x, ~/x).
     /(?:^|[\s"'(=])(?:\.{1,2}|~)\//.test(value) ||
     // Obvious media/stream filenames anywhere.
-    /\.(mp4|mov|avi|mkv|webm|m3u8|mts|png|jpe?g|bmp|gif)\b/i.test(value)
-  ) {
-    return true;
-  }
-  // Bare slash-separated segments (recordings/session, feeds/cam-a,
-  // clips/test-1). Prose pairs like "pass/fail" or "pickup/return" are
-  // allowed: a pair is PATH-LIKE when any segment carries a digit,
-  // hyphen, underscore, or dot, when there are 2+ separators, or when a
-  // segment is long enough (≥8 chars) to read as a directory name.
-  for (const match of value.matchAll(/([\w.-]+)((?:\/[\w.-]+)+)/g)) {
-    const segments = [match[1], ...match[2].split('/').slice(1)];
-    const pathLike =
-      segments.length > 2 ||
-      segments.some(
-        (segment) => /[\d_.-]/.test(segment) || segment.length >= 8,
-      );
-    if (pathLike) {
-      return true;
-    }
-  }
-  return false;
+    /\.(mp4|mov|avi|mkv|webm|m3u8|mts|png|jpe?g|bmp|gif)\b/i.test(value) ||
+    // EVERY compact slash-separated token (feeds/camera, media/input,
+    // recordings/session, a/b/c). No length/character heuristics
+    // (Codex P1): this module's no-source/no-path contract outweighs
+    // prose pairs — write "pass or fail", not "pass/fail".
+    /[\w.-]+\/[\w.-]+/.test(value)
+  );
 }
 
 /** Free-text fields (name/description/notes) are screened with the
@@ -138,6 +125,27 @@ export class CvTestProtocolService {
     private readonly prisma: PrismaService,
     private readonly evaluations: PilotEvaluationService,
   ) {}
+
+  /**
+   * ONE serialization boundary for every mutation that can affect
+   * evidence validity (Codex P1): scenario insertion, result recording,
+   * evaluation-run relinking, and the completion evidence check all run
+   * under the SAME protocol-scoped advisory lock, and every decision is
+   * made from IN-TRANSACTION re-reads — never pre-lock snapshots.
+   */
+  private withProtocolLock<T>(
+    tenantId: string,
+    protocolId: string,
+    work: (tx: Prisma.TransactionClient) => Promise<T>,
+  ): Promise<T> {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${cvTestProtocolAdvisoryLockKey(
+        tenantId,
+        protocolId,
+      )}))::text`;
+      return work(tx);
+    });
+  }
 
   async createProtocol(
     tenantId: string,
@@ -298,11 +306,10 @@ export class CvTestProtocolService {
     // take the same lock, so completion can never miss a concurrently
     // added pending scenario and a completed protocol can never gain
     // one.
-    const updated = await this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${cvTestProtocolAdvisoryLockKey(
-        tenantId,
-        protocolId,
-      )}))::text`;
+    const updated = await this.withProtocolLock(
+      tenantId,
+      protocolId,
+      async (tx) => {
       if (status === CvTestProtocolStatus.COMPLETED) {
         // COMPLETION GATE (Codex P1): a terminal protocol can never be
         // reopened, so completing without full evidence would strand
@@ -365,7 +372,8 @@ export class CvTestProtocolService {
           ...(terminal ? { completedAt: new Date() } : {}),
         },
       });
-    });
+      },
+    );
     if (updated.count === 0) {
       const protocol = await this.requireProtocol(tenantId, protocolId);
       throw new ConflictException(
@@ -386,34 +394,44 @@ export class CvTestProtocolService {
     evaluationRunId: string,
   ) {
     await this.requireEvaluationRun(tenantId, evaluationRunId);
-    const current = await this.requireProtocol(tenantId, protocolId);
-    if (current.evaluationRunId === evaluationRunId) {
-      // Idempotent re-link to the SAME run — nothing changes.
-      return this.protocolDetail(tenantId, protocolId);
-    }
-    const recorded = await this.prisma.cvTestProtocolScenario.count({
-      where: { tenantId, protocolId, result: { not: null } },
+    // Every decision below is made from IN-LOCK re-reads (Codex P1): a
+    // result recording holds the same lock, so relink can never observe
+    // "no results yet" while a result from the OLD run is mid-commit.
+    await this.withProtocolLock(tenantId, protocolId, async (tx) => {
+      const current = await tx.cvTestProtocol.findFirst({
+        where: { id: protocolId, tenantId },
+        select: { status: true, evaluationRunId: true },
+      });
+      if (!current) {
+        throw new NotFoundException('Test protocol not found');
+      }
+      if (current.evaluationRunId === evaluationRunId) {
+        // Idempotent re-link to the SAME run — nothing changes.
+        return;
+      }
+      if (!NON_TERMINAL_PROTOCOL_STATUSES.includes(current.status)) {
+        throw new ConflictException(
+          `test protocol is ${current.status} — evaluation run cannot change`,
+        );
+      }
+      const recorded = await tx.cvTestProtocolScenario.count({
+        where: { tenantId, protocolId, result: { not: null } },
+      });
+      if (recorded > 0) {
+        throw new ConflictException(
+          'scenario results already recorded against the linked run — ' +
+            'relinking is not allowed (CV_TEST_PROTOCOL_RESULTS_EXIST)',
+        );
+      }
+      await tx.cvTestProtocol.updateMany({
+        where: {
+          id: protocolId,
+          tenantId,
+          status: { in: NON_TERMINAL_PROTOCOL_STATUSES },
+        },
+        data: { evaluationRunId },
+      });
     });
-    if (recorded > 0) {
-      throw new ConflictException(
-        'scenario results already recorded against the linked run — ' +
-          'relinking is not allowed (CV_TEST_PROTOCOL_RESULTS_EXIST)',
-      );
-    }
-    const updated = await this.prisma.cvTestProtocol.updateMany({
-      where: {
-        id: protocolId,
-        tenantId,
-        status: { in: NON_TERMINAL_PROTOCOL_STATUSES },
-      },
-      data: { evaluationRunId },
-    });
-    if (updated.count === 0) {
-      const protocol = await this.requireProtocol(tenantId, protocolId);
-      throw new ConflictException(
-        `test protocol is ${protocol.status} — evaluation run cannot change`,
-      );
-    }
     return this.protocolDetail(tenantId, protocolId);
   }
 
@@ -478,11 +496,7 @@ export class CvTestProtocolService {
     // — a completion committing concurrently either sees this scenario
     // in its evidence query or this insert sees the terminal status and
     // refuses. No COMPLETED protocol can gain a pending scenario.
-    await this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${cvTestProtocolAdvisoryLockKey(
-        tenantId,
-        protocolId,
-      )}))::text`;
+    await this.withProtocolLock(tenantId, protocolId, async (tx) => {
       const current = await tx.cvTestProtocol.findFirst({
         where: { id: protocolId, tenantId },
         select: { status: true },
@@ -528,60 +542,62 @@ export class CvTestProtocolService {
     },
     actorId?: string,
   ) {
-    const protocol = await this.requireProtocol(tenantId, protocolId);
-    if (!NON_TERMINAL_PROTOCOL_STATUSES.includes(protocol.status)) {
-      throw new ConflictException('test protocol is not open for results');
-    }
-    if (!protocol.evaluationRunId) {
-      throw new ConflictException(
-        'link an evaluation run before recording scenario results',
-      );
-    }
     if (!input.liveSessionId) {
       throw new BadRequestException(
         'liveSessionId is required — a result must name the evaluated session',
       );
     }
+    const liveSessionId = input.liveSessionId;
     const resultNotes = screenText('resultNotes', input.resultNotes);
-    const attached = await this.prisma.pilotEvaluationSession.findFirst({
-      where: {
-        tenantId,
-        evaluationRunId: protocol.evaluationRunId,
-        liveSessionId: input.liveSessionId,
+    // ALL run/session validation happens INSIDE the protocol lock
+    // (Codex P1): a concurrent relink holds the same lock, so the
+    // session is always validated against the run the protocol is
+    // linked to AT COMMIT TIME — evidence from a previously linked run
+    // can never slip through.
+    const updated = await this.withProtocolLock(
+      tenantId,
+      protocolId,
+      async (tx) => {
+        const current = await tx.cvTestProtocol.findFirst({
+          where: { id: protocolId, tenantId },
+          select: { status: true, evaluationRunId: true },
+        });
+        if (!current) {
+          throw new NotFoundException('Test protocol not found');
+        }
+        if (!NON_TERMINAL_PROTOCOL_STATUSES.includes(current.status)) {
+          throw new ConflictException('test protocol is not open for results');
+        }
+        if (!current.evaluationRunId) {
+          throw new ConflictException(
+            'link an evaluation run before recording scenario results',
+          );
+        }
+        const attached = await tx.pilotEvaluationSession.findFirst({
+          where: {
+            tenantId,
+            evaluationRunId: current.evaluationRunId,
+            liveSessionId,
+          },
+          select: { id: true },
+        });
+        if (!attached) {
+          throw new ConflictException(
+            'live session is not attached to this protocol’s evaluation run',
+          );
+        }
+        return tx.cvTestProtocolScenario.updateMany({
+          where: { id: scenarioId, tenantId, protocolId },
+          data: {
+            result: input.result,
+            resultNotes,
+            liveSessionId,
+            resultById: actorId ?? null,
+            resultAt: new Date(),
+          },
+        });
       },
-      select: { id: true },
-    });
-    if (!attached) {
-      throw new ConflictException(
-        'live session is not attached to this protocol’s evaluation run',
-      );
-    }
-    const updated = await this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${cvTestProtocolAdvisoryLockKey(
-        tenantId,
-        protocolId,
-      )}))::text`;
-      const current = await tx.cvTestProtocol.findFirst({
-        where: { id: protocolId, tenantId },
-        select: { status: true },
-      });
-      if (
-        !current ||
-        !NON_TERMINAL_PROTOCOL_STATUSES.includes(current.status)
-      ) {
-        throw new ConflictException('test protocol is not open for results');
-      }
-      return tx.cvTestProtocolScenario.updateMany({
-        where: { id: scenarioId, tenantId, protocolId },
-        data: {
-          result: input.result,
-          resultNotes,
-          liveSessionId: input.liveSessionId,
-          resultById: actorId ?? null,
-          resultAt: new Date(),
-        },
-      });
-    });
+    );
     if (updated.count === 0) {
       throw new NotFoundException('Scenario not found');
     }
