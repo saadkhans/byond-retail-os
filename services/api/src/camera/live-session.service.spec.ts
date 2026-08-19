@@ -2937,6 +2937,58 @@ describe('LiveSessionService — atomic pilot ownership + time budget (Codex rou
     expect(harness.journeys.abortShadowJourney).not.toHaveBeenCalled();
   });
 
+  it('a STALE operator session is REFUSED before any reclaim — never marked STOPPING, never finalized (Codex P1)', async () => {
+    const staleOperator = {
+      id: 'live-stale-op',
+      tenantId: TENANT,
+      cameraSourceId: 'cam-1',
+      status: LiveCameraSessionStatus.RUNNING,
+      journeyId: 'journey-op',
+      leaseOwner: 'operator-process',
+      errorCode: null,
+      startedAt: new Date('2026-08-17T09:00:00.000Z'),
+      // Heartbeat far past the 5-minute stale cutoff at the virtual
+      // clock start — a NORMAL start would reclaim this row.
+      heartbeatAt: new Date('2026-08-17T09:30:00.000Z'),
+      eventWindows: [],
+    };
+    const harness = buildHarness({
+      env: { CV_LIVE_PILOT_RUNNER_ENABLED: 'true' },
+      existingSession: { ...staleOperator },
+    });
+    await expect(
+      harness.service.runPilotTest(TENANT, 'cam-1', {}, 'user-1'),
+    ).rejects.toThrow(/LIVE_PILOT_SESSION_ALREADY_ACTIVE/);
+    // The stale session is UNTOUCHED: same status, same owner, no
+    // reclaim stamp, journey never closed, no intents recorded.
+    const row = harness.sessions[0];
+    expect(row.status).toBe(LiveCameraSessionStatus.RUNNING);
+    expect(row.leaseOwner).toBe('operator-process');
+    expect(row.errorCode).toBeNull();
+    expect(row.finalizationMode).toBeUndefined();
+    expect(harness.journeys.exit).not.toHaveBeenCalled();
+    expect(harness.journeys.abortShadowJourney).not.toHaveBeenCalled();
+    expect(harness.intents).toHaveLength(0);
+    // No pilot session was created either.
+    expect(harness.sessions).toHaveLength(1);
+    // The controlled error carries no source/credential material.
+    await harness.service
+      .runPilotTest(TENANT, 'cam-1', {}, 'user-1')
+      .catch((error: Error) => {
+        expect(error.message).not.toContain('rtsp');
+        expect(error.message).not.toContain('CAMERA_');
+        expect(error.message).not.toContain('://');
+      });
+    // A NORMAL start still reclaims the stale row (existing Phase 13
+    // behavior unchanged): the old session terminalizes and a fresh one
+    // starts.
+    const view = await harness.service.start(TENANT, 'cam-1', {}, 'user-1');
+    expect(view.sessionId).not.toBe('live-stale-op');
+    expect(view.status).toBe(LiveCameraSessionStatus.RUNNING);
+    expect(harness.sessions[0].status).toBe(LiveCameraSessionStatus.ERROR);
+    await harness.service.awaitLoop(view.sessionId);
+  });
+
   it('normal (non-pilot) start keeps its idempotent behavior: an active session is returned, not refused', async () => {
     const harness = buildHarness({
       existingSession: {

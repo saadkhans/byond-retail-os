@@ -804,19 +804,23 @@ export class LiveSessionService {
       include: SOURCE_INCLUDE,
     });
     if (active) {
+      // CREATE-ONLY pilot start (Codex P1): ANY existing non-terminal
+      // session — fresh, stale, local, or remote — refuses BEFORE any
+      // branch below can touch it. A pilot must never stop, reclaim,
+      // finalize, or mutate a pre-existing session in any way; stale
+      // reclaim in particular would mark an unrelated operator session
+      // STOPPING and close its journey. Normal starts keep the full
+      // reclaim behavior unchanged.
+      if (input.requireNewSession) {
+        refuseExisting();
+      }
       if (this.loops.has(active.id)) {
-        if (input.requireNewSession) {
-          refuseExisting();
-        }
         return toDetail(active as SessionWithSource);
       }
       const heartbeatMs = (active.heartbeatAt ?? active.startedAt).getTime();
       if (this.now().getTime() - heartbeatMs < LIVE_SESSION_STALE_MS) {
         // Fresh heartbeat, no LOCAL loop — a loop may live in another
         // process. Conservative: never reclaim a possibly-live session.
-        if (input.requireNewSession) {
-          refuseExisting();
-        }
         return toDetail(active as SessionWithSource);
       }
       const reclaimed = await this.reclaimStaleSession(
@@ -827,10 +831,7 @@ export class LiveSessionService {
       if (!reclaimed) {
         // Lost the reclaim race (a real loop beat us, or another start
         // reclaimed first) or the cleanup parked retryably — the row's
-        // CURRENT state is the answer (a pilot refuses: not its session).
-        if (input.requireNewSession) {
-          refuseExisting();
-        }
+        // CURRENT state is the answer.
         return this.byId(tenantId, active.id);
       }
       // Reclaim complete (terminal, journey closed): fall through to a
