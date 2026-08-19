@@ -60,7 +60,10 @@ ALTER TABLE "CvTestProtocol" ADD CONSTRAINT "CvTestProtocol_cameraSourceId_fkey"
 ALTER TABLE "CvTestProtocol" ADD CONSTRAINT "CvTestProtocol_evaluationRunId_fkey" FOREIGN KEY ("evaluationRunId") REFERENCES "PilotEvaluationRun"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE "CvTestProtocolScenario" ADD CONSTRAINT "CvTestProtocolScenario_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE "CvTestProtocolScenario" ADD CONSTRAINT "CvTestProtocolScenario_protocolId_fkey" FOREIGN KEY ("protocolId") REFERENCES "CvTestProtocol"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
-ALTER TABLE "CvTestProtocolScenario" ADD CONSTRAINT "CvTestProtocolScenario_expectedProductId_fkey" FOREIGN KEY ("expectedProductId") REFERENCES "Product"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+-- Same-tenant composite product relation (Codex P1): the FK itself
+-- carries the tenant, so a scenario can never resolve another tenant's
+-- product.
+ALTER TABLE "CvTestProtocolScenario" ADD CONSTRAINT "CvTestProtocolScenario_expectedProductId_tenantId_fkey" FOREIGN KEY ("expectedProductId", "tenantId") REFERENCES "Product"("id", "tenantId") ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE "CvTestProtocolScenario" ADD CONSTRAINT "CvTestProtocolScenario_liveSessionId_fkey" FOREIGN KEY ("liveSessionId") REFERENCES "LiveCameraSession"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- Same-tenant composite FKs (AGENTS.md: tenancy).

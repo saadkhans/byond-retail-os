@@ -113,11 +113,14 @@ export class RecordScenarioResultDto {
   @IsEnum(CvTestScenarioResult)
   result!: CvTestScenarioResult;
 
-  @ApiPropertyOptional({ description: 'Live session id, tenant-scoped' })
-  @IsOptionalNonNull()
+  @ApiProperty({
+    description:
+      'The evaluated live session — REQUIRED and must be attached to the ' +
+      "protocol's linked evaluation run",
+  })
   @IsString()
   @Length(1, 64)
-  liveSessionId?: string;
+  liveSessionId!: string;
 
   @ApiPropertyOptional({ maxLength: 300 })
   @IsOptionalNonNull()

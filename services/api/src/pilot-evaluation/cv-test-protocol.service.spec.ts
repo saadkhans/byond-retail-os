@@ -21,6 +21,8 @@ function buildHarness(
     summary?: Record<string, unknown> | null;
     exportRows?: number;
     sessionPerformance?: ({ fastMode?: boolean } | null)[];
+    /** Linked run's status for the completion gate (default COMPLETED). */
+    runStatus?: string;
   } = {},
 ) {
   let seq = 0;
@@ -143,10 +145,22 @@ function buildHarness(
     },
     pilotEvaluationRun: {
       findFirst: jest.fn(async (args: { where: { id?: string } }) =>
-        args.where.id === 'run-1' ? { id: 'run-1' } : null,
+        args.where.id === 'run-1'
+          ? { id: 'run-1', status: options.runStatus ?? 'COMPLETED' }
+          : null,
       ),
     },
     pilotEvaluationSession: {
+      // live-1 is attached to run-1; nothing else is.
+      findFirst: jest.fn(
+        async (args: {
+          where: { evaluationRunId?: string; liveSessionId?: string };
+        }) =>
+          args.where.evaluationRunId === 'run-1' &&
+          args.where.liveSessionId === 'live-1'
+            ? { id: 'att-1' }
+            : null,
+      ),
       findMany: jest.fn(async () =>
         (options.sessionPerformance ?? []).map((performance, index) => ({
           liveSession: { id: `live-${index + 1}`, performance },
@@ -230,15 +244,29 @@ describe('CvTestProtocolService — protocols', () => {
     expect(harness.protocols).toHaveLength(0);
   });
 
-  it('status transitions: DRAFT→ACTIVE→COMPLETED; no reopening; no DRAFT return', async () => {
+  it('status transitions: DRAFT→ACTIVE→COMPLETED (with evidence); no reopening; no DRAFT return', async () => {
     const harness = buildHarness();
-    const created = await harness.service.createProtocol(TENANT, { name: 'p' });
+    const created = await harness.service.createProtocol(TENANT, {
+      name: 'p',
+      evaluationRunId: 'run-1',
+    });
     const active = await harness.service.setStatus(
       TENANT,
       created.protocolId,
       CvTestProtocolStatus.ACTIVE,
     );
     expect(active.status).toBe(CvTestProtocolStatus.ACTIVE);
+    // Earn completion: one scenario with a session-bound result.
+    const detail = await harness.service.addScenario(TENANT, created.protocolId, {
+      scenarioType: CvTestScenarioType.SINGLE_PICKUP,
+      expectedAction: PilotExpectedAction.PICKUP,
+    });
+    await harness.service.recordScenarioResult(
+      TENANT,
+      created.protocolId,
+      detail.scenarios[0].scenarioId,
+      { result: CvTestScenarioResult.PASS, liveSessionId: 'live-1' },
+    );
     const done = await harness.service.setStatus(
       TENANT,
       created.protocolId,
@@ -348,7 +376,7 @@ describe('CvTestProtocolService — scenarios', () => {
       TENANT,
       protocolId,
       scenarioId,
-      { result: CvTestScenarioResult.PASS },
+      { result: CvTestScenarioResult.PASS, liveSessionId: 'live-1' },
       'operator-1',
     );
     expect(rerecorded.scenarios[0].result).toBe(CvTestScenarioResult.PASS);
@@ -358,6 +386,12 @@ describe('CvTestProtocolService — scenarios', () => {
 
   it('a COMPLETED protocol accepts no more scenarios or results', async () => {
     const { harness, protocolId, detail } = await protocolWithScenario();
+    await harness.service.recordScenarioResult(
+      TENANT,
+      protocolId,
+      detail.scenarios[0].scenarioId,
+      { result: CvTestScenarioResult.PASS, liveSessionId: 'live-1' },
+    );
     await harness.service.setStatus(
       TENANT,
       protocolId,
@@ -374,7 +408,7 @@ describe('CvTestProtocolService — scenarios', () => {
         TENANT,
         protocolId,
         detail.scenarios[0].scenarioId,
-        { result: CvTestScenarioResult.PASS },
+        { result: CvTestScenarioResult.PASS, liveSessionId: 'live-1' },
       ),
     ).rejects.toBeInstanceOf(ConflictException);
   });
@@ -392,22 +426,34 @@ describe('CvTestProtocolService — validation report', () => {
       evaluationRunId: 'run-1',
       fastModeExpected: true,
     });
-    for (const [type, result] of [
-      [CvTestScenarioType.SINGLE_PICKUP, CvTestScenarioResult.PASS],
-      [CvTestScenarioType.SINGLE_RETURN, CvTestScenarioResult.FAIL],
-      [CvTestScenarioType.FALSE_TOUCH_NO_PRODUCT_MOVED, null],
+    for (const [type, action, result] of [
+      [
+        CvTestScenarioType.SINGLE_PICKUP,
+        PilotExpectedAction.PICKUP,
+        CvTestScenarioResult.PASS,
+      ],
+      [
+        CvTestScenarioType.SINGLE_RETURN,
+        PilotExpectedAction.RETURN,
+        CvTestScenarioResult.FAIL,
+      ],
+      [
+        CvTestScenarioType.FALSE_TOUCH_NO_PRODUCT_MOVED,
+        PilotExpectedAction.NO_OP,
+        null,
+      ],
     ] as const) {
       const detail = await harness.service.addScenario(
         TENANT,
         created.protocolId,
-        { scenarioType: type, expectedAction: PilotExpectedAction.PICKUP },
+        { scenarioType: type, expectedAction: action },
       );
       if (result) {
         await harness.service.recordScenarioResult(
           TENANT,
           created.protocolId,
           detail.scenarios[detail.scenarios.length - 1].scenarioId,
-          { result },
+          { result, liveSessionId: 'live-1' },
         );
       }
     }
@@ -458,5 +504,190 @@ describe('CvTestProtocolService — validation report', () => {
     });
     const report = await harness.service.report(TENANT, created.protocolId);
     expect(report.fastModeObserved).toBeNull();
+  });
+});
+
+describe('CvTestProtocolService — Codex round 1 (source screening, binding, gating, consistency)', () => {
+  it('protocol free text REJECTS source URLs, file paths, and media filenames — without echoing them', async () => {
+    const harness = buildHarness();
+    const scheme = 'rtsp' + '://';
+    const cases = [
+      scheme + 'host/path',
+      'rtsps' + '://' + 'host/path',
+      'file' + ':///tmp/camera.mp4',
+      '/home/user/camera.mp4',
+      'C:\\Users\\test\\camera.mp4',
+      '\\\\server\\share\\clip.avi',
+      'see camera.mp4 for footage',
+    ];
+    for (const value of cases) {
+      const error = await harness.service
+        .createProtocol(TENANT, { name: 'ok', description: value })
+        .then(() => null)
+        .catch((err: Error) => err);
+      expect(error).toBeInstanceOf(BadRequestException);
+      // The rejected value is NEVER echoed back.
+      expect(error!.message).not.toContain('camera');
+      expect(error!.message).not.toContain('host/path');
+    }
+    expect(harness.protocols).toHaveLength(0);
+    // Normal human notes still pass.
+    const created = await harness.service.createProtocol(TENANT, {
+      name: 'Water bottle day',
+      description: 'front shelf, second row, morning light',
+    });
+    expect(created.name).toBe('Water bottle day');
+  });
+
+  it('scenario results REQUIRE a session attached to the linked run; no run = controlled conflict', async () => {
+    const harness = buildHarness();
+    const noRun = await harness.service.createProtocol(TENANT, { name: 'p' });
+    const detail = await harness.service.addScenario(TENANT, noRun.protocolId, {
+      scenarioType: CvTestScenarioType.SINGLE_PICKUP,
+      expectedAction: PilotExpectedAction.PICKUP,
+    });
+    // No evaluation run linked → conflict.
+    await expect(
+      harness.service.recordScenarioResult(
+        TENANT,
+        noRun.protocolId,
+        detail.scenarios[0].scenarioId,
+        { result: CvTestScenarioResult.PASS, liveSessionId: 'live-1' },
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+    await harness.service.linkEvaluationRun(TENANT, noRun.protocolId, 'run-1');
+    // Missing session → 400.
+    await expect(
+      harness.service.recordScenarioResult(
+        TENANT,
+        noRun.protocolId,
+        detail.scenarios[0].scenarioId,
+        { result: CvTestScenarioResult.PASS },
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    // Session NOT attached to the linked run → conflict.
+    await expect(
+      harness.service.recordScenarioResult(
+        TENANT,
+        noRun.protocolId,
+        detail.scenarios[0].scenarioId,
+        { result: CvTestScenarioResult.PASS, liveSessionId: 'live-unrelated' },
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+    // Attached session → accepted and bound.
+    const recorded = await harness.service.recordScenarioResult(
+      TENANT,
+      noRun.protocolId,
+      detail.scenarios[0].scenarioId,
+      { result: CvTestScenarioResult.PASS, liveSessionId: 'live-1' },
+    );
+    expect(recorded.scenarios[0].liveSessionId).toBe('live-1');
+  });
+
+  it('COMPLETION GATE: requires linked COMPLETED run, ≥1 scenario, and session-bound results on every scenario', async () => {
+    // No run linked.
+    const bare = buildHarness();
+    const noRun = await bare.service.createProtocol(TENANT, { name: 'p' });
+    await expect(
+      bare.service.setStatus(
+        TENANT,
+        noRun.protocolId,
+        CvTestProtocolStatus.COMPLETED,
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+    // Run linked but still OPEN.
+    const openRun = buildHarness({ runStatus: 'OPEN' });
+    const p2 = await openRun.service.createProtocol(TENANT, {
+      name: 'p',
+      evaluationRunId: 'run-1',
+    });
+    await expect(
+      openRun.service.setStatus(
+        TENANT,
+        p2.protocolId,
+        CvTestProtocolStatus.COMPLETED,
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+    // Run COMPLETED but no scenarios.
+    const noScenarios = buildHarness();
+    const p3 = await noScenarios.service.createProtocol(TENANT, {
+      name: 'p',
+      evaluationRunId: 'run-1',
+    });
+    await expect(
+      noScenarios.service.setStatus(
+        TENANT,
+        p3.protocolId,
+        CvTestProtocolStatus.COMPLETED,
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+    // Scenario pending (no result).
+    const pending = buildHarness();
+    const p4 = await pending.service.createProtocol(TENANT, {
+      name: 'p',
+      evaluationRunId: 'run-1',
+    });
+    const d4 = await pending.service.addScenario(TENANT, p4.protocolId, {
+      scenarioType: CvTestScenarioType.SINGLE_PICKUP,
+      expectedAction: PilotExpectedAction.PICKUP,
+    });
+    await expect(
+      pending.service.setStatus(
+        TENANT,
+        p4.protocolId,
+        CvTestProtocolStatus.COMPLETED,
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+    // Fully resolved → completes.
+    await pending.service.recordScenarioResult(
+      TENANT,
+      p4.protocolId,
+      d4.scenarios[0].scenarioId,
+      { result: CvTestScenarioResult.PASS, liveSessionId: 'live-1' },
+    );
+    const done = await pending.service.setStatus(
+      TENANT,
+      p4.protocolId,
+      CvTestProtocolStatus.COMPLETED,
+    );
+    expect(done.status).toBe(CvTestProtocolStatus.COMPLETED);
+    // CANCELLED needs no evidence (separate path unchanged).
+    const cancel = buildHarness();
+    const p5 = await cancel.service.createProtocol(TENANT, { name: 'p' });
+    const cancelled = await cancel.service.setStatus(
+      TENANT,
+      p5.protocolId,
+      CvTestProtocolStatus.CANCELLED,
+    );
+    expect(cancelled.status).toBe(CvTestProtocolStatus.CANCELLED);
+  });
+
+  it('contradictory scenario expectations are REJECTED for fixed templates; UNKNOWN_PRODUCT stays open', async () => {
+    const harness = buildHarness();
+    const created = await harness.service.createProtocol(TENANT, { name: 'p' });
+    await expect(
+      harness.service.addScenario(TENANT, created.protocolId, {
+        scenarioType: CvTestScenarioType.SINGLE_RETURN,
+        expectedAction: PilotExpectedAction.PICKUP,
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    await expect(
+      harness.service.addScenario(TENANT, created.protocolId, {
+        scenarioType: CvTestScenarioType.FALSE_TOUCH_NO_PRODUCT_MOVED,
+        expectedAction: PilotExpectedAction.PICKUP,
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(harness.scenarios).toHaveLength(0);
+    // Matching fixed actions pass.
+    await harness.service.addScenario(TENANT, created.protocolId, {
+      scenarioType: CvTestScenarioType.FALSE_TOUCH_NO_PRODUCT_MOVED,
+      expectedAction: PilotExpectedAction.NO_OP,
+    });
+    // Open-ended template accepts any action.
+    const open = await harness.service.addScenario(TENANT, created.protocolId, {
+      scenarioType: CvTestScenarioType.UNKNOWN_PRODUCT,
+      expectedAction: PilotExpectedAction.UNKNOWN,
+    });
+    expect(open.scenarios).toHaveLength(2);
   });
 });

@@ -164,8 +164,18 @@ export class CameraSourcesController {
     @CurrentTenantId() tenantId: string,
     @Param('id') id: string,
     @Query('evaluationRunId') evaluationRunId?: string,
+    @Query('fastModeExpected') fastModeExpected?: string,
+    @Query('requirePilotRunner') requirePilotRunner?: string,
   ) {
-    return this.live.liveTestPreflight(tenantId, id, evaluationRunId || null);
+    return this.live.liveTestPreflight(tenantId, id, evaluationRunId || null, {
+      fastModeExpected:
+        fastModeExpected === 'true'
+          ? true
+          : fastModeExpected === 'false'
+            ? false
+            : null,
+      requirePilotRunner: requirePilotRunner === 'true',
+    });
   }
 
   @Post(':id/pilot-test')

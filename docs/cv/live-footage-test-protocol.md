@@ -39,12 +39,16 @@ Before a test run, check readiness (booleans only — no URLs or
 credentials in the response):
 
 ```
-GET /camera-sources/:id/live-test-preflight?evaluationRunId=<optional>
+GET /camera-sources/:id/live-test-preflight?evaluationRunId=<optional>&fastModeExpected=<true|false>&requirePilotRunner=<true>
 ```
 
 `ready: true` means: source exists, is ACTIVE and RTSP_SHADOW, the env
 slot is configured, ffmpeg is available, no live session is already
-active, and the pilot runner is enabled.
+active, and — when stated — the fast-mode expectation matches the
+active mode. The pilot runner flag is informational unless you pass
+`requirePilotRunner=true` (manual live sessions do not need it). The
+protocol detail page runs this preflight with the protocol's own
+fast-mode expectation.
 
 ## 4. Create the test protocol
 

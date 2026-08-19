@@ -1,13 +1,18 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import {
   ApiError,
+  CameraSourceView,
   CvTestProtocolDetail,
   CvTestProtocolReport,
   CvTestProtocolView,
   CvTestScenarioResult,
   CvTestScenarioType,
+  LiveTestPreflight,
+  Paginated,
+  PilotEvaluationDetail,
   PilotExpectedAction,
+  Store,
   api,
 } from '../api';
 import { Page, formatDate, useLoad } from '../components';
@@ -38,6 +43,26 @@ const SCENARIO_TYPES: CvTestScenarioType[] = [
 const ACTIONS: PilotExpectedAction[] = ['PICKUP', 'RETURN', 'NO_OP', 'UNKNOWN'];
 const RESULTS: CvTestScenarioResult[] = ['PASS', 'FAIL', 'INCONCLUSIVE'];
 
+/** Fixed expected actions per template (mirrors the backend rule): the
+ *  select locks to the template's ground truth; only open-ended
+ *  templates stay configurable. */
+const FIXED_ACTIONS: Partial<Record<CvTestScenarioType, PilotExpectedAction>> = {
+  SINGLE_PICKUP: 'PICKUP',
+  MISSED_PICKUP: 'PICKUP',
+  TWO_PRODUCTS_VISIBLE_ONE_PICKED: 'PICKUP',
+  SIMILAR_SKU_CONFUSION: 'PICKUP',
+  MULTI_QUANTITY_PICKUP: 'PICKUP',
+  HAND_OCCLUSION: 'PICKUP',
+  FAST_PICKUP: 'PICKUP',
+  SLOW_PICKUP: 'PICKUP',
+  LOW_LIGHT: 'PICKUP',
+  BAD_ANGLE: 'PICKUP',
+  SINGLE_RETURN: 'RETURN',
+  MISSED_RETURN: 'RETURN',
+  FALSE_TOUCH_NO_PRODUCT_MOVED: 'NO_OP',
+  EMPTY_SHELF: 'NO_OP',
+};
+
 /**
  * Phase 16 — live CV test protocols (SHADOW ONLY). Scripted real-footage
  * scenarios with expected outcomes, wrapped around the Phase 15
@@ -49,10 +74,16 @@ export function CvTestProtocolsPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
+  const [locationId, setLocationId] = useState('');
+  const [cameraSourceId, setCameraSourceId] = useState('');
+  const [fastModeExpected, setFastModeExpected] = useState('');
   const protocols = useLoad<CvTestProtocolView[]>(
     () => api('/cv-test-protocols'),
     [reload],
   );
+  // Store/camera pickers (ids + names only — no source strings).
+  const stores = useLoad<Paginated<Store>>(() => api('/stores?take=50'), []);
+  const cameras = useLoad<CameraSourceView[]>(() => api('/camera-sources'), []);
 
   async function createProtocol() {
     if (!name.trim()) {
@@ -67,10 +98,18 @@ export function CvTestProtocolsPage() {
         body: {
           name: name.trim(),
           ...(description.trim() ? { description: description.trim() } : {}),
+          ...(locationId ? { locationId } : {}),
+          ...(cameraSourceId ? { cameraSourceId } : {}),
+          ...(fastModeExpected
+            ? { fastModeExpected: fastModeExpected === 'on' }
+            : {}),
         },
       });
       setName('');
       setDescription('');
+      setLocationId('');
+      setCameraSourceId('');
+      setFastModeExpected('');
       setReload((n) => n + 1);
     } catch (err) {
       setActionError(errorMessage(err));
@@ -102,6 +141,33 @@ export function CvTestProtocolsPage() {
           value={description}
           onChange={(e) => setDescription(e.target.value)}
         />
+        <select value={locationId} onChange={(e) => setLocationId(e.target.value)}>
+          <option value="">Store (optional)</option>
+          {(stores.data?.items ?? []).map((store) => (
+            <option key={store.id} value={store.id}>
+              {store.name}
+            </option>
+          ))}
+        </select>
+        <select
+          value={cameraSourceId}
+          onChange={(e) => setCameraSourceId(e.target.value)}
+        >
+          <option value="">Camera source (optional)</option>
+          {(cameras.data ?? []).map((camera) => (
+            <option key={camera.id} value={camera.id}>
+              {camera.name}
+            </option>
+          ))}
+        </select>
+        <select
+          value={fastModeExpected}
+          onChange={(e) => setFastModeExpected(e.target.value)}
+        >
+          <option value="">Fast mode: not specified</option>
+          <option value="on">Fast mode: expected ON</option>
+          <option value="off">Fast mode: expected OFF</option>
+        </select>
         <button className="primary" disabled={busy} onClick={() => void createProtocol()}>
           Create protocol
         </button>
@@ -168,6 +234,9 @@ export function CvTestProtocolDetailPage() {
   const [expectedProductId, setExpectedProductId] = useState('');
   const [notes, setNotes] = useState('');
 
+  const [resultSessionId, setResultSessionId] = useState('');
+  const [preflight, setPreflight] = useState<LiveTestPreflight | null>(null);
+
   const detail = useLoad<CvTestProtocolDetail>(
     () => api(`/cv-test-protocols/${id}`),
     [id, tick],
@@ -178,6 +247,56 @@ export function CvTestProtocolDetailPage() {
   );
   const data = detail.data;
   const open = data?.status === 'DRAFT' || data?.status === 'ACTIVE';
+  // Attached sessions of the linked evaluation run — every scenario
+  // result must name one of these.
+  const runDetail = useLoad<PilotEvaluationDetail | null>(
+    () =>
+      data?.evaluationRunId
+        ? api(`/pilot-evaluations/${data.evaluationRunId}`)
+        : Promise.resolve(null),
+    [data?.evaluationRunId, tick],
+  );
+  const attachedSessions = runDetail.data?.sessions ?? [];
+  // Exactly one attached session → default the result binding to it.
+  useEffect(() => {
+    if (attachedSessions.length === 1) {
+      setResultSessionId(attachedSessions[0].liveSessionId);
+    }
+  }, [attachedSessions.length, attachedSessions[0]?.liveSessionId]);
+  // The scenario-type template locks its expected action.
+  const fixedAction = FIXED_ACTIONS[scenarioType];
+  useEffect(() => {
+    if (fixedAction) {
+      setExpectedAction(fixedAction);
+    }
+  }, [fixedAction]);
+
+  async function runPreflight() {
+    if (!data?.cameraSourceId) {
+      return;
+    }
+    setBusy(true);
+    setActionError(null);
+    try {
+      const expected =
+        data.fastModeExpected === null
+          ? ''
+          : `&fastModeExpected=${data.fastModeExpected}`;
+      setPreflight(
+        await api<LiveTestPreflight>(
+          `/camera-sources/${data.cameraSourceId}/live-test-preflight?x=1${expected}${
+            data.evaluationRunId
+              ? `&evaluationRunId=${data.evaluationRunId}`
+              : ''
+          }`,
+        ),
+      );
+    } catch (err) {
+      setActionError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function action(work: () => Promise<unknown>) {
     setBusy(true);
@@ -271,8 +390,35 @@ export function CvTestProtocolDetailPage() {
               <span className="muted">no evaluation run linked · </span>
             )}
             <Link to="/live-sessions">Live sessions →</Link>{' '}
-            <Link to="/review-queue">Review queue →</Link>
+            <Link to="/review-queue">Review queue →</Link>{' '}
+            {data.cameraSourceId ? (
+              <button disabled={busy} onClick={() => void runPreflight()}>
+                Run preflight
+              </button>
+            ) : null}
           </p>
+          {preflight ? (
+            <p className="muted">
+              Preflight:{' '}
+              <span className={`badge ${preflight.ready ? 'ok' : 'down'}`}>
+                {preflight.ready ? 'READY' : 'NOT READY'}
+              </span>{' '}
+              source {preflight.sourceExists ? 'ok' : 'missing'} · active{' '}
+              {preflight.sourceActive ? 'yes' : 'no'} · configured{' '}
+              {preflight.sourceConfigured ? 'yes' : 'no'} · ffmpeg{' '}
+              {preflight.ffmpegAvailable ? 'yes' : 'no'} · free{' '}
+              {preflight.noActiveLiveSession ? 'yes' : 'session active'} ·
+              fast mode {preflight.fastModeActive ? 'ON' : 'OFF'}
+              {preflight.fastModeMatches === false
+                ? ' (MISMATCH with expectation)'
+                : ''}{' '}
+              · pilot runner{' '}
+              {preflight.pilotRunnerEnabled ? 'enabled' : 'disabled (manual ok)'}
+              {preflight.evaluationRunExists === false
+                ? ' · evaluation run missing'
+                : ''}
+            </p>
+          ) : null}
 
           {open ? (
             <div className="form-row">
@@ -299,6 +445,26 @@ export function CvTestProtocolDetailPage() {
 
           <h2>Scenario checklist ({data.scenarios.length})</h2>
           {open ? (
+            <p className="muted">
+              Results are recorded against the evaluated session:{' '}
+              <select
+                value={resultSessionId}
+                onChange={(e) => setResultSessionId(e.target.value)}
+              >
+                <option value="">
+                  {attachedSessions.length === 0
+                    ? 'no sessions attached to the linked run yet'
+                    : 'select session'}
+                </option>
+                {attachedSessions.map((session) => (
+                  <option key={session.liveSessionId} value={session.liveSessionId}>
+                    {session.liveSessionId} ({session.status})
+                  </option>
+                ))}
+              </select>
+            </p>
+          ) : null}
+          {open ? (
             <div className="form-row">
               <select
                 value={scenarioType}
@@ -314,6 +480,12 @@ export function CvTestProtocolDetailPage() {
               </select>
               <select
                 value={expectedAction}
+                disabled={fixedAction !== undefined}
+                title={
+                  fixedAction !== undefined
+                    ? 'Expected action is fixed by the scenario template'
+                    : undefined
+                }
                 onChange={(e) =>
                   setExpectedAction(e.target.value as PilotExpectedAction)
                 }
@@ -403,14 +575,22 @@ export function CvTestProtocolDetailPage() {
                       ? RESULTS.map((result) => (
                           <button
                             key={result}
-                            disabled={busy}
+                            disabled={busy || !resultSessionId}
+                            title={
+                              resultSessionId
+                                ? `Record ${result} for session ${resultSessionId}`
+                                : 'Select the evaluated session first'
+                            }
                             onClick={() =>
                               void action(() =>
                                 api(
                                   `/cv-test-protocols/${id}/scenarios/${scenario.scenarioId}/result`,
                                   {
                                     method: 'POST',
-                                    body: { result },
+                                    body: {
+                                      result,
+                                      liveSessionId: resultSessionId,
+                                    },
                                   },
                                 ),
                               )

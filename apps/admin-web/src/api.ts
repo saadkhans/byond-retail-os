@@ -1586,7 +1586,10 @@ export interface LiveTestPreflight {
   ffmpegAvailable: boolean;
   noActiveLiveSession: boolean;
   pilotRunnerEnabled: boolean;
-  fastMode: boolean;
+  fastModeActive: boolean;
+  /** The protocol's expectation (null = none) and whether it matches. */
+  fastModeExpected: boolean | null;
+  fastModeMatches: boolean | null;
   performanceEndpointAvailable: boolean;
   evaluationRunExists: boolean | null;
   ready: boolean;

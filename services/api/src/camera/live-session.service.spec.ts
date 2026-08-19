@@ -3094,7 +3094,9 @@ describe('LiveSessionService — Phase 16 live test preflight', () => {
       ffmpegAvailable: true,
       noActiveLiveSession: true,
       pilotRunnerEnabled: true,
-      fastMode: true,
+      fastModeActive: true,
+      fastModeExpected: null,
+      fastModeMatches: null,
       performanceEndpointAvailable: true,
       evaluationRunExists: true,
       ready: true,
@@ -3150,5 +3152,88 @@ describe('LiveSessionService — Phase 16 live test preflight', () => {
     const preflight = await harness.service.liveTestPreflight(TENANT, 'cam-1');
     expect(preflight.sourceConfigured).toBe(false);
     expect(preflight.ready).toBe(false);
+  });
+});
+
+describe('LiveSessionService — preflight fast-mode expectation + optional pilot runner (Codex round 1)', () => {
+  it('a stated fast-mode expectation must MATCH the active mode for readiness', async () => {
+    // expected true, active false → not ready.
+    const offButExpectedOn = buildHarness({});
+    const mismatch = await offButExpectedOn.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+      null,
+      { fastModeExpected: true },
+    );
+    expect(mismatch.fastModeActive).toBe(false);
+    expect(mismatch.fastModeExpected).toBe(true);
+    expect(mismatch.fastModeMatches).toBe(false);
+    expect(mismatch.ready).toBe(false);
+    // expected false, active true → not ready.
+    const onButExpectedOff = buildHarness({
+      env: { CV_LIVE_FAST_MODE: 'true' },
+    });
+    const mismatch2 = await onButExpectedOff.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+      null,
+      { fastModeExpected: false },
+    );
+    expect(mismatch2.fastModeMatches).toBe(false);
+    expect(mismatch2.ready).toBe(false);
+    // expected true, active true → ready.
+    const match = await onButExpectedOff.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+      null,
+      { fastModeExpected: true },
+    );
+    expect(match.fastModeMatches).toBe(true);
+    expect(match.ready).toBe(true);
+    // expected null → informational only, never a failure.
+    const noExpectation = await offButExpectedOn.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+      null,
+      { fastModeExpected: null },
+    );
+    expect(noExpectation.fastModeMatches).toBeNull();
+    expect(noExpectation.ready).toBe(true);
+  });
+
+  it('the pilot runner is INFORMATIONAL by default and mandatory only under requirePilotRunner', async () => {
+    // Runner disabled + manual workflow → still ready.
+    const manual = buildHarness({});
+    const withoutRunner = await manual.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+    );
+    expect(withoutRunner.pilotRunnerEnabled).toBe(false);
+    expect(withoutRunner.ready).toBe(true);
+    // requirePilotRunner + disabled → not ready.
+    const required = await manual.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+      null,
+      { requirePilotRunner: true },
+    );
+    expect(required.ready).toBe(false);
+    // requirePilotRunner + enabled → ready.
+    const enabled = buildHarness({
+      env: { CV_LIVE_PILOT_RUNNER_ENABLED: 'true' },
+    });
+    const satisfied = await enabled.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+      null,
+      { requirePilotRunner: true },
+    );
+    expect(satisfied.pilotRunnerEnabled).toBe(true);
+    expect(satisfied.ready).toBe(true);
+    // Controlled output only.
+    const raw = JSON.stringify(satisfied);
+    expect(raw).not.toContain('rtsp');
+    expect(raw).not.toContain('://');
+    expect(raw).not.toContain('CAMERA_SECRET_SLOT');
   });
 });

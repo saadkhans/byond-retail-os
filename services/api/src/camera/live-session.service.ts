@@ -2384,6 +2384,16 @@ export class LiveSessionService {
     tenantId: string,
     cameraSourceId: string,
     evaluationRunId?: string | null,
+    options?: {
+      /** The protocol's fast-mode expectation (Codex P1): true/false
+       *  makes a mismatch with the ACTIVE mode fail readiness; null =
+       *  no expectation, never a failure. */
+      fastModeExpected?: boolean | null;
+      /** The bounded pilot runner gates only /pilot-test — manual live
+       *  sessions do not need it (Codex P1). Only when the caller says
+       *  it will USE the runner does its flag join the readiness set. */
+      requirePilotRunner?: boolean;
+    },
   ) {
     const source = await this.prisma.cameraSource.findFirst({
       where: { tenantId, id: cameraSourceId },
@@ -2423,6 +2433,10 @@ export class LiveSessionService {
       (this.config?.get<string>('CV_LIVE_PILOT_RUNNER_ENABLED') ?? '')
         .trim()
         .toLowerCase() === 'true';
+    const fastModeActive = this.liveFastMode();
+    const fastModeExpected = options?.fastModeExpected ?? null;
+    const fastModeMatches =
+      fastModeExpected === null ? null : fastModeExpected === fastModeActive;
     const checks = {
       sourceExists,
       sourceActive,
@@ -2430,13 +2444,19 @@ export class LiveSessionService {
       sourceConfigured,
       ffmpegAvailable,
       noActiveLiveSession: activeSession === null,
-      pilotRunnerEnabled,
+      // Mandatory ONLY when the caller will use the bounded runner.
+      ...(options?.requirePilotRunner ? { pilotRunnerEnabled } : {}),
+      // A stated fast-mode expectation must match the active mode.
+      ...(fastModeMatches !== null ? { fastModeMatches } : {}),
     };
     return {
       apiReachable: true,
       cameraSourceId,
       ...checks,
-      fastMode: this.liveFastMode(),
+      pilotRunnerEnabled,
+      fastModeActive,
+      fastModeExpected,
+      fastModeMatches,
       performanceEndpointAvailable: true,
       evaluationRunExists,
       ready: Object.values(checks).every((value) => value === true),

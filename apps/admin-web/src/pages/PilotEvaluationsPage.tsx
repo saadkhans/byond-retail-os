@@ -156,6 +156,13 @@ export function PilotEvaluationDetailPage() {
     useState<PilotExpectedAction>('PICKUP');
   const [expectedProductId, setExpectedProductId] = useState('');
   const [notes, setNotes] = useState('');
+  // MISSED-EVENT entry (Codex P1): a false negative has no observation
+  // to attach to — it is recorded against an attached SESSION.
+  const [missedSessionId, setMissedSessionId] = useState('');
+  const [missedAction, setMissedAction] =
+    useState<PilotExpectedAction>('PICKUP');
+  const [missedProductId, setMissedProductId] = useState('');
+  const [missedNotes, setMissedNotes] = useState('');
 
   const detail = useLoad<PilotEvaluationDetail>(
     () => api(`/pilot-evaluations/${id}`),
@@ -183,6 +190,29 @@ export function PilotEvaluationDetailPage() {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function submitMissedEvent() {
+    if (!missedSessionId) {
+      setActionError('Select the session the missed event happened in');
+      return;
+    }
+    await action(() =>
+      api(`/pilot-evaluations/${id}/reviews`, {
+        method: 'POST',
+        body: {
+          verdict: 'MISSED_EVENT',
+          expectedAction: missedAction,
+          liveSessionId: missedSessionId,
+          ...(missedProductId.trim()
+            ? { expectedProductId: missedProductId.trim() }
+            : {}),
+          ...(missedNotes.trim() ? { notes: missedNotes.trim() } : {}),
+        },
+      }),
+    );
+    setMissedProductId('');
+    setMissedNotes('');
   }
 
   async function submitReview() {
@@ -593,6 +623,88 @@ export function PilotEvaluationDetailPage() {
                 Close
               </button>
             </div>
+          ) : null}
+
+          <h2>
+            Record missed event (
+            {observations.data ? observations.data.missedEvents.length : '…'}{' '}
+            recorded)
+          </h2>
+          <p className="muted">
+            An interaction the CV never detected — recorded against the
+            session it happened in (no observation exists to attach it to).
+          </p>
+          {open ? (
+            <div className="form-row">
+              <select
+                value={missedSessionId}
+                onChange={(e) => setMissedSessionId(e.target.value)}
+              >
+                <option value="">
+                  {data.sessions.length === 0
+                    ? 'no sessions attached yet'
+                    : 'select session'}
+                </option>
+                {data.sessions.map((session) => (
+                  <option
+                    key={session.liveSessionId}
+                    value={session.liveSessionId}
+                  >
+                    {session.liveSessionId} ({session.status})
+                  </option>
+                ))}
+              </select>
+              <select
+                value={missedAction}
+                onChange={(e) =>
+                  setMissedAction(e.target.value as PilotExpectedAction)
+                }
+              >
+                <option value="PICKUP">missed PICKUP</option>
+                <option value="RETURN">missed RETURN</option>
+              </select>
+              <input
+                placeholder="Expected product id (optional)"
+                value={missedProductId}
+                onChange={(e) => setMissedProductId(e.target.value)}
+              />
+              <input
+                placeholder="Notes (optional, screened)"
+                value={missedNotes}
+                onChange={(e) => setMissedNotes(e.target.value)}
+              />
+              <button
+                className="primary"
+                disabled={busy || !missedSessionId}
+                onClick={() => void submitMissedEvent()}
+              >
+                Record missed event
+              </button>
+            </div>
+          ) : (
+            <p className="muted">Run is closed — no new entries.</p>
+          )}
+          {observations.data && observations.data.missedEvents.length > 0 ? (
+            <table>
+              <thead>
+                <tr>
+                  <th>Session</th>
+                  <th>Expected</th>
+                  <th>SKU</th>
+                  <th>Recorded</th>
+                </tr>
+              </thead>
+              <tbody>
+                {observations.data.missedEvents.map((row) => (
+                  <tr key={row.reviewId}>
+                    <td>{row.liveSessionId ?? '—'}</td>
+                    <td>{row.expectedAction}</td>
+                    <td>{row.expectedSku ?? '—'}</td>
+                    <td>{formatDate(row.reviewedAt)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           ) : null}
 
           <p className="muted">

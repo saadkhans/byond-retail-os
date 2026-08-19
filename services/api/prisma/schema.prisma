@@ -2607,7 +2607,10 @@ model CvTestProtocolScenario {
 
   tenant          Tenant             @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   protocol        CvTestProtocol     @relation(fields: [protocolId], references: [id], onDelete: Restrict)
-  expectedProduct Product?           @relation("CvScenarioExpectedProduct", fields: [expectedProductId], references: [id], onDelete: Restrict)
+  // SAME-TENANT composite relation (Codex P1): the product join carries
+  // the tenant in the FK itself — a malformed/imported row can never
+  // resolve another tenant's product name through this relation.
+  expectedProduct Product?           @relation("CvScenarioExpectedProduct", fields: [expectedProductId, tenantId], references: [id, tenantId], onDelete: Restrict)
   liveSession     LiveCameraSession? @relation(fields: [liveSessionId], references: [id], onDelete: Restrict)
 
   @@unique([id, tenantId])
