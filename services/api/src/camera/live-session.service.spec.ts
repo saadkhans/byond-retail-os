@@ -48,6 +48,12 @@ class TestLiveSessionService extends LiveSessionService {
   protected override drainTimeoutMs(): number {
     return this.drainMs;
   }
+
+  /** Pilot runner polls immediately — the virtual clock still advances
+   *  through sleep(), keeping the auto-stop bound reachable. */
+  protected override pilotPollMs(): number {
+    return 1;
+  }
 }
 
 function buildHarness(
@@ -63,6 +69,9 @@ function buildHarness(
     onFusionCall?: () => void;
     clockStepMs?: number;
     drainMs?: number;
+    /** Phase 14 — env flags served through the optional ConfigService
+     *  (CV_LIVE_FAST_MODE, CV_LIVE_PILOT_RUNNER_ENABLED). */
+    env?: Record<string, string>;
   } = {},
 ) {
   const sourceRow =
@@ -488,6 +497,7 @@ function buildHarness(
     sampler as never,
     fusion as never,
     journeys as never,
+    { get: (key: string) => options.env?.[key] } as never,
   );
   if (options.clockStepMs !== undefined) {
     service.clockStepMs = options.clockStepMs;
@@ -2546,3 +2556,130 @@ describe('LiveSessionService — durable ADDITIVE intents (Codex P1, Invariant E
   });
 });
 
+
+describe('LiveSessionService — Phase 14 speed pilot testing', () => {
+  it('timing metrics are recorded and persisted: frame sample, window detection, fusion, journey import, event-to-review', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }, { value: 200 }, { value: 40 }, { value: 40 }],
+    });
+    await startAndFinish(harness);
+    const row = harness.sessions[0];
+    const perf = row.performance as {
+      fastMode: boolean;
+      stages: Record<string, { count: number; p50Ms: number; p95Ms: number; maxMs: number }>;
+    };
+    expect(perf).toBeTruthy();
+    expect(perf.fastMode).toBe(false);
+    for (const stage of [
+      'frameSample',
+      'windowDetection',
+      'fusion',
+      'journeyImport',
+      'eventToReview',
+    ]) {
+      expect(perf.stages[stage]).toBeTruthy();
+      expect(perf.stages[stage].count).toBeGreaterThanOrEqual(1);
+      expect(perf.stages[stage].p50Ms).toBeGreaterThanOrEqual(0);
+      expect(perf.stages[stage].p95Ms).toBeGreaterThanOrEqual(
+        perf.stages[stage].p50Ms,
+      );
+      expect(perf.stages[stage].maxMs).toBeGreaterThanOrEqual(
+        perf.stages[stage].p95Ms,
+      );
+    }
+  });
+
+  it('fast mode is stamped on the performance snapshot', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }],
+      env: { CV_LIVE_FAST_MODE: 'true' },
+    });
+    await startAndFinish(harness);
+    const perf = harness.sessions[0].performance as { fastMode: boolean };
+    expect(perf.fastMode).toBe(true);
+  });
+
+  it('the performance report returns controlled JSON: timings, slowest stage, zero-mutation safety — no URL or credential material', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }, { value: 200 }, { value: 40 }, { value: 40 }],
+    });
+    await startAndFinish(harness);
+    const report = await harness.service.performance(TENANT, 'live-1');
+    expect(report.sessionId).toBe('live-1');
+    expect(report.vlmInvoked).toBe(true); // stubbed fusion evidence says invoked
+    expect(report.slowestStage).toBeTruthy();
+    expect(
+      report.timings[report.slowestStage!.stage].p95Ms,
+    ).toBe(report.slowestStage!.p95Ms);
+    // Structural zeros: this module cannot address billing/payment/
+    // inventory tables at all (shadow-mode static guard fails CI on any
+    // reference), so the summary is zeros BY CONSTRUCTION.
+    expect(report.safety).toEqual({
+      orders: 0,
+      checkoutSessions: 0,
+      paymentIntents: 0,
+      paymentEvents: 0,
+      inventoryMovements: 0,
+      basis: 'SHADOW_MODE_STATIC_GUARD',
+    });
+    // Controlled JSON only — nothing URL- or credential-shaped.
+    const raw = JSON.stringify(report);
+    expect(raw).not.toContain('rtsp');
+    expect(raw).not.toContain('CAMERA_SECRET_SLOT');
+    expect(raw).not.toContain('://');
+  });
+
+  it('the performance report 404s across tenants', async () => {
+    const harness = buildHarness({ script: [{ value: 40 }] });
+    await startAndFinish(harness);
+    await expect(
+      harness.service.performance('tenant-B', 'live-1'),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('the pilot runner is REFUSED with a controlled 409 when CV_LIVE_PILOT_RUNNER_ENABLED is not true', async () => {
+    const harness = buildHarness({ script: [{ value: 40 }] });
+    await expect(
+      harness.service.runPilotTest(TENANT, 'cam-1', {}, 'user-1'),
+    ).rejects.toThrow(/CV_LIVE_PILOT_RUNNER_ENABLED/);
+    expect(harness.prisma.liveCameraSession.create).not.toHaveBeenCalled();
+  });
+
+  it('the pilot runner starts, samples, stops, and reports a zero-mutation review-first summary', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }, { value: 200 }, { value: 40 }, { value: 40 }],
+      env: { CV_LIVE_PILOT_RUNNER_ENABLED: 'true' },
+    });
+    const summary = await harness.service.runPilotTest(
+      TENANT,
+      'cam-1',
+      { maxFrames: 4, maxSeconds: 60 },
+      'user-1',
+    );
+    expect(summary.status).toBe(LiveCameraSessionStatus.STOPPED);
+    expect(summary.framesSampled).toBeGreaterThanOrEqual(4);
+    expect(summary.eventWindowsDetected).toBe(1);
+    expect(summary.eventWindowsProcessed).toBe(1);
+    expect(summary.reviewNeeded).toBeGreaterThanOrEqual(0);
+    // Review-first: a detected window can never summarize as READY.
+    expect(summary.decision).toBe(CustomerJourneyDecision.NEEDS_EVENT_REVIEW);
+    expect(summary.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+    // Zero billing/payment/inventory mutations — structural, enforced
+    // by the camera shadow-mode static guard.
+    expect(summary.safety).toEqual({
+      orders: 0,
+      checkoutSessions: 0,
+      paymentIntents: 0,
+      paymentEvents: 0,
+      inventoryMovements: 0,
+      basis: 'SHADOW_MODE_STATIC_GUARD',
+    });
+    expect(summary.eventToReviewMs).toBeTruthy();
+    const raw = JSON.stringify(summary);
+    expect(raw).not.toContain('rtsp');
+    expect(raw).not.toContain('CAMERA_SECRET_SLOT');
+    await harness.service.awaitLoop(summary.sessionId);
+  });
+});

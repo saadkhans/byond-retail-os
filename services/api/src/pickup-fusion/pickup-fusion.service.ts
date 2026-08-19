@@ -491,6 +491,7 @@ export class PickupFusionService {
   private readonly vlmEnabled: boolean;
   private readonly vlmProvider: 'local' | 'anthropic';
   private readonly vlmMode: 'UNCERTAIN_ONLY' | 'VALIDATION_ALWAYS';
+  private readonly liveFastMode: boolean;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -577,6 +578,15 @@ export class PickupFusionService {
       config.get<string>('PICKUP_VLM_MODE') === 'VALIDATION_ALWAYS'
         ? 'VALIDATION_ALWAYS'
         : 'UNCERTAIN_ONLY';
+    // Phase 14 — LIVE fast mode: the LIVE_WINDOW VLM gate always blocks
+    // (Phase 13 hard rule), so its extra per-crop OCR passes exist only
+    // to refine the review REASON. Fast mode skips those passes and
+    // blocks directly with LIVE_FRAME_PIXEL_SCREEN_REQUIRED — same
+    // review-first outcome, lower latency. Asset/FILE_REPLAY paths are
+    // untouched by this flag.
+    this.liveFastMode =
+      (config.get<string>('CV_LIVE_FAST_MODE') ?? '').trim().toLowerCase() ===
+      'true';
   }
 
   /** The configured verifier PORT — LOCAL (Ollama) by default; no paid
@@ -1350,6 +1360,20 @@ export class PickupFusionService {
         // the extra passes never store or forward recognized text.
         if (ctx.evidence.liveSessionId !== undefined) {
           let blockReason: string = LIVE_FRAME_PIXEL_SCREEN_REQUIRED;
+          if (this.liveFastMode) {
+            // FAST MODE (Phase 14): skip the reason-refining OCR passes
+            // entirely — the gate blocks either way, so this is a pure
+            // latency win with the identical review-first outcome.
+            ctx.evidence.vlm.invoked = false;
+            ctx.evidence.vlm.reason = LIVE_FRAME_PIXEL_SCREEN_REQUIRED;
+            ctx.evidence.vlm.status = 'UNAVAILABLE';
+            ctx.evidence.policy = {
+              result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
+              reason:
+                'live frames require pixel-level screening before VLM — routed to review',
+            };
+            return;
+          }
           if (ctx.evidence.ocr.status !== 'OK') {
             // The bestPre screen never completed — indistinguishable
             // from unscreened pixels.

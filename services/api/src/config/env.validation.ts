@@ -274,6 +274,24 @@ class EnvironmentVariables {
   })
   PICKUP_VLM_ENABLED?: string;
 
+  // Phase 14 — LIVE fast mode for pilot testing: skips the pre-VLM
+  // per-crop screening passes on LIVE_WINDOW runs (the VLM is never
+  // invoked for live in Phase 13/14 regardless, so the passes only
+  // refine the review reason). Review-first behavior is unchanged.
+  @IsOptional()
+  @Matches(/^(true|false)$/i, {
+    message: 'CV_LIVE_FAST_MODE must be true or false',
+  })
+  CV_LIVE_FAST_MODE?: string;
+
+  // Phase 14 — dev/admin-only pilot test runner endpoint gate. Off by
+  // default; the runner refuses with a controlled 409 when disabled.
+  @IsOptional()
+  @Matches(/^(true|false)$/i, {
+    message: 'CV_LIVE_PILOT_RUNNER_ENABLED must be true or false',
+  })
+  CV_LIVE_PILOT_RUNNER_ENABLED?: string;
+
   // Which verifier adapter serves VLM verification. Default local (Ollama
   // on the operator's own box) — never a paid API implicitly.
   @IsOptional()

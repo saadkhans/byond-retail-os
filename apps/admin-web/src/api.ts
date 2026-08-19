@@ -1263,6 +1263,48 @@ export interface LiveSessionDetail extends LiveSessionView {
     endMs: number;
     confidence: number;
   }[];
+  performance: LivePerformanceSnapshot | null;
+}
+
+/** Phase 14 — per-stage timing statistics (controlled numeric
+ *  aggregates only; no URLs, credentials, or free text). */
+export interface LiveStageStats {
+  count: number;
+  avgMs: number;
+  p50Ms: number;
+  p95Ms: number;
+  maxMs: number;
+}
+
+export interface LivePerformanceSnapshot {
+  fastMode: boolean;
+  stages: Record<string, LiveStageStats>;
+}
+
+/** Phase 14 — GET /live-sessions/:id/performance report. */
+export interface LiveSessionPerformance {
+  sessionId: string;
+  status: LiveSessionStatus;
+  decision: JourneyDecision | null;
+  fastMode: boolean;
+  vlmInvoked: boolean;
+  frameIntervalMs: number;
+  framesSampled: number;
+  eventWindowsDetected: number;
+  eventWindowsProcessed: number;
+  reviewNeeded: number;
+  timings: Record<string, LiveStageStats>;
+  slowestStage: { stage: string; p95Ms: number; maxMs: number } | null;
+  safety: {
+    orders: number;
+    checkoutSessions: number;
+    paymentIntents: number;
+    paymentEvents: number;
+    inventoryMovements: number;
+    /** Zeros are STRUCTURAL: the camera module has no access to these
+     *  tables at all — CI-enforced by the shadow-mode static guard. */
+    basis: string;
+  };
 }
 
 /** One journey observation awaiting human review (shadow pilot queue). */
