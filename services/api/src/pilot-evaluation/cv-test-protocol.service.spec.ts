@@ -816,14 +816,20 @@ describe('CvTestProtocolService — Codex round 2 (relink guard, relative paths,
     expect(harness.prisma.$queryRaw).toHaveBeenCalled();
   });
 
-  it('EVERY bare slash token is rejected — no length or character heuristics (Codex P1 round 3)', async () => {
+  it('EVERY bare slash token is rejected — no length or character heuristics, Unicode segments included (Codex P1 rounds 3+4)', async () => {
     const harness = buildHarness();
     const cases = [
       'feeds/camera',
       'media/input',
       'recordings/session',
       'feeds\\camera',
+      'media\\input',
       'check clips/a then continue',
+      // Non-ASCII / non-\w segments (Codex P1 round 4): a path segment
+      // is ANY non-whitespace text, not just ASCII word characters.
+      '資料/映像',
+      'café/vidéo',
+      '@camera/@input',
     ];
     for (const value of cases) {
       const error = await harness.service
@@ -831,9 +837,13 @@ describe('CvTestProtocolService — Codex round 2 (relink guard, relative paths,
         .then(() => null)
         .catch((err: Error) => err);
       expect(error).toBeInstanceOf(BadRequestException);
+      // The rejected value is NEVER echoed — ASCII or not.
       expect(error!.message).not.toContain('feeds');
       expect(error!.message).not.toContain('media');
       expect(error!.message).not.toContain('clips');
+      expect(error!.message).not.toContain('資料');
+      expect(error!.message).not.toContain('café');
+      expect(error!.message).not.toContain('@camera');
     }
     expect(harness.protocols).toHaveLength(0);
     // A slash-free sentence still passes.

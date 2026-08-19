@@ -53,11 +53,14 @@ export function containsSourceOrPathText(value: string): boolean {
     /(?:^|[\s"'(=])(?:\.{1,2}|~)\//.test(value) ||
     // Obvious media/stream filenames anywhere.
     /\.(mp4|mov|avi|mkv|webm|m3u8|mts|png|jpe?g|bmp|gif)\b/i.test(value) ||
-    // EVERY compact slash-separated token (feeds/camera, media/input,
-    // recordings/session, a/b/c). No length/character heuristics
-    // (Codex P1): this module's no-source/no-path contract outweighs
-    // prose pairs — write "pass or fail", not "pass/fail".
-    /[\w.-]+\/[\w.-]+/.test(value)
+    // EVERY compact slash/backslash-separated token, with NO character-
+    // class restriction on the segments (Codex P1): a path segment can
+    // be any non-whitespace text — Unicode directories, @-scoped names,
+    // accented words — so ASCII-only \w would let tokens like Unicode
+    // folder pairs straight through. Any separator with non-whitespace
+    // on both sides rejects; this module's no-source/no-path contract
+    // outweighs prose pairs — write "pass or fail", not "pass/fail".
+    /[^\s\\/]+[\\/][^\s\\/]+/.test(value)
   );
 }
 
