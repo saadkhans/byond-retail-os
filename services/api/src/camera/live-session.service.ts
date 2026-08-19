@@ -2372,6 +2372,105 @@ export class LiveSessionService {
     };
   }
 
+  /**
+   * Phase 16 — real-footage test PREFLIGHT: one controlled readiness
+   * snapshot before a live test run. Read-only; every field is a
+   * boolean/enum/controlled string — never a URL, path, credential
+   * slot value, or exception text. A missing source reports
+   * sourceExists=false instead of throwing (the preflight's job is to
+   * SAY what is wrong).
+   */
+  async liveTestPreflight(
+    tenantId: string,
+    cameraSourceId: string,
+    evaluationRunId?: string | null,
+    options?: {
+      /** The protocol's fast-mode expectation (Codex P1): true/false
+       *  makes a mismatch with the ACTIVE mode fail readiness; null =
+       *  no expectation, never a failure. */
+      fastModeExpected?: boolean | null;
+      /** The bounded pilot runner gates only /pilot-test — manual live
+       *  sessions do not need it (Codex P1). Only when the caller says
+       *  it will USE the runner does its flag join the readiness set. */
+      requirePilotRunner?: boolean;
+    },
+  ) {
+    const source = await this.prisma.cameraSource.findFirst({
+      where: { tenantId, id: cameraSourceId },
+      select: {
+        id: true,
+        sourceType: true,
+        status: true,
+        credentialRef: true,
+      },
+    });
+    const sourceExists = source !== null;
+    const sourceActive = source?.status === CameraSourceStatus.ACTIVE;
+    const sourceTypeSupported =
+      source?.sourceType === CameraSourceType.RTSP_SHADOW;
+    const sourceConfigured =
+      source?.credentialRef != null
+        ? this.sampler.resolveSource(tenantId, source.credentialRef).configured
+        : false;
+    const ffmpegAvailable = await this.sampler.checkFfmpeg();
+    const activeSession = await this.prisma.liveCameraSession.findFirst({
+      where: {
+        tenantId,
+        cameraSourceId,
+        status: { in: NON_TERMINAL_SESSION_STATUSES },
+      },
+      select: { id: true },
+    });
+    let evaluationRunExists: boolean | null = null;
+    if (evaluationRunId) {
+      const run = await this.prisma.pilotEvaluationRun.findFirst({
+        where: { tenantId, id: evaluationRunId },
+        select: { id: true },
+      });
+      evaluationRunExists = run !== null;
+    }
+    const pilotRunnerEnabled =
+      (this.config?.get<string>('CV_LIVE_PILOT_RUNNER_ENABLED') ?? '')
+        .trim()
+        .toLowerCase() === 'true';
+    const fastModeActive = this.liveFastMode();
+    const fastModeExpected = options?.fastModeExpected ?? null;
+    const fastModeMatches =
+      fastModeExpected === null ? null : fastModeExpected === fastModeActive;
+    const checks = {
+      sourceExists,
+      sourceActive,
+      sourceTypeSupported,
+      sourceConfigured,
+      ffmpegAvailable,
+      noActiveLiveSession: activeSession === null,
+      // Mandatory ONLY when the caller will use the bounded runner.
+      ...(options?.requirePilotRunner ? { pilotRunnerEnabled } : {}),
+      // A stated fast-mode expectation must match the active mode.
+      ...(fastModeMatches !== null ? { fastModeMatches } : {}),
+    };
+    return {
+      apiReachable: true,
+      cameraSourceId,
+      ...checks,
+      pilotRunnerEnabled,
+      fastModeActive,
+      fastModeExpected,
+      fastModeMatches,
+      performanceEndpointAvailable: true,
+      evaluationRunExists,
+      ready: Object.values(checks).every((value) => value === true),
+      safety: {
+        orders: 0,
+        checkoutSessions: 0,
+        paymentIntents: 0,
+        paymentEvents: 0,
+        inventoryMovements: 0,
+        basis: 'SHADOW_MODE_STATIC_GUARD',
+      },
+    };
+  }
+
   /** Phase 14 pilot runner poll cadence (real time). */
   protected pilotPollMs(): number {
     return 1000;

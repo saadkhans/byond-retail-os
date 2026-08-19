@@ -251,6 +251,8 @@ model Tenant {
   liveCameraSessions             LiveCameraSession[]
   liveSessionFinalizationIntents LiveCameraSessionFinalizationIntent[]
   pilotEvaluationRuns            PilotEvaluationRun[]
+  cvTestProtocols                CvTestProtocol[]
+  cvTestProtocolScenarios        CvTestProtocolScenario[]
   pilotEvaluationSessions        PilotEvaluationSession[]
   pilotObservationReviews        PilotObservationReview[]
 }
@@ -390,6 +392,7 @@ model Location {
   customerJourneys    CustomerJourney[]
   cameraSources       CameraSource[]
   pilotEvaluationRuns PilotEvaluationRun[]
+  cvTestProtocols     CvTestProtocol[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -545,6 +548,7 @@ model Product {
   journeyEvents           CustomerJourneyEvent[]
   journeyEventReviews     CustomerJourneyEventReview[] @relation("JourneyReviewCorrectedProduct")
   pilotReviewExpectations PilotObservationReview[]     @relation("PilotReviewExpectedProduct")
+  cvScenarioExpectations  CvTestProtocolScenario[]     @relation("CvScenarioExpectedProduct")
 
   @@unique([tenantId, sku])
   @@unique([id, tenantId])
@@ -935,6 +939,7 @@ model CameraSource {
   replayVideoAsset VideoAsset?         @relation("CameraReplayAsset", fields: [replayVideoAssetId], references: [id], onDelete: SetNull)
   pilotRuns        CameraPilotRun[]
   liveSessions     LiveCameraSession[]
+  cvTestProtocols  CvTestProtocol[]
 
   @@unique([id, tenantId])
   @@unique([tenantId, locationId, name])
@@ -1068,6 +1073,7 @@ model LiveCameraSession {
   fusionRuns              PickupFusionRun[]
   finalizationIntents     LiveCameraSessionFinalizationIntent[]
   pilotEvaluationSessions PilotEvaluationSession[]
+  cvTestScenarios         CvTestProtocolScenario[]
 
   @@unique([id, tenantId])
   @@index([tenantId, cameraSourceId, createdAt(sort: Desc)])
@@ -2453,10 +2459,11 @@ model PilotEvaluationRun {
   createdAt   DateTime                 @default(now())
   completedAt DateTime?
 
-  tenant   Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location Location?                @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  sessions PilotEvaluationSession[]
-  reviews  PilotObservationReview[]
+  tenant        Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location      Location?                @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  sessions      PilotEvaluationSession[]
+  reviews       PilotObservationReview[]
+  testProtocols CvTestProtocol[]
 
   @@unique([id, tenantId])
   @@index([tenantId, createdAt(sort: Desc)])
@@ -2508,4 +2515,107 @@ model PilotObservationReview {
   @@unique([id, tenantId])
   @@index([tenantId, evaluationRunId, createdAt])
   @@index([tenantId, journeyEventId, createdAt])
+}
+
+// ---------------------------------------------------------------------
+// Phase 16 — live CV TEST PROTOCOL (SHADOW ONLY). A protocol organizes
+// repeatable real-footage tests: named scenarios with expected outcomes,
+// linked to ONE Phase 15 evaluation run for metrics/review/export.
+// Purely organizational — no CV decision reads these tables, and nothing
+// here touches checkout, order, payment, or inventory state.
+// ---------------------------------------------------------------------
+
+enum CvTestProtocolStatus {
+  DRAFT
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum CvTestScenarioType {
+  SINGLE_PICKUP
+  SINGLE_RETURN
+  FALSE_TOUCH_NO_PRODUCT_MOVED
+  MISSED_PICKUP
+  MISSED_RETURN
+  TWO_PRODUCTS_VISIBLE_ONE_PICKED
+  SIMILAR_SKU_CONFUSION
+  MULTI_QUANTITY_PICKUP
+  HAND_OCCLUSION
+  FAST_PICKUP
+  SLOW_PICKUP
+  LOW_LIGHT
+  BAD_ANGLE
+  EMPTY_SHELF
+  UNKNOWN_PRODUCT
+}
+
+enum CvTestScenarioResult {
+  PASS
+  FAIL
+  INCONCLUSIVE
+}
+
+model CvTestProtocol {
+  id               String               @id @default(cuid())
+  tenantId         String
+  name             String
+  description      String?
+  locationId       String?
+  cameraSourceId   String?
+  evaluationRunId  String?
+  /**
+   * Whether the protocol EXPECTS fast mode (null = no expectation).
+   */
+  fastModeExpected Boolean?
+  status           CvTestProtocolStatus @default(DRAFT)
+  createdById      String?
+  createdAt        DateTime             @default(now())
+  completedAt      DateTime?
+
+  tenant        Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  // SAME-TENANT composite location relation (Codex P1): the store join
+  // carries the tenant in the FK itself — a malformed row can never
+  // resolve another tenant's store name.
+  location      Location?                @relation(fields: [locationId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  cameraSource  CameraSource?            @relation(fields: [cameraSourceId], references: [id], onDelete: Restrict)
+  evaluationRun PilotEvaluationRun?      @relation(fields: [evaluationRunId], references: [id], onDelete: Restrict)
+  scenarios     CvTestProtocolScenario[]
+
+  @@unique([id, tenantId])
+  @@index([tenantId, createdAt(sort: Desc)])
+}
+
+// One scripted test case inside a protocol: what the operator will act
+// out on camera and what the CV is EXPECTED to conclude. The operator
+// result (PASS/FAIL/INCONCLUSIVE) is reporting only — CV decisions never
+// read scenarios.
+model CvTestProtocolScenario {
+  id                String                @id @default(cuid())
+  tenantId          String
+  protocolId        String
+  scenarioType      CvTestScenarioType
+  expectedAction    PilotExpectedAction
+  expectedProductId String?
+  expectedSku       String?
+  expectedQuantity  Int?
+  notes             String?
+  liveSessionId     String?
+  result            CvTestScenarioResult?
+  resultNotes       String?
+  resultById        String?
+  resultAt          DateTime?
+  createdById       String?
+  createdAt         DateTime              @default(now())
+
+  tenant          Tenant             @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  protocol        CvTestProtocol     @relation(fields: [protocolId], references: [id], onDelete: Restrict)
+  // SAME-TENANT composite relation (Codex P1): the product join carries
+  // the tenant in the FK itself — a malformed/imported row can never
+  // resolve another tenant's product name through this relation.
+  expectedProduct Product?           @relation("CvScenarioExpectedProduct", fields: [expectedProductId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  liveSession     LiveCameraSession? @relation(fields: [liveSessionId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@index([tenantId, protocolId, createdAt])
 }

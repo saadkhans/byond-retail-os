@@ -282,6 +282,25 @@ function buildHarness(
         },
       ),
     },
+    // Phase 16 preflight reads the source row and evaluation run
+    // directly (booleans only — never the credentialRef value).
+    cameraSource: {
+      findFirst: jest.fn(async (args: { where: { id?: string } }) =>
+        sourceRow && args.where.id === 'cam-1'
+          ? {
+              id: sourceRow.id,
+              sourceType: sourceRow.sourceType,
+              status: sourceRow.status,
+              credentialRef: sourceRow.credentialRef,
+            }
+          : null,
+      ),
+    },
+    pilotEvaluationRun: {
+      findFirst: jest.fn(async (args: { where: { id?: string } }) =>
+        args.where.id === 'run-1' ? { id: 'run-1' } : null,
+      ),
+    },
     liveCameraSessionFinalizationIntent: {
       create: jest.fn(async (args: { data: Record<string, unknown> }) => {
         if (
@@ -3053,5 +3072,168 @@ describe('LiveSessionService — atomic pilot ownership + time budget (Codex rou
     const loopSleeps = sleeps.filter((ms) => ms > harness.service['drainMs']);
     expect(loopSleeps).toHaveLength(0);
     expect(sleeps.some((ms) => ms <= 1000)).toBe(true);
+  });
+});
+
+describe('LiveSessionService — Phase 16 live test preflight', () => {
+  it('a ready source reports every check true — controlled booleans only, no URL/credential material', async () => {
+    const harness = buildHarness({
+      env: { CV_LIVE_PILOT_RUNNER_ENABLED: 'true', CV_LIVE_FAST_MODE: 'true' },
+    });
+    const preflight = await harness.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+      'run-1',
+    );
+    expect(preflight).toMatchObject({
+      apiReachable: true,
+      sourceExists: true,
+      sourceActive: true,
+      sourceTypeSupported: true,
+      sourceConfigured: true,
+      ffmpegAvailable: true,
+      noActiveLiveSession: true,
+      pilotRunnerEnabled: true,
+      fastModeActive: true,
+      fastModeExpected: null,
+      fastModeMatches: null,
+      performanceEndpointAvailable: true,
+      evaluationRunExists: true,
+      ready: true,
+    });
+    expect(preflight.safety).toMatchObject({
+      orders: 0,
+      checkoutSessions: 0,
+      paymentIntents: 0,
+      paymentEvents: 0,
+      inventoryMovements: 0,
+    });
+    // Leak scan: the credentialRef slot NAME, URLs, and paths never
+    // appear — only booleans and controlled ids.
+    const raw = JSON.stringify(preflight);
+    expect(raw).not.toContain('CAMERA_SECRET_SLOT');
+    expect(raw).not.toContain('rtsp');
+    expect(raw).not.toContain('://');
+    expect(raw).not.toContain('.mp4');
+  });
+
+  it('a missing source reports sourceExists=false (no throw); an active session and disabled runner report not ready', async () => {
+    const missing = buildHarness({});
+    const gone = await missing.service.liveTestPreflight(TENANT, 'cam-x');
+    expect(gone.sourceExists).toBe(false);
+    expect(gone.ready).toBe(false);
+    expect(gone.evaluationRunExists).toBeNull();
+
+    const busy = buildHarness({
+      existingSession: {
+        id: 'live-op',
+        tenantId: TENANT,
+        cameraSourceId: 'cam-1',
+        status: LiveCameraSessionStatus.RUNNING,
+        journeyId: 'journey-op',
+        leaseOwner: 'op',
+        startedAt: new Date(),
+        heartbeatAt: new Date(),
+        eventWindows: [],
+      },
+    });
+    const report = await busy.service.liveTestPreflight(TENANT, 'cam-1', 'run-x');
+    expect(report.noActiveLiveSession).toBe(false);
+    expect(report.pilotRunnerEnabled).toBe(false);
+    expect(report.evaluationRunExists).toBe(false);
+    expect(report.ready).toBe(false);
+    // The preflight is READ-ONLY: nothing was mutated.
+    expect(busy.sessions[0].status).toBe(LiveCameraSessionStatus.RUNNING);
+    expect(busy.journeys.exit).not.toHaveBeenCalled();
+  });
+
+  it('an unconfigured runtime slot reports sourceConfigured=false without resolving any value into the response', async () => {
+    const harness = buildHarness({ configured: false });
+    const preflight = await harness.service.liveTestPreflight(TENANT, 'cam-1');
+    expect(preflight.sourceConfigured).toBe(false);
+    expect(preflight.ready).toBe(false);
+  });
+});
+
+describe('LiveSessionService — preflight fast-mode expectation + optional pilot runner (Codex round 1)', () => {
+  it('a stated fast-mode expectation must MATCH the active mode for readiness', async () => {
+    // expected true, active false → not ready.
+    const offButExpectedOn = buildHarness({});
+    const mismatch = await offButExpectedOn.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+      null,
+      { fastModeExpected: true },
+    );
+    expect(mismatch.fastModeActive).toBe(false);
+    expect(mismatch.fastModeExpected).toBe(true);
+    expect(mismatch.fastModeMatches).toBe(false);
+    expect(mismatch.ready).toBe(false);
+    // expected false, active true → not ready.
+    const onButExpectedOff = buildHarness({
+      env: { CV_LIVE_FAST_MODE: 'true' },
+    });
+    const mismatch2 = await onButExpectedOff.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+      null,
+      { fastModeExpected: false },
+    );
+    expect(mismatch2.fastModeMatches).toBe(false);
+    expect(mismatch2.ready).toBe(false);
+    // expected true, active true → ready.
+    const match = await onButExpectedOff.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+      null,
+      { fastModeExpected: true },
+    );
+    expect(match.fastModeMatches).toBe(true);
+    expect(match.ready).toBe(true);
+    // expected null → informational only, never a failure.
+    const noExpectation = await offButExpectedOn.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+      null,
+      { fastModeExpected: null },
+    );
+    expect(noExpectation.fastModeMatches).toBeNull();
+    expect(noExpectation.ready).toBe(true);
+  });
+
+  it('the pilot runner is INFORMATIONAL by default and mandatory only under requirePilotRunner', async () => {
+    // Runner disabled + manual workflow → still ready.
+    const manual = buildHarness({});
+    const withoutRunner = await manual.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+    );
+    expect(withoutRunner.pilotRunnerEnabled).toBe(false);
+    expect(withoutRunner.ready).toBe(true);
+    // requirePilotRunner + disabled → not ready.
+    const required = await manual.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+      null,
+      { requirePilotRunner: true },
+    );
+    expect(required.ready).toBe(false);
+    // requirePilotRunner + enabled → ready.
+    const enabled = buildHarness({
+      env: { CV_LIVE_PILOT_RUNNER_ENABLED: 'true' },
+    });
+    const satisfied = await enabled.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+      null,
+      { requirePilotRunner: true },
+    );
+    expect(satisfied.pilotRunnerEnabled).toBe(true);
+    expect(satisfied.ready).toBe(true);
+    // Controlled output only.
+    const raw = JSON.stringify(satisfied);
+    expect(raw).not.toContain('rtsp');
+    expect(raw).not.toContain('://');
+    expect(raw).not.toContain('CAMERA_SECRET_SLOT');
   });
 });

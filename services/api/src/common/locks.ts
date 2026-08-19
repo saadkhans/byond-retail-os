@@ -243,3 +243,17 @@ export function paymentEventAdvisoryLockKey(
 ): string {
   return `payment-event:${tenantId}:${provider}:${providerEventId}`;
 }
+
+/**
+ * Serializes Phase 16 test-protocol evidence mutations — scenario
+ * insertion, result recording, and the COMPLETED transition's evidence
+ * check — for the SAME protocol. Without it, a scenario inserted between
+ * completion's evidence query and its terminal status write would leave
+ * a COMPLETED protocol with a pending scenario (Codex P1).
+ */
+export function cvTestProtocolAdvisoryLockKey(
+  tenantId: string,
+  protocolId: string,
+): string {
+  return `cv-test-protocol:${tenantId}:${protocolId}`;
+}

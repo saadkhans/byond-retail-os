@@ -1480,3 +1480,125 @@ export interface PilotDatasetExport {
   format: string;
   manifest: string;
 }
+
+/** Phase 16 — CV test protocols (shadow only). */
+export type CvTestProtocolStatus = 'DRAFT' | 'ACTIVE' | 'COMPLETED' | 'CANCELLED';
+export type CvTestScenarioResult = 'PASS' | 'FAIL' | 'INCONCLUSIVE';
+export type CvTestScenarioType =
+  | 'SINGLE_PICKUP'
+  | 'SINGLE_RETURN'
+  | 'FALSE_TOUCH_NO_PRODUCT_MOVED'
+  | 'MISSED_PICKUP'
+  | 'MISSED_RETURN'
+  | 'TWO_PRODUCTS_VISIBLE_ONE_PICKED'
+  | 'SIMILAR_SKU_CONFUSION'
+  | 'MULTI_QUANTITY_PICKUP'
+  | 'HAND_OCCLUSION'
+  | 'FAST_PICKUP'
+  | 'SLOW_PICKUP'
+  | 'LOW_LIGHT'
+  | 'BAD_ANGLE'
+  | 'EMPTY_SHELF'
+  | 'UNKNOWN_PRODUCT';
+
+export interface CvTestProtocolView {
+  protocolId: string;
+  name: string;
+  description: string | null;
+  status: CvTestProtocolStatus;
+  locationName: string | null;
+  cameraSourceName: string | null;
+  evaluationRunId: string | null;
+  fastModeExpected: boolean | null;
+  scenarioCount: number;
+  createdAt: string;
+  completedAt: string | null;
+}
+
+export interface CvTestScenarioView {
+  scenarioId: string;
+  scenarioType: CvTestScenarioType;
+  expectedAction: PilotExpectedAction;
+  expectedProductId: string | null;
+  expectedSku: string | null;
+  expectedProductName: string | null;
+  expectedQuantity: number | null;
+  notes: string | null;
+  liveSessionId: string | null;
+  result: CvTestScenarioResult | null;
+  resultNotes: string | null;
+  resultAt: string | null;
+  createdAt: string;
+}
+
+export interface CvTestProtocolDetail {
+  protocolId: string;
+  name: string;
+  description: string | null;
+  status: CvTestProtocolStatus;
+  locationId: string | null;
+  locationName: string | null;
+  cameraSourceId: string | null;
+  cameraSourceName: string | null;
+  evaluationRunId: string | null;
+  fastModeExpected: boolean | null;
+  createdAt: string;
+  completedAt: string | null;
+  scenarios: CvTestScenarioView[];
+}
+
+export interface CvTestProtocolReport {
+  protocolId: string;
+  name: string;
+  status: CvTestProtocolStatus;
+  evaluationRunId: string | null;
+  fastModeExpected: boolean | null;
+  fastModeObserved: boolean | null;
+  scenarios: {
+    total: number;
+    completed: number;
+    pending: number;
+    pass: number;
+    fail: number;
+    inconclusive: number;
+  };
+  detectionRecall: number | null;
+  evaluation: PilotEvaluationSummary | null;
+  datasetExport: { available: boolean; rowCount: number } | null;
+  safety: {
+    orders: number;
+    checkoutSessions: number;
+    paymentIntents: number;
+    paymentEvents: number;
+    inventoryMovements: number;
+    basis: string;
+  };
+}
+
+/** Phase 16 — GET /camera-sources/:id/live-test-preflight. */
+export interface LiveTestPreflight {
+  apiReachable: boolean;
+  cameraSourceId: string;
+  sourceExists: boolean;
+  sourceActive: boolean;
+  sourceTypeSupported: boolean;
+  sourceConfigured: boolean;
+  ffmpegAvailable: boolean;
+  noActiveLiveSession: boolean;
+  pilotRunnerEnabled: boolean;
+  fastModeActive: boolean;
+  /** The protocol's expectation (null = none) and whether it matches. */
+  fastModeExpected: boolean | null;
+  fastModeMatches: boolean | null;
+  performanceEndpointAvailable: boolean;
+  evaluationRunExists: boolean | null;
+  ready: boolean;
+  safety: {
+    orders: number;
+    checkoutSessions: number;
+    paymentIntents: number;
+    paymentEvents: number;
+    inventoryMovements: number;
+    basis: string;
+  };
+}
