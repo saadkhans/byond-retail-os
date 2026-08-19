@@ -6,6 +6,7 @@ import {
   Param,
   Patch,
   Post,
+  Query,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import {
@@ -148,6 +149,23 @@ export class CameraSourcesController {
       { frameIntervalMs: body.frameIntervalMs },
       actor.userId,
     );
+  }
+
+  @Get(':id/live-test-preflight')
+  @RequirePermissions('vision:read')
+  @ApiOperation({
+    summary:
+      'Phase 16 real-footage test preflight: source/config/ffmpeg/' +
+      'fast-mode/pilot-runner/active-session readiness as controlled ' +
+      'booleans — no URL, path, or credential material. Optional ' +
+      '?evaluationRunId= existence check.',
+  })
+  liveTestPreflight(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Query('evaluationRunId') evaluationRunId?: string,
+  ) {
+    return this.live.liveTestPreflight(tenantId, id, evaluationRunId || null);
   }
 
   @Post(':id/pilot-test')

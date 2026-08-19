@@ -11,6 +11,14 @@ import {
 } from '../auth/decorators/request-context.decorators';
 import { RequestContext } from '../auth/request-context';
 import { PlatformModulesModule } from '../platform-modules/platform-modules.module';
+import { CvTestProtocolService } from './cv-test-protocol.service';
+import {
+  AddTestScenarioDto,
+  CreateTestProtocolDto,
+  LinkEvaluationRunDto,
+  RecordScenarioResultDto,
+  SetTestProtocolStatusDto,
+} from './dto/cv-test-protocol.dto';
 import {
   AttachEvaluationSessionDto,
   CreateEvaluationRunDto,
@@ -155,9 +163,151 @@ export class PilotEvaluationController {
   }
 }
 
+/**
+ * Phase 16 — CV test protocols (SHADOW ONLY): scripted real-footage test
+ * scenarios with expected outcomes, wrapped around the Phase 15
+ * evaluation loop. Organizational + reporting only; no CV decision reads
+ * protocol state, and no route touches checkout/order/payment/inventory.
+ */
+@ApiTags('cv-test-protocols')
+@ApiBearerAuth()
+@TenantOnly()
+@RequireModule('cv')
+@Controller('cv-test-protocols')
+export class CvTestProtocolController {
+  constructor(private readonly protocols: CvTestProtocolService) {}
+
+  @Post()
+  @RequirePermissions('vision:review')
+  @ApiOperation({ summary: 'Create a CV test protocol (DRAFT)' })
+  create(
+    @CurrentTenantId() tenantId: string,
+    @Body() body: CreateTestProtocolDto,
+    @CurrentUser() actor: RequestContext,
+  ) {
+    return this.protocols.createProtocol(
+      tenantId,
+      {
+        name: body.name,
+        description: body.description,
+        locationId: body.locationId,
+        cameraSourceId: body.cameraSourceId,
+        evaluationRunId: body.evaluationRunId,
+        fastModeExpected: body.fastModeExpected,
+      },
+      actor.userId,
+    );
+  }
+
+  @Get()
+  @RequirePermissions('vision:read')
+  @ApiOperation({ summary: 'CV test protocols (newest first)' })
+  list(@CurrentTenantId() tenantId: string) {
+    return this.protocols.listProtocols(tenantId);
+  }
+
+  @Get(':id')
+  @RequirePermissions('vision:read')
+  @ApiOperation({ summary: 'Protocol detail with its scenario checklist' })
+  detail(@CurrentTenantId() tenantId: string, @Param('id') id: string) {
+    return this.protocols.protocolDetail(tenantId, id);
+  }
+
+  @Post(':id/status')
+  @RequirePermissions('vision:review')
+  @ApiOperation({
+    summary: 'DRAFT → ACTIVE; DRAFT/ACTIVE → COMPLETED / CANCELLED',
+  })
+  setStatus(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Body() body: SetTestProtocolStatusDto,
+  ) {
+    return this.protocols.setStatus(tenantId, id, body.status);
+  }
+
+  @Post(':id/evaluation-run')
+  @RequirePermissions('vision:review')
+  @ApiOperation({ summary: 'Link the evaluation run this protocol reports over' })
+  linkRun(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Body() body: LinkEvaluationRunDto,
+  ) {
+    return this.protocols.linkEvaluationRun(
+      tenantId,
+      id,
+      body.evaluationRunId,
+    );
+  }
+
+  @Post(':id/scenarios')
+  @RequirePermissions('vision:review')
+  @ApiOperation({ summary: 'Add one scripted scenario to the checklist' })
+  addScenario(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Body() body: AddTestScenarioDto,
+    @CurrentUser() actor: RequestContext,
+  ) {
+    return this.protocols.addScenario(
+      tenantId,
+      id,
+      {
+        scenarioType: body.scenarioType,
+        expectedAction: body.expectedAction,
+        expectedProductId: body.expectedProductId,
+        expectedQuantity: body.expectedQuantity,
+        notes: body.notes,
+      },
+      actor.userId,
+    );
+  }
+
+  @Post(':id/scenarios/:scenarioId/result')
+  @RequirePermissions('vision:review')
+  @ApiOperation({
+    summary:
+      "Record the operator's PASS/FAIL/INCONCLUSIVE for one scenario " +
+      '(reporting only — never a CV input)',
+  })
+  recordResult(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Param('scenarioId') scenarioId: string,
+    @Body() body: RecordScenarioResultDto,
+    @CurrentUser() actor: RequestContext,
+  ) {
+    return this.protocols.recordScenarioResult(
+      tenantId,
+      id,
+      scenarioId,
+      {
+        result: body.result,
+        liveSessionId: body.liveSessionId,
+        resultNotes: body.resultNotes,
+      },
+      actor.userId,
+    );
+  }
+
+  @Get(':id/report')
+  @RequirePermissions('vision:read')
+  @ApiOperation({
+    summary:
+      'Validation report: scenario pass/fail counts + the linked ' +
+      "evaluation run's honest metrics + detection recall + fast-mode " +
+      'observation + dataset availability. Missing data is null — never ' +
+      'fabricated.',
+  })
+  report(@CurrentTenantId() tenantId: string, @Param('id') id: string) {
+    return this.protocols.report(tenantId, id);
+  }
+}
+
 @Module({
   imports: [PlatformModulesModule],
-  controllers: [PilotEvaluationController],
-  providers: [PilotEvaluationService],
+  controllers: [PilotEvaluationController, CvTestProtocolController],
+  providers: [PilotEvaluationService, CvTestProtocolService],
 })
 export class PilotEvaluationModule {}

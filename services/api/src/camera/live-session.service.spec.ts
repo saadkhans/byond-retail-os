@@ -282,6 +282,25 @@ function buildHarness(
         },
       ),
     },
+    // Phase 16 preflight reads the source row and evaluation run
+    // directly (booleans only — never the credentialRef value).
+    cameraSource: {
+      findFirst: jest.fn(async (args: { where: { id?: string } }) =>
+        sourceRow && args.where.id === 'cam-1'
+          ? {
+              id: sourceRow.id,
+              sourceType: sourceRow.sourceType,
+              status: sourceRow.status,
+              credentialRef: sourceRow.credentialRef,
+            }
+          : null,
+      ),
+    },
+    pilotEvaluationRun: {
+      findFirst: jest.fn(async (args: { where: { id?: string } }) =>
+        args.where.id === 'run-1' ? { id: 'run-1' } : null,
+      ),
+    },
     liveCameraSessionFinalizationIntent: {
       create: jest.fn(async (args: { data: Record<string, unknown> }) => {
         if (
@@ -3053,5 +3072,83 @@ describe('LiveSessionService — atomic pilot ownership + time budget (Codex rou
     const loopSleeps = sleeps.filter((ms) => ms > harness.service['drainMs']);
     expect(loopSleeps).toHaveLength(0);
     expect(sleeps.some((ms) => ms <= 1000)).toBe(true);
+  });
+});
+
+describe('LiveSessionService — Phase 16 live test preflight', () => {
+  it('a ready source reports every check true — controlled booleans only, no URL/credential material', async () => {
+    const harness = buildHarness({
+      env: { CV_LIVE_PILOT_RUNNER_ENABLED: 'true', CV_LIVE_FAST_MODE: 'true' },
+    });
+    const preflight = await harness.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+      'run-1',
+    );
+    expect(preflight).toMatchObject({
+      apiReachable: true,
+      sourceExists: true,
+      sourceActive: true,
+      sourceTypeSupported: true,
+      sourceConfigured: true,
+      ffmpegAvailable: true,
+      noActiveLiveSession: true,
+      pilotRunnerEnabled: true,
+      fastMode: true,
+      performanceEndpointAvailable: true,
+      evaluationRunExists: true,
+      ready: true,
+    });
+    expect(preflight.safety).toMatchObject({
+      orders: 0,
+      checkoutSessions: 0,
+      paymentIntents: 0,
+      paymentEvents: 0,
+      inventoryMovements: 0,
+    });
+    // Leak scan: the credentialRef slot NAME, URLs, and paths never
+    // appear — only booleans and controlled ids.
+    const raw = JSON.stringify(preflight);
+    expect(raw).not.toContain('CAMERA_SECRET_SLOT');
+    expect(raw).not.toContain('rtsp');
+    expect(raw).not.toContain('://');
+    expect(raw).not.toContain('.mp4');
+  });
+
+  it('a missing source reports sourceExists=false (no throw); an active session and disabled runner report not ready', async () => {
+    const missing = buildHarness({});
+    const gone = await missing.service.liveTestPreflight(TENANT, 'cam-x');
+    expect(gone.sourceExists).toBe(false);
+    expect(gone.ready).toBe(false);
+    expect(gone.evaluationRunExists).toBeNull();
+
+    const busy = buildHarness({
+      existingSession: {
+        id: 'live-op',
+        tenantId: TENANT,
+        cameraSourceId: 'cam-1',
+        status: LiveCameraSessionStatus.RUNNING,
+        journeyId: 'journey-op',
+        leaseOwner: 'op',
+        startedAt: new Date(),
+        heartbeatAt: new Date(),
+        eventWindows: [],
+      },
+    });
+    const report = await busy.service.liveTestPreflight(TENANT, 'cam-1', 'run-x');
+    expect(report.noActiveLiveSession).toBe(false);
+    expect(report.pilotRunnerEnabled).toBe(false);
+    expect(report.evaluationRunExists).toBe(false);
+    expect(report.ready).toBe(false);
+    // The preflight is READ-ONLY: nothing was mutated.
+    expect(busy.sessions[0].status).toBe(LiveCameraSessionStatus.RUNNING);
+    expect(busy.journeys.exit).not.toHaveBeenCalled();
+  });
+
+  it('an unconfigured runtime slot reports sourceConfigured=false without resolving any value into the response', async () => {
+    const harness = buildHarness({ configured: false });
+    const preflight = await harness.service.liveTestPreflight(TENANT, 'cam-1');
+    expect(preflight.sourceConfigured).toBe(false);
+    expect(preflight.ready).toBe(false);
   });
 });

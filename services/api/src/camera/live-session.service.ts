@@ -2372,6 +2372,85 @@ export class LiveSessionService {
     };
   }
 
+  /**
+   * Phase 16 — real-footage test PREFLIGHT: one controlled readiness
+   * snapshot before a live test run. Read-only; every field is a
+   * boolean/enum/controlled string — never a URL, path, credential
+   * slot value, or exception text. A missing source reports
+   * sourceExists=false instead of throwing (the preflight's job is to
+   * SAY what is wrong).
+   */
+  async liveTestPreflight(
+    tenantId: string,
+    cameraSourceId: string,
+    evaluationRunId?: string | null,
+  ) {
+    const source = await this.prisma.cameraSource.findFirst({
+      where: { tenantId, id: cameraSourceId },
+      select: {
+        id: true,
+        sourceType: true,
+        status: true,
+        credentialRef: true,
+      },
+    });
+    const sourceExists = source !== null;
+    const sourceActive = source?.status === CameraSourceStatus.ACTIVE;
+    const sourceTypeSupported =
+      source?.sourceType === CameraSourceType.RTSP_SHADOW;
+    const sourceConfigured =
+      source?.credentialRef != null
+        ? this.sampler.resolveSource(tenantId, source.credentialRef).configured
+        : false;
+    const ffmpegAvailable = await this.sampler.checkFfmpeg();
+    const activeSession = await this.prisma.liveCameraSession.findFirst({
+      where: {
+        tenantId,
+        cameraSourceId,
+        status: { in: NON_TERMINAL_SESSION_STATUSES },
+      },
+      select: { id: true },
+    });
+    let evaluationRunExists: boolean | null = null;
+    if (evaluationRunId) {
+      const run = await this.prisma.pilotEvaluationRun.findFirst({
+        where: { tenantId, id: evaluationRunId },
+        select: { id: true },
+      });
+      evaluationRunExists = run !== null;
+    }
+    const pilotRunnerEnabled =
+      (this.config?.get<string>('CV_LIVE_PILOT_RUNNER_ENABLED') ?? '')
+        .trim()
+        .toLowerCase() === 'true';
+    const checks = {
+      sourceExists,
+      sourceActive,
+      sourceTypeSupported,
+      sourceConfigured,
+      ffmpegAvailable,
+      noActiveLiveSession: activeSession === null,
+      pilotRunnerEnabled,
+    };
+    return {
+      apiReachable: true,
+      cameraSourceId,
+      ...checks,
+      fastMode: this.liveFastMode(),
+      performanceEndpointAvailable: true,
+      evaluationRunExists,
+      ready: Object.values(checks).every((value) => value === true),
+      safety: {
+        orders: 0,
+        checkoutSessions: 0,
+        paymentIntents: 0,
+        paymentEvents: 0,
+        inventoryMovements: 0,
+        basis: 'SHADOW_MODE_STATIC_GUARD',
+      },
+    };
+  }
+
   /** Phase 14 pilot runner poll cadence (real time). */
   protected pilotPollMs(): number {
     return 1000;
