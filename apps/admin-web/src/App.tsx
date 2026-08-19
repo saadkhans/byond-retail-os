@@ -8,6 +8,10 @@ import {
   useLocation,
 } from 'react-router-dom';
 import { AuthProvider, useAuth } from './auth';
+import {
+  CameraCalibrationDetailPage,
+  CameraCalibrationPage,
+} from './pages/CameraCalibrationPage';
 import { CamerasPage } from './pages/CamerasPage';
 import {
   LiveSessionDetailPage,
@@ -103,6 +107,7 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/cv-evaluation">CV Evaluation</NavLink>
         <NavLink to="/journeys">Journeys</NavLink>
         <NavLink to="/cameras">Cameras</NavLink>
+        <NavLink to="/camera-calibration">Camera calibration</NavLink>
         <NavLink to="/pilot-runs">Pilot runs</NavLink>
         <NavLink to="/live-sessions">Live sessions</NavLink>
         <NavLink to="/pilot-evaluations">Pilot evaluations</NavLink>
@@ -198,6 +203,14 @@ export function App() {
                       element={<JourneyDetailPage />}
                     />
                     <Route path="cameras" element={<CamerasPage />} />
+                    <Route
+                      path="camera-calibration"
+                      element={<CameraCalibrationPage />}
+                    />
+                    <Route
+                      path="camera-calibration/:cameraSourceId"
+                      element={<CameraCalibrationDetailPage />}
+                    />
                     <Route path="pilot-runs" element={<PilotRunsPage />} />
                     <Route
                       path="pilot-runs/:id"

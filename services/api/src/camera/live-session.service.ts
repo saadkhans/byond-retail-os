@@ -22,6 +22,7 @@ import {
 } from '../pickup-detection/analysis/pickup-analyzer';
 import { PickupFusionService } from '../pickup-fusion/pickup-fusion.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { computeCalibrationReadiness } from './camera-calibration.service';
 import {
   CameraSourcesService,
   RTSP_NEEDS_CREDENTIAL_SLOT,
@@ -2404,6 +2405,15 @@ export class LiveSessionService {
         credentialRef: true,
       },
     });
+    // Phase 17 — calibration readiness joins the preflight (shared pure
+    // derivation; controlled enums/booleans only). Null when the source
+    // itself is missing — sourceExists already reports that.
+    const calibration = source
+      ? await computeCalibrationReadiness(this.prisma, tenantId, {
+          id: source.id,
+          status: source.status,
+        })
+      : null;
     const sourceExists = source !== null;
     const sourceActive = source?.status === CameraSourceStatus.ACTIVE;
     const sourceTypeSupported =
@@ -2448,6 +2458,12 @@ export class LiveSessionService {
       ...(options?.requirePilotRunner ? { pilotRunnerEnabled } : {}),
       // A stated fast-mode expectation must match the active mode.
       ...(fastModeMatches !== null ? { fastModeMatches } : {}),
+      // Phase 17: REAL live-footage testing (RTSP_SHADOW) requires a
+      // usable calibration — NOT_READY fails the preflight. FILE_REPLAY
+      // checks are byte-for-byte unchanged (replay needs no calibration).
+      ...(source?.sourceType === CameraSourceType.RTSP_SHADOW && calibration
+        ? { calibrationReady: calibration.readiness !== 'NOT_READY' }
+        : {}),
     };
     return {
       apiReachable: true,
@@ -2459,6 +2475,13 @@ export class LiveSessionService {
       fastModeMatches,
       performanceEndpointAvailable: true,
       evaluationRunExists,
+      calibration: calibration
+        ? {
+            readiness: calibration.readiness,
+            warnings: calibration.warnings,
+            activeProfileId: calibration.activeProfileId,
+          }
+        : null,
       ready: Object.values(checks).every((value) => value === true),
       safety: {
         orders: 0,

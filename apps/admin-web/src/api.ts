@@ -1592,7 +1592,137 @@ export interface LiveTestPreflight {
   fastModeMatches: boolean | null;
   performanceEndpointAvailable: boolean;
   evaluationRunExists: boolean | null;
+  /** Phase 17 — present when calibration is part of the readiness checks. */
+  calibrationReady?: boolean;
+  /** Null when the camera source does not exist. */
+  calibration: {
+    readiness: CalibrationReadinessLevel;
+    warnings: string[];
+    activeProfileId: string | null;
+  } | null;
   ready: boolean;
+  safety: {
+    orders: number;
+    checkoutSessions: number;
+    paymentIntents: number;
+    paymentEvents: number;
+    inventoryMovements: number;
+    basis: string;
+  };
+}
+
+/** Phase 17 — camera calibration & pilot hardening (shadow only). */
+export type CameraCalibrationProfileStatus = 'DRAFT' | 'ACTIVE' | 'ARCHIVED';
+export type CameraCalibrationOrientation = 'LANDSCAPE' | 'PORTRAIT' | 'UNKNOWN';
+export type CameraCalibrationMount =
+  | 'OVERHEAD'
+  | 'FRONT_SHELF'
+  | 'ANGLED_SHELF'
+  | 'UNKNOWN';
+export type CameraCalibrationZoneType =
+  | 'SHELF_ZONE'
+  | 'INTERACTION_ZONE'
+  | 'IGNORE_ZONE'
+  | 'ENTRY_EXIT_ZONE';
+export type CalibrationReadinessLevel = 'READY' | 'WARNING' | 'NOT_READY';
+
+export interface CalibrationPolygonPoint {
+  x: number;
+  y: number;
+}
+
+export interface CameraCalibrationProfileView {
+  id: string;
+  cameraSourceId: string;
+  locationId: string | null;
+  name: string;
+  status: CameraCalibrationProfileStatus;
+  calibrationVersion: number;
+  frameWidth: number | null;
+  frameHeight: number | null;
+  orientation: CameraCalibrationOrientation;
+  cameraMount: CameraCalibrationMount;
+  notes: string | null;
+  zoneCount: number;
+  createdAt: string;
+  updatedAt: string;
+  activatedAt: string | null;
+  archivedAt: string | null;
+}
+
+export interface CameraCalibrationZoneView {
+  id: string;
+  calibrationProfileId: string;
+  cameraSourceId: string;
+  zoneType: CameraCalibrationZoneType;
+  label: string;
+  polygon: CalibrationPolygonPoint[];
+  qualityScore: number | null;
+  isActive: boolean;
+  sortOrder: number;
+  expectedProducts: { productId: string; sku: string }[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CameraCalibrationProfileDetail
+  extends CameraCalibrationProfileView {
+  zones: CameraCalibrationZoneView[];
+}
+
+/** GET /camera-sources/:id/calibration-readiness. Warnings are controlled
+ *  enum strings only — never free text, URLs, or paths. */
+export interface CalibrationReadiness {
+  cameraSourceId: string;
+  hasActiveCalibrationProfile: boolean;
+  activeProfileId: string | null;
+  profileStatus: 'ACTIVE' | null;
+  hasShelfZone: boolean;
+  hasInteractionZone: boolean;
+  hasIgnoreZone: boolean;
+  hasExpectedProducts: boolean;
+  frameDimensionsKnown: boolean;
+  orientationKnown: boolean;
+  cameraMountKnown: boolean;
+  zoneCount: number;
+  expectedProductCount: number;
+  readiness: CalibrationReadinessLevel;
+  warnings: string[];
+}
+
+/** GET /camera-sources/:id/pilot-hardening-report. */
+export interface PilotHardeningReport {
+  cameraSourceId: string;
+  sourceStatus: CameraSourceStatus;
+  sourceType: CameraSourceType;
+  calibrationReadiness: CalibrationReadiness;
+  activeCalibrationProfile: CameraCalibrationProfileView | null;
+  zoneSummary: {
+    total: number;
+    shelfZones: number;
+    interactionZones: number;
+    ignoreZones: number;
+    entryExitZones: number;
+  };
+  expectedProductsSummary: {
+    shelfZonesWithProducts: number;
+    productCount: number;
+  };
+  latestLiveSessionSummary: {
+    id: string;
+    status: string;
+    startedAt: string | null;
+    stoppedAt: string | null;
+    framesSampled: number;
+    eventWindowsDetected: number;
+    reviewNeeded: number;
+    decision: string | null;
+  } | null;
+  latestPerformanceSummary: {
+    fastMode: boolean | null;
+    slowestStage: { stage: string; p95Ms: number; maxMs: number } | null;
+  } | null;
+  recommendedNextActions: string[];
   safety: {
     orders: number;
     checkoutSessions: number;

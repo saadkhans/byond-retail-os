@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Module,
   Param,
@@ -24,8 +25,15 @@ import { PickupDetectionModule } from '../pickup-detection/pickup-detection.modu
 import { PickupFusionModule } from '../pickup-fusion/pickup-fusion.module';
 import { PlatformModulesModule } from '../platform-modules/platform-modules.module';
 import { VideoIngestModule } from '../video-ingest/video-ingest.module';
+import { CameraCalibrationService } from './camera-calibration.service';
 import { CameraReplayService } from './camera-replay.service';
 import { CameraSourcesService } from './camera-sources.service';
+import {
+  CreateCalibrationProfileDto,
+  CreateCalibrationZoneDto,
+  UpdateCalibrationProfileDto,
+  UpdateCalibrationZoneDto,
+} from './dto/camera-calibration.dto';
 import { CreateCameraSourceDto } from './dto/create-camera-source.dto';
 import { PilotTestDto } from './dto/pilot-test.dto';
 import { ReplayRunDto } from './dto/replay-run.dto';
@@ -52,6 +60,7 @@ export class CameraSourcesController {
     private readonly sources: CameraSourcesService,
     private readonly replay: CameraReplayService,
     private readonly live: LiveSessionService,
+    private readonly calibration: CameraCalibrationService,
   ) {}
 
   @Post()
@@ -178,6 +187,37 @@ export class CameraSourcesController {
     });
   }
 
+  @Get(':id/calibration-readiness')
+  @RequirePermissions('vision:read')
+  @ApiOperation({
+    summary:
+      'Phase 17 calibration readiness for this camera source: controlled ' +
+      'booleans/enums/counts plus a controlled warning list — no URL, ' +
+      'path, or credential material.',
+  })
+  calibrationReadiness(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+  ) {
+    return this.calibration.calibrationReadiness(tenantId, id);
+  }
+
+  @Get(':id/pilot-hardening-report')
+  @RequirePermissions('vision:read')
+  @ApiOperation({
+    summary:
+      'Phase 17 pilot hardening report: source status, calibration ' +
+      'readiness, zone/product coverage, latest live session + ' +
+      'performance (null when absent, never fabricated), and a ' +
+      'controlled next-action list. No URL, path, or credential material.',
+  })
+  pilotHardeningReport(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+  ) {
+    return this.calibration.pilotHardeningReport(tenantId, id);
+  }
+
   @Post(':id/pilot-test')
   @RequirePermissions('vision:ingest')
   @ApiOperation({
@@ -290,6 +330,133 @@ export class PilotRunsController {
   }
 }
 
+/**
+ * Phase 17 — camera calibration profiles + zones (SHADOW ONLY).
+ * Calibration is setup metadata for reliable live TESTING: normalized
+ * zones and safe structured fields only. No RTSP URL, file path,
+ * credential slot, raw frame, or raw video is ever stored or returned,
+ * and no route here touches checkout, orders, payments, or inventory.
+ */
+@ApiTags('camera')
+@ApiBearerAuth()
+@TenantOnly()
+@RequireModule('cv')
+@Controller('camera-calibration-profiles')
+export class CameraCalibrationController {
+  constructor(private readonly calibration: CameraCalibrationService) {}
+
+  @Post()
+  @RequirePermissions('vision:ingest')
+  @ApiOperation({
+    summary:
+      'Create a calibration profile (DRAFT) for a camera source. Safe ' +
+      'structured metadata only; notes are screened free text.',
+  })
+  create(
+    @CurrentTenantId() tenantId: string,
+    @Body() body: CreateCalibrationProfileDto,
+    @CurrentUser() actor: RequestContext,
+  ) {
+    return this.calibration.createProfile(tenantId, body, actor.userId);
+  }
+
+  @Get()
+  @RequirePermissions('vision:read')
+  @ApiOperation({
+    summary:
+      'List calibration profiles (newest first), optionally filtered by ' +
+      '?cameraSourceId=',
+  })
+  list(
+    @CurrentTenantId() tenantId: string,
+    @Query('cameraSourceId') cameraSourceId?: string,
+  ) {
+    return this.calibration.listProfiles(tenantId, cameraSourceId || null);
+  }
+
+  @Get(':id')
+  @RequirePermissions('vision:read')
+  @ApiOperation({ summary: 'Calibration profile detail with its zones' })
+  byId(@CurrentTenantId() tenantId: string, @Param('id') id: string) {
+    return this.calibration.profileById(tenantId, id);
+  }
+
+  @Patch(':id')
+  @RequirePermissions('vision:ingest')
+  @ApiOperation({
+    summary:
+      'Update calibration metadata (DRAFT/ACTIVE only — an ARCHIVED ' +
+      'profile is immutable).',
+  })
+  update(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Body() body: UpdateCalibrationProfileDto,
+  ) {
+    return this.calibration.updateProfile(tenantId, id, body);
+  }
+
+  @Post(':id/activate')
+  @RequirePermissions('vision:ingest')
+  @ApiOperation({
+    summary:
+      'EXPLICIT activation: requires at least one active SHELF_ZONE and ' +
+      'one active INTERACTION_ZONE; archives the source\'s current ' +
+      'ACTIVE profile (one ACTIVE per camera source).',
+  })
+  activate(@CurrentTenantId() tenantId: string, @Param('id') id: string) {
+    return this.calibration.activateProfile(tenantId, id);
+  }
+
+  @Post(':id/archive')
+  @RequirePermissions('vision:ingest')
+  @ApiOperation({ summary: 'Archive a calibration profile (terminal)' })
+  archive(@CurrentTenantId() tenantId: string, @Param('id') id: string) {
+    return this.calibration.archiveProfile(tenantId, id);
+  }
+
+  @Post(':id/zones')
+  @RequirePermissions('vision:ingest')
+  @ApiOperation({
+    summary:
+      'Add a zone (normalized 0..1 polygon, 3..20 points). Expected ' +
+      'products are SHELF_ZONE-only and tenant-scoped.',
+  })
+  addZone(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Body() body: CreateCalibrationZoneDto,
+  ) {
+    return this.calibration.addZone(tenantId, id, body);
+  }
+
+  @Patch(':id/zones/:zoneId')
+  @RequirePermissions('vision:ingest')
+  @ApiOperation({
+    summary:
+      'Update a zone; expectedProductIds uses REPLACE-ALL semantics.',
+  })
+  updateZone(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Param('zoneId') zoneId: string,
+    @Body() body: UpdateCalibrationZoneDto,
+  ) {
+    return this.calibration.updateZone(tenantId, id, zoneId, body);
+  }
+
+  @Delete(':id/zones/:zoneId')
+  @RequirePermissions('vision:ingest')
+  @ApiOperation({ summary: 'Delete a zone (and its expected products)' })
+  deleteZone(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Param('zoneId') zoneId: string,
+  ) {
+    return this.calibration.deleteZone(tenantId, id, zoneId);
+  }
+}
+
 @Module({
   imports: [
     PlatformModulesModule,
@@ -302,12 +469,14 @@ export class PilotRunsController {
     CameraSourcesController,
     PilotRunsController,
     LiveSessionsController,
+    CameraCalibrationController,
   ],
   providers: [
     CameraSourcesService,
     CameraReplayService,
     LiveSessionService,
     RtspFrameSampler,
+    CameraCalibrationService,
   ],
 })
 export class CameraModule {}
