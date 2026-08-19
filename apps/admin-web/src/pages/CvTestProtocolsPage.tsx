@@ -263,13 +263,26 @@ export function CvTestProtocolDetailPage() {
       setResultSessionId(attachedSessions[0].liveSessionId);
     }
   }, [attachedSessions.length, attachedSessions[0]?.liveSessionId]);
-  // The scenario-type template locks its expected action.
+  // The scenario-type template locks its expected action; UNKNOWN_PRODUCT
+  // is open-ended over PRODUCT interactions only (never NO_OP).
   const fixedAction = FIXED_ACTIONS[scenarioType];
+  const allowedActions: PilotExpectedAction[] =
+    fixedAction !== undefined
+      ? [fixedAction]
+      : scenarioType === 'UNKNOWN_PRODUCT'
+        ? ['UNKNOWN', 'PICKUP', 'RETURN']
+        : ACTIONS;
   useEffect(() => {
     if (fixedAction) {
       setExpectedAction(fixedAction);
+    } else if (
+      scenarioType === 'UNKNOWN_PRODUCT' &&
+      expectedAction === 'NO_OP'
+    ) {
+      setExpectedAction('UNKNOWN');
     }
-  }, [fixedAction]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fixedAction, scenarioType]);
 
   async function runPreflight() {
     if (!data?.cameraSourceId) {
@@ -490,7 +503,7 @@ export function CvTestProtocolDetailPage() {
                   setExpectedAction(e.target.value as PilotExpectedAction)
                 }
               >
-                {ACTIONS.map((option) => (
+                {allowedActions.map((option) => (
                   <option key={option} value={option}>
                     {option}
                   </option>

@@ -2574,7 +2574,10 @@ model CvTestProtocol {
   completedAt      DateTime?
 
   tenant        Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location      Location?                @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  // SAME-TENANT composite location relation (Codex P1): the store join
+  // carries the tenant in the FK itself — a malformed row can never
+  // resolve another tenant's store name.
+  location      Location?                @relation(fields: [locationId, tenantId], references: [id, tenantId], onDelete: Restrict)
   cameraSource  CameraSource?            @relation(fields: [cameraSourceId], references: [id], onDelete: Restrict)
   evaluationRun PilotEvaluationRun?      @relation(fields: [evaluationRunId], references: [id], onDelete: Restrict)
   scenarios     CvTestProtocolScenario[]

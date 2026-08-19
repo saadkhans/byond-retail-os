@@ -55,7 +55,8 @@ CREATE INDEX "CvTestProtocolScenario_tenantId_protocolId_createdAt_idx" ON "CvTe
 
 -- AddForeignKey
 ALTER TABLE "CvTestProtocol" ADD CONSTRAINT "CvTestProtocol_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
-ALTER TABLE "CvTestProtocol" ADD CONSTRAINT "CvTestProtocol_locationId_fkey" FOREIGN KEY ("locationId") REFERENCES "Location"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+-- Same-tenant composite location relation (Codex P1).
+ALTER TABLE "CvTestProtocol" ADD CONSTRAINT "CvTestProtocol_locationId_tenantId_fkey" FOREIGN KEY ("locationId", "tenantId") REFERENCES "Location"("id", "tenantId") ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE "CvTestProtocol" ADD CONSTRAINT "CvTestProtocol_cameraSourceId_fkey" FOREIGN KEY ("cameraSourceId") REFERENCES "CameraSource"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE "CvTestProtocol" ADD CONSTRAINT "CvTestProtocol_evaluationRunId_fkey" FOREIGN KEY ("evaluationRunId") REFERENCES "PilotEvaluationRun"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE "CvTestProtocolScenario" ADD CONSTRAINT "CvTestProtocolScenario_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE RESTRICT ON UPDATE CASCADE;

@@ -38,6 +38,9 @@ function buildHarness(
       if (cond !== null && typeof cond === 'object' && 'in' in (cond as object)) {
         return ((cond as { in: unknown[] }).in ?? []).includes(row[key]);
       }
+      if (cond !== null && typeof cond === 'object' && 'not' in (cond as object)) {
+        return row[key] !== (cond as { not: unknown }).not;
+      }
       return row[key] === cond;
     });
 
@@ -122,6 +125,9 @@ function buildHarness(
           return { count: hits.length };
         },
       ),
+      count: jest.fn(async (args: { where: Record<string, unknown> }) =>
+        scenarios.filter((r) => whereMatch(r, args.where)).length,
+      ),
     },
     location: {
       findFirst: jest.fn(async (args: { where: { id?: string } }) =>
@@ -167,7 +173,13 @@ function buildHarness(
         })),
       ),
     },
+    $queryRaw: jest.fn(async () => []),
   };
+  // Interactive transaction: same client back (advisory lock is a
+  // no-result side effect in the stub).
+  prisma.$transaction = jest.fn(
+    async (fn: (tx: unknown) => Promise<unknown>) => fn(prisma),
+  );
   /* eslint-enable @typescript-eslint/no-explicit-any */
 
   const evaluations = {
@@ -689,5 +701,139 @@ describe('CvTestProtocolService — Codex round 1 (source screening, binding, ga
       expectedAction: PilotExpectedAction.UNKNOWN,
     });
     expect(open.scenarios).toHaveLength(2);
+  });
+});
+
+describe('CvTestProtocolService — Codex round 2 (relink guard, relative paths, atomic completion, NO_OP)', () => {
+  it('relinking is allowed before results exist, REFUSED after — results untouched', async () => {
+    const harness = buildHarness();
+    const created = await harness.service.createProtocol(TENANT, {
+      name: 'p',
+      evaluationRunId: 'run-1',
+    });
+    const detail = await harness.service.addScenario(TENANT, created.protocolId, {
+      scenarioType: CvTestScenarioType.SINGLE_PICKUP,
+      expectedAction: PilotExpectedAction.PICKUP,
+    });
+    // No results yet → relink (to the same run is idempotent; the guard
+    // is for CHANGING the run).
+    await harness.service.linkEvaluationRun(TENANT, created.protocolId, 'run-1');
+    // Record a result, then attempt to change the run.
+    await harness.service.recordScenarioResult(
+      TENANT,
+      created.protocolId,
+      detail.scenarios[0].scenarioId,
+      { result: CvTestScenarioResult.PASS, liveSessionId: 'live-1' },
+    );
+    // A different (also valid-looking) run id must be refused. The stub
+    // only knows run-1, so extend it for this call.
+    harness.prisma.pilotEvaluationRun.findFirst.mockResolvedValueOnce({
+      id: 'run-2',
+      status: 'OPEN',
+    });
+    const error = await harness.service
+      .linkEvaluationRun(TENANT, created.protocolId, 'run-2')
+      .then(() => null)
+      .catch((err: Error) => err);
+    expect(error).toBeInstanceOf(ConflictException);
+    expect(error!.message).toContain('CV_TEST_PROTOCOL_RESULTS_EXIST');
+    // The rejection cleared NOTHING.
+    expect(harness.scenarios[0].result).toBe(CvTestScenarioResult.PASS);
+    expect(harness.scenarios[0].liveSessionId).toBe('live-1');
+    expect(harness.protocols[0].evaluationRunId).toBe('run-1');
+    // Idempotent same-run relink still fine even with results.
+    const same = await harness.service.linkEvaluationRun(
+      TENANT,
+      created.protocolId,
+      'run-1',
+    );
+    expect(same.evaluationRunId).toBe('run-1');
+  });
+
+  it('relative and home-relative paths are rejected from protocol text — never echoed', async () => {
+    const harness = buildHarness();
+    const cases = [
+      './recordings/camera',
+      '../feeds/cam-a',
+      'recordings/session',
+      '~/streams/camera',
+      'recordings\\session',
+    ];
+    for (const value of cases) {
+      const error = await harness.service
+        .createProtocol(TENANT, { name: 'ok', description: value })
+        .then(() => null)
+        .catch((err: Error) => err);
+      expect(error).toBeInstanceOf(BadRequestException);
+      expect(error!.message).not.toContain('recordings');
+      expect(error!.message).not.toContain('feeds');
+      expect(error!.message).not.toContain('streams');
+    }
+    expect(harness.protocols).toHaveLength(0);
+    // Ordinary prose — including natural slash pairs — still passes.
+    const created = await harness.service.createProtocol(TENANT, {
+      name: 'ok',
+      description: 'test low light pickup near shelf, note pass/fail per item',
+    });
+    expect(created.protocolId).toBeTruthy();
+  });
+
+  it('a protocol completed between addScenario’s pre-read and its transactional write does NOT gain the scenario (Codex P1)', async () => {
+    const harness = buildHarness();
+    const created = await harness.service.createProtocol(TENANT, { name: 'p' });
+    // The pre-read (requireProtocol) sees DRAFT; a concurrent completion
+    // lands before the transactional re-check. The in-tx status read is
+    // the SECOND cvTestProtocol.findFirst call of addScenario.
+    const original =
+      harness.prisma.cvTestProtocol.findFirst.getMockImplementation() as (
+        args: unknown,
+      ) => Promise<unknown>;
+    let reads = 0;
+    harness.prisma.cvTestProtocol.findFirst.mockImplementation(
+      async (args: unknown) => {
+        reads += 1;
+        if (reads === 2) {
+          // Concurrent completion committed while this insert was on the
+          // way to its transaction.
+          harness.protocols[0].status = CvTestProtocolStatus.CANCELLED;
+        }
+        return original(args);
+      },
+    );
+    await expect(
+      harness.service.addScenario(TENANT, created.protocolId, {
+        scenarioType: CvTestScenarioType.SINGLE_PICKUP,
+        expectedAction: PilotExpectedAction.PICKUP,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    // The terminal protocol gained NO scenario.
+    expect(harness.scenarios).toHaveLength(0);
+    // Both the insert and the completion path take the SAME advisory
+    // lock inside a transaction — the serialization primitive is pinned.
+    expect(harness.prisma.$transaction).toHaveBeenCalled();
+    expect(harness.prisma.$queryRaw).toHaveBeenCalled();
+  });
+
+  it('UNKNOWN_PRODUCT accepts UNKNOWN/PICKUP/RETURN and rejects NO_OP (Codex P2)', async () => {
+    const harness = buildHarness();
+    const created = await harness.service.createProtocol(TENANT, { name: 'p' });
+    for (const action of [
+      PilotExpectedAction.UNKNOWN,
+      PilotExpectedAction.PICKUP,
+      PilotExpectedAction.RETURN,
+    ]) {
+      await harness.service.addScenario(TENANT, created.protocolId, {
+        scenarioType: CvTestScenarioType.UNKNOWN_PRODUCT,
+        expectedAction: action,
+      });
+    }
+    expect(harness.scenarios).toHaveLength(3);
+    await expect(
+      harness.service.addScenario(TENANT, created.protocolId, {
+        scenarioType: CvTestScenarioType.UNKNOWN_PRODUCT,
+        expectedAction: PilotExpectedAction.NO_OP,
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(harness.scenarios).toHaveLength(3);
   });
 });
