@@ -1,20 +1,66 @@
-import { CameraSourceStatus, CameraSourceType, PilotRunStatus } from './api';
+import {
+  CameraSourceStatus,
+  CameraSourceType,
+  LiveSessionStatus,
+  PilotRunStatus,
+} from './api';
 
 /**
- * Pure presentation logic for the Phase 12 camera registry, pilot-run
- * dashboard, and review queue — kept free of React so it is unit-testable
- * (vitest) without a DOM.
+ * Pure presentation logic for the Phase 12/13 camera registry, pilot-run
+ * dashboard, live sessions, and review queue — kept free of React so it
+ * is unit-testable (vitest) without a DOM.
  */
 
 export const SOURCE_TYPE_LABEL: Record<CameraSourceType, string> = {
   FILE_REPLAY: 'File replay',
   RTSP_PLACEHOLDER: 'RTSP (not enabled)',
   LOCAL_WEBCAM_PLACEHOLDER: 'Local webcam (not enabled)',
+  RTSP_SHADOW: 'RTSP (shadow)',
 };
 
-/** Only FILE_REPLAY is functional in the shadow pilot. */
+/** FILE_REPLAY and RTSP_SHADOW are functional; the *_PLACEHOLDER types
+ *  can never activate (Phase 12 rule, unchanged). */
 export function isPlaceholderType(sourceType: CameraSourceType): boolean {
-  return sourceType !== 'FILE_REPLAY';
+  return (
+    sourceType === 'RTSP_PLACEHOLDER' ||
+    sourceType === 'LOCAL_WEBCAM_PLACEHOLDER'
+  );
+}
+
+/** RUNNING ok · STARTING/STOPPING warn · ERROR down · STOPPED neutral. */
+export function liveSessionStatusTone(
+  status: LiveSessionStatus | string,
+): string {
+  if (status === 'RUNNING') {
+    return 'ok';
+  }
+  if (status === 'ERROR') {
+    return 'down';
+  }
+  if (status === 'STOPPED') {
+    return '';
+  }
+  return 'warn';
+}
+
+/** Phase 13 (Codex P1): a STOPPING session is RETRYABLE, not dead — the
+ *  service resumes a parked finalization only when another stop() call
+ *  arrives, so the UI must keep polling it and keep the stop action
+ *  visible. Terminal STOPPED/ERROR stay non-actionable. */
+export function liveSessionIsActionable(
+  status: LiveSessionStatus | string,
+): boolean {
+  return (
+    status === 'STARTING' || status === 'RUNNING' || status === 'STOPPING'
+  );
+}
+
+/** Stop-action label: a clearly-marked RETRY for a parked STOPPING
+ *  finalization; the plain stop otherwise. */
+export function liveSessionStopLabel(
+  status: LiveSessionStatus | string,
+): string {
+  return status === 'STOPPING' ? 'Retry stop' : 'Stop session';
 }
 
 export function sourceStatusTone(status: CameraSourceStatus | string): string {

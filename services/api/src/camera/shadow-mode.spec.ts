@@ -59,6 +59,18 @@ describe('camera module shadow mode', () => {
     }
   });
 
+  it('never imports billing/checkout/payment services (Phase 13 live runtime included)', () => {
+    const forbidden =
+      /from\s+'[^']*(checkout|payments?|orders?)\/[^']*'|CheckoutService|OrdersService|PaymentsService/;
+    for (const file of sourceFiles(root)) {
+      const source = readFileSync(file, 'utf8');
+      const match = source.match(forbidden);
+      expect(
+        match ? `${file} references ${match[0]} — billing is elsewhere` : null,
+      ).toBeNull();
+    }
+  });
+
   it('never reaches the VLM — no adapter import, no verifier port, no token', () => {
     const forbidden =
       /VlmVerifier|PICKUP_VLM_VERIFIER|OllamaVlmVerifier|AnthropicVlmVerifier|vlm-provider|adapters\/(ollama-vlm|vlm-verifier|vlm-shared)|VlmRequestEvidence/;

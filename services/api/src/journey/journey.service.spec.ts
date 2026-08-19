@@ -326,6 +326,20 @@ function buildService(overrides: {
    *  (isPlatformSandbox marker). Default false — an ordinary customer
    *  tenant, on which platform reviewer attribution must be refused. */
   verifiedSandbox?: boolean;
+  /** A live camera session that OWNS the journey (Codex P1 exit guard +
+   *  review-first fence). status defaults to RUNNING when omitted.
+   *  Default null — no live owner, generic exits allowed, no fence. */
+  liveOwnerSession?: {
+    id: string;
+    status?: string;
+    eventWindowsDetected?: number;
+    eventWindowsProcessed?: number;
+    errorCode?: string | null;
+    finalizationMode?: string | null;
+  } | null;
+  /** A durable finalization intent row on the owning live session (the
+   *  fence's last check). Default null. */
+  liveIntent?: { id: string } | null;
 } = {}) {
   const createdEvents: Record<string, unknown>[] = [];
   const createdReviews: Record<string, unknown>[] = [];
@@ -344,6 +358,31 @@ function buildService(overrides: {
   };
   /* eslint-disable @typescript-eslint/no-explicit-any */
   const prisma: any = {
+    // Live-owned journey guard + review-first fence (Codex P1): the
+    // generic-exit guard queries with a non-terminal status filter; the
+    // reconcile fence queries with NO status filter. The stub honors an
+    // `in` status predicate so a TERMINAL session row still fences the
+    // decision while no longer blocking the generic exit. Default: no
+    // live owner.
+    liveCameraSession: {
+      findFirst: jest.fn(
+        async (args?: { where?: { status?: { in?: string[] } } }) => {
+          const row = overrides.liveOwnerSession ?? null;
+          if (!row) {
+            return null;
+          }
+          const statusIn = args?.where?.status?.in;
+          const rowStatus = (row as { status?: string }).status ?? 'RUNNING';
+          if (statusIn && !statusIn.includes(rowStatus)) {
+            return null;
+          }
+          return row;
+        },
+      ),
+    },
+    liveCameraSessionFinalizationIntent: {
+      findFirst: jest.fn(async () => overrides.liveIntent ?? null),
+    },
     location: { findFirst: jest.fn(async () => ({ id: 'store-1' })) },
     retailUnit: {
       findFirst: jest.fn(async () =>
@@ -590,6 +629,221 @@ describe('JourneyService', () => {
     });
     await service.exit(TENANT, 'j-1');
     expect(journeyRow.status).toBe(CustomerJourneyStatus.RECONCILED);
+  });
+
+  it('generic exit on a journey OWNED by an active live session is a controlled 409 — the journey stays OPEN (Codex P1)', async () => {
+    const { service, prisma, journeyRow } = buildService({
+      liveOwnerSession: { id: 'live-1' },
+    });
+    await expect(service.exit(TENANT, 'j-1')).rejects.toThrow(
+      /LIVE_JOURNEY_EXIT_REQUIRES_SESSION_FINALIZER/,
+    );
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.OPEN);
+    expect(journeyRow.decision).toBeNull();
+    // Tenant-scoped, status-bounded ownership lookup.
+    const call = prisma.liveCameraSession.findFirst.mock.calls[0][0] as {
+      where: { tenantId: string; journeyId: string; status: { in: string[] } };
+    };
+    expect(call.where.tenantId).toBe(TENANT);
+    expect(call.where.journeyId).toBe('j-1');
+    expect(call.where.status.in).toEqual(
+      expect.arrayContaining(['STARTING', 'RUNNING', 'STOPPING']),
+    );
+  });
+
+  it('the live-session FINALIZER bypass still exits a live-owned journey — review-first, never READY (Phase 13 hard rule)', async () => {
+    const { service, journeyRow } = buildService({
+      liveOwnerSession: { id: 'live-1' },
+    });
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    // The journey CLOSED (ended, decided) — but a live-owned journey
+    // never settles READY, so it lands in review.
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.REVIEW_REQUIRED);
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+    expect(journeyRow.endedAt).not.toBeNull();
+  });
+
+  it('HARD RULE: a live-owned journey with a CLEAN basket that would compute READY writes NEEDS_EVENT_REVIEW at the final update', async () => {
+    const { service, journeyRow } = buildService({
+      liveOwnerSession: { id: 'live-1' },
+    });
+    await service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+    });
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+    expect(journeyRow.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+  });
+
+  it('REVIEW-FIRST FENCE: a live-owned journey with DETECTED work cannot commit READY even when the basket folds cleanly (Codex P1)', async () => {
+    const { service, journeyRow } = buildService({
+      liveOwnerSession: {
+        id: 'live-1',
+        status: 'STOPPING',
+        eventWindowsDetected: 1,
+      },
+    });
+    await service.appendEvent(TENANT, 'j-1', {
+      eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+      productId: 'prod-a',
+    });
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    // The JOURNEY's own decision is review — not just a session copy.
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+    expect(journeyRow.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.REVIEW_REQUIRED);
+  });
+
+  it('REVIEW-FIRST FENCE: a TERMINAL live session with a finalization error mode/code still fences the in-flight exit (timeout takeover race)', async () => {
+    // The takeover stamped mode+code and terminalized the session; the
+    // ORIGINAL exit, blocked until now, finally commits — the fence read
+    // inside its deciding transaction must refuse READY.
+    const { service, journeyRow } = buildService({
+      liveOwnerSession: {
+        id: 'live-1',
+        status: 'ERROR',
+        eventWindowsDetected: 0,
+        errorCode: 'LIVE_WINDOW_DRAIN_TIMEOUT',
+        finalizationMode: 'ERROR',
+      },
+    });
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+    expect(journeyRow.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+  });
+
+  it('REVIEW-FIRST FENCE: any durable finalization intent on the owning live session forbids READY', async () => {
+    const { service, journeyRow } = buildService({
+      liveOwnerSession: { id: 'live-1', status: 'STOPPING' },
+      liveIntent: { id: 'intent-1' },
+    });
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+  });
+
+  it('COMMIT-POINT RECHECK: a timeout fence stamped AFTER the fold reads but before the final update still blocks READY (Codex P1)', async () => {
+    const liveOwner: {
+      id: string;
+      status: string;
+      eventWindowsDetected: number;
+      errorCode: string | null;
+      finalizationMode: string | null;
+    } = {
+      id: 'live-1',
+      status: 'STOPPING',
+      eventWindowsDetected: 0,
+      errorCode: null,
+      finalizationMode: null,
+    };
+    const { service, prisma, journeyRow } = buildService({
+      liveOwnerSession: liveOwner,
+    });
+    const originalFindMany =
+      prisma.customerJourneyEvent.findMany.getMockImplementation() as (
+        args: unknown,
+      ) => Promise<unknown[]>;
+    prisma.customerJourneyEvent.findMany.mockImplementationOnce(
+      async (args: unknown) => {
+        // The ORIGINAL exit is mid-reconcile (fold reads done, decision
+        // not yet committed) when the timeout takeover stamps the owning
+        // session with ERROR mode + code. The fence recheck at the
+        // commit point must see it — no cached clean verdict.
+        liveOwner.finalizationMode = 'ERROR';
+        liveOwner.errorCode = 'LIVE_WINDOW_DRAIN_TIMEOUT';
+        return originalFindMany(args);
+      },
+    );
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+    expect(journeyRow.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+    expect(journeyRow.status).toBe(CustomerJourneyStatus.REVIEW_REQUIRED);
+  });
+
+  it('COMMIT-POINT RECHECK: a fence read that THROWS fails the journey closed — never READY on an unverifiable fence', async () => {
+    const { service, prisma, journeyRow } = buildService();
+    prisma.liveCameraSession.findFirst.mockRejectedValueOnce(
+      new Error('fence read outage'),
+    );
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    expect(journeyRow.decision).toBe(CustomerJourneyDecision.FAILED);
+    expect(journeyRow.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
+  });
+
+  it('REVIEW-FIRST FENCE: a session with PROCESSED windows fences even when the detected counter reads zero', async () => {
+    const { service, journeyRow } = buildService({
+      liveOwnerSession: {
+        id: 'live-1',
+        status: 'STOPPING',
+        eventWindowsDetected: 0,
+        eventWindowsProcessed: 1,
+      },
+    });
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+  });
+
+  it('HARD RULE: even a clean ZERO-MOTION live session never settles its journey READY — ownership alone decides (Phase 13)', async () => {
+    const { service, journeyRow } = buildService({
+      liveOwnerSession: {
+        id: 'live-1',
+        status: 'STOPPING',
+        eventWindowsDetected: 0,
+        errorCode: null,
+        finalizationMode: null,
+      },
+    });
+    await service.exit(TENANT, 'j-1', undefined, {
+      viaLiveSessionFinalizer: true,
+    });
+    // No risky state at all — ownership is the whole predicate, which is
+    // what removes the fence race: no takeover timing can change it.
+    expect(journeyRow.decision).toBe(
+      CustomerJourneyDecision.NEEDS_EVENT_REVIEW,
+    );
+    expect(journeyRow.decision).not.toBe(
+      CustomerJourneyDecision.READY_TO_SETTLE_SHADOW,
+    );
   });
 
   it('exit scopes the status update by the id_tenantId composite key (tenant isolation at the write)', async () => {

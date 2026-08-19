@@ -14,6 +14,7 @@ import {
   FusionPolicyResult,
   FusionRunScope,
   JourneyEventReviewDecision,
+  LiveCameraSessionStatus,
   Prisma,
   TenantStatus,
   UserType,
@@ -69,7 +70,9 @@ export interface JourneyEventReviewView {
  *  evidence JSON's rawPreview/errorDetail/OCR text never leave the API. */
 export interface JourneyFusionRunSummary {
   runId: string;
-  videoAssetId: string;
+  /** Null for LIVE_WINDOW runs (Phase 13) — those carry a live session
+   *  instead of a video asset. */
+  videoAssetId: string | null;
   pipelineVersion: string;
   policy: FusionPolicyResult;
   fusedTopSku: string | null;
@@ -443,7 +446,33 @@ export class JourneyService {
       entryAt?: Date;
     },
   ) {
-    const location = await this.prisma.location.findFirst({
+    // ATOMIC open: the journey row and its ENTRY event become visible
+    // together. If the ENTRY insert failed after the journey committed,
+    // an OPEN journey with no ENTRY event would remain and a retry would
+    // open a SECOND journey for the same shopper.
+    const journey = await this.prisma.$transaction(async (tx) =>
+      this.openJourneyInTransaction(tx, tenantId, input, actorId, options),
+    );
+    return this.detail(tenantId, journey.journeyId);
+  }
+
+  /**
+   * Open a journey INSIDE a caller-owned transaction (Phase 13): the
+   * live-session runtime must create its journey and link it onto the
+   * session row ATOMICALLY — a journey existing without its session link
+   * is an orphan waiting to happen, so both writes commit or neither
+   * does. Validations run on the SAME transaction client; the caller
+   * performs its own linking write in the same transaction and lets the
+   * whole thing roll back on any failure.
+   */
+  async openJourneyInTransaction(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    input: { locationId: string; unitId?: string | null },
+    actorId?: string,
+    options?: { entryAt?: Date },
+  ): Promise<{ journeyId: string }> {
+    const location = await tx.location.findFirst({
       where: { tenantId, id: input.locationId },
       select: { id: true },
     });
@@ -456,7 +485,7 @@ export class JourneyService {
       // within BOTH this tenant and this location before it is written —
       // otherwise a known foreign unit id links a journey across tenants
       // (or across stores of the same tenant).
-      const unit = await this.prisma.retailUnit.findFirst({
+      const unit = await tx.retailUnit.findFirst({
         where: { tenantId, id: input.unitId, locationId: input.locationId },
         select: { id: true },
       });
@@ -464,33 +493,26 @@ export class JourneyService {
         throw new NotFoundException('Unit not found in this store');
       }
     }
-    // ATOMIC open: the journey row and its ENTRY event become visible
-    // together. If the ENTRY insert failed after the journey committed,
-    // an OPEN journey with no ENTRY event would remain and a retry would
-    // open a SECOND journey for the same shopper.
     const entryAt = options?.entryAt ?? new Date();
-    const journey = await this.prisma.$transaction(async (tx) => {
-      const created = await tx.customerJourney.create({
-        data: {
-          tenantId,
-          locationId: input.locationId,
-          unitId: input.unitId ?? null,
-          startedAt: entryAt,
-        },
-      });
-      await tx.customerJourneyEvent.create({
-        data: {
-          tenantId,
-          journeyId: created.id,
-          eventType: CustomerJourneyEventType.ENTRY,
-          occurredAt: entryAt,
-          sourceType: 'MANUAL',
-          createdById: actorId ?? null,
-        },
-      });
-      return created;
+    const created = await tx.customerJourney.create({
+      data: {
+        tenantId,
+        locationId: input.locationId,
+        unitId: input.unitId ?? null,
+        startedAt: entryAt,
+      },
     });
-    return this.detail(tenantId, journey.id);
+    await tx.customerJourneyEvent.create({
+      data: {
+        tenantId,
+        journeyId: created.id,
+        eventType: CustomerJourneyEventType.ENTRY,
+        occurredAt: entryAt,
+        sourceType: 'MANUAL',
+        createdById: actorId ?? null,
+      },
+    });
+    return { journeyId: created.id };
   }
 
   /**
@@ -610,6 +632,30 @@ export class JourneyService {
       decision = CustomerJourneyDecision.FAILED;
       reason = 'reconciliation failed unexpectedly — see server logs';
     }
+    // PHASE 13 LIVE HARD RULE — COMMIT-POINT CHECK (Codex P1): consulted
+    // as the LAST read before the deciding write, never a cached earlier
+    // verdict. A LIVE-OWNED journey never writes READY_TO_SETTLE_SHADOW,
+    // full stop — the check depends only on the stable journey link, so
+    // a timeout takeover committing at ANY point during this exit cannot
+    // flip the answer between this read and the update below (there is
+    // no mutable session state left in the predicate to race on). A
+    // fence-read failure fails the journey closed.
+    if (decision === CustomerJourneyDecision.READY_TO_SETTLE_SHADOW) {
+      try {
+        const fence = await this.liveReviewFence(tx, tenantId, journeyId);
+        if (fence !== null) {
+          decision = CustomerJourneyDecision.NEEDS_EVENT_REVIEW;
+          reason = fence;
+        }
+      } catch (error) {
+        this.logger.error(
+          `journey ${journeyId} live fence recheck failed`,
+          error instanceof Error ? error.stack : String(error),
+        );
+        decision = CustomerJourneyDecision.FAILED;
+        reason = 'live review fence recheck failed — journey failed closed';
+      }
+    }
     await tx.customerJourney.update({
       where: { id_tenantId: { id: journeyId, tenantId } },
       data: {
@@ -692,6 +738,23 @@ export class JourneyService {
             ...(input.dedupScope === 'run' && input.fusionRunId
               ? { fusionRunId: input.fusionRunId }
               : { videoAssetId: input.videoAssetId }),
+          },
+          select: { id: true },
+        });
+        if (existing) {
+          return;
+        }
+      }
+      // LIVE imports (Phase 13) have NO video asset — the run itself is
+      // the physical observation, and a live session imports each of its
+      // window runs exactly once into the journey it owns.
+      if (input.sourceType === 'LIVE_SHADOW' && input.fusionRunId) {
+        const existing = await tx.customerJourneyEvent.findFirst({
+          where: {
+            tenantId,
+            journeyId,
+            sourceType: 'LIVE_SHADOW',
+            fusionRunId: input.fusionRunId,
           },
           select: { id: true },
         });
@@ -880,6 +943,115 @@ export class JourneyService {
     );
   }
 
+  /**
+   * Import ONE live-window fusion run (Phase 13) as a journey
+   * observation. Live runs have no video asset: the run is resolved
+   * tenant-scoped by exact id, its owning live session supplies the
+   * store context (the session's camera must sit in the journey's
+   * store), and observations stamp on the session's source timeline —
+   * sourceTimeBase (the session start) + the detector peak, falling back
+   * to the sampler window's peak so a no-detection import never lands on
+   * the wall clock. Idempotent per run id. Shadow only, like every other
+   * journey write.
+   */
+  async appendFromLiveFusionRun(
+    tenantId: string,
+    journeyId: string,
+    fusionRunId: string,
+    actorId?: string,
+    options?: { sourceTimeBase?: Date; fallbackPeakMs?: number },
+  ) {
+    const journey = await this.prisma.customerJourney.findFirst({
+      where: { tenantId, id: journeyId },
+      select: { locationId: true, unitId: true },
+    });
+    if (!journey) {
+      throw new NotFoundException('Journey not found');
+    }
+    const run = await this.prisma.pickupFusionRun.findFirst({
+      where: {
+        tenantId,
+        id: fusionRunId,
+        runScope: FusionRunScope.LIVE_WINDOW,
+        liveSessionId: { not: null },
+      },
+    });
+    if (!run || !run.liveSessionId) {
+      throw new NotFoundException('Live fusion run not found in this tenant');
+    }
+    const session = await this.prisma.liveCameraSession.findFirst({
+      where: { tenantId, id: run.liveSessionId },
+      select: { cameraSourceId: true, startedAt: true },
+    });
+    if (!session) {
+      throw new NotFoundException('Live session not found in this tenant');
+    }
+    const camera = await this.prisma.cameraSource.findFirst({
+      where: { tenantId, id: session.cameraSourceId },
+      select: { locationId: true, unitId: true },
+    });
+    // STORE-CONTEXT MATCH, same rule as the video import: an observation
+    // captured by one store's camera must not land in a journey opened
+    // in another.
+    if (!camera || camera.locationId !== journey.locationId) {
+      throw new ConflictException(
+        "the camera's store context does not match this journey's store",
+      );
+    }
+    if (journey.unitId && camera.unitId && camera.unitId !== journey.unitId) {
+      throw new ConflictException(
+        "the camera's unit does not match this journey's unit",
+      );
+    }
+    const evidence = run.evidence as {
+      detector?: { events?: { kind?: string; peakMs?: number }[] };
+      fused?: { productId: string; sku: string; productName: string }[];
+    };
+    const detectedKind = evidence.detector?.events?.[0]?.kind;
+    const peakMs = evidence.detector?.events?.[0]?.peakMs;
+    const sourceTimeBase = options?.sourceTimeBase ?? session.startedAt;
+    const effectivePeakMs =
+      typeof peakMs === 'number' && Number.isFinite(peakMs)
+        ? peakMs
+        : Math.max(0, options?.fallbackPeakMs ?? 0);
+    const occurredAt = new Date(
+      sourceTimeBase.getTime() + Math.max(0, Math.round(effectivePeakMs)),
+    ).toISOString();
+    const top = evidence.fused?.[0];
+    if (run.policy === FusionPolicyResult.AUTO_PROPOSE && top) {
+      return this.appendEvent(
+        tenantId,
+        journeyId,
+        {
+          eventType:
+            detectedKind === 'RETURN'
+              ? CustomerJourneyEventType.PRODUCT_RETURN
+              : CustomerJourneyEventType.PRODUCT_PICKUP,
+          occurredAt,
+          productId: top.productId,
+          matchScore: run.fusedTopScore,
+          sourceType: 'LIVE_SHADOW',
+          fusionRunId: run.id,
+          note: `policy ${run.policy}`,
+        },
+        actorId,
+      );
+    }
+    return this.appendEvent(
+      tenantId,
+      journeyId,
+      {
+        eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+        occurredAt,
+        sourceType: 'LIVE_SHADOW',
+        fusionRunId: run.id,
+        matchScore: run.fusedTopScore,
+        note: `policy ${run.policy}${run.fusedTopSku ? ` · top ${run.fusedTopSku}` : ''}`,
+      },
+      actorId,
+    );
+  }
+
   /** EXIT + reconciliation: fold the (review-aware) basket, surface
    *  unresolved issues, and settle status + the final SHADOW decision —
    *  RECONCILED/READY_TO_SETTLE_SHADOW only when clean. Runs entirely
@@ -896,8 +1068,18 @@ export class JourneyService {
        *  FASTER than the footage's own timeline can never place an
        *  observation after EXIT. */
       exitAt?: Date;
+      /** INTERNAL bypass for the live-session finalizer ONLY (Codex P1):
+       *  a journey owned by an active live camera session may be closed
+       *  exclusively by that session's lease-aware finalizer — a generic
+       *  exit would settle the journey (possibly READY) while the live
+       *  loop still has windows, failures, or intents pending. Never
+       *  reachable from a request DTO. */
+      viaLiveSessionFinalizer?: boolean;
     },
   ) {
+    if (!options?.viaLiveSessionFinalizer) {
+      await this.assertNotLiveOwned(tenantId, journeyId);
+    }
     const exitAt = options?.exitAt ?? new Date();
     await this.withOpenJourney(tenantId, journeyId, async (tx, journey) => {
       await tx.customerJourneyEvent.create({
@@ -920,6 +1102,61 @@ export class JourneyService {
       });
     });
     return this.detail(tenantId, journeyId);
+  }
+
+  /**
+   * Phase 13 HARD RULE (Codex P1): a journey owned by ANY live camera
+   * session — terminal or not, evidence or none — never settles
+   * READY_TO_SETTLE_SHADOW. Live journeys are review-first for the
+   * WHOLE phase; making them settlement-ready is explicitly out of
+   * scope. This is what removes the timeout-fence race entirely: the
+   * verdict depends only on the journey LINK, a stable fact (journeyId
+   * never unlinks once set), so no takeover timing between this read
+   * and the update it guards can change the answer — there is no risky
+   * session state left to race on. Controlled reason string only.
+   */
+  private async liveReviewFence(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    journeyId: string,
+  ): Promise<string | null> {
+    const live = await tx.liveCameraSession.findFirst({
+      where: { tenantId, journeyId },
+      select: { id: true },
+    });
+    return live
+      ? 'live camera journeys are review-first in Phase 13 — settlement-ready is not permitted'
+      : null;
+  }
+
+  /** Reject a generic close of a journey owned by an ACTIVE (non-
+   *  terminal) live camera session (Codex P1): only the lease-aware
+   *  live-session finalizer may exit/abort it. Tenant-scoped lookup;
+   *  controlled conflict code only. */
+  private async assertNotLiveOwned(
+    tenantId: string,
+    journeyId: string,
+  ): Promise<void> {
+    const liveOwner = await this.prisma.liveCameraSession.findFirst({
+      where: {
+        tenantId,
+        journeyId,
+        status: {
+          in: [
+            LiveCameraSessionStatus.STARTING,
+            LiveCameraSessionStatus.RUNNING,
+            LiveCameraSessionStatus.STOPPING,
+          ],
+        },
+      },
+      select: { id: true },
+    });
+    if (liveOwner) {
+      throw new ConflictException(
+        'journey is owned by an active live camera session — only its ' +
+          'finalizer may close it (LIVE_JOURNEY_EXIT_REQUIRES_SESSION_FINALIZER)',
+      );
+    }
   }
 
   /**

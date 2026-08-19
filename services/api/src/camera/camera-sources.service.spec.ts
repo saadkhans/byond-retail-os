@@ -3,6 +3,7 @@ import { CameraSourceStatus, CameraSourceType } from '@prisma/client';
 import {
   CAMERA_CREDENTIAL_SLOTS,
   CameraSourcesService,
+  RTSP_NEEDS_CREDENTIAL_SLOT,
   connectionNoteViolation,
   toCameraSourceView,
   validateCredentialRef,
@@ -503,5 +504,105 @@ describe('CameraSourcesService — placeholder source types', () => {
     await expect(
       service.update(TENANT, 'cam-1', { status: CameraSourceStatus.ACTIVE }),
     ).rejects.toThrow('source type not enabled in shadow pilot');
+  });
+});
+
+describe('CameraSourcesService — RTSP_SHADOW rules (Phase 13)', () => {
+  it('registers ACTIVE when a credential slot arrives with the creation', async () => {
+    const { service, prisma } = buildService();
+    await service.create(
+      TENANT,
+      {
+        ...CREATE,
+        sourceType: CameraSourceType.RTSP_SHADOW,
+        credentialRef: 'CAMERA_SECRET_SLOT_TEST',
+      },
+      'user-1',
+    );
+    expect(prisma.cameraSource.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          sourceType: CameraSourceType.RTSP_SHADOW,
+          status: CameraSourceStatus.ACTIVE,
+        }),
+      }),
+    );
+  });
+
+  it('registers DISABLED (no error) when no credential slot is given', async () => {
+    const { service, prisma } = buildService();
+    await service.create(
+      TENANT,
+      { ...CREATE, sourceType: CameraSourceType.RTSP_SHADOW },
+      'user-1',
+    );
+    expect(prisma.cameraSource.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: CameraSourceStatus.DISABLED,
+          credentialRef: null,
+        }),
+      }),
+    );
+  });
+
+  it('cannot be activated without a credential slot', async () => {
+    const { service } = buildService({
+      existing: sourceRow({
+        sourceType: CameraSourceType.RTSP_SHADOW,
+        status: CameraSourceStatus.DISABLED,
+        credentialRef: null,
+      }),
+    });
+    await expect(
+      service.update(TENANT, 'cam-1', { status: CameraSourceStatus.ACTIVE }),
+    ).rejects.toThrow(RTSP_NEEDS_CREDENTIAL_SLOT);
+  });
+
+  it('activates when the credential slot arrives in the SAME patch', async () => {
+    const { service, prisma } = buildService({
+      existing: sourceRow({
+        sourceType: CameraSourceType.RTSP_SHADOW,
+        status: CameraSourceStatus.DISABLED,
+        credentialRef: null,
+      }),
+    });
+    await service.update(TENANT, 'cam-1', {
+      status: CameraSourceStatus.ACTIVE,
+      credentialRef: 'CAMERA_SECRET_SLOT_ALPHA',
+    });
+    expect(prisma.cameraSource.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: CameraSourceStatus.ACTIVE,
+          credentialRef: 'CAMERA_SECRET_SLOT_ALPHA',
+        }),
+      }),
+    );
+  });
+
+  it('activates when a credential slot is already stored', async () => {
+    const { service } = buildService({
+      existing: sourceRow({
+        sourceType: CameraSourceType.RTSP_SHADOW,
+        status: CameraSourceStatus.DISABLED,
+        credentialRef: 'CAMERA_SECRET_SLOT_TEST',
+      }),
+    });
+    const view = await service.update(TENANT, 'cam-1', {
+      status: CameraSourceStatus.ACTIVE,
+    });
+    expect(view.status).toBe(CameraSourceStatus.ACTIVE);
+  });
+
+  it('RTSP_SHADOW responses still redact the credential slot to a boolean', async () => {
+    const view = toCameraSourceView(
+      sourceRow({
+        sourceType: CameraSourceType.RTSP_SHADOW,
+        credentialRef: 'CAMERA_SECRET_SLOT_TEST',
+      }) as never,
+    );
+    expect(view.hasCredentialRef).toBe(true);
+    expect(JSON.stringify(view)).not.toContain('CAMERA_SECRET_SLOT_TEST');
   });
 });

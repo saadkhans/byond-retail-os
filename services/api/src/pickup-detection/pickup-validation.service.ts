@@ -377,7 +377,13 @@ export class PickupValidationService {
       (typeof fusionRows)[number]
     >();
     for (const fusionRow of fusionRows) {
-      if (!latestFusionByAssetId.has(fusionRow.videoAssetId)) {
+      // videoAssetId is nullable since Phase 13 (LIVE_WINDOW runs carry a
+      // live session instead) — the WHOLE_CLIP filter above already
+      // excludes those, so this guard is type narrowing, not policy.
+      if (
+        fusionRow.videoAssetId !== null &&
+        !latestFusionByAssetId.has(fusionRow.videoAssetId)
+      ) {
         latestFusionByAssetId.set(fusionRow.videoAssetId, fusionRow);
       }
     }

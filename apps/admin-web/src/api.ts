@@ -1144,14 +1144,16 @@ export interface EvaluationTestRuns {
   scoreNote: string;
 }
 
-// Phase 12 — edge camera replay runtime (SHADOW pilot). Only FILE_REPLAY
-// is functional; RTSP/webcam are registered placeholders. Camera-source
-// responses NEVER carry a URL or a credential — only whether a secret
-// slot NAME is configured.
+// Phase 12/13 — camera runtime (SHADOW). FILE_REPLAY and RTSP_SHADOW are
+// functional; RTSP_PLACEHOLDER/webcam remain registered placeholders.
+// Camera-source responses NEVER carry a URL or a credential — only
+// whether a secret slot NAME is configured; RTSP stream URLs live in
+// server-side runtime configuration only.
 export type CameraSourceType =
   | 'FILE_REPLAY'
   | 'RTSP_PLACEHOLDER'
-  | 'LOCAL_WEBCAM_PLACEHOLDER';
+  | 'LOCAL_WEBCAM_PLACEHOLDER'
+  | 'RTSP_SHADOW';
 
 export type CameraSourceStatus = 'ACTIVE' | 'DISABLED' | 'ERROR';
 
@@ -1215,6 +1217,52 @@ export interface PilotRunDetail extends PilotRunView {
   stageTimings: { stage: string; ms: number }[];
   /** Controlled error codes only — never provider/exception text. */
   errors: { stage: string; code: string }[];
+}
+
+// Phase 13 — live RTSP shadow sessions. One row per live camera start;
+// the session owns one shadow journey and its LIVE_WINDOW fusion runs.
+// Responses never carry a URL, credential, or slot value.
+export type LiveSessionStatus =
+  | 'STARTING'
+  | 'RUNNING'
+  | 'STOPPING'
+  | 'STOPPED'
+  | 'ERROR';
+
+export interface LiveSessionView {
+  sessionId: string;
+  cameraSourceId: string;
+  cameraSourceName: string;
+  sourceType: CameraSourceType;
+  journeyId: string | null;
+  status: LiveSessionStatus;
+  frameIntervalMs: number;
+  startedAt: string;
+  stoppedAt: string | null;
+  heartbeatAt: string | null;
+  lastFrameAt: string | null;
+  framesSampled: number;
+  eventWindowsDetected: number;
+  eventWindowsProcessed: number;
+  fusionRunsCompleted: number;
+  journeyEventsCreated: number;
+  vlmInvoked: number;
+  vlmSkipped: number;
+  vlmFailed: number;
+  reviewNeeded: number;
+  decision: JourneyDecision | null;
+  /** Controlled error code only — never raw exception text. */
+  errorCode: string | null;
+}
+
+export interface LiveSessionDetail extends LiveSessionView {
+  /** Window confidence is an uncalibrated heuristic score. */
+  eventWindows: {
+    startMs: number;
+    peakMs: number;
+    endMs: number;
+    confidence: number;
+  }[];
 }
 
 /** One journey observation awaiting human review (shadow pilot queue). */

@@ -130,7 +130,10 @@ export class CvEvaluationService {
           });
     const latestByAsset = new Map<string, (typeof runs)[number]>();
     for (const run of runs) {
-      if (!latestByAsset.has(run.videoAssetId)) {
+      // videoAssetId is nullable since Phase 13 (LIVE_WINDOW runs carry a
+      // live session instead) — the WHOLE_CLIP filter above already
+      // excludes those, so this guard is type narrowing, not policy.
+      if (run.videoAssetId !== null && !latestByAsset.has(run.videoAssetId)) {
         latestByAsset.set(run.videoAssetId, run);
       }
     }

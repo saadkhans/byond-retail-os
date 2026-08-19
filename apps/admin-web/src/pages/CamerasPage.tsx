@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import {
   ApiError,
   CameraSourceView,
+  LiveSessionDetail,
   Paginated,
   PilotRunDetail,
   Store,
@@ -20,9 +21,10 @@ function errorMessage(err: unknown): string {
 }
 
 /**
- * Phase 12 camera source registry (SHADOW pilot). Only FILE_REPLAY
- * sources are functional; RTSP/webcam register as disabled placeholders.
- * No URL or credential is ever shown — the API never returns one.
+ * Phase 12/13 camera source registry (SHADOW). FILE_REPLAY replays test
+ * videos; RTSP_SHADOW starts live shadow sessions (credential slot
+ * required); the legacy placeholders stay disabled. No URL or credential
+ * is ever shown — the API never returns one.
  */
 export function CamerasPage() {
   const navigate = useNavigate();
@@ -113,6 +115,25 @@ export function CamerasPage() {
     }
   }
 
+  async function startLiveSession(source: CameraSourceView) {
+    // Idempotent-safe on the server: starting an already-live camera
+    // returns its existing active session, so no client key is needed.
+    setBusy(true);
+    setActionError(null);
+    setNotice(null);
+    try {
+      const session = await api<LiveSessionDetail>(
+        `/camera-sources/${source.id}/live-session`,
+        { method: 'POST', body: {} },
+      );
+      navigate(`/live-sessions/${session.sessionId}`);
+    } catch (err) {
+      setActionError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function runReplay(source: CameraSourceView) {
     const existing = replayKeys.current.get(source.id);
     const idempotencyKey = existing ?? crypto.randomUUID();
@@ -144,9 +165,10 @@ export function CamerasPage() {
       loading={sources.loading && !sources.data}
     >
       <p className="muted">
-        Camera source registry for the replay pilot. Only file replay is
-        enabled — RTSP and local webcam are registered placeholders. No
-        source URL or credential is ever stored in plaintext or shown here.
+        Camera source registry (shadow). File replay and RTSP shadow are
+        enabled — the legacy RTSP/webcam placeholders stay disabled. RTSP
+        stream URLs live only in server runtime configuration; no source
+        URL or credential is ever stored in plaintext or shown here.
       </p>
       {actionError ? <div className="error">{actionError}</div> : null}
       {notice ? <p className="muted">✓ {notice}</p> : null}
@@ -178,6 +200,7 @@ export function CamerasPage() {
           onChange={(e) => setSourceType(e.target.value)}
         >
           <option value="FILE_REPLAY">{SOURCE_TYPE_LABEL.FILE_REPLAY}</option>
+          <option value="RTSP_SHADOW">{SOURCE_TYPE_LABEL.RTSP_SHADOW}</option>
           <option value="RTSP_PLACEHOLDER">
             {SOURCE_TYPE_LABEL.RTSP_PLACEHOLDER}
           </option>
@@ -260,12 +283,20 @@ export function CamerasPage() {
                   ) : (
                     <>
                       {source.status !== 'ACTIVE' ? (
-                        <button
-                          disabled={busy}
-                          onClick={() => void setStatus(source, 'ACTIVE')}
-                        >
-                          Enable
-                        </button>
+                        // An RTSP shadow source cannot activate without a
+                        // credential slot — the server 409s; show the
+                        // requirement instead of a doomed button.
+                        source.sourceType === 'RTSP_SHADOW' &&
+                        !source.hasCredentialRef ? (
+                          <span className="muted">needs credential slot</span>
+                        ) : (
+                          <button
+                            disabled={busy}
+                            onClick={() => void setStatus(source, 'ACTIVE')}
+                          >
+                            Enable
+                          </button>
+                        )
                       ) : null}{' '}
                       {source.status !== 'DISABLED' ? (
                         <button
@@ -275,7 +306,8 @@ export function CamerasPage() {
                           Disable
                         </button>
                       ) : null}{' '}
-                      {source.status === 'ACTIVE' ? (
+                      {source.status === 'ACTIVE' &&
+                      source.sourceType === 'FILE_REPLAY' ? (
                         <button
                           className="primary"
                           disabled={busy || !source.replayVideoAssetId}
@@ -287,6 +319,16 @@ export function CamerasPage() {
                           onClick={() => void runReplay(source)}
                         >
                           Run replay
+                        </button>
+                      ) : null}
+                      {source.status === 'ACTIVE' &&
+                      source.sourceType === 'RTSP_SHADOW' ? (
+                        <button
+                          className="primary"
+                          disabled={busy}
+                          onClick={() => void startLiveSession(source)}
+                        >
+                          Start live session
                         </button>
                       ) : null}
                     </>

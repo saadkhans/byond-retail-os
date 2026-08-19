@@ -27,7 +27,10 @@ import { CameraReplayService } from './camera-replay.service';
 import { CameraSourcesService } from './camera-sources.service';
 import { CreateCameraSourceDto } from './dto/create-camera-source.dto';
 import { ReplayRunDto } from './dto/replay-run.dto';
+import { StartLiveSessionDto } from './dto/start-live-session.dto';
 import { UpdateCameraSourceDto } from './dto/update-camera-source.dto';
+import { LiveSessionService } from './live-session.service';
+import { RtspFrameSampler } from './rtsp/rtsp-frame-sampler';
 
 /**
  * Phase 12 — camera source registry + FILE_REPLAY pilot runtime, SHADOW
@@ -46,6 +49,7 @@ export class CameraSourcesController {
   constructor(
     private readonly sources: CameraSourcesService,
     private readonly replay: CameraReplayService,
+    private readonly live: LiveSessionService,
   ) {}
 
   @Post()
@@ -119,6 +123,76 @@ export class CameraSourcesController {
       actor.userId,
     );
   }
+
+  @Post(':id/live-session')
+  @RequirePermissions('vision:ingest')
+  @ApiOperation({
+    summary:
+      'Start ONE live RTSP shadow session on this source (Phase 13). ' +
+      'Idempotent-safe: an already-active session for the source is ' +
+      'returned instead of starting a second. The stream URL is resolved ' +
+      'server-side from the credential slot and never stored or returned.',
+  })
+  startLiveSession(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Body() body: StartLiveSessionDto,
+    @CurrentUser() actor: RequestContext,
+  ) {
+    // Whitelisted forwarding — provenance (journeyId, counters, lease)
+    // is runtime-owned, never caller-supplied.
+    return this.live.start(
+      tenantId,
+      id,
+      { frameIntervalMs: body.frameIntervalMs },
+      actor.userId,
+    );
+  }
+}
+
+@ApiTags('camera')
+@ApiBearerAuth()
+@TenantOnly()
+@RequireModule('cv')
+@Controller('live-sessions')
+export class LiveSessionsController {
+  constructor(private readonly live: LiveSessionService) {}
+
+  @Get()
+  @RequirePermissions('vision:read')
+  @ApiOperation({
+    summary:
+      'Live shadow sessions (newest first). No URL or credential ' +
+      'material in any response.',
+  })
+  list(@CurrentTenantId() tenantId: string) {
+    return this.live.list(tenantId);
+  }
+
+  @Get(':id')
+  @RequirePermissions('vision:read')
+  @ApiOperation({
+    summary: 'Live session detail: counters, event windows, error code',
+  })
+  byId(@CurrentTenantId() tenantId: string, @Param('id') id: string) {
+    return this.live.byId(tenantId, id);
+  }
+
+  @Post(':id/stop')
+  @RequirePermissions('vision:ingest')
+  @ApiOperation({
+    summary:
+      'Stop a live session — safe even if the sampling loop already ' +
+      'died: the journey is exited/reconciled and the session settles ' +
+      'STOPPED. Idempotent on terminal sessions.',
+  })
+  stop(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @CurrentUser() actor: RequestContext,
+  ) {
+    return this.live.stop(tenantId, id, actor.userId);
+  }
 }
 
 @ApiTags('camera')
@@ -154,7 +228,16 @@ export class PilotRunsController {
     PickupFusionModule,
     JourneyModule,
   ],
-  controllers: [CameraSourcesController, PilotRunsController],
-  providers: [CameraSourcesService, CameraReplayService],
+  controllers: [
+    CameraSourcesController,
+    PilotRunsController,
+    LiveSessionsController,
+  ],
+  providers: [
+    CameraSourcesService,
+    CameraReplayService,
+    LiveSessionService,
+    RtspFrameSampler,
+  ],
 })
 export class CameraModule {}
