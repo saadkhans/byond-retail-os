@@ -453,6 +453,61 @@ describe('RtspFrameSampler', () => {
     expect(args[args.indexOf('-ss') + 1]).toBe('900.000');
   });
 
+  it('RTSP classification is by COMPLETE URI scheme, case-insensitive (Codex P2): mixed-case streams stream, rtsp-named files seek', async () => {
+    // Mixed-case RTSP is a LIVE STREAM: transport flag present, no seek.
+    for (const scheme of ['RTSP', 'RtSp', 'rtsps', 'RTSPS']) {
+      jest.clearAllMocks();
+      process.env[ENV_KEY] = scheme + '://' + 'cam-host/live';
+      const sampler = buildSampler();
+      const child = new FakeChild();
+      childProcess.spawn.mockReturnValue(child);
+      const pending = sampler.sampleFrame(TENANT, SLOT, {
+        width: 4,
+        height: 4,
+        timeoutMs: 2000,
+        seekMs: 3000,
+      });
+      child.emit('close', 1);
+      await pending;
+      const args = childProcess.spawn.mock.calls[0][1] as string[];
+      expect(args).toContain('-rtsp_transport');
+      expect(args).not.toContain('-ss');
+    }
+    // A local FILE merely named like rtsp is FILE-BACKED: seek advances,
+    // no stream transport flag.
+    jest.clearAllMocks();
+    process.env[ENV_KEY] = 'rtsp-pilot.mp4';
+    const sampler = buildSampler();
+    const child = new FakeChild();
+    childProcess.spawn.mockReturnValue(child);
+    const pending = sampler.sampleFrame(TENANT, SLOT, {
+      width: 4,
+      height: 4,
+      timeoutMs: 2000,
+      seekMs: 3000,
+    });
+    child.emit('close', 1);
+    await pending;
+    const args = childProcess.spawn.mock.calls[0][1] as string[];
+    expect(args).not.toContain('-rtsp_transport');
+    expect(args[args.indexOf('-ss') + 1]).toBe('3.000');
+  });
+
+  it('mixed-case credential-bearing RTSP is still rejected before spawn', async () => {
+    process.env[ENV_KEY] = 'RTSP' + '://' + 'user:secret@camera/live';
+    const sampler = buildSampler();
+    const result = await sampler.sampleFrame(TENANT, SLOT, {
+      width: 4,
+      height: 4,
+      timeoutMs: 2000,
+    });
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      ok: false,
+      code: 'RTSP_CREDENTIALS_IN_URL_UNSUPPORTED',
+    });
+  });
+
   it('exports exactly the controlled error-code vocabulary', () => {
     expect([...RTSP_SAMPLE_ERROR_CODES].sort()).toEqual(
       [

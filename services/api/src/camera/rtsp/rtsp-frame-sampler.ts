@@ -197,7 +197,12 @@ export class RtspFrameSampler {
       RTSP_SAMPLE_MIN_TIMEOUT_MS,
       Math.min(opts.timeoutMs, RTSP_SAMPLE_MAX_TIMEOUT_MS),
     );
-    const isRtsp = source.startsWith('rtsp');
+    // COMPLETE URI-scheme detection, case-insensitive (Codex P2): a
+    // mixed-case `RTSP://…` is a live stream (transport flag, no seek),
+    // while a local file merely NAMED `rtsp-pilot.mp4` is file-backed
+    // and must keep advancing via seek. A bare `rtsp` prefix check gets
+    // both wrong.
+    const isRtsp = /^rtsps?:\/\//i.test(source);
     // Bounded numeric seek — always argv-safe (Number → fixed decimal
     // string), never derived from or echoing the source value.
     const seekSeconds =

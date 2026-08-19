@@ -118,8 +118,11 @@ export class LocationsRepository extends TenantScopedRepository {
       if (!before) {
         return null;
       }
+      // Tenant scope IN the destructive predicate (repo invariant): the
+      // composite key makes the write itself tenant-isolated — never
+      // only the prior lookup.
       const after = await tx.location.update({
-        where: { id: before.id },
+        where: { id_tenantId: { id: before.id, tenantId: scopedTenantId } },
         data,
       });
       await this.auditLog.record(buildAuditEntry(before, after), tx);
@@ -147,7 +150,9 @@ export class LocationsRepository extends TenantScopedRepository {
       // Restrict FKs (retail units, inventory levels/movements) abort this
       // transaction with P2003 when the store is still referenced — mapped
       // to a controlled 409 in the service.
-      await tx.location.delete({ where: { id: existing.id } });
+      await tx.location.delete({
+        where: { id_tenantId: { id: existing.id, tenantId: scopedTenantId } },
+      });
       await this.auditLog.record(buildAuditEntry(existing), tx);
       return existing;
     });

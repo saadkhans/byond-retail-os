@@ -190,18 +190,18 @@ enum DeviceStatus {
 }
 
 model Tenant {
-  id        String       @id @default(cuid())
-  name      String
-  slug      String       @unique
-  status    TenantStatus @default(PENDING)
-  settings  Json?
+  id                String       @id @default(cuid())
+  name              String
+  slug              String       @unique
+  status            TenantStatus @default(PENDING)
+  settings          Json?
   /// VERIFIED platform-sandbox identity: set exclusively by the sandbox
   /// seeder, never by the tenant-creation API. Platform users resolve
   /// their request context ONLY to a tenant carrying this marker — a
   /// customer tenant squatting the reserved slug can never be resolved.
-  isPlatformSandbox Boolean @default(false)
-  createdAt DateTime     @default(now())
-  updatedAt DateTime     @updatedAt
+  isPlatformSandbox Boolean      @default(false)
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
 
   users     User[]
   roles     Role[]
@@ -209,18 +209,18 @@ model Tenant {
   modules   TenantModule[]
   auditLogs AuditLog[]
 
-  productCategories  ProductCategory[]
-  brands             Brand[]
-  products           Product[]
-  productBarcodes    ProductBarcode[]
-  inventoryLevels    InventoryLevel[]
-  inventoryMovements InventoryMovement[]
-  retailUnits        RetailUnit[]
-  devices            Device[]
-  checkoutSessions     CheckoutSession[]
-  checkoutSessionLines CheckoutSessionLine[]
-  orders               Order[]
-  orderLines           OrderLine[]
+  productCategories     ProductCategory[]
+  brands                Brand[]
+  products              Product[]
+  productBarcodes       ProductBarcode[]
+  inventoryLevels       InventoryLevel[]
+  inventoryMovements    InventoryMovement[]
+  retailUnits           RetailUnit[]
+  devices               Device[]
+  checkoutSessions      CheckoutSession[]
+  checkoutSessionLines  CheckoutSessionLine[]
+  orders                Order[]
+  orderLines            OrderLine[]
   evidenceBundles       EvidenceBundle[]
   visionEvents          VisionEvent[]
   visionEventCandidates VisionEventCandidate[]
@@ -236,30 +236,33 @@ model Tenant {
   inferenceResults    InferenceResult[]
   inferenceCandidates InferenceCandidate[]
 
-  videoAssets             VideoAsset[]
-  videoArtifacts          VideoArtifact[]
-  productReferenceImages  ProductReferenceImage[]
-  videoGroundTruths       VideoGroundTruth[]
-  productReferenceEmbeddings ProductReferenceEmbedding[]
-  pickupFusionRuns        PickupFusionRun[]
-  customerJourneys        CustomerJourney[]
-  customerJourneyEvents   CustomerJourneyEvent[]
-  customerJourneyEventReviews CustomerJourneyEventReview[]
-  videoExtractionRequests VideoExtractionRequest[]
-  cameraSources           CameraSource[]
-  cameraPilotRuns         CameraPilotRun[]
-  liveCameraSessions      LiveCameraSession[]
+  videoAssets                    VideoAsset[]
+  videoArtifacts                 VideoArtifact[]
+  productReferenceImages         ProductReferenceImage[]
+  videoGroundTruths              VideoGroundTruth[]
+  productReferenceEmbeddings     ProductReferenceEmbedding[]
+  pickupFusionRuns               PickupFusionRun[]
+  customerJourneys               CustomerJourney[]
+  customerJourneyEvents          CustomerJourneyEvent[]
+  customerJourneyEventReviews    CustomerJourneyEventReview[]
+  videoExtractionRequests        VideoExtractionRequest[]
+  cameraSources                  CameraSource[]
+  cameraPilotRuns                CameraPilotRun[]
+  liveCameraSessions             LiveCameraSession[]
   liveSessionFinalizationIntents LiveCameraSessionFinalizationIntent[]
+  pilotEvaluationRuns            PilotEvaluationRun[]
+  pilotEvaluationSessions        PilotEvaluationSession[]
+  pilotObservationReviews        PilotObservationReview[]
 }
 
 model User {
-  id       String   @id @default(cuid())
-  tenantId String?
-  userType UserType
-  email    String   @unique
-  firstName String
-  lastName  String
-  status    UserStatus @default(INVITED)
+  id           String     @id @default(cuid())
+  tenantId     String?
+  userType     UserType
+  email        String     @unique
+  firstName    String
+  lastName     String
+  status       UserStatus @default(INVITED)
   // Nullable: users may authenticate via future providers (SSO/OIDC/OTP)
   // and never hold a local credential. Never plaintext. Only AuthRepository
   // may load this column — every non-auth user query goes through
@@ -267,13 +270,13 @@ model User {
   // redaction and toSafeUser() are additional layers, not the only ones.
   passwordHash String?
   lastLoginAt  DateTime?
-  createdAt   DateTime   @default(now())
-  updatedAt   DateTime   @updatedAt
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
 
-  tenant    Tenant?    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  userRoles UserRole[]
-  auditLogs AuditLog[] @relation("AuditActor")
-  inventoryMovements InventoryMovement[] @relation("InventoryMovementActor")
+  tenant                      Tenant?               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  userRoles                   UserRole[]
+  auditLogs                   AuditLog[]            @relation("AuditActor")
+  inventoryMovements          InventoryMovement[]   @relation("InventoryMovementActor")
   checkoutSessionsCreated     CheckoutSession[]     @relation("CheckoutSessionActor")
   checkoutSessionLinesCreated CheckoutSessionLine[] @relation("CheckoutSessionLineActor")
   ordersCreated               Order[]               @relation("OrderActor")
@@ -330,9 +333,9 @@ model Permission {
 }
 
 model UserRole {
-  id String @id @default(cuid())
-  userId String
-  roleId String
+  id           String   @id @default(cuid())
+  userId       String
+  roleId       String
   // Denormalized from Role for join-free tenant isolation filtering.
   // Invariant (service layer): tenantId === role.tenantId.
   tenantId     String?
@@ -376,16 +379,17 @@ model Location {
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
 
-  inventoryLevels    InventoryLevel[]
-  inventoryMovements InventoryMovement[]
-  retailUnits        RetailUnit[]
-  checkoutSessions   CheckoutSession[]
-  orders             Order[]
-  visionEvents       VisionEvent[]
-  inferenceJobs      InferenceJob[]
-  videoAssets        VideoAsset[]
-  customerJourneys   CustomerJourney[]
-  cameraSources      CameraSource[]
+  inventoryLevels     InventoryLevel[]
+  inventoryMovements  InventoryMovement[]
+  retailUnits         RetailUnit[]
+  checkoutSessions    CheckoutSession[]
+  orders              Order[]
+  visionEvents        VisionEvent[]
+  inferenceJobs       InferenceJob[]
+  videoAssets         VideoAsset[]
+  customerJourneys    CustomerJourney[]
+  cameraSources       CameraSource[]
+  pilotEvaluationRuns PilotEvaluationRun[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -433,9 +437,9 @@ model TenantModule {
 // Users are never hard-deleted while audit rows reference them — lifecycle is
 // status-driven (DEACTIVATED), per the platform's audit retention model.
 model AuditLog {
-  id       String  @id @default(cuid())
-  tenantId String?
-  actorId  String?
+  id         String      @id @default(cuid())
+  tenantId   String?
+  actorId    String?
   // Point-in-time snapshot of the actor's email at write time.
   actorEmail String
   action     AuditAction
@@ -468,14 +472,14 @@ model AuditLog {
 // ---------------------------------------------------------------------------
 
 model ProductCategory {
-  id          String  @id @default(cuid())
+  id          String   @id @default(cuid())
   tenantId    String
   name        String
   description String?
   // Optional single-parent hierarchy within the same tenant.
-  parentId  String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  parentId    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
   tenant   Tenant            @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   parent   ProductCategory?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Restrict)
@@ -488,7 +492,7 @@ model ProductCategory {
 }
 
 model Brand {
-  id          String  @id @default(cuid())
+  id          String   @id @default(cuid())
   tenantId    String
   name        String
   description String?
@@ -503,43 +507,44 @@ model Brand {
 }
 
 model Product {
-  id          String  @id @default(cuid())
-  tenantId    String
+  id                String        @id @default(cuid())
+  tenantId          String
   // Stock-keeping unit code, unique per tenant, normalized to uppercase.
-  sku         String
-  name        String
-  description String?
+  sku               String
+  name              String
+  description       String?
   // OCR/text-evidence catalog fields (pickup-fusion-v2): the Arabic
   // display/label name and free-form aliases the label may carry. Optional;
   // maintained through the same catalog ingestion path as everything else.
-  nameArabic  String?
-  aliases     String[] @default([])
-  categoryId  String?
-  brandId     String?
-  unitOfMeasure UnitOfMeasure @default(EACH)
-  status        ProductStatus @default(DRAFT)
+  nameArabic        String?
+  aliases           String[]      @default([])
+  categoryId        String?
+  brandId           String?
+  unitOfMeasure     UnitOfMeasure @default(EACH)
+  status            ProductStatus @default(DRAFT)
   // When set, inventory reads flag levels with quantity <= threshold as low
   // stock. Product-wide (per-location overrides are a later phase).
   lowStockThreshold Int?
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
 
   tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   category ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: Restrict)
   brand    Brand?           @relation(fields: [brandId], references: [id], onDelete: Restrict)
 
-  barcodes           ProductBarcode[]
-  inventoryLevels    InventoryLevel[]
-  inventoryMovements InventoryMovement[]
-  checkoutSessionLines CheckoutSessionLine[]
-  orderLines           OrderLine[]
-  visionEventCandidates VisionEventCandidate[]
-  visionReviewsApplied  VisionEventReview[]   @relation("VisionReviewAppliedProduct")
-  referenceImages       ProductReferenceImage[]
-  groundTruths          VideoGroundTruth[]
-  referenceEmbeddings   ProductReferenceEmbedding[]
-  journeyEvents         CustomerJourneyEvent[]
-  journeyEventReviews   CustomerJourneyEventReview[] @relation("JourneyReviewCorrectedProduct")
+  barcodes                ProductBarcode[]
+  inventoryLevels         InventoryLevel[]
+  inventoryMovements      InventoryMovement[]
+  checkoutSessionLines    CheckoutSessionLine[]
+  orderLines              OrderLine[]
+  visionEventCandidates   VisionEventCandidate[]
+  visionReviewsApplied    VisionEventReview[]          @relation("VisionReviewAppliedProduct")
+  referenceImages         ProductReferenceImage[]
+  groundTruths            VideoGroundTruth[]
+  referenceEmbeddings     ProductReferenceEmbedding[]
+  journeyEvents           CustomerJourneyEvent[]
+  journeyEventReviews     CustomerJourneyEventReview[] @relation("JourneyReviewCorrectedProduct")
+  pilotReviewExpectations PilotObservationReview[]     @relation("PilotReviewExpectedProduct")
 
   @@unique([tenantId, sku])
   @@unique([id, tenantId])
@@ -572,7 +577,7 @@ model ProductBarcode {
 // VideoAsset/VideoArtifact). A product is INFERENCE-READY only when it has
 // at least PICKUP_MIN_REFERENCE_IMAGES (5) of these.
 model ProductReferenceImage {
-  id               String  @id @default(cuid())
+  id               String   @id @default(cuid())
   tenantId         String
   productId        String
   originalFilename String
@@ -583,8 +588,8 @@ model ProductReferenceImage {
   createdById      String?
   createdAt        DateTime @default(now())
 
-  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+  tenant     Tenant                      @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  product    Product                     @relation(fields: [productId], references: [id], onDelete: Restrict)
   embeddings ProductReferenceEmbedding[]
 
   // Anchor for hand-written same-tenant composite FKs
@@ -599,7 +604,7 @@ model ProductReferenceImage {
 // backfills alongside the old instead of overwriting it; deleting the
 // reference image cascades its vectors away.
 model ProductReferenceEmbedding {
-  id               String  @id @default(cuid())
+  id               String   @id @default(cuid())
   tenantId         String
   referenceImageId String
   productId        String
@@ -660,27 +665,27 @@ enum JourneyEventReviewDecision {
 }
 
 model CustomerJourney {
-  id         String                @id @default(cuid())
-  tenantId   String
-  locationId String
-  unitId     String?
-  status     CustomerJourneyStatus @default(OPEN)
+  id             String                   @id @default(cuid())
+  tenantId       String
+  locationId     String
+  unitId         String?
+  status         CustomerJourneyStatus    @default(OPEN)
   // Phase 11 — final shadow decision, set at exit reconciliation and
   // recomputed after each event review. Null while the journey is OPEN.
   decision       CustomerJourneyDecision?
   decisionReason String?
   decidedAt      DateTime?
-  startedAt  DateTime              @default(now())
-  endedAt    DateTime?
-  createdAt  DateTime              @default(now())
-  updatedAt  DateTime              @updatedAt
+  startedAt      DateTime                 @default(now())
+  endedAt        DateTime?
+  createdAt      DateTime                 @default(now())
+  updatedAt      DateTime                 @updatedAt
 
-  tenant   Tenant      @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location Location    @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit     RetailUnit? @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  events   CustomerJourneyEvent[]
-  eventReviews CustomerJourneyEventReview[]
-  cameraPilotRuns CameraPilotRun[]
+  tenant             Tenant                       @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location           Location                     @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit               RetailUnit?                  @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  events             CustomerJourneyEvent[]
+  eventReviews       CustomerJourneyEventReview[]
+  cameraPilotRuns    CameraPilotRun[]
   liveCameraSessions LiveCameraSession[]
 
   // Anchor for hand-written same-tenant composite FKs
@@ -694,28 +699,31 @@ model CustomerJourney {
 // canonical link; sku/productName snapshots keep rows meaningful even if
 // the catalog renames later.
 model CustomerJourneyEvent {
-  id          String                   @id @default(cuid())
-  tenantId    String
-  journeyId   String
-  eventType   CustomerJourneyEventType
-  occurredAt  DateTime
-  productId   String?
-  sku         String?
-  productName String?
-  quantity    Int                      @default(1)
-  /** Uncalibrated score carried from the producing shadow pipeline. */
-  matchScore  Float?
-  sourceType  String                   @default("MANUAL")
+  id           String                   @id @default(cuid())
+  tenantId     String
+  journeyId    String
+  eventType    CustomerJourneyEventType
+  occurredAt   DateTime
+  productId    String?
+  sku          String?
+  productName  String?
+  quantity     Int                      @default(1)
+  /**
+   * Uncalibrated score carried from the producing shadow pipeline.
+   */
+  matchScore   Float?
+  sourceType   String                   @default("MANUAL")
   videoAssetId String?
   fusionRunId  String?
-  note        String?
-  createdById String?
-  createdAt   DateTime                 @default(now())
+  note         String?
+  createdById  String?
+  createdAt    DateTime                 @default(now())
 
-  tenant  Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  journey CustomerJourney @relation(fields: [journeyId], references: [id], onDelete: Cascade)
-  product Product?        @relation(fields: [productId], references: [id], onDelete: Restrict)
-  reviews CustomerJourneyEventReview[]
+  tenant       Tenant                       @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  journey      CustomerJourney              @relation(fields: [journeyId], references: [id], onDelete: Cascade)
+  product      Product?                     @relation(fields: [productId], references: [id], onDelete: Restrict)
+  reviews      CustomerJourneyEventReview[]
+  pilotReviews PilotObservationReview[]
 
   // Anchor for the review table's same-tenant composite FK (Phase 11).
   @@unique([id, tenantId])
@@ -729,11 +737,11 @@ model CustomerJourneyEvent {
 // lands with an AuditLog row in the same transaction. No review path
 // touches checkout, order, payment, or inventory tables.
 model CustomerJourneyEventReview {
-  id        String                     @id @default(cuid())
-  tenantId  String
-  journeyId String
-  eventId   String
-  decision  JourneyEventReviewDecision
+  id                   String                     @id @default(cuid())
+  tenantId             String
+  journeyId            String
+  eventId              String
+  decision             JourneyEventReviewDecision
   // CORRECT payload: what the fold should count instead. Snapshots keep
   // the correction meaningful if the catalog renames later. CHECK
   // constraints in migration SQL: CORRECT requires product + quantity;
@@ -751,7 +759,7 @@ model CustomerJourneyEventReview {
   // the same human action. Unique per (tenant, event); NULLs (no key) are
   // distinct, preserving plain append-only behavior.
   idempotencyKey       String?
-  createdAt            DateTime @default(now())
+  createdAt            DateTime                   @default(now())
 
   tenant           Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   journey          CustomerJourney      @relation(fields: [journeyId], references: [id], onDelete: Restrict)
@@ -899,14 +907,14 @@ enum CameraPilotRunStatus {
 }
 
 model CameraSource {
-  id         String             @id @default(cuid())
-  tenantId   String
-  locationId String
-  unitId     String?
-  name       String
-  shelfZone  String?
-  sourceType CameraSourceType
-  status     CameraSourceStatus @default(ACTIVE)
+  id                 String             @id @default(cuid())
+  tenantId           String
+  locationId         String
+  unitId             String?
+  name               String
+  shelfZone          String?
+  sourceType         CameraSourceType
+  status             CameraSourceStatus @default(ACTIVE)
   // SAFE metadata only. connectionNote is screened free text (reject-on-
   // write, same policy as journey notes) — a URL with embedded
   // credentials never passes. credentialRef is the NAME of an
@@ -918,13 +926,13 @@ model CameraSource {
   replayVideoAssetId String?
   lastError          String?
   createdById        String?
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
 
-  tenant           Tenant      @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location         Location    @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit             RetailUnit? @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  replayVideoAsset VideoAsset? @relation("CameraReplayAsset", fields: [replayVideoAssetId], references: [id], onDelete: SetNull)
+  tenant           Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location         Location            @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit             RetailUnit?         @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  replayVideoAsset VideoAsset?         @relation("CameraReplayAsset", fields: [replayVideoAssetId], references: [id], onDelete: SetNull)
   pilotRuns        CameraPilotRun[]
   liveSessions     LiveCameraSession[]
 
@@ -938,47 +946,47 @@ model CameraSource {
 // JSON only (timestamps, scores, stage names — never media bytes, OCR
 // text, or free text from evidence).
 model CameraPilotRun {
-  id             String               @id @default(cuid())
-  tenantId       String
-  cameraSourceId String
-  videoAssetId   String
-  journeyId      String?
-  status         CameraPilotRunStatus @default(RUNNING)
-  frameIntervalMs      Int
-  framesProcessed      Int @default(0)
+  id                     String                   @id @default(cuid())
+  tenantId               String
+  cameraSourceId         String
+  videoAssetId           String
+  journeyId              String?
+  status                 CameraPilotRunStatus     @default(RUNNING)
+  frameIntervalMs        Int
+  framesProcessed        Int                      @default(0)
   // Windows the heuristics DETECTED vs windows the pipeline PROCESSED —
   // a failed window leaves the gap visible. Crop FRAMES (pre/peak/post
   // evidence) are counted separately from clip ARTIFACTS; Phase 12
   // generates no clip artifacts, so that counter stays 0 honestly.
-  eventWindowsDetected   Int @default(0)
-  eventWindowsProcessed  Int @default(0)
-  cropFramesGenerated    Int @default(0)
-  clipArtifactsGenerated Int @default(0)
-  fusionRunsCompleted  Int @default(0)
-  vlmInvoked           Int @default(0)
-  vlmSkipped           Int @default(0)
-  vlmFailed            Int @default(0)
-  journeyEventsCreated Int @default(0)
-  reviewNeeded         Int @default(0)
+  eventWindowsDetected   Int                      @default(0)
+  eventWindowsProcessed  Int                      @default(0)
+  cropFramesGenerated    Int                      @default(0)
+  clipArtifactsGenerated Int                      @default(0)
+  fusionRunsCompleted    Int                      @default(0)
+  vlmInvoked             Int                      @default(0)
+  vlmSkipped             Int                      @default(0)
+  vlmFailed              Int                      @default(0)
+  journeyEventsCreated   Int                      @default(0)
+  reviewNeeded           Int                      @default(0)
   // Snapshot of the linked journey's final SHADOW decision at run end.
-  decision     CustomerJourneyDecision?
-  eventWindows Json?
-  stageTimings Json?
-  errors       Json?
+  decision               CustomerJourneyDecision?
+  eventWindows           Json?
+  stageTimings           Json?
+  errors                 Json?
   // Client replay token: a retried run request with the same key returns
   // the existing run instead of replaying the footage twice.
-  idempotencyKey String?
-  startedAt      DateTime  @default(now())
+  idempotencyKey         String?
+  startedAt              DateTime                 @default(now())
   // Lease heartbeat + owner: the heartbeat is bumped PERIODICALLY while a
   // stage runs (not merely between stages), and every heartbeat and
   // finalization write is conditional on status=RUNNING AND the owner
   // token — a reclaimed or completed row can never be overwritten by an
   // attempt that lost its lease.
-  heartbeatAt    DateTime?
-  leaseOwner     String?
-  finishedAt     DateTime?
-  createdById    String?
-  createdAt      DateTime  @default(now())
+  heartbeatAt            DateTime?
+  leaseOwner             String?
+  finishedAt             DateTime?
+  createdById            String?
+  createdAt              DateTime                 @default(now())
 
   tenant       Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   cameraSource CameraSource     @relation(fields: [cameraSourceId], references: [id], onDelete: Restrict)
@@ -1013,52 +1021,53 @@ enum LiveCameraSessionStatus {
 }
 
 model LiveCameraSession {
-  id             String                  @id @default(cuid())
-  tenantId       String
-  cameraSourceId String
-  journeyId      String?
-  status         LiveCameraSessionStatus @default(STARTING)
-  frameIntervalMs Int
-  startedAt      DateTime  @default(now())
-  stoppedAt      DateTime?
+  id                    String                   @id @default(cuid())
+  tenantId              String
+  cameraSourceId        String
+  journeyId             String?
+  status                LiveCameraSessionStatus  @default(STARTING)
+  frameIntervalMs       Int
+  startedAt             DateTime                 @default(now())
+  stoppedAt             DateTime?
   // Lease heartbeat + owner, same discipline as CameraPilotRun: bumped
   // periodically while sampling; every heartbeat and finalization write
   // is conditional on (non-terminal status AND owner token).
-  heartbeatAt DateTime?
-  leaseOwner  String?
-  lastFrameAt DateTime?
-  framesSampled         Int @default(0)
-  eventWindowsDetected  Int @default(0)
-  eventWindowsProcessed Int @default(0)
-  fusionRunsCompleted   Int @default(0)
-  journeyEventsCreated  Int @default(0)
-  vlmInvoked            Int @default(0)
-  vlmSkipped            Int @default(0)
-  vlmFailed             Int @default(0)
-  reviewNeeded          Int @default(0)
+  heartbeatAt           DateTime?
+  leaseOwner            String?
+  lastFrameAt           DateTime?
+  framesSampled         Int                      @default(0)
+  eventWindowsDetected  Int                      @default(0)
+  eventWindowsProcessed Int                      @default(0)
+  fusionRunsCompleted   Int                      @default(0)
+  journeyEventsCreated  Int                      @default(0)
+  vlmInvoked            Int                      @default(0)
+  vlmSkipped            Int                      @default(0)
+  vlmFailed             Int                      @default(0)
+  reviewNeeded          Int                      @default(0)
   // Snapshot of the linked journey's final SHADOW decision at stop.
-  decision  CustomerJourneyDecision?
-  errorCode String?
+  decision              CustomerJourneyDecision?
+  errorCode             String?
   // Parked-finalization MODE ('STOP' | 'ERROR', DB CHECK) — recorded when
   // a finalization parks retryably so the retry re-enters with the SAME
   // journey-closure semantics (exit vs abort). NEVER derived from an
   // intent reason or the advisory errorCode (Codex P1: a marker-append
   // failure must not convert an ERROR finalization into a clean STOP).
-  finalizationMode String?
-  eventWindows Json?
+  finalizationMode      String?
+  eventWindows          Json?
   // Phase 14 — per-stage timing statistics (p50/p95/max/avg/count per
   // pipeline stage) written by the sampling loop. OBSERVABILITY ONLY:
   // controlled numeric aggregates, never URLs, credentials, pixels, or
   // free text; never read by any decision path.
-  performance Json?
-  createdById  String?
-  createdAt    DateTime @default(now())
+  performance           Json?
+  createdById           String?
+  createdAt             DateTime                 @default(now())
 
-  tenant       Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  cameraSource CameraSource     @relation(fields: [cameraSourceId], references: [id], onDelete: Restrict)
-  journey      CustomerJourney? @relation(fields: [journeyId], references: [id], onDelete: Restrict)
-  fusionRuns   PickupFusionRun[]
-  finalizationIntents LiveCameraSessionFinalizationIntent[]
+  tenant                  Tenant                                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  cameraSource            CameraSource                          @relation(fields: [cameraSourceId], references: [id], onDelete: Restrict)
+  journey                 CustomerJourney?                      @relation(fields: [journeyId], references: [id], onDelete: Restrict)
+  fusionRuns              PickupFusionRun[]
+  finalizationIntents     LiveCameraSessionFinalizationIntent[]
+  pilotEvaluationSessions PilotEvaluationSession[]
 
   @@unique([id, tenantId])
   @@index([tenantId, cameraSourceId, createdAt(sort: Desc)])
@@ -1095,11 +1104,11 @@ model LiveCameraSessionFinalizationIntent {
 // the source of truth, per AGENTS.md). CHECK (quantity >= 0) in migration
 // SQL backstops the application-level guard against races.
 model InventoryLevel {
-  id        String @id @default(cuid())
-  tenantId  String
+  id         String   @id @default(cuid())
+  tenantId   String
   locationId String
   productId  String
-  quantity   Int    @default(0)
+  quantity   Int      @default(0)
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
@@ -1117,23 +1126,23 @@ model InventoryLevel {
 // SAME tenant (composite FK in migration SQL). Deletion is Restrict-guarded:
 // a unit with devices (or future inventory references) cannot be removed.
 model RetailUnit {
-  id       String @id @default(cuid())
-  tenantId String
+  id         String           @id @default(cuid())
+  tenantId   String
   // The store (Location) this unit lives in.
   locationId String
   // Short human-readable identifier, unique per tenant, uppercase.
-  code   String
-  name   String
-  type   RetailUnitType
-  status RetailUnitStatus @default(DRAFT)
+  code       String
+  name       String
+  type       RetailUnitType
+  status     RetailUnitStatus @default(DRAFT)
   // Physical placement within the store, e.g. "Aisle 3, next to entrance".
-  placement String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  placement  String?
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
 
-  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location Location @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  devices  Device[]
+  tenant           Tenant            @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location         Location          @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  devices          Device[]
   checkoutSessions CheckoutSession[]
   orders           Order[]
   visionEvents     VisionEvent[]
@@ -1160,28 +1169,28 @@ model RetailUnit {
 // token; the plaintext is returned once at issuance and never persisted or
 // logged. Redeeming the token (POST /edge/register) clears the hash.
 model Device {
-  id       String @id @default(cuid())
-  tenantId String
-  unitId   String
-  name     String
-  type     DeviceType
-  status   DeviceStatus @default(PROVISIONED)
+  id                         String       @id @default(cuid())
+  tenantId                   String
+  unitId                     String
+  name                       String
+  type                       DeviceType
+  status                     DeviceStatus @default(PROVISIONED)
   // Hardware serial number / ID, unique per tenant. Stored as entered
   // (trimmed) — serials can be case-sensitive.
-  serialNumber String
-  metadata     Json?
-  firmwareVersion String?
-  softwareVersion String?
+  serialNumber               String
+  metadata                   Json?
+  firmwareVersion            String?
+  softwareVersion            String?
   // Updated by the heartbeat endpoint; never client-supplied.
-  lastSeenAt DateTime?
-  registrationTokenHash      String?   @unique
+  lastSeenAt                 DateTime?
+  registrationTokenHash      String?      @unique
   registrationTokenExpiresAt DateTime?
   registeredAt               DateTime?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt                  DateTime     @default(now())
+  updatedAt                  DateTime     @updatedAt
 
-  tenant Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  unit   RetailUnit @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  tenant           Tenant            @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  unit             RetailUnit        @relation(fields: [unitId], references: [id], onDelete: Restrict)
   checkoutSessions CheckoutSession[]
   visionEvents     VisionEvent[]
   inferenceJobs    InferenceJob[]
@@ -1200,10 +1209,10 @@ model Device {
 // database level (same hardening as AuditLog). All relations are Restrict/
 // NoAction so no FK action can ever need to mutate a ledger row.
 model InventoryMovement {
-  id         String @id @default(cuid())
-  tenantId   String
-  locationId String
-  productId  String
+  id            String                @id @default(cuid())
+  tenantId      String
+  locationId    String
+  productId     String
   movementType  InventoryMovementType
   // Signed change, never zero (CHECK in migration SQL).
   quantityDelta Int
@@ -1216,7 +1225,7 @@ model InventoryMovement {
   referenceType String?
   referenceId   String?
   createdById   String?
-  createdAt     DateTime @default(now())
+  createdAt     DateTime              @default(now())
 
   tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   location  Location @relation(fields: [locationId], references: [id], onDelete: Restrict, onUpdate: NoAction)
@@ -1295,47 +1304,47 @@ enum CheckoutSessionLineStatus {
 // the audit trail. Completion is the ONLY path that creates an Order and
 // consumes stock, atomically with SALE ledger movements.
 model CheckoutSession {
-  id         String                @id @default(cuid())
-  tenantId   String
-  locationId String
-  unitId     String
+  id                        String                @id @default(cuid())
+  tenantId                  String
+  locationId                String
+  unitId                    String
   // Optional source device reference (no edge runtime in Phase 5).
-  deviceId  String?
-  status    CheckoutSessionStatus @default(OPEN)
-  startedAt DateTime              @default(now())
-  endedAt   DateTime?
+  deviceId                  String?
+  status                    CheckoutSessionStatus @default(OPEN)
+  startedAt                 DateTime              @default(now())
+  endedAt                   DateTime?
   // Vendor-neutral evidence/source lineage (see Phase 5 header comment).
   // Since Phase 7, evidenceBundleId/visionEventId are CANONICAL references
   // to the Phase 7 EvidenceBundle/VisionEvent tables (validated at the
   // data-access layer, backstopped by same-tenant FKs in migration SQL).
-  sourceType       EvidenceSourceType @default(MANUAL)
-  sourceId         String?
-  evidenceBundleId String?
-  visionEventId    String?
+  sourceType                EvidenceSourceType    @default(MANUAL)
+  sourceId                  String?
+  evidenceBundleId          String?
+  visionEventId             String?
   // Pre-Phase-7 compatibility: opaque evidence references accepted by the
   // Phase 5 API before the canonical tables existed. Preserved verbatim by
   // the legacy_vision_ref_compat migration, NEVER resolved against Phase 7
   // tables, and not writable through the API.
   externalVisionEventRef    String?
   externalEvidenceBundleRef String?
-  vlmReviewId      String?
-  evidenceScore    Float?
-  evidenceQuality  EvidenceQuality?
-  reasonCodes      String[]           @default([])
+  vlmReviewId               String?
+  evidenceScore             Float?
+  evidenceQuality           EvidenceQuality?
+  reasonCodes               String[]              @default([])
   // Tenant-scoped idempotency for session creation: replays return the
   // original session instead of opening a duplicate.
-  idempotencyKey String?
-  createdById    String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  idempotencyKey            String?
+  createdById               String?
+  createdAt                 DateTime              @default(now())
+  updatedAt                 DateTime              @updatedAt
 
-  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location  Location   @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit      RetailUnit @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  device    Device?    @relation(fields: [deviceId], references: [id], onDelete: Restrict)
-  createdBy User?      @relation("CheckoutSessionActor", fields: [createdById], references: [id], onDelete: Restrict)
-  lines     CheckoutSessionLine[]
-  order     Order?
+  tenant         Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location       Location              @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit           RetailUnit            @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  device         Device?               @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  createdBy      User?                 @relation("CheckoutSessionActor", fields: [createdById], references: [id], onDelete: Restrict)
+  lines          CheckoutSessionLine[]
+  order          Order?
   visionEvents   VisionEvent[]
   paymentIntents PaymentIntent[]
   inferenceJobs  InferenceJob[]
@@ -1355,48 +1364,48 @@ model CheckoutSession {
 // catalog is edited later. Every mutation carries evidence/source lineage or
 // a manual/admin actor reference.
 model CheckoutSessionLine {
-  id        String @id @default(cuid())
-  tenantId  String
-  sessionId String
-  productId String
+  id                        String                    @id @default(cuid())
+  tenantId                  String
+  sessionId                 String
+  productId                 String
   // Product snapshot (immutable history even if the product is later edited):
-  sku           String
-  productName   String
-  unitOfMeasure UnitOfMeasure
-  quantity      Int
+  sku                       String
+  productName               String
+  unitOfMeasure             UnitOfMeasure
+  quantity                  Int
   // Soft-delete lifecycle: REMOVED lines are tombstones that keep the
   // idempotencyKey reserved (see CheckoutSessionLineStatus above).
-  status    CheckoutSessionLineStatus @default(ACTIVE)
-  removedAt DateTime?
+  status                    CheckoutSessionLineStatus @default(ACTIVE)
+  removedAt                 DateTime?
   // Pricing placeholders — ALWAYS NULL in Phase 5; future pricing/payment
   // phases populate them (minor currency units, integer-exact).
-  unitPriceMinor Int?
-  lineTotalMinor Int?
-  currencyCode   String?
+  unitPriceMinor            Int?
+  lineTotalMinor            Int?
+  currencyCode              String?
   // Vendor-neutral evidence/source lineage (same set as the session,
   // including the pre-Phase-7 external compatibility refs — see
   // CheckoutSession for the canonical-vs-external split).
-  sourceType       EvidenceSourceType @default(MANUAL)
-  sourceId         String?
-  evidenceBundleId String?
-  visionEventId    String?
+  sourceType                EvidenceSourceType        @default(MANUAL)
+  sourceId                  String?
+  evidenceBundleId          String?
+  visionEventId             String?
   externalVisionEventRef    String?
   externalEvidenceBundleRef String?
-  vlmReviewId      String?
-  evidenceScore    Float?
-  evidenceQuality  EvidenceQuality?
-  reasonCodes      String[]           @default([])
+  vlmReviewId               String?
+  evidenceScore             Float?
+  evidenceQuality           EvidenceQuality?
+  reasonCodes               String[]                  @default([])
   // Tenant-scoped idempotency for line creation replays.
-  idempotencyKey String?
-  createdById    String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  idempotencyKey            String?
+  createdById               String?
+  createdAt                 DateTime                  @default(now())
+  updatedAt                 DateTime                  @updatedAt
 
-  tenant     Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  session    CheckoutSession @relation(fields: [sessionId], references: [id], onDelete: Restrict)
-  product    Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
-  createdBy  User?           @relation("CheckoutSessionLineActor", fields: [createdById], references: [id], onDelete: Restrict)
-  orderLines OrderLine[]
+  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  session            CheckoutSession     @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  product            Product             @relation(fields: [productId], references: [id], onDelete: Restrict)
+  createdBy          User?               @relation("CheckoutSessionLineActor", fields: [createdById], references: [id], onDelete: Restrict)
+  orderLines         OrderLine[]
   visionEventReviews VisionEventReview[]
 
   @@unique([id, tenantId])
@@ -1415,60 +1424,60 @@ model CheckoutSessionLine {
 // payment status arrives in a later phase. Cancelling an order in Phase 5 is
 // a status change only (stock reversal ships with the returns/refunds phase).
 model Order {
-  id       String @id @default(cuid())
-  tenantId String
+  id                        String             @id @default(cuid())
+  tenantId                  String
   // Human-readable, unique per tenant (ORD-000001 style).
-  orderNumber String
+  orderNumber               String
   // One order per session; globally unique because ids are cuids, and
   // additionally unique per tenant below (the composite same-tenant FK in
   // migration SQL keeps the pair tenant-consistent).
-  checkoutSessionId String      @unique
-  locationId        String
-  unitId            String
-  status            OrderStatus @default(CONFIRMED)
-  placedAt          DateTime    @default(now())
-  confirmedAt       DateTime?
-  cancelledAt       DateTime?
-  cancelReason      String?
-  totalQuantity     Int
+  checkoutSessionId         String             @unique
+  locationId                String
+  unitId                    String
+  status                    OrderStatus        @default(CONFIRMED)
+  placedAt                  DateTime           @default(now())
+  confirmedAt               DateTime?
+  cancelledAt               DateTime?
+  cancelReason              String?
+  totalQuantity             Int
   // Pricing placeholders — ALWAYS NULL until the pricing phase.
-  subtotalMinor Int?
-  totalMinor    Int?
-  currencyCode  String?
+  subtotalMinor             Int?
+  totalMinor                Int?
+  currencyCode              String?
   // Phase 6 — payment linkage. paymentStatus is UNPAID until the internal
   // payment state machine reaches a valid captured/success state (only a
   // CAPTURED PaymentIntent flips it to PAID; a failed/voided intent NEVER
   // marks an order paid). REFUND_PENDING/REFUNDED are reserved for a later
   // returns/refunds phase (no money movement in Phase 6). paidAt is set
   // exactly when paymentStatus becomes PAID.
-  paymentStatus OrderPaymentStatus @default(UNPAID)
-  paidAt        DateTime?
+  paymentStatus             OrderPaymentStatus @default(UNPAID)
+  paidAt                    DateTime?
   // Evidence lineage copied from the completed session (canonical Phase 7
   // refs and pre-Phase-7 external compatibility refs stay separate — see
   // CheckoutSession).
-  sourceType       EvidenceSourceType @default(MANUAL)
-  sourceId         String?
-  evidenceBundleId String?
-  visionEventId    String?
+  sourceType                EvidenceSourceType @default(MANUAL)
+  sourceId                  String?
+  evidenceBundleId          String?
+  visionEventId             String?
   externalVisionEventRef    String?
   externalEvidenceBundleRef String?
-  vlmReviewId      String?
-  evidenceScore    Float?
-  evidenceQuality  EvidenceQuality?
-  reasonCodes      String[]           @default([])
+  vlmReviewId               String?
+  evidenceScore             Float?
+  evidenceQuality           EvidenceQuality?
+  reasonCodes               String[]           @default([])
   // Tenant-scoped completion idempotency: a duplicate completion request
   // with the same key returns this order instead of creating another.
-  idempotencyKey String?
-  createdById    String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  idempotencyKey            String?
+  createdById               String?
+  createdAt                 DateTime           @default(now())
+  updatedAt                 DateTime           @updatedAt
 
-  tenant    Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  session   CheckoutSession @relation(fields: [checkoutSessionId], references: [id], onDelete: Restrict)
-  location  Location        @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit      RetailUnit      @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  createdBy User?           @relation("OrderActor", fields: [createdById], references: [id], onDelete: Restrict)
-  lines     OrderLine[]
+  tenant         Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  session        CheckoutSession @relation(fields: [checkoutSessionId], references: [id], onDelete: Restrict)
+  location       Location        @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit           RetailUnit      @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  createdBy      User?           @relation("OrderActor", fields: [createdById], references: [id], onDelete: Restrict)
+  lines          OrderLine[]
   paymentIntents PaymentIntent[]
 
   @@unique([id, tenantId])
@@ -1484,35 +1493,35 @@ model Order {
 // the full chain session -> basket line -> order line -> SALE movement stays
 // traceable. Never updated after creation (no updatedAt by design).
 model OrderLine {
-  id        String  @id @default(cuid())
-  tenantId  String
-  orderId   String
-  productId String
+  id                        String             @id @default(cuid())
+  tenantId                  String
+  orderId                   String
+  productId                 String
   // Lineage: which basket line this order line was materialized from.
-  sessionLineId String?
-  sku           String
-  productName   String
-  unitOfMeasure UnitOfMeasure
-  quantity      Int
+  sessionLineId             String?
+  sku                       String
+  productName               String
+  unitOfMeasure             UnitOfMeasure
+  quantity                  Int
   // Pricing placeholders — ALWAYS NULL in Phase 5.
-  unitPriceMinor Int?
-  lineTotalMinor Int?
-  currencyCode   String?
+  unitPriceMinor            Int?
+  lineTotalMinor            Int?
+  currencyCode              String?
   // Vendor-neutral evidence/source lineage copied from the session line
   // (canonical Phase 7 refs and pre-Phase-7 external compatibility refs
   // stay separate — see CheckoutSession).
-  sourceType       EvidenceSourceType @default(MANUAL)
-  sourceId         String?
-  evidenceBundleId String?
-  visionEventId    String?
+  sourceType                EvidenceSourceType @default(MANUAL)
+  sourceId                  String?
+  evidenceBundleId          String?
+  visionEventId             String?
   externalVisionEventRef    String?
   externalEvidenceBundleRef String?
-  vlmReviewId      String?
-  evidenceScore    Float?
-  evidenceQuality  EvidenceQuality?
-  reasonCodes      String[]           @default([])
-  createdById      String?
-  createdAt        DateTime           @default(now())
+  vlmReviewId               String?
+  evidenceScore             Float?
+  evidenceQuality           EvidenceQuality?
+  reasonCodes               String[]           @default([])
+  createdById               String?
+  createdAt                 DateTime           @default(now())
 
   tenant      Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   order       Order                @relation(fields: [orderId], references: [id], onDelete: Restrict)
@@ -1629,38 +1638,38 @@ enum ReconciliationStatus {
 // migration SQL). An intent may be created before an order exists (walk-out:
 // payment association happens before/during checkout) and later bound to one.
 model PaymentIntent {
-  id                String          @id @default(cuid())
-  tenantId          String
-  orderId           String?
-  checkoutSessionId String?
-  provider          PaymentProvider @default(SIMULATED)
-  status            PaymentStatus   @default(CREATED)
-  amountMinor       Int
-  currencyCode      String
+  id                    String          @id @default(cuid())
+  tenantId              String
+  orderId               String?
+  checkoutSessionId     String?
+  provider              PaymentProvider @default(SIMULATED)
+  status                PaymentStatus   @default(CREATED)
+  amountMinor           Int
+  currencyCode          String
   // Simulated capture accumulates here; only ever set by the capture path.
-  capturedAmountMinor Int @default(0)
+  capturedAmountMinor   Int             @default(0)
   // OPAQUE provider references — never secrets. Screened for credential- and
   // payment-bearing values before any write.
-  providerRef         String?
-  providerCustomerRef String?
+  providerRef           String?
+  providerCustomerRef   String?
   // SAFE instrument metadata ONLY — never raw PAN/CVV/PIN/track/token.
   instrumentBrand       String?
   instrumentLast4       String?
   instrumentExpiryMonth Int?
   instrumentExpiryYear  Int?
   instrumentWallet      String?
-  description   String?
-  failureReason String?
-  authorizedAt  DateTime?
-  capturedAt    DateTime?
-  cancelledAt   DateTime?
-  failedAt      DateTime?
-  expiresAt     DateTime?
+  description           String?
+  failureReason         String?
+  authorizedAt          DateTime?
+  capturedAt            DateTime?
+  cancelledAt           DateTime?
+  failedAt              DateTime?
+  expiresAt             DateTime?
   // Tenant-scoped idempotency for intent creation.
-  idempotencyKey String?
-  createdById    String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  idempotencyKey        String?
+  createdById           String?
+  createdAt             DateTime        @default(now())
+  updatedAt             DateTime        @updatedAt
 
   tenant                Tenant                        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   order                 Order?                        @relation(fields: [orderId], references: [id], onDelete: Restrict)
@@ -1683,19 +1692,19 @@ model PaymentIntent {
 // A simulated authorization hold recorded when an intent is authorized. Voided
 // when the intent is cancelled/voided.
 model PaymentAuthorization {
-  id           String                     @id @default(cuid())
-  tenantId     String
-  intentId     String
-  status       PaymentAuthorizationStatus @default(AUTHORIZED)
-  amountMinor  Int
-  providerRef  String?
-  authorizedAt DateTime                   @default(now())
-  expiresAt    DateTime?
-  voidedAt     DateTime?
+  id             String                     @id @default(cuid())
+  tenantId       String
+  intentId       String
+  status         PaymentAuthorizationStatus @default(AUTHORIZED)
+  amountMinor    Int
+  providerRef    String?
+  authorizedAt   DateTime                   @default(now())
+  expiresAt      DateTime?
+  voidedAt       DateTime?
   idempotencyKey String?
   createdById    String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  createdAt      DateTime                   @default(now())
+  updatedAt      DateTime                   @updatedAt
 
   tenant    Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   intent    PaymentIntent @relation(fields: [intentId], references: [id], onDelete: Restrict)
@@ -1710,21 +1719,21 @@ model PaymentAuthorization {
 // backstop against a DUPLICATE CAPTURE: a retried capture with the same key
 // replays the original instead of moving money twice.
 model PaymentCapture {
-  id          String               @id @default(cuid())
-  tenantId    String
-  intentId    String
-  status      PaymentCaptureStatus @default(SUCCEEDED)
-  amountMinor Int
-  providerRef String?
-  capturedAt  DateTime?
+  id             String               @id @default(cuid())
+  tenantId       String
+  intentId       String
+  status         PaymentCaptureStatus @default(SUCCEEDED)
+  amountMinor    Int
+  providerRef    String?
+  capturedAt     DateTime?
   idempotencyKey String?
   createdById    String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
 
-  tenant    Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  intent    PaymentIntent @relation(fields: [intentId], references: [id], onDelete: Restrict)
-  createdBy User?         @relation("PaymentCaptureActor", fields: [createdById], references: [id], onDelete: Restrict)
+  tenant                Tenant                        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  intent                PaymentIntent                 @relation(fields: [intentId], references: [id], onDelete: Restrict)
+  createdBy             User?                         @relation("PaymentCaptureActor", fields: [createdById], references: [id], onDelete: Restrict)
   reconciliationRecords PaymentReconciliationRecord[]
 
   @@unique([id, tenantId])
@@ -1749,8 +1758,8 @@ model PaymentEvent {
   processedAt     DateTime?
   idempotencyKey  String?
   createdById     String?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
 
   tenant    Tenant         @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   intent    PaymentIntent? @relation(fields: [intentId], references: [id], onDelete: Restrict)
@@ -1780,8 +1789,8 @@ model PaymentReconciliationRecord {
   notes               String?
   reconciledAt        DateTime?
   createdById         String?
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
 
   tenant    Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   intent    PaymentIntent?  @relation(fields: [intentId], references: [id], onDelete: Restrict)
@@ -1795,7 +1804,6 @@ model PaymentReconciliationRecord {
   @@index([tenantId, status, createdAt, id])
   @@index([tenantId, intentId])
 }
-
 
 // ---------------------------------------------------------------------------
 // Phase 7 — CV product recognition & virtual basket foundation.
@@ -1861,25 +1869,25 @@ enum VisionBasketEffect {
 // tamper-evident by construction. All relations are Restrict/NoAction so no
 // FK action can ever need to mutate a bundle row.
 model EvidenceBundle {
-  id       String @id @default(cuid())
-  tenantId String
+  id               String             @id @default(cuid())
+  tenantId         String
   // Opaque, vendor-neutral provenance (adapter-populated; never interpreted).
-  sourceType   EvidenceSourceType @default(VISION)
-  sourceId     String?
-  modelName    String?
-  modelVersion String?
+  sourceType       EvidenceSourceType @default(VISION)
+  sourceId         String?
+  modelName        String?
+  modelVersion     String?
   // Capture window reported by the source.
   captureStartedAt DateTime?
   captureEndedAt   DateTime?
   // Opaque artifact descriptors (kind/uri/contentType/sha256/...) — metadata
   // ONLY, no binaries, screened for sensitive content before persistence.
-  artifacts Json?
-  metadata  Json?
-  createdById String?
-  createdAt   DateTime @default(now())
+  artifacts        Json?
+  metadata         Json?
+  createdById      String?
+  createdAt        DateTime           @default(now())
 
-  tenant    Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
-  createdBy User?  @relation("EvidenceBundleActor", fields: [createdById], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  createdBy    User?         @relation("EvidenceBundleActor", fields: [createdById], references: [id], onDelete: Restrict, onUpdate: NoAction)
   visionEvents VisionEvent[]
 
   @@unique([id, tenantId])
@@ -1891,52 +1899,52 @@ model EvidenceBundle {
 // only when approved — applied to the linked checkout session's basket.
 // The event itself NEVER mutates inventory or the basket at ingest time.
 model VisionEvent {
-  id         String @id @default(cuid())
-  tenantId   String
-  locationId String
-  unitId     String
+  id               String             @id @default(cuid())
+  tenantId         String
+  locationId       String
+  unitId           String
   // Optional source camera/device (no edge runtime in Phase 7).
-  deviceId String?
+  deviceId         String?
   // Optional checkout session binding. Basket-affecting approvals REQUIRE a
   // session; events may still be ingested unbound (e.g. before the shopper's
   // session is known) and reviewed for the record.
-  sessionId String?
-  type   VisionEventType
-  status VisionEventStatus @default(PENDING_REVIEW)
+  sessionId        String?
+  type             VisionEventType
+  status           VisionEventStatus  @default(PENDING_REVIEW)
   // Units of the product the source believes were moved (integer, in the
   // product's unit of measure — same integer-exact rule as the ledger).
-  quantity Int @default(1)
+  quantity         Int                @default(1)
   // When the interaction happened per the source; ingestedAt is server time.
-  occurredAt DateTime
-  ingestedAt DateTime @default(now())
+  occurredAt       DateTime
+  ingestedAt       DateTime           @default(now())
   // Opaque, vendor-neutral provenance (same set as EvidenceBundle).
-  sourceType   EvidenceSourceType @default(VISION)
-  sourceId     String?
-  modelName    String?
-  modelVersion String?
+  sourceType       EvidenceSourceType @default(VISION)
+  sourceId         String?
+  modelName        String?
+  modelVersion     String?
   evidenceBundleId String?
   evidenceScore    Float?
   evidenceQuality  EvidenceQuality?
-  reasonCodes      String[]         @default([])
+  reasonCodes      String[]           @default([])
   // SAFE, NON-SECRET normalized extras only (screened before persistence).
-  metadata Json?
+  metadata         Json?
   // Tenant-scoped ingestion idempotency: at-least-once delivery from edge
   // adapters replays the original event instead of duplicating it.
-  idempotencyKey String?
-  createdById    String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  idempotencyKey   String?
+  createdById      String?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
 
-  tenant         Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location       Location         @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit           RetailUnit       @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  device         Device?          @relation(fields: [deviceId], references: [id], onDelete: Restrict)
-  session        CheckoutSession? @relation(fields: [sessionId], references: [id], onDelete: Restrict)
-  evidenceBundle EvidenceBundle?  @relation(fields: [evidenceBundleId], references: [id], onDelete: Restrict)
-  createdBy      User?            @relation("VisionEventActor", fields: [createdById], references: [id], onDelete: Restrict)
-  candidates VisionEventCandidate[]
-  review     VisionEventReview?
-  inferenceJobs InferenceJob[]
+  tenant         Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location       Location               @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit           RetailUnit             @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  device         Device?                @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  session        CheckoutSession?       @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  evidenceBundle EvidenceBundle?        @relation(fields: [evidenceBundleId], references: [id], onDelete: Restrict)
+  createdBy      User?                  @relation("VisionEventActor", fields: [createdById], references: [id], onDelete: Restrict)
+  candidates     VisionEventCandidate[]
+  review         VisionEventReview?
+  inferenceJobs  InferenceJob[]
 
   @@unique([id, tenantId])
   @@unique([tenantId, idempotencyKey])
@@ -1953,15 +1961,15 @@ model VisionEvent {
 // the catalog is edited later. Append-only (triggers in migration SQL):
 // candidates are evidence of what the source proposed and never change.
 model VisionEventCandidate {
-  id        String @id @default(cuid())
-  tenantId  String
-  eventId   String
-  productId String
-  rank      Int
+  id          String   @id @default(cuid())
+  tenantId    String
+  eventId     String
+  productId   String
+  rank        Int
   // Normalized [0, 1] confidence for THIS candidate, if the source ranks by
   // score. Opaque label is whatever the source called the object.
-  score Float?
-  label String?
+  score       Float?
+  label       String?
   // Product snapshot at ingest time.
   sku         String
   productName String
@@ -1988,20 +1996,20 @@ model VisionEventCandidate {
 // sessionLineId forward to the line. The line's vlmReviewId column stays
 // NULL in Phase 7 — line → event → review is the canonical chain.
 model VisionEventReview {
-  id       String @id @default(cuid())
-  tenantId String
-  eventId  String @unique
-  decision VisionReviewDecision
-  reason   String?
+  id               String               @id @default(cuid())
+  tenantId         String
+  eventId          String               @unique
+  decision         VisionReviewDecision
+  reason           String?
   // What was actually applied: the top candidate (APPROVE) or the reviewer's
   // choice (OVERRIDE). NULL for rejections and record-only event types.
   appliedProductId String?
   appliedQuantity  Int?
-  basketEffect     VisionBasketEffect @default(NONE)
+  basketEffect     VisionBasketEffect   @default(NONE)
   // The basket line the decision created/updated/removed, when any.
-  sessionLineId String?
-  reviewedById  String?
-  createdAt     DateTime @default(now())
+  sessionLineId    String?
+  reviewedById     String?
+  createdAt        DateTime             @default(now())
 
   tenant         Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   event          VisionEvent          @relation(fields: [eventId], references: [id], onDelete: Restrict, onUpdate: NoAction)
@@ -2057,58 +2065,58 @@ enum InferenceJobStatus {
 // compare-and-set on status, ordered by priority DESC then requestedAt ASC
 // then id ASC (deterministic). Only QUEUED rows are claimable.
 model InferenceJob {
-  id       String @id @default(cuid())
-  tenantId String
+  id              String             @id @default(cuid())
+  tenantId        String
   // Optional store/unit/device/session context. Conversion to a Phase 7
   // VisionEvent requires locationId + unitId (the vision ingest contract).
-  locationId String?
-  unitId     String?
-  deviceId   String?
-  sessionId  String?
-  jobType InferenceJobType
-  status  InferenceJobStatus @default(QUEUED)
+  locationId      String?
+  unitId          String?
+  deviceId        String?
+  sessionId       String?
+  jobType         InferenceJobType
+  status          InferenceJobStatus @default(QUEUED)
   // Queue priority, 0..1000 (CHECK in migration SQL); higher runs first.
-  priority    Int      @default(100)
-  requestedAt DateTime @default(now())
-  startedAt   DateTime?
-  completedAt DateTime?
+  priority        Int                @default(100)
+  requestedAt     DateTime           @default(now())
+  startedAt       DateTime?
+  completedAt     DateTime?
   // Lease ownership: every claim increments attempts and takes a lease;
   // complete/fail clear it. A RUNNING job whose lease expired (worker
   // crashed) is reclaimed on the next claim — back to QUEUED, or FAILED
   // with LEASE_EXPIRED once attempts are exhausted. RUNNING ⟺ leased
   // (CHECK in migration SQL).
-  attempts       Int       @default(0)
-  leaseExpiresAt DateTime?
+  attempts        Int                @default(0)
+  leaseExpiresAt  DateTime?
   // Opaque, vendor-neutral provenance (same closed enum as Phase 7).
-  sourceType EvidenceSourceType @default(VISION)
-  sourceId   String?
+  sourceType      EvidenceSourceType @default(VISION)
+  sourceId        String?
   // Which registered adapter claimed the job (opaque key, e.g. "simulated").
-  adapterKey String?
+  adapterKey      String?
   // SAFE, NON-SECRET input descriptor only (screened before persistence):
   // trigger context, crop/zone references by id, frame counts — never raw
   // media, media/storage URLs, signed URLs, or credentials.
   inputDescriptor Json?
   // FAILED only: a stable UPPER_SNAKE error code plus a screened message.
-  errorCode    String?
-  errorMessage String?
+  errorCode       String?
+  errorMessage    String?
   // Tenant-scoped creation idempotency: at-least-once trigger delivery
   // replays the original job instead of duplicating it.
-  idempotencyKey String?
+  idempotencyKey  String?
   // Set once by the to-vision-event conversion; conversion is one-shot and
   // replays the linked event afterwards.
-  visionEventId String?
-  createdById   String?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  visionEventId   String?
+  createdById     String?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
 
-  tenant      Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location    Location?        @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit        RetailUnit?      @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  device      Device?          @relation(fields: [deviceId], references: [id], onDelete: Restrict)
-  session     CheckoutSession? @relation(fields: [sessionId], references: [id], onDelete: Restrict)
-  visionEvent VisionEvent?     @relation(fields: [visionEventId], references: [id], onDelete: Restrict)
-  createdBy   User?            @relation("InferenceJobActor", fields: [createdById], references: [id], onDelete: Restrict)
-  result InferenceResult?
+  tenant         Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location       Location?        @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit           RetailUnit?      @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  device         Device?          @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  session        CheckoutSession? @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  visionEvent    VisionEvent?     @relation(fields: [visionEventId], references: [id], onDelete: Restrict)
+  createdBy      User?            @relation("InferenceJobActor", fields: [createdById], references: [id], onDelete: Restrict)
+  result         InferenceResult?
   videoArtifacts VideoArtifact[]
 
   @@unique([id, tenantId])
@@ -2130,11 +2138,11 @@ model InferenceJob {
 // Append-only (triggers in migration SQL): what the adapter produced is
 // evidence and never changes.
 model InferenceResult {
-  id       String @id @default(cuid())
-  tenantId String
-  jobId    String @unique
-  eventType     VisionEventType
-  quantityDelta Int
+  id              String           @id @default(cuid())
+  tenantId        String
+  jobId           String           @unique
+  eventType       VisionEventType
+  quantityDelta   Int
   // The SOURCE-reported interaction time (from the completion input), NOT
   // when inference ran — delayed/queued jobs keep correct event chronology,
   // and the VisionEvent conversion emits exactly this timestamp.
@@ -2142,14 +2150,14 @@ model InferenceResult {
   evidenceScore   Float?
   evidenceQuality EvidenceQuality?
   // Opaque model/provider metadata (screened; never interpreted).
-  modelKey     String?
-  modelVersion String?
+  modelKey        String?
+  modelVersion    String?
   // SAFE, NON-SECRET normalized extras only (screened before persistence).
-  metadata  Json?
-  createdAt DateTime @default(now())
+  metadata        Json?
+  createdAt       DateTime         @default(now())
 
-  tenant Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
-  job    InferenceJob @relation(fields: [jobId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  tenant     Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  job        InferenceJob         @relation(fields: [jobId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   candidates InferenceCandidate[]
 
   @@unique([id, tenantId])
@@ -2161,12 +2169,12 @@ model InferenceResult {
 // tenant catalog at VisionEvent conversion time, exactly like the Phase 8
 // mapper output. Append-only (triggers in migration SQL).
 model InferenceCandidate {
-  id       String @id @default(cuid())
-  tenantId String
-  resultId String
-  rank     Int
-  sku      String
-  label    String?
+  id        String   @id @default(cuid())
+  tenantId  String
+  resultId  String
+  rank      Int
+  sku       String
+  label     String?
   // Normalized [0, 1] confidence, rounded to 4 decimals by the adapter.
   score     Float
   createdAt DateTime @default(now())
@@ -2249,33 +2257,33 @@ enum VideoMediaWriteState {
 // Soft delete: deletedAt marks the row; the local file is removed and the
 // metadata row is kept for audit lineage (artifacts keep their references).
 model VideoAsset {
-  id       String @id @default(cuid())
-  tenantId String
+  id                       String                @id @default(cuid())
+  tenantId                 String
   // Optional store/unit/device/session context, same binding rules as
   // Phase 9 inference jobs (all same-tenant, composite FKs in migration SQL).
-  locationId String?
-  unitId     String?
-  deviceId   String?
-  sessionId  String?
+  locationId               String?
+  unitId                   String?
+  deviceId                 String?
+  sessionId                String?
   // Sanitized original filename (basename only, safe charset) — display only,
   // NEVER used to build storage paths.
-  originalFilename String
-  mimeType         String
-  sizeBytes        Int
+  originalFilename         String
+  mimeType                 String
+  sizeBytes                Int
   // Probed metadata (null until a probe/validate ran).
-  durationMs Int?
-  width      Int?
-  height     Int?
-  fps        Float?
-  status VideoAssetStatus @default(UPLOADED)
+  durationMs               Int?
+  width                    Int?
+  height                   Int?
+  fps                      Float?
+  status                   VideoAssetStatus      @default(UPLOADED)
   // INTERNAL storage key relative to the configured local storage root
   // (opaque, server-generated). Never exposed in API responses and never
   // user-supplied.
-  storageKey     String
-  checksumSha256 String
+  storageKey               String
+  checksumSha256           String
   // Safe, stable failure information (UPPER_SNAKE code + screened message).
-  errorCode    String?
-  errorMessage String?
+  errorCode                String?
+  errorMessage             String?
   // Server-side SCREENING INSPECTION EVIDENCE: stamped ONLY by the guarded
   // screening-preview serve authorization (which requires a byte-reading
   // extractor and at least one actually-served frame), and REQUIRED by the
@@ -2285,8 +2293,8 @@ model VideoAsset {
   screeningInspectedAt     DateTime?
   screeningInspectedBy     String?
   screeningInspectedFrames Int?
-  uploadedById String?
-  deletedAt    DateTime?
+  uploadedById             String?
+  deletedAt                DateTime?
   // EXACTLY-ONCE media-removal completion marker: stamped by a DB
   // compare-and-set (updateMany WHERE mediaRemovedAt IS NULL) in the same
   // transaction as the "media removal completed" audit entry, so the
@@ -2295,7 +2303,7 @@ model VideoAsset {
   // never the storage adapter's "did anything exist" report, is the
   // authority. Shared by the screening-rejection removal and the delete
   // cleanup (the completion audit reason distinguishes them).
-  mediaRemovedAt DateTime?
+  mediaRemovedAt           DateTime?
   // DURABLE media-write phase for the upload's single storage.put. The
   // DELETE cleanup may record its exactly-once completion ONLY when this is
   // RESOLVED (SUCCEEDED/FAILED — or NULL, meaning no put was ever
@@ -2305,21 +2313,21 @@ model VideoAsset {
   // yet. Replaces the old inference "the row is PENDING_MEDIA / already
   // soft-deleted, so the write must have drained", which a DELETE REPLAY
   // could not observe at all.
-  mediaWriteState VideoMediaWriteState?
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+  mediaWriteState          VideoMediaWriteState?
+  createdAt                DateTime              @default(now())
+  updatedAt                DateTime              @updatedAt
 
-  tenant     Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location   Location?        @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit       RetailUnit?      @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  device     Device?          @relation(fields: [deviceId], references: [id], onDelete: Restrict)
-  session    CheckoutSession? @relation(fields: [sessionId], references: [id], onDelete: Restrict)
-  uploadedBy User?            @relation("VideoAssetUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
-  artifacts  VideoArtifact[]
-  extractionRequests VideoExtractionRequest[]
-  groundTruth VideoGroundTruth?
-  fusionRuns  PickupFusionRun[]
-  replayCameraSources CameraSource[] @relation("CameraReplayAsset")
+  tenant              Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location            Location?                @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit                RetailUnit?              @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  device              Device?                  @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  session             CheckoutSession?         @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  uploadedBy          User?                    @relation("VideoAssetUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
+  artifacts           VideoArtifact[]
+  extractionRequests  VideoExtractionRequest[]
+  groundTruth         VideoGroundTruth?
+  fusionRuns          PickupFusionRun[]
+  replayCameraSources CameraSource[]           @relation("CameraReplayAsset")
   cameraPilotRuns     CameraPilotRun[]
 
   @@unique([id, tenantId])
@@ -2334,32 +2342,32 @@ model VideoAsset {
 // except the one-shot inferenceJobId link set when a Phase 9 job is created
 // from a crop.
 model VideoArtifact {
-  id           String @id @default(cuid())
-  tenantId     String
-  videoAssetId String
-  artifactType VideoArtifactType
-  reason       VideoCropReason?
+  id             String            @id @default(cuid())
+  tenantId       String
+  videoAssetId   String
+  artifactType   VideoArtifactType
+  reason         VideoCropReason?
   // Position in the source video.
-  timestampMs Int
+  timestampMs    Int
   // Crop box within the source frame (CROP only; null for full FRAMEs).
-  cropX      Int?
-  cropY      Int?
-  cropWidth  Int?
-  cropHeight Int?
+  cropX          Int?
+  cropY          Int?
+  cropWidth      Int?
+  cropHeight     Int?
   // Output dimensions of the extracted artifact.
-  width     Int
-  height    Int
-  mimeType  String
-  sizeBytes Int
+  width          Int
+  height         Int
+  mimeType       String
+  sizeBytes      Int
   checksumSha256 String
   // INTERNAL storage key relative to the configured local storage root —
   // never exposed in API responses.
-  storageKey String
+  storageKey     String
   // Set once when a Phase 9 inference job is created from this crop; the
   // job's input descriptor references this artifact BY ID only.
   inferenceJobId String?
   createdById    String?
-  createdAt      DateTime @default(now())
+  createdAt      DateTime          @default(now())
 
   tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   videoAsset   VideoAsset    @relation(fields: [videoAssetId], references: [id], onDelete: Restrict)
@@ -2377,13 +2385,13 @@ model VideoArtifact {
 // never extract and append again. The row stores only ids (no media, no
 // storage keys) and is written in the SAME transaction as its batch.
 model VideoExtractionRequest {
-  id             String   @id @default(cuid())
-  tenantId       String
-  videoAssetId   String
-  idempotencyKey String
+  id                 String   @id @default(cuid())
+  tenantId           String
+  videoAssetId       String
+  idempotencyKey     String
   // The artifact ids the committed batch produced, in creation order —
   // replay resolves them through the tenant-scoped artifact reads.
-  artifactIds    Json
+  artifactIds        Json
   // Canonical fingerprint of the request parameters that produced the batch
   // (fixed operation tag, fixed field order, defaults applied). A replay is
   // honored ONLY when the incoming request's fingerprint matches — the same
@@ -2391,7 +2399,7 @@ model VideoExtractionRequest {
   // of the old batch. Null only on rows recorded before this column existed
   // (those fail closed: they can no longer prove the request is identical).
   requestFingerprint String?
-  createdAt      DateTime @default(now())
+  createdAt          DateTime @default(now())
 
   tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   videoAsset VideoAsset @relation(fields: [videoAssetId], references: [id], onDelete: Restrict)
@@ -2399,4 +2407,105 @@ model VideoExtractionRequest {
   @@unique([id, tenantId])
   @@unique([tenantId, idempotencyKey])
   @@index([tenantId, videoAssetId])
+}
+
+// ---------------------------------------------------------------------
+// Phase 15 — live pilot EVALUATION loop (SHADOW ONLY). An evaluation run
+// groups live sessions so pilot accuracy and speed can be measured;
+// operator reviews are APPEND-ONLY labels over live CV observations
+// (never a rewrite of the observation, never an inventory/billing
+// side effect); the dataset export reads ONLY these tables plus the
+// observations they label. Nothing in this module touches checkout,
+// order, payment, or inventory state.
+// ---------------------------------------------------------------------
+
+enum PilotEvaluationRunStatus {
+  OPEN
+  COMPLETED
+  CANCELLED
+}
+
+enum PilotObservationVerdict {
+  CORRECT
+  INCORRECT
+  UNCERTAIN
+  FALSE_TOUCH
+  WRONG_SKU
+  WRONG_ACTION
+  MISSED_EVENT
+}
+
+enum PilotExpectedAction {
+  PICKUP
+  RETURN
+  NO_OP
+  UNKNOWN
+}
+
+model PilotEvaluationRun {
+  id          String                   @id @default(cuid())
+  tenantId    String
+  locationId  String?
+  name        String
+  description String?
+  status      PilotEvaluationRunStatus @default(OPEN)
+  createdById String?
+  createdAt   DateTime                 @default(now())
+  completedAt DateTime?
+
+  tenant   Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location Location?                @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  sessions PilotEvaluationSession[]
+  reviews  PilotObservationReview[]
+
+  @@unique([id, tenantId])
+  @@index([tenantId, createdAt(sort: Desc)])
+}
+
+model PilotEvaluationSession {
+  id              String   @id @default(cuid())
+  tenantId        String
+  evaluationRunId String
+  liveSessionId   String
+  createdAt       DateTime @default(now())
+
+  tenant        Tenant             @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  evaluationRun PilotEvaluationRun @relation(fields: [evaluationRunId], references: [id], onDelete: Restrict)
+  liveSession   LiveCameraSession  @relation(fields: [liveSessionId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@unique([evaluationRunId, liveSessionId])
+  @@index([tenantId, evaluationRunId])
+}
+
+// APPEND-ONLY operator label over one live CV observation (or, for
+// MISSED_EVENT, over an interaction the CV never produced an event for).
+// predicted* fields are SERVER-side snapshots of the observation at
+// review time — never caller-supplied. The newest review per observation
+// is the one metrics use; older rows remain as audit history.
+model PilotObservationReview {
+  id                 String                  @id @default(cuid())
+  tenantId           String
+  evaluationRunId    String
+  liveSessionId      String?
+  journeyEventId     String?
+  verdict            PilotObservationVerdict
+  expectedAction     PilotExpectedAction
+  expectedProductId  String?
+  expectedSku        String?
+  predictedProductId String?
+  predictedSku       String?
+  predictedAction    PilotExpectedAction?
+  notes              String?
+  reviewedById       String?
+  createdAt          DateTime                @default(now())
+
+  tenant          Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  evaluationRun   PilotEvaluationRun    @relation(fields: [evaluationRunId], references: [id], onDelete: Restrict)
+  journeyEvent    CustomerJourneyEvent? @relation(fields: [journeyEventId], references: [id], onDelete: Restrict)
+  expectedProduct Product?              @relation("PilotReviewExpectedProduct", fields: [expectedProductId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@index([tenantId, evaluationRunId, createdAt])
+  @@index([tenantId, journeyEventId, createdAt])
 }

@@ -12,6 +12,7 @@ import {
   LIVE_MAX_CONSECUTIVE_SAMPLE_FAILURES,
   LiveSessionService,
   MAX_LIVE_SESSION_MS,
+  summarizeSamples,
 } from './live-session.service';
 
 const TENANT = 'tenant-1';
@@ -2654,10 +2655,12 @@ describe('LiveSessionService — Phase 14 speed pilot testing', () => {
       script: [{ value: 40 }, { value: 200 }, { value: 40 }, { value: 40 }],
       env: { CV_LIVE_PILOT_RUNNER_ENABLED: 'true' },
     });
+    // maxSeconds 600: the virtual clock advances 60s per sleep, so the
+    // deadline must cover the 4 sampled frames (4 × 60s virtual).
     const summary = await harness.service.runPilotTest(
       TENANT,
       'cam-1',
-      { maxFrames: 4, maxSeconds: 60 },
+      { maxFrames: 4, maxSeconds: 600 },
       'user-1',
     );
     expect(summary.status).toBe(LiveCameraSessionStatus.STOPPED);
@@ -2847,5 +2850,208 @@ describe('LiveSessionService — Phase 14 Codex review fixes', () => {
     const row = harness.sessions[0];
     expect(row.status).toBe(LiveCameraSessionStatus.STOPPED);
     await harness.service.awaitLoop(row.id as string);
+  });
+});
+
+describe('summarizeSamples — nearest-rank percentiles (Codex P2)', () => {
+  it('p95 over 20 ordered samples is index 18 (19th smallest), NOT the max', () => {
+    const samples = Array.from({ length: 20 }, (_unused, i) => (i + 1) * 10);
+    const stats = summarizeSamples(samples);
+    // ceil(0.95 * 20) - 1 = 18 → value 190; the max (200) would be wrong.
+    expect(stats.p95Ms).toBe(190);
+    expect(stats.maxMs).toBe(200);
+  });
+
+  it('p50 over an even count follows nearest-rank: ceil(0.5·n) − 1', () => {
+    const stats = summarizeSamples([10, 20, 30, 40]);
+    // ceil(2) - 1 = 1 → the 2nd smallest.
+    expect(stats.p50Ms).toBe(20);
+    expect(stats.avgMs).toBe(25);
+  });
+
+  it('one sample: every percentile is that sample; empty: zeros', () => {
+    const single = summarizeSamples([42]);
+    expect(single).toEqual({
+      count: 1,
+      avgMs: 42,
+      p50Ms: 42,
+      p95Ms: 42,
+      maxMs: 42,
+    });
+    const empty = summarizeSamples([]);
+    expect(empty).toEqual({ count: 0, avgMs: 0, p50Ms: 0, p95Ms: 0, maxMs: 0 });
+  });
+
+  it('unsorted input is ranked, not positional', () => {
+    const stats = summarizeSamples([50, 10, 40, 20, 30]);
+    // ceil(0.5·5)−1 = 2 → 3rd smallest = 30.
+    expect(stats.p50Ms).toBe(30);
+    expect(stats.maxMs).toBe(50);
+  });
+});
+
+describe('LiveSessionService — atomic pilot ownership + time budget (Codex round 2)', () => {
+  it('a CONCURRENT start winning between pre-check and create → controlled 409, winner untouched (Codex P1)', async () => {
+    const harness = buildHarness({
+      script: [{ value: 40 }],
+      env: { CV_LIVE_PILOT_RUNNER_ENABLED: 'true' },
+    });
+    // No session exists at the pre-check read, but the operator's start
+    // commits FIRST — the pilot's create hits the one-active-per-source
+    // unique (the stub raises P2002 on an active clash).
+    const originalFindFirst =
+      harness.prisma.liveCameraSession.findFirst.getMockImplementation() as (
+        args: unknown,
+      ) => Promise<unknown>;
+    let raced = false;
+    harness.prisma.liveCameraSession.findFirst.mockImplementation(
+      async (args: unknown) => {
+        if (!raced) {
+          raced = true;
+          // Pre-check sees nothing; the operator's session lands NOW.
+          harness.sessions.push({
+            id: 'live-operator',
+            tenantId: TENANT,
+            cameraSourceId: 'cam-1',
+            status: LiveCameraSessionStatus.RUNNING,
+            journeyId: 'journey-op',
+            leaseOwner: 'operator-process',
+            startedAt: new Date('2026-08-17T10:00:00.000Z'),
+            heartbeatAt: new Date('2026-08-17T10:00:00.000Z'),
+            eventWindows: [],
+          });
+          return null;
+        }
+        return originalFindFirst(args);
+      },
+    );
+    await expect(
+      harness.service.runPilotTest(TENANT, 'cam-1', {}, 'user-1'),
+    ).rejects.toThrow(/LIVE_PILOT_SESSION_ALREADY_ACTIVE/);
+    // The winning operator session is untouched — never polled, never
+    // stopped, journey never closed.
+    const operator = harness.sessions.find((row) => row.id === 'live-operator')!;
+    expect(operator.status).toBe(LiveCameraSessionStatus.RUNNING);
+    expect(operator.leaseOwner).toBe('operator-process');
+    expect(harness.journeys.exit).not.toHaveBeenCalled();
+    expect(harness.journeys.abortShadowJourney).not.toHaveBeenCalled();
+  });
+
+  it('a STALE operator session is REFUSED before any reclaim — never marked STOPPING, never finalized (Codex P1)', async () => {
+    const staleOperator = {
+      id: 'live-stale-op',
+      tenantId: TENANT,
+      cameraSourceId: 'cam-1',
+      status: LiveCameraSessionStatus.RUNNING,
+      journeyId: 'journey-op',
+      leaseOwner: 'operator-process',
+      errorCode: null,
+      startedAt: new Date('2026-08-17T09:00:00.000Z'),
+      // Heartbeat far past the 5-minute stale cutoff at the virtual
+      // clock start — a NORMAL start would reclaim this row.
+      heartbeatAt: new Date('2026-08-17T09:30:00.000Z'),
+      eventWindows: [],
+    };
+    const harness = buildHarness({
+      env: { CV_LIVE_PILOT_RUNNER_ENABLED: 'true' },
+      existingSession: { ...staleOperator },
+    });
+    await expect(
+      harness.service.runPilotTest(TENANT, 'cam-1', {}, 'user-1'),
+    ).rejects.toThrow(/LIVE_PILOT_SESSION_ALREADY_ACTIVE/);
+    // The stale session is UNTOUCHED: same status, same owner, no
+    // reclaim stamp, journey never closed, no intents recorded.
+    const row = harness.sessions[0];
+    expect(row.status).toBe(LiveCameraSessionStatus.RUNNING);
+    expect(row.leaseOwner).toBe('operator-process');
+    expect(row.errorCode).toBeNull();
+    expect(row.finalizationMode).toBeUndefined();
+    expect(harness.journeys.exit).not.toHaveBeenCalled();
+    expect(harness.journeys.abortShadowJourney).not.toHaveBeenCalled();
+    expect(harness.intents).toHaveLength(0);
+    // No pilot session was created either.
+    expect(harness.sessions).toHaveLength(1);
+    // The controlled error carries no source/credential material.
+    await harness.service
+      .runPilotTest(TENANT, 'cam-1', {}, 'user-1')
+      .catch((error: Error) => {
+        expect(error.message).not.toContain('rtsp');
+        expect(error.message).not.toContain('CAMERA_');
+        expect(error.message).not.toContain('://');
+      });
+    // A NORMAL start still reclaims the stale row (existing Phase 13
+    // behavior unchanged): the old session terminalizes and a fresh one
+    // starts.
+    const view = await harness.service.start(TENANT, 'cam-1', {}, 'user-1');
+    expect(view.sessionId).not.toBe('live-stale-op');
+    expect(view.status).toBe(LiveCameraSessionStatus.RUNNING);
+    expect(harness.sessions[0].status).toBe(LiveCameraSessionStatus.ERROR);
+    await harness.service.awaitLoop(view.sessionId);
+  });
+
+  it('normal (non-pilot) start keeps its idempotent behavior: an active session is returned, not refused', async () => {
+    const harness = buildHarness({
+      existingSession: {
+        id: 'live-existing',
+        tenantId: TENANT,
+        cameraSourceId: 'cam-1',
+        status: LiveCameraSessionStatus.RUNNING,
+        journeyId: 'journey-existing',
+        startedAt: new Date('2026-08-17T09:59:00.000Z'),
+        heartbeatAt: new Date('2026-08-17T10:00:00.000Z'),
+        eventWindows: [],
+      },
+    });
+    const view = await harness.service.start(TENANT, 'cam-1', {}, 'user-1');
+    expect(view.sessionId).toBe('live-existing');
+  });
+
+  it('maxSeconds is enforced INSIDE the loop: a 60s frame interval exits at the deadline, no drain timeout (Codex P2)', async () => {
+    const harness = buildHarness({
+      script: Array.from({ length: 20 }, () => ({ value: 40 })),
+      env: { CV_LIVE_PILOT_RUNNER_ENABLED: 'true' },
+    });
+    const summary = await harness.service.runPilotTest(
+      TENANT,
+      'cam-1',
+      { maxSeconds: 1, frameIntervalMs: 60000 },
+      'user-1',
+    );
+    // The deadline broke the loop after the first frame — the 60s sleep
+    // was deadline-capped, and the session finalized cleanly (no
+    // LIVE_WINDOW_DRAIN_TIMEOUT fail-closed path).
+    expect(summary.framesSampled).toBe(1);
+    expect(summary.status).toBe(LiveCameraSessionStatus.STOPPED);
+    expect(summary.errorCode).not.toBe('LIVE_WINDOW_DRAIN_TIMEOUT');
+    expect(harness.sampler.sampleFrame).toHaveBeenCalledTimes(1);
+  });
+
+  it('the deadline-aware sleep never sleeps past the deadline', async () => {
+    const sleeps: number[] = [];
+    const harness = buildHarness({
+      script: Array.from({ length: 20 }, () => ({ value: 40 })),
+      env: { CV_LIVE_PILOT_RUNNER_ENABLED: 'true' },
+    });
+    const service = harness.service as unknown as {
+      sleep: (ms: number) => Promise<void>;
+    };
+    const originalSleep = service.sleep.bind(service);
+    jest
+      .spyOn(service as never, 'sleep' as never)
+      .mockImplementation(((ms: number) => {
+        sleeps.push(ms);
+        return originalSleep(ms);
+      }) as never);
+    await harness.service.runPilotTest(
+      TENANT,
+      'cam-1',
+      { maxSeconds: 1, frameIntervalMs: 60000 },
+      'user-1',
+    );
+    // Every loop sleep was capped by the remaining time (≤ 1000ms) —
+    // never the raw 60s interval.
+    const loopSleeps = sleeps.filter((ms) => ms > harness.service['drainMs']);
+    expect(loopSleeps).toHaveLength(0);
+    expect(sleeps.some((ms) => ms <= 1000)).toBe(true);
   });
 });

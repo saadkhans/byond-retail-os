@@ -13,6 +13,10 @@ import {
   LiveSessionDetailPage,
   LiveSessionsPage,
 } from './pages/LiveSessionsPage';
+import {
+  PilotEvaluationDetailPage,
+  PilotEvaluationsPage,
+} from './pages/PilotEvaluationsPage';
 import { CatalogPage } from './pages/CatalogPage';
 import {
   CheckoutSessionDetailPage,
@@ -97,6 +101,7 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/cameras">Cameras</NavLink>
         <NavLink to="/pilot-runs">Pilot runs</NavLink>
         <NavLink to="/live-sessions">Live sessions</NavLink>
+        <NavLink to="/pilot-evaluations">Pilot evaluations</NavLink>
         <NavLink to="/review-queue">Review queue</NavLink>
         <div className="spacer" />
         <div className="who">{user?.email}</div>
@@ -196,6 +201,14 @@ export function App() {
                     <Route
                       path="live-sessions"
                       element={<LiveSessionsPage />}
+                    />
+                    <Route
+                      path="pilot-evaluations"
+                      element={<PilotEvaluationsPage />}
+                    />
+                    <Route
+                      path="pilot-evaluations/:id"
+                      element={<PilotEvaluationDetailPage />}
                     />
                     <Route
                       path="live-sessions/:id"

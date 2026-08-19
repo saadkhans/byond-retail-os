@@ -1339,3 +1339,144 @@ export interface ReviewQueueItem {
    *  returned); kept for shape stability. */
   latestReview: { decision: JourneyReviewDecision; createdAt: string } | null;
 }
+
+/** Phase 15 — pilot evaluation loop (shadow only). */
+export type PilotEvaluationStatus = 'OPEN' | 'COMPLETED' | 'CANCELLED';
+export type PilotVerdict =
+  | 'CORRECT'
+  | 'INCORRECT'
+  | 'UNCERTAIN'
+  | 'FALSE_TOUCH'
+  | 'WRONG_SKU'
+  | 'WRONG_ACTION'
+  | 'MISSED_EVENT';
+export type PilotExpectedAction = 'PICKUP' | 'RETURN' | 'NO_OP' | 'UNKNOWN';
+
+export interface PilotEvaluationRunView {
+  evaluationRunId: string;
+  name: string;
+  description: string | null;
+  locationId: string | null;
+  locationName: string | null;
+  status: PilotEvaluationStatus;
+  sessionCount: number;
+  reviewCount: number;
+  createdAt: string;
+  completedAt: string | null;
+}
+
+export interface PilotEvaluationDetail {
+  evaluationRunId: string;
+  name: string;
+  description: string | null;
+  locationId: string | null;
+  locationName: string | null;
+  status: PilotEvaluationStatus;
+  createdAt: string;
+  completedAt: string | null;
+  reviewCount: number;
+  sessions: {
+    liveSessionId: string;
+    attachedAt: string;
+    status: LiveSessionStatus;
+    decision: JourneyDecision | null;
+    startedAt: string;
+    stoppedAt: string | null;
+    framesSampled: number;
+    eventWindowsDetected: number;
+    eventWindowsProcessed: number;
+    reviewNeeded: number;
+    errorCode: string | null;
+  }[];
+}
+
+export interface PilotObservationRow {
+  journeyEventId: string;
+  liveSessionId: string | null;
+  eventType: string;
+  occurredAt: string;
+  predictedProductId: string | null;
+  predictedSku: string | null;
+  predictedProductName: string | null;
+  matchScore: number | null;
+  latestReview: {
+    reviewId: string;
+    verdict: PilotVerdict;
+    expectedAction: PilotExpectedAction;
+    expectedProductId: string | null;
+    expectedSku: string | null;
+    notes: string | null;
+    reviewedById: string | null;
+    reviewedAt: string;
+  } | null;
+}
+
+export interface PilotObservationsResponse {
+  evaluationRunId: string;
+  observations: PilotObservationRow[];
+  missedEvents: {
+    reviewId: string;
+    liveSessionId: string | null;
+    expectedAction: PilotExpectedAction;
+    expectedSku: string | null;
+    notes: string | null;
+    reviewedAt: string;
+  }[];
+}
+
+export interface PilotEvaluationSummary {
+  evaluationRunId: string;
+  status: PilotEvaluationStatus;
+  totals: {
+    observations: number;
+    reviewed: number;
+    unreviewed: number;
+    correct: number;
+    incorrect: number;
+    uncertain: number;
+    falseTouch: number;
+    wrongSku: number;
+    wrongAction: number;
+    missedEvents: number;
+  };
+  accuracy: {
+    action: number | null;
+    sku: number | null;
+    combined: number | null;
+  };
+  confusion: {
+    action: { predicted: string; expected: string; count: number }[];
+    sku: { predicted: string; expected: string; count: number }[];
+  };
+  latency: {
+    sessions: {
+      liveSessionId: string;
+      eventToReview: LiveStageStats | null;
+      fusion: LiveStageStats | null;
+      journeyImport: LiveStageStats | null;
+      slowestStage: { stage: string; p95Ms: number } | null;
+    }[];
+    combined: {
+      liveSessionId: string;
+      eventToReview: LiveStageStats | null;
+      fusion: LiveStageStats | null;
+      journeyImport: LiveStageStats | null;
+      slowestStage: { stage: string; p95Ms: number } | null;
+    } | null;
+  };
+  safety: {
+    orders: number;
+    checkoutSessions: number;
+    paymentIntents: number;
+    paymentEvents: number;
+    inventoryMovements: number;
+    basis: string;
+  };
+}
+
+export interface PilotDatasetExport {
+  evaluationRunId: string;
+  rowCount: number;
+  format: string;
+  manifest: string;
+}

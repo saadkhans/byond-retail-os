@@ -273,10 +273,19 @@ export interface LiveSessionDetail extends LiveSessionView {
  *  no matter how long the session runs (oldest samples roll off). */
 export const LIVE_PERF_MAX_SAMPLES = 500;
 
-function summarizeSamples(samples: number[]): LiveStageStats {
+/** NEAREST-RANK percentiles (Codex P2): index = ceil(q·n) − 1, clamped
+ *  to [0, n−1] — an integral q·n selects the exact rank (p95 over 20
+ *  samples is the 19th smallest, index 18 — NOT the max). Exported for
+ *  direct unit testing. */
+export function summarizeSamples(samples: number[]): LiveStageStats {
   const sorted = [...samples].sort((a, b) => a - b);
   const at = (q: number) =>
-    sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] ?? 0;
+    sorted[
+      Math.min(
+        sorted.length - 1,
+        Math.max(0, Math.ceil(q * sorted.length) - 1),
+      )
+    ] ?? 0;
   const total = sorted.reduce((sum, value) => sum + value, 0);
   return {
     count: sorted.length,
@@ -749,9 +758,26 @@ export class LiveSessionService {
        *  its own stop the moment this many frames have been persisted,
        *  so a polling cadence can never overshoot the budget. */
       pilotFrameBudget?: number | null;
+      /** INTERNAL (pilot runner only): absolute deadline (now()-clock
+       *  epoch ms) enforced INSIDE the sampling loop — the loop stops
+       *  itself when reached, deadline-aware sleeps included. */
+      pilotDeadlineAtMs?: number | null;
+      /** INTERNAL (pilot runner only, Codex P1): CREATE-ONLY start. A
+       *  pilot may poll/stop exclusively a session THIS call created,
+       *  so every idempotent existing-session return below becomes a
+       *  controlled 409 (LIVE_PILOT_SESSION_ALREADY_ACTIVE) instead —
+       *  ownership is atomic (DB partial unique is the race backstop),
+       *  never inferred from timestamps. */
+      requireNewSession?: boolean;
     },
     actorId?: string,
   ): Promise<LiveSessionDetail> {
+    const refuseExisting = (): never => {
+      throw new ConflictException(
+        'camera source already has an active live session ' +
+          '(LIVE_PILOT_SESSION_ALREADY_ACTIVE)',
+      );
+    };
     const source = await this.sources.requireSource(tenantId, cameraSourceId);
     if (source.sourceType !== CameraSourceType.RTSP_SHADOW) {
       throw new ConflictException(
@@ -778,6 +804,16 @@ export class LiveSessionService {
       include: SOURCE_INCLUDE,
     });
     if (active) {
+      // CREATE-ONLY pilot start (Codex P1): ANY existing non-terminal
+      // session — fresh, stale, local, or remote — refuses BEFORE any
+      // branch below can touch it. A pilot must never stop, reclaim,
+      // finalize, or mutate a pre-existing session in any way; stale
+      // reclaim in particular would mark an unrelated operator session
+      // STOPPING and close its journey. Normal starts keep the full
+      // reclaim behavior unchanged.
+      if (input.requireNewSession) {
+        refuseExisting();
+      }
       if (this.loops.has(active.id)) {
         return toDetail(active as SessionWithSource);
       }
@@ -845,8 +881,13 @@ export class LiveSessionService {
         error.code === 'P2002'
       ) {
         // RACE BACKSTOP: the partial unique (one non-terminal session per
-        // source) means a concurrent start won — its session is THE
-        // session.
+        // source) means a concurrent start won. For a normal start its
+        // session IS the session; a CREATE-ONLY pilot start refuses —
+        // the winner is someone else's session (Codex P1: this DB
+        // constraint is the atomic ownership arbiter, not timestamps).
+        if (input.requireNewSession) {
+          refuseExisting();
+        }
         const winner = await this.prisma.liveCameraSession.findFirst({
           where: {
             tenantId,
@@ -990,6 +1031,7 @@ export class LiveSessionService {
         frameIntervalMs,
         startedAt: session.startedAt,
         frameBudget: input.pilotFrameBudget ?? null,
+        deadlineAtMs: input.pilotDeadlineAtMs ?? null,
       },
       actorId,
     ).catch((error) => {
@@ -1173,6 +1215,9 @@ export class LiveSessionService {
       startedAt: Date;
       /** Pilot frame budget (null = unbounded normal session). */
       frameBudget: number | null;
+      /** Pilot time budget as an absolute now()-clock deadline (null =
+       *  unbounded normal session). */
+      deadlineAtMs: number | null;
     },
     actorId?: string,
   ): Promise<void> {
@@ -1437,12 +1482,19 @@ export class LiveSessionService {
           // land before this loop may ever finalize normally.
           await retryUnpersistedIntent();
         }
-        // PILOT FRAME BUDGET (Codex P2): checked BEFORE scheduling the
-        // next sample — a budget of N never samples frame N+1, no matter
-        // how coarse any external polling is.
+        // PILOT BUDGETS (Codex P2): frame budget AND time deadline are
+        // both checked BEFORE scheduling the next sample — a budget of N
+        // never samples frame N+1, and a passed deadline never starts
+        // another sample, no matter how coarse any external polling is.
         if (
           context.frameBudget !== null &&
           counters.framesSampled >= context.frameBudget
+        ) {
+          break;
+        }
+        if (
+          context.deadlineAtMs !== null &&
+          this.now().getTime() >= context.deadlineAtMs
         ) {
           break;
         }
@@ -1516,15 +1568,28 @@ export class LiveSessionService {
         if (controller.stopRequested || leaseLost) {
           break;
         }
-        // Budget met exactly at this frame: break NOW (skipping the idle
-        // sleep) — the closed-window pass for this frame already ran.
+        // Budget/deadline met exactly at this frame: break NOW (skipping
+        // the idle sleep) — the closed-window pass for this frame ran.
         if (
           context.frameBudget !== null &&
           counters.framesSampled >= context.frameBudget
         ) {
           break;
         }
-        await this.sleep(context.frameIntervalMs);
+        if (
+          context.deadlineAtMs !== null &&
+          this.now().getTime() >= context.deadlineAtMs
+        ) {
+          break;
+        }
+        // DEADLINE-AWARE sleep (Codex P2): never sleep past the pilot
+        // deadline — a 60s frame interval with 1s remaining sleeps 1s,
+        // wakes, and exits above instead of stalling into drain timeout.
+        const remainingMs =
+          context.deadlineAtMs !== null
+            ? Math.max(1, context.deadlineAtMs - this.now().getTime())
+            : context.frameIntervalMs;
+        await this.sleep(Math.min(context.frameIntervalMs, remainingMs));
         await beat();
       }
 
@@ -2341,53 +2406,35 @@ export class LiveSessionService {
         'pilot test runner is disabled (CV_LIVE_PILOT_RUNNER_ENABLED)',
       );
     }
-    // Bounded budgets — a pilot run is a short measurement, never a
-    // long-running session (the 15-minute session bound still backstops).
+    // Bounded budgets — a pilot run is a short measurement; the time
+    // ceiling matches the 15-minute session auto-stop bound.
     const maxFrames = Math.max(1, Math.min(input.maxFrames ?? 30, 300));
-    const maxSeconds = Math.max(1, Math.min(input.maxSeconds ?? 60, 120));
-    // OWNERSHIP PRE-CHECK (Codex P2): start() is idempotent-safe and can
-    // hand back an EXISTING active session — one an operator or another
-    // pilot owns. A pilot may only ever stop a session it created, so an
-    // already-active source refuses up front with a controlled conflict.
-    const pilotStartedAt = this.now();
-    const preExisting = await this.prisma.liveCameraSession.findFirst({
-      where: {
-        tenantId,
-        cameraSourceId,
-        status: { in: NON_TERMINAL_SESSION_STATUSES },
-      },
-      select: { id: true },
-    });
-    if (preExisting) {
-      throw new ConflictException(
-        'camera source already has an active live session ' +
-          '(LIVE_PILOT_SESSION_ALREADY_ACTIVE)',
-      );
-    }
+    const maxSeconds = Math.max(
+      1,
+      Math.min(input.maxSeconds ?? 60, MAX_LIVE_SESSION_MS / 1000),
+    );
+    // ATOMIC OWNERSHIP (Codex P1): a CREATE-ONLY start — any existing
+    // active/non-terminal session on the source (operator's, another
+    // pilot's, or a concurrent winner via the one-active-per-source DB
+    // unique) is a controlled 409, never adopted. The session returned
+    // here therefore exists BECAUSE this call created it, so this pilot
+    // may poll and stop it — no timestamp inference anywhere.
     const startedAtMs = Date.now();
     const started = await this.start(
       tenantId,
       cameraSourceId,
       {
         frameIntervalMs: input.frameIntervalMs,
-        // Enforced INSIDE the sampling loop (Codex P2): the loop stops
-        // itself at the budget — polling cadence can never overshoot.
+        // Both budgets enforced INSIDE the sampling loop (Codex P2): the
+        // loop stops itself at the frame budget or the deadline — the
+        // runner's polling cadence can never overshoot either.
         pilotFrameBudget: maxFrames,
+        pilotDeadlineAtMs: this.now().getTime() + maxSeconds * 1000,
+        requireNewSession: true,
       },
       actorId,
     );
     const sessionId = started.sessionId;
-    // RACE BACKSTOP: a session that PRE-DATES this pilot call slipped in
-    // between the pre-check and start() (idempotent return) — it is NOT
-    // ours; refuse without touching it. (The residual same-instant race
-    // is closed by stop() being idempotent-safe and the frame budget
-    // living inside the loop, not in this runner.)
-    if (started.startedAt.getTime() < pilotStartedAt.getTime()) {
-      throw new ConflictException(
-        'camera source already has an active live session ' +
-          '(LIVE_PILOT_SESSION_ALREADY_ACTIVE)',
-      );
-    }
     // From here the session is PILOT-OWNED: whatever happens during
     // polling, the finally below guarantees a stop request — a failed
     // poll must never leave the sampler running to the 15-minute cap
