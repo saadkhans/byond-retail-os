@@ -15,9 +15,13 @@ import {
 } from '../api';
 import { Page, StatusBadge, formatDate, useLoad } from '../components';
 import {
+  buildZoneCreateBody,
+  buildZoneUpdateBody,
   calibrationReadinessTone,
   formatNextAction,
+  formatReadiness,
   formatWarning,
+  hardeningStatusMessage,
   parsePolygonInput,
   polygonToInput,
   profileStatusTone,
@@ -112,11 +116,15 @@ export function CameraCalibrationPage() {
                 </td>
                 <td>
                   {r ? (
-                    <span
-                      className={`badge ${calibrationReadinessTone(r.readiness)}`}
-                    >
-                      {r.readiness}
-                    </span>
+                    r.readiness === 'NOT_APPLICABLE' ? (
+                      <span className="muted">Not required</span>
+                    ) : (
+                      <span
+                        className={`badge ${calibrationReadinessTone(r.readiness)}`}
+                      >
+                        {formatReadiness(r.readiness)}
+                      </span>
+                    )
                   ) : readiness.loading ? (
                     <span className="muted">checking…</span>
                   ) : (
@@ -270,35 +278,26 @@ export function CameraCalibrationDetailPage() {
       setActionError('Zone label is required');
       return;
     }
-    const productIds = zProductIds
-      .split(/[\s,]+/)
-      .map((id) => id.trim())
-      .filter(Boolean);
-    const body = {
+    // zoneType is immutable after creation: the PATCH DTO does not whitelist
+    // it, so the update builder structurally cannot include it.
+    const form = {
       zoneType: zType,
-      label: zLabel.trim(),
+      label: zLabel,
       polygon: parsed.points,
-      ...(zQuality.trim() ? { qualityScore: Number(zQuality) } : {}),
-      sortOrder: Number(zSortOrder) || 0,
+      qualityScoreText: zQuality,
+      sortOrderText: zSortOrder,
       isActive: zActive,
-      // Expected products apply to shelf zones only; PATCH replaces the set.
-      ...(zType === 'SHELF_ZONE'
-        ? editingZoneId
-          ? { expectedProductIds: productIds }
-          : productIds.length > 0
-            ? { expectedProductIds: productIds }
-            : {}
-        : {}),
+      expectedProductIdsText: zProductIds,
     };
     await action(() =>
       editingZoneId
         ? api(
             `/camera-calibration-profiles/${selectedProfileId}/zones/${editingZoneId}`,
-            { method: 'PATCH', body },
+            { method: 'PATCH', body: buildZoneUpdateBody(form) },
           )
         : api(`/camera-calibration-profiles/${selectedProfileId}/zones`, {
             method: 'POST',
-            body,
+            body: buildZoneCreateBody(form),
           }),
     );
     resetZoneForm();
@@ -332,13 +331,19 @@ export function CameraCalibrationDetailPage() {
           </p>
 
           <h2>Calibration readiness</h2>
-          {readiness.data ? (
+          {readiness.data && readiness.data.readiness === 'NOT_APPLICABLE' ? (
+            <p className="muted">
+              Calibration is not required for FILE_REPLAY sources — replay
+              tests run without a calibration profile. Profiles below are
+              optional.
+            </p>
+          ) : readiness.data ? (
             <>
               <p>
                 <span
                   className={`badge ${calibrationReadinessTone(readiness.data.readiness)}`}
                 >
-                  {readiness.data.readiness}
+                  {formatReadiness(readiness.data.readiness)}
                 </span>{' '}
                 <span className="muted">
                   {readiness.data.hasActiveCalibrationProfile
@@ -713,18 +718,24 @@ export function CameraCalibrationDetailPage() {
                 <>
                   <h3>{editingZoneId ? 'Edit zone' : 'Add zone'}</h3>
                   <div className="form-row">
-                    <select
-                      value={zType}
-                      onChange={(e) =>
-                        setZType(e.target.value as CameraCalibrationZoneType)
-                      }
-                    >
-                      {ZONE_TYPES.map((option) => (
-                        <option key={option} value={option}>
-                          {option}
-                        </option>
-                      ))}
-                    </select>
+                    {editingZoneId ? (
+                      // zoneType is immutable after creation (PATCH does not
+                      // accept it) — show it read-only while editing.
+                      <span className="muted">Type: {zType}</span>
+                    ) : (
+                      <select
+                        value={zType}
+                        onChange={(e) =>
+                          setZType(e.target.value as CameraCalibrationZoneType)
+                        }
+                      >
+                        {ZONE_TYPES.map((option) => (
+                          <option key={option} value={option}>
+                            {option}
+                          </option>
+                        ))}
+                      </select>
+                    )}
                     <input
                       placeholder="Label (screened)"
                       value={zLabel}
@@ -845,9 +856,31 @@ export function CameraCalibrationDetailPage() {
                     ))}
                   </ul>
                 </>
-              ) : (
-                <p className="muted">No recommendations — ready for testing.</p>
-              )}
+              ) : null}
+              {/* The status line follows readiness, never the (possibly
+                  empty) recommendation list. */}
+              <p>
+                <span
+                  className={`badge ${calibrationReadinessTone(report.data.calibrationReadiness.readiness)}`}
+                >
+                  {formatReadiness(report.data.calibrationReadiness.readiness)}
+                </span>{' '}
+                {hardeningStatusMessage(
+                  report.data.calibrationReadiness.readiness,
+                  report.data.recommendedNextActions.length,
+                )}
+              </p>
+              {report.data.calibrationReadiness.readiness !== 'READY' &&
+              report.data.calibrationReadiness.readiness !== 'NOT_APPLICABLE' &&
+              report.data.calibrationReadiness.warnings.length > 0 ? (
+                <ul>
+                  {report.data.calibrationReadiness.warnings.map((warning) => (
+                    <li key={warning} className="muted">
+                      {formatWarning(warning)}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
               <p className="muted">
                 Safety — mutations from CV: orders {report.data.safety.orders}{' '}
                 · checkout {report.data.safety.checkoutSessions} · payment

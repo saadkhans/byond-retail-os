@@ -16,7 +16,10 @@ import {
   LiveCameraSessionStatus,
   Prisma,
 } from '@prisma/client';
-import { containsSourceOrPathText } from '../common/free-text-safety';
+import {
+  containsCredentialSlotText,
+  containsSourceOrPathText,
+} from '../common/free-text-safety';
 import { cameraCalibrationAdvisoryLockKey } from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
 import { containsSensitiveFreeText } from '../video-ingest/media-safety';
@@ -71,6 +74,7 @@ const BLOCKING_WARNINGS: readonly CalibrationWarning[] = [
 
 /** Controlled operator next-action vocabulary. */
 export const PILOT_NEXT_ACTIONS = [
+  'ENABLE_CAMERA_SOURCE',
   'CREATE_CALIBRATION_PROFILE',
   'ADD_SHELF_ZONE',
   'ADD_INTERACTION_ZONE',
@@ -218,6 +222,8 @@ export function toCalibrationZoneView(
 
 export interface CalibrationReadiness {
   cameraSourceId: string;
+  /** False for FILE_REPLAY — replay needs no calibration (Codex P1). */
+  applicable: boolean;
   hasActiveCalibrationProfile: boolean;
   activeProfileId: string | null;
   profileStatus: 'ACTIVE' | null;
@@ -230,7 +236,7 @@ export interface CalibrationReadiness {
   cameraMountKnown: boolean;
   zoneCount: number;
   expectedProductCount: number;
-  readiness: 'READY' | 'WARNING' | 'NOT_READY';
+  readiness: 'READY' | 'WARNING' | 'NOT_READY' | 'NOT_APPLICABLE';
   warnings: CalibrationWarning[];
 }
 
@@ -242,12 +248,22 @@ export interface CalibrationReadiness {
  * zones of the ACTIVE profile count. Zone/metadata warnings are emitted
  * only when an active profile exists — without one,
  * NO_ACTIVE_CALIBRATION_PROFILE already says everything actionable.
+ *
+ * FILE_REPLAY sources need no calibration (Phase 16 contract — Codex
+ * P1): they report applicable=false, readiness NOT_APPLICABLE, and NO
+ * warnings, while the factual fields still describe whatever calibration
+ * data happens to exist.
  */
 export async function computeCalibrationReadiness(
   prisma: PrismaService,
   tenantId: string,
-  source: { id: string; status: CameraSourceStatus },
+  source: {
+    id: string;
+    status: CameraSourceStatus;
+    sourceType: CameraSourceType;
+  },
 ): Promise<CalibrationReadiness> {
+  const applicable = source.sourceType !== CameraSourceType.FILE_REPLAY;
   const profile = await prisma.cameraCalibrationProfile.findFirst({
     where: {
       tenantId,
@@ -299,41 +315,53 @@ export async function computeCalibrationReadiness(
   const cameraMountKnown =
     profile !== null && profile.cameraMount !== CameraCalibrationMount.UNKNOWN;
 
+  // FILE_REPLAY: calibration is NOT APPLICABLE — no warnings, never
+  // NOT_READY, and never a prompt to create calibration.
   const warnings: CalibrationWarning[] = [];
-  if (!profile) {
-    warnings.push('NO_ACTIVE_CALIBRATION_PROFILE');
-  } else {
-    if (!hasShelfZone) {
-      warnings.push('NO_SHELF_ZONE');
+  if (applicable) {
+    if (!profile) {
+      warnings.push('NO_ACTIVE_CALIBRATION_PROFILE');
+    } else {
+      if (!hasShelfZone) {
+        warnings.push('NO_SHELF_ZONE');
+      }
+      if (!hasInteractionZone) {
+        warnings.push('NO_INTERACTION_ZONE');
+      }
+      if (expectedProducts.length === 0) {
+        warnings.push('NO_EXPECTED_PRODUCTS');
+      }
+      if (!frameDimensionsKnown) {
+        warnings.push('FRAME_DIMENSIONS_UNKNOWN');
+      }
+      if (!orientationKnown) {
+        warnings.push('ORIENTATION_UNKNOWN');
+      }
+      if (!cameraMountKnown) {
+        warnings.push('CAMERA_MOUNT_UNKNOWN');
+      }
     }
-    if (!hasInteractionZone) {
-      warnings.push('NO_INTERACTION_ZONE');
+    if (source.status !== CameraSourceStatus.ACTIVE) {
+      warnings.push('SOURCE_NOT_ACTIVE');
     }
-    if (expectedProducts.length === 0) {
-      warnings.push('NO_EXPECTED_PRODUCTS');
+    if (activeSession !== null) {
+      warnings.push('LIVE_SESSION_ALREADY_ACTIVE');
     }
-    if (!frameDimensionsKnown) {
-      warnings.push('FRAME_DIMENSIONS_UNKNOWN');
-    }
-    if (!orientationKnown) {
-      warnings.push('ORIENTATION_UNKNOWN');
-    }
-    if (!cameraMountKnown) {
-      warnings.push('CAMERA_MOUNT_UNKNOWN');
-    }
-  }
-  if (source.status !== CameraSourceStatus.ACTIVE) {
-    warnings.push('SOURCE_NOT_ACTIVE');
-  }
-  if (activeSession !== null) {
-    warnings.push('LIVE_SESSION_ALREADY_ACTIVE');
   }
 
   const notReady = warnings.some((warning) =>
     BLOCKING_WARNINGS.includes(warning),
   );
+  const readiness = !applicable
+    ? 'NOT_APPLICABLE'
+    : notReady
+      ? 'NOT_READY'
+      : warnings.length
+        ? 'WARNING'
+        : 'READY';
   return {
     cameraSourceId: source.id,
+    applicable,
     hasActiveCalibrationProfile: profile !== null,
     activeProfileId: profile?.id ?? null,
     profileStatus: profile ? 'ACTIVE' : null,
@@ -346,7 +374,7 @@ export async function computeCalibrationReadiness(
     cameraMountKnown,
     zoneCount: zones.length,
     expectedProductCount: expectedProducts.length,
-    readiness: notReady ? 'NOT_READY' : warnings.length ? 'WARNING' : 'READY',
+    readiness,
     warnings,
   };
 }
@@ -412,6 +440,14 @@ export class CameraCalibrationService {
       throw new BadRequestException(
         `${label} rejected: URLs and file paths are not allowed in ` +
           'calibration text',
+      );
+    }
+    // Codex P1: a bare reserved slot identifier (credential/source slot
+    // namespaces) is neither a URL nor credential-shaped, so the screens
+    // above pass it — reject it here, without echoing the value.
+    if (containsCredentialSlotText(text)) {
+      throw new BadRequestException(
+        `${label} must not reference credential or source slot names`,
       );
     }
     return text;
@@ -959,7 +995,7 @@ export class CameraCalibrationService {
   ): Promise<CalibrationReadiness> {
     const source = await this.prisma.cameraSource.findFirst({
       where: { tenantId, id: cameraSourceId },
-      select: { id: true, status: true },
+      select: { id: true, status: true, sourceType: true },
     });
     if (!source) {
       throw new NotFoundException('Camera source not found');
@@ -1027,40 +1063,56 @@ export class CameraCalibrationService {
     }
 
     const actions: PilotNextAction[] = [];
-    if (!readiness.hasActiveCalibrationProfile) {
-      actions.push('CREATE_CALIBRATION_PROFILE');
+    // A disabled/errored source blocks EVERY kind of live testing —
+    // surfaced first so an empty recommendation list can never read as
+    // "ready" while the source itself is off (Codex P1).
+    if (source.status !== CameraSourceStatus.ACTIVE) {
+      actions.push('ENABLE_CAMERA_SOURCE');
     }
-    if (readiness.hasActiveCalibrationProfile && !readiness.hasShelfZone) {
-      actions.push('ADD_SHELF_ZONE');
-    }
-    if (
-      readiness.hasActiveCalibrationProfile &&
-      !readiness.hasInteractionZone
-    ) {
-      actions.push('ADD_INTERACTION_ZONE');
-    }
-    if (
-      readiness.hasActiveCalibrationProfile &&
-      readiness.hasShelfZone &&
-      !readiness.hasExpectedProducts
-    ) {
-      actions.push('ASSIGN_EXPECTED_PRODUCTS');
-    }
-    if (activeProfile && !readiness.cameraMountKnown) {
-      actions.push('IMPROVE_CAMERA_ANGLE');
-    }
-    const lowQualityZone = zones.some(
-      (zone) =>
-        zone.qualityScore !== null &&
-        zone.qualityScore < ZONE_QUALITY_ATTENTION_THRESHOLD,
-    );
-    if (lowQualityZone) {
-      actions.push('CHECK_LIGHTING', 'REDUCE_OCCLUSION');
+    // Calibration next-actions apply only where calibration itself does —
+    // FILE_REPLAY operators are never told to calibrate (Codex P1).
+    if (readiness.applicable) {
+      if (!readiness.hasActiveCalibrationProfile) {
+        actions.push('CREATE_CALIBRATION_PROFILE');
+      }
+      if (readiness.hasActiveCalibrationProfile && !readiness.hasShelfZone) {
+        actions.push('ADD_SHELF_ZONE');
+      }
+      if (
+        readiness.hasActiveCalibrationProfile &&
+        !readiness.hasInteractionZone
+      ) {
+        actions.push('ADD_INTERACTION_ZONE');
+      }
+      if (
+        readiness.hasActiveCalibrationProfile &&
+        readiness.hasShelfZone &&
+        !readiness.hasExpectedProducts
+      ) {
+        actions.push('ASSIGN_EXPECTED_PRODUCTS');
+      }
+      if (activeProfile && !readiness.cameraMountKnown) {
+        actions.push('IMPROVE_CAMERA_ANGLE');
+      }
+      const lowQualityZone = zones.some(
+        (zone) =>
+          zone.qualityScore !== null &&
+          zone.qualityScore < ZONE_QUALITY_ATTENTION_THRESHOLD,
+      );
+      if (lowQualityZone) {
+        actions.push('CHECK_LIGHTING', 'REDUCE_OCCLUSION');
+      }
     }
     if ((latestSession?.reviewNeeded ?? 0) > 0) {
       actions.push('REVIEW_MISSED_EVENTS');
     }
-    if (readiness.readiness === 'READY') {
+    // Calibration-READY (or exempt FILE_REPLAY on an ACTIVE source)
+    // without a protocol yet → point at the Phase 16 flow.
+    const calibrationSatisfied =
+      readiness.readiness === 'READY' ||
+      (readiness.readiness === 'NOT_APPLICABLE' &&
+        source.status === CameraSourceStatus.ACTIVE);
+    if (calibrationSatisfied) {
       const protocol = await this.prisma.cvTestProtocol.findFirst({
         where: { tenantId, cameraSourceId },
         select: { id: true },

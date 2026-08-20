@@ -3408,7 +3408,7 @@ describe('LiveSessionService — Phase 17 calibration readiness in preflight', (
     expect(warnedPreflight.ready).toBe(true);
   });
 
-  it('FILE_REPLAY behavior is unchanged: no calibrationReady check joins the readiness set', async () => {
+  it('FILE_REPLAY behavior is unchanged: calibration is NOT_APPLICABLE and no calibrationReady check joins the readiness set', async () => {
     const harness = buildHarness({
       source: { sourceType: CameraSourceType.FILE_REPLAY },
       calibration: null,
@@ -3417,9 +3417,12 @@ describe('LiveSessionService — Phase 17 calibration readiness in preflight', (
       TENANT,
       'cam-1',
     );
-    // The calibration BLOCK is informational for every source type…
-    expect(preflight.calibration?.readiness).toBe('NOT_READY');
-    // …but the CHECK exists only for RTSP_SHADOW: replay readiness is
+    // Replay needs no calibration (Codex P1): the informational block
+    // says NOT_APPLICABLE with NO warnings — never a prompt to create
+    // calibration for a replay source…
+    expect(preflight.calibration?.readiness).toBe('NOT_APPLICABLE');
+    expect(preflight.calibration?.warnings).toEqual([]);
+    // …and the CHECK exists only for RTSP_SHADOW: replay readiness is
     // exactly the pre-Phase-17 set (here failing only on source type).
     expect(preflight).not.toHaveProperty('calibrationReady');
     expect(preflight.sourceTypeSupported).toBe(false);

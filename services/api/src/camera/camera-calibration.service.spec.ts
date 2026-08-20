@@ -669,6 +669,7 @@ describe('CameraCalibrationService — calibration readiness', () => {
     expect(readiness).toMatchObject({
       readiness: 'READY',
       warnings: [],
+      applicable: true,
       hasActiveCalibrationProfile: true,
       profileStatus: 'ACTIVE',
       hasShelfZone: true,
@@ -738,6 +739,114 @@ describe('CameraCalibrationService — calibration readiness', () => {
   });
 });
 
+describe('CameraCalibrationService — credential-slot text screening (Codex P1)', () => {
+  // Runtime-assembled reserved identifiers — never literals in source.
+  const secretSlot = assemble('CAMERA_SECRET', '_SLOT_', 'ALPHA');
+  const rtspSlot = assemble('CAMERA_RT', 'SP_SOURCE_', 'ALPHA');
+
+  it('rejects reserved slot identifiers in profile name and notes without echoing the value', async () => {
+    const harness = buildHarness();
+    for (const input of [
+      { cameraSourceId: 'cam-1', name: secretSlot },
+      { cameraSourceId: 'cam-1', name: 'ok name', notes: `uses ${secretSlot}` },
+      { cameraSourceId: 'cam-1', name: 'ok name', notes: rtspSlot },
+      {
+        cameraSourceId: 'cam-1',
+        name: 'ok name',
+        notes: assemble('MY_', 'CREDENTIAL', '_SLOT_9'),
+      },
+    ]) {
+      const error: unknown = await harness.service
+        .createProfile(TENANT, input as never)
+        .then(() => null)
+        .catch((thrown: unknown) => thrown);
+      expect(error).toBeInstanceOf(BadRequestException);
+      const message = String((error as BadRequestException).message);
+      expect(message).not.toContain(secretSlot);
+      expect(message).not.toContain(rtspSlot);
+      expect(message).not.toContain('ALPHA');
+    }
+    expect(harness.profiles).toHaveLength(0);
+  });
+
+  it('rejects reserved slot identifiers in zone labels; normal labels still pass', async () => {
+    const harness = buildHarness();
+    const profile = await harness.service.createProfile(TENANT, {
+      cameraSourceId: 'cam-1',
+      name: 'labels',
+    });
+    const error: unknown = await harness.service
+      .addZone(TENANT, profile.id, {
+        zoneType: 'SHELF_ZONE' as never,
+        label: `shelf ${secretSlot}`,
+        polygon: SQUARE,
+      } as never)
+      .then(() => null)
+      .catch((thrown: unknown) => thrown);
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect(String((error as BadRequestException).message)).not.toContain(
+      secretSlot,
+    );
+    expect(harness.zones).toHaveLength(0);
+
+    const zone = await harness.service.addZone(TENANT, profile.id, {
+      zoneType: 'SHELF_ZONE' as never,
+      label: 'Front shelf zone A',
+      polygon: SQUARE,
+    } as never);
+    expect(zone.label).toBe('Front shelf zone A');
+  });
+});
+
+describe('CameraCalibrationService — FILE_REPLAY exemption (Codex P1)', () => {
+  const fileReplaySource = {
+    id: 'cam-1',
+    tenantId: TENANT,
+    locationId: 'store-1',
+    status: 'ACTIVE',
+    sourceType: 'FILE_REPLAY',
+  };
+
+  it('FILE_REPLAY readiness is NOT_APPLICABLE with no warnings — never NOT_READY for missing calibration', async () => {
+    const harness = buildHarness({ sources: [{ ...fileReplaySource }] });
+    const readiness = await harness.service.calibrationReadiness(
+      TENANT,
+      'cam-1',
+    );
+    expect(readiness.applicable).toBe(false);
+    expect(readiness.readiness).toBe('NOT_APPLICABLE');
+    expect(readiness.warnings).toEqual([]);
+    // Factual fields still report reality.
+    expect(readiness.hasActiveCalibrationProfile).toBe(false);
+    expect(readiness.activeProfileId).toBeNull();
+  });
+
+  it('FILE_REPLAY hardening report never prompts calibration actions', async () => {
+    const harness = buildHarness({ sources: [{ ...fileReplaySource }] });
+    const report = await harness.service.pilotHardeningReport(
+      TENANT,
+      'cam-1',
+    );
+    expect(report.calibrationReadiness.readiness).toBe('NOT_APPLICABLE');
+    // Calibration is exempt and the source is ACTIVE with no protocol
+    // yet — the ONLY suggestion is the Phase 16 flow itself.
+    expect(report.recommendedNextActions).toEqual([
+      'RUN_PHASE16_TEST_PROTOCOL',
+    ]);
+  });
+
+  it('RTSP_SHADOW without an active profile stays NOT_READY (gating unchanged)', async () => {
+    const harness = buildHarness();
+    const readiness = await harness.service.calibrationReadiness(
+      TENANT,
+      'cam-1',
+    );
+    expect(readiness.applicable).toBe(true);
+    expect(readiness.readiness).toBe('NOT_READY');
+    expect(readiness.warnings).toEqual(['NO_ACTIVE_CALIBRATION_PROFILE']);
+  });
+});
+
 describe('CameraCalibrationService — pilot hardening report', () => {
   it('with nothing configured: CREATE_CALIBRATION_PROFILE, null summaries, structural safety zeros', async () => {
     const harness = buildHarness();
@@ -796,6 +905,36 @@ describe('CameraCalibrationService — pilot hardening report', () => {
       shelfZonesWithProducts: 1,
       productCount: 1,
     });
+    for (const action of report.recommendedNextActions) {
+      expect(PILOT_NEXT_ACTIONS).toContain(action);
+    }
+  });
+
+  it('a disabled source with a complete profile recommends ENABLE_CAMERA_SOURCE first and stays NOT_READY (Codex P1)', async () => {
+    const harness = buildHarness({
+      sources: [
+        {
+          id: 'cam-1',
+          tenantId: TENANT,
+          locationId: 'store-1',
+          status: 'DISABLED',
+          sourceType: 'RTSP_SHADOW',
+        },
+      ],
+    });
+    await seedActivatedProfile(harness);
+    const report = await harness.service.pilotHardeningReport(
+      TENANT,
+      'cam-1',
+    );
+    expect(report.sourceStatus).toBe('DISABLED');
+    expect(report.calibrationReadiness.readiness).toBe('NOT_READY');
+    expect(report.calibrationReadiness.warnings).toContain(
+      'SOURCE_NOT_ACTIVE',
+    );
+    // The recommendation list is NEVER empty while the source is off —
+    // an empty list must not read as "ready".
+    expect(report.recommendedNextActions).toEqual(['ENABLE_CAMERA_SOURCE']);
     for (const action of report.recommendedNextActions) {
       expect(PILOT_NEXT_ACTIONS).toContain(action);
     }

@@ -2412,6 +2412,10 @@ export class LiveSessionService {
       ? await computeCalibrationReadiness(this.prisma, tenantId, {
           id: source.id,
           status: source.status,
+          // FILE_REPLAY comes back NOT_APPLICABLE with no warnings —
+          // replay needs no calibration (Codex P1), and its checks
+          // below stay byte-for-byte unchanged either way.
+          sourceType: source.sourceType,
         })
       : null;
     const sourceExists = source !== null;

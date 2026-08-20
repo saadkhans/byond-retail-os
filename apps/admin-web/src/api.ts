@@ -1592,9 +1592,11 @@ export interface LiveTestPreflight {
   fastModeMatches: boolean | null;
   performanceEndpointAvailable: boolean;
   evaluationRunExists: boolean | null;
-  /** Phase 17 — present when calibration is part of the readiness checks. */
+  /** Phase 17 — present only for RTSP_SHADOW, where calibration gates
+   *  readiness. */
   calibrationReady?: boolean;
-  /** Null when the camera source does not exist. */
+  /** Null when the camera source does not exist; readiness is
+   *  NOT_APPLICABLE for FILE_REPLAY sources. */
   calibration: {
     readiness: CalibrationReadinessLevel;
     warnings: string[];
@@ -1624,7 +1626,11 @@ export type CameraCalibrationZoneType =
   | 'INTERACTION_ZONE'
   | 'IGNORE_ZONE'
   | 'ENTRY_EXIT_ZONE';
-export type CalibrationReadinessLevel = 'READY' | 'WARNING' | 'NOT_READY';
+export type CalibrationReadinessLevel =
+  | 'READY'
+  | 'WARNING'
+  | 'NOT_READY'
+  | 'NOT_APPLICABLE';
 
 export interface CalibrationPolygonPoint {
   x: number;
@@ -1674,6 +1680,9 @@ export interface CameraCalibrationProfileDetail
  *  enum strings only — never free text, URLs, or paths. */
 export interface CalibrationReadiness {
   cameraSourceId: string;
+  /** False for FILE_REPLAY sources — calibration is not required there and
+   *  readiness reads NOT_APPLICABLE. */
+  applicable: boolean;
   hasActiveCalibrationProfile: boolean;
   activeProfileId: string | null;
   profileStatus: 'ACTIVE' | null;

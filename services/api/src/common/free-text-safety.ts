@@ -1,3 +1,29 @@
+import { CAMERA_CREDENTIAL_SLOTS } from '../camera/dto/create-camera-source.dto';
+
+/**
+ * Reserved credential/source slot NAMESPACES (Codex P1): a bare slot
+ * identifier such as a CAMERA_SECRET_SLOT_* value is not a URL, not a
+ * path, and not credential-shaped, so the other screens let it through —
+ * yet persisting and echoing it leaks the operator-managed secret-slot
+ * namespace into free text. Matched as case-insensitive PATTERNS (whole
+ * namespaces, not single literals) plus every entry of the
+ * server-recognized allowlist, so new slots are covered automatically.
+ */
+const CREDENTIAL_SLOT_PATTERNS: readonly RegExp[] = [
+  /CAMERA_SECRET_SLOT/i,
+  /CAMERA_RTSP_SOURCE/i,
+  /RTSP_SOURCE/i,
+  /CREDENTIAL_SLOT/i,
+];
+
+export function containsCredentialSlotText(value: string): boolean {
+  if (CREDENTIAL_SLOT_PATTERNS.some((pattern) => pattern.test(value))) {
+    return true;
+  }
+  const upper = value.toUpperCase();
+  return CAMERA_CREDENTIAL_SLOTS.some((slot) => upper.includes(slot));
+}
+
 /**
  * NO-SOURCE/NO-PATH screen (Codex P1), shared by every CV module that
  * accepts operator free text: the sensitive-text predicate
