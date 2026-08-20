@@ -550,22 +550,24 @@ export function CvDatasetImprovementDetailPage() {
               ) : null}
               {quality.data.lowCoverageSkus.length > 0 ? (
                 <p className="muted">
-                  Low-coverage SKUs (examples/min · independent groups):{' '}
+                  Low-coverage SKUs (minimum applies to independent session
+                  groups):{' '}
                   {quality.data.lowCoverageSkus
                     .map(
                       (row) =>
-                        `${row.sku} (${row.count}/${row.minimum} · ${row.groups} groups)`,
+                        `${row.sku} (${row.groups} groups of minimum ${row.minimum}, ${row.count} examples)`,
                     )
                     .join(' · ')}
                 </p>
               ) : null}
               {quality.data.lowCoverageActions.length > 0 ? (
                 <p className="muted">
-                  Low-coverage actions (examples/min · independent groups):{' '}
+                  Low-coverage actions (minimum applies to independent session
+                  groups):{' '}
                   {quality.data.lowCoverageActions
                     .map(
                       (row) =>
-                        `${row.action} (${row.count}/${row.minimum} · ${row.groups} groups)`,
+                        `${row.action} (${row.groups} groups of minimum ${row.minimum}, ${row.count} examples)`,
                     )
                     .join(' · ')}
                 </p>

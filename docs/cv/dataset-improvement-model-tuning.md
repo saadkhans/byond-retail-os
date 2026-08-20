@@ -30,6 +30,17 @@ missed-event recovery, calibration validation, or mixed).
 Run lifecycle: `DRAFT` (editable) → `READY` (minimum reviewed data
 exists) → `EXPORTED` (manifest generated) and `ARCHIVED` (terminal).
 
+**Editing invalidates stale plans.** Changing a DRAFT run's split
+percentages, coverage minimums, or purpose atomically clears any
+existing split assignments — the response says
+`CV_DATASET_SPLITS_REQUIRE_REPLAN` and export refuses
+(`CV_DATASET_EXPORT_REQUIRES_PLANNED_SPLITS`) until you re-plan.
+Changing a source link discards the candidate ledger entirely
+(`CV_DATASET_CANDIDATES_REQUIRE_REFRESH`): candidates describe the old
+source family and must be rebuilt. A manifest can therefore never
+advertise new percentages over assignments planned for old ones.
+`EXPORTED` and `ARCHIVED` runs reject configuration changes outright.
+
 ## 2. How reviewed data becomes training-ready metadata
 
 Refreshing candidates reads the linked sources and builds a ledger of
@@ -67,6 +78,17 @@ export.
 SKU was something else" — a row without a corrected SKU, or one whose
 "correction" repeats the prediction, carries no trainable truth, so it
 is excluded with a controlled reason instead of polluting the labels.
+Product-ID equality is canonical: when both the predicted and the
+corrected product ids are known, the same id is `CORRECTION_NOT_DIFFERENT`
+even if the SKU code snapshots differ or one of them is missing — SKU
+text comparison is only the fallback when the ids are not both known.
+
+**False-touch SKUs are not SKU labels:** a FALSE_TOUCH row is a
+reviewed NO_OP *negative* — the reviewer confirmed nothing was taken,
+not the predicted SKU's identity. The predicted SKU stays on the
+candidate as reference metadata, but it never counts as a SKU class:
+not for SKU-classification readiness, not in the tuning report's class
+counts, and not in the manifest's label list.
 
 **Why missed events are excluded (missing locators):** a missed-event
 review names a session and a label, but Phase 15 records no safe
@@ -99,22 +121,26 @@ and BYOND never fabricates values.
 - missed-event and false-touch counts;
 - confusion pairs, passed through verbatim from the Phase 15 summary
   (null when no evaluation run is linked);
-- low-coverage SKUs/actions (below your configured minimums), each with
-  its example count AND its independent-group count — many
-  near-duplicate examples from one live session are ONE unit of
-  evidence, and `LOW_INDEPENDENT_GROUP_COVERAGE` flags classes that
-  look covered but come from a single session;
+- low-coverage SKUs/actions, each with its raw example count AND its
+  independent-group count. **Minimum class coverage is measured in
+  independent groups, not raw rows**: many near-duplicate examples from
+  one live session are ONE unit of evidence, so 30 rows from two
+  sessions never satisfy a minimum of five
+  (`INSUFFICIENT_CLASS_GROUP_COVERAGE`), and
+  `LOW_INDEPENDENT_GROUP_COVERAGE` flags classes whose examples all
+  come from a single session. Raw counts are still shown, but they are
+  never the readiness basis;
 - controlled imbalance warnings (`SKU_IMBALANCE`, `ACTION_IMBALANCE`,
   `SMALL_DATASET` — durable, not a one-off planner note — and the
   task-label warnings `NO_SKU_LABELS_FOR_TASK`,
   `NO_ACTION_LABELS_FOR_TASK`, `INSUFFICIENT_TASK_LABELS`) and leakage
   warnings (`SPLITS_NOT_PLANNED`, `SAME_SESSION_ACROSS_SPLITS`,
   `REQUESTED_VALIDATION_SPLIT_EMPTY`, `REQUESTED_TEST_SPLIT_EMPTY`,
-  `CLASS_MISSING_TRAIN_SPLIT` and friends);
+  `CLASS_MISSING_TRAIN_SPLIT`, `INSUFFICIENT_STABLE_SPLIT_COVERAGE`);
 - a readiness verdict — `NOT_READY` (no eligible data, no usable labels
-  for the run's PURPOSE, or a requested split ended up empty),
-  `WARNING` (usable but flawed), `READY` — plus controlled next
-  actions.
+  for the run's PURPOSE, a requested split ended up empty, or a
+  trainable class has no TRAIN examples), `WARNING` (usable but
+  flawed), `READY` — plus controlled next actions.
 
 Readiness is **purpose-aware**: a SKU-classification run with zero
 SKU-labeled examples is `NOT_READY` no matter how many action labels it
@@ -138,16 +164,17 @@ TEST:
 - **Same session stays together.** All candidates from one live session
   share one group, so near-identical frames can never sit on both sides
   of a train/test boundary (leakage guard).
-- **Low coverage is forced into TRAIN.** A SKU or action below your
-  minimum cannot support a meaningful test set; its groups all go to
-  TRAIN and you get `LOW_COVERAGE_SKU_FORCED_TRAIN` /
-  `LOW_COVERAGE_ACTION_FORCED_TRAIN` warnings instead of a pretend
-  metric. Fewer than 30 eligible examples adds `SMALL_DATASET`, which
-  persists into the quality report, the tuning report, and the export
-  manifest.
-- **Every class keeps TRAIN coverage.** A class the hash would send
-  entirely to VALIDATION/TEST is pulled back into TRAIN with
-  `CLASS_MISSING_TRAIN_SPLIT` — an untrainable class is never silent.
+- **The stable assignment is never overridden.** Earlier drafts forced
+  low-coverage classes into TRAIN per run — but a rule that depends on
+  THIS run's composition moves the same group between splits across
+  runs (split drift, and evaluation data leaking into TRAIN as the
+  dataset grows). The planner now only warns: a class the stable hash
+  left without TRAIN examples gets `CLASS_MISSING_TRAIN_SPLIT` and
+  `INSUFFICIENT_STABLE_SPLIT_COVERAGE`, readiness drops to `NOT_READY`,
+  and export refuses — collect more independent sessions or adjust the
+  percentages instead of silently rearranging groups. Fewer than 30
+  eligible examples adds `SMALL_DATASET`, which persists into the
+  quality report, the tuning report, and the export manifest.
 - **Requested splits must exist.** If your percentages request a
   validation or test split and the planner cannot fill it, you get
   `REQUESTED_VALIDATION_SPLIT_EMPTY` / `REQUESTED_TEST_SPLIT_EMPTY`,
@@ -168,8 +195,12 @@ whole export is atomic under the run's lock: the run status, the
 candidate rows, a **re-validation against the CURRENT source records**,
 the purpose-aware label check, and the split completeness check all
 happen against one locked snapshot, and the manifest you receive is
-built from exactly that snapshot. If someone appended a newer review or
-re-recorded a scenario after your last refresh, export refuses with
+built from exactly that snapshot. The freshness check compares labels
+AND evidence lineage — verdicts, corrected labels, SKU snapshots, the
+live session, the evaluation-run and protocol lineage, and the
+calibration stamp. A scenario re-recorded with the same verdict against
+a different session, or a calibration stamp that no longer matches the
+cameras, is just as stale as a flipped verdict: export refuses with
 `CV_DATASET_STALE_CANDIDATES` — refresh candidates and re-plan splits,
 then export again. Once `EXPORTED`, the run is frozen: candidate
 refresh and split planning are rejected so the stored rows keep
@@ -240,7 +271,8 @@ improvement percentage, that is a bug — file it.
   empty) until a later phase produces safe source data.
 - Confusion pairs exist only when an evaluation run is linked.
 - The split planner does not stratify by class; it balances by volume,
-  blocks leakage, and guarantees per-class TRAIN coverage only.
+  blocks leakage, and keeps assignments stable — a class the stable
+  hash cannot cover blocks the run rather than being rearranged.
 - One evaluation run, one protocol, and one calibration profile per
   dataset run in this phase.
 

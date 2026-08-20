@@ -50,6 +50,8 @@ describe('formatDatasetWarning', () => {
       'REQUESTED_TEST_SPLIT_EMPTY',
       'INSUFFICIENT_GROUPS_FOR_REQUESTED_SPLITS',
       'LOW_INDEPENDENT_GROUP_COVERAGE',
+      'INSUFFICIENT_STABLE_SPLIT_COVERAGE',
+      'INSUFFICIENT_CLASS_GROUP_COVERAGE',
       'CLASS_MISSING_TRAIN_SPLIT',
       'CLASS_MISSING_VALIDATION_SPLIT',
       'CLASS_MISSING_TEST_SPLIT',
@@ -60,6 +62,13 @@ describe('formatDatasetWarning', () => {
 
   it('falls back to the raw value for unknown warnings', () => {
     expect(formatDatasetWarning('NEW_WARNING')).toBe('NEW_WARNING');
+  });
+
+  it('states that missing TRAIN coverage blocks export without forcing language', () => {
+    const label = formatDatasetWarning('CLASS_MISSING_TRAIN_SPLIT');
+    expect(label).toContain('blocked');
+    expect(label.toLowerCase()).not.toContain('forced');
+    expect(label.toLowerCase()).not.toContain('kept in train');
   });
 });
 
@@ -91,6 +100,9 @@ describe('formatDatasetErrorMessage', () => {
       'CV_DATASET_STALE_CANDIDATES',
       'CV_DATASET_SOURCE_LINEAGE_MISMATCH',
       'CV_DATASET_CALIBRATION_CAMERA_MISMATCH',
+      'CV_DATASET_SPLITS_REQUIRE_REPLAN',
+      'CV_DATASET_CANDIDATES_REQUIRE_REFRESH',
+      'CV_DATASET_EXPORT_REQUIRES_PLANNED_SPLITS',
     ]) {
       const formatted = formatDatasetErrorMessage(`${token}: server guidance`);
       expect(formatted.startsWith(`${token}: `)).toBe(true);

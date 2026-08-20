@@ -1799,6 +1799,13 @@ export interface CvDatasetRunDetail extends CvDatasetRunView {
   candidateSummary: CvDatasetCandidateSummary;
 }
 
+/** PATCH /cv-dataset-improvement-runs/:id — controlled warning tokens
+ *  (e.g. CV_DATASET_SPLITS_REQUIRE_REPLAN, CV_DATASET_CANDIDATES_REQUIRE_REFRESH)
+ *  flag follow-up work the config change made necessary. */
+export interface CvDatasetRunPatchResult extends CvDatasetRunView {
+  warnings: string[];
+}
+
 export interface CvDatasetCandidateView {
   id: string;
   sourceType: CvDatasetCandidateSourceType;

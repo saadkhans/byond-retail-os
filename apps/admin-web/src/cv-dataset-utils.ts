@@ -58,7 +58,12 @@ const DATASET_WARNING_LABELS: Record<string, string> = {
     'Too few independent session groups for the requested splits',
   LOW_INDEPENDENT_GROUP_COVERAGE:
     'Some classes come from very few independent sessions',
-  CLASS_MISSING_TRAIN_SPLIT: 'A class has no TRAIN examples',
+  INSUFFICIENT_STABLE_SPLIT_COVERAGE:
+    'Stable splits leave too little training coverage — collect more independent sessions',
+  INSUFFICIENT_CLASS_GROUP_COVERAGE:
+    'A class has too few independent session groups for its minimum',
+  CLASS_MISSING_TRAIN_SPLIT:
+    'A class has no TRAIN coverage under the stable splits — export is blocked until more sessions are collected',
   CLASS_MISSING_VALIDATION_SPLIT: 'A class has no VALIDATION examples',
   CLASS_MISSING_TEST_SPLIT: 'A class has no TEST examples',
 };
@@ -115,6 +120,12 @@ const DATASET_ERROR_GUIDANCE: Record<string, string> = {
     'The linked evaluation run and test protocol do not describe the same data — fix the source links',
   CV_DATASET_CALIBRATION_CAMERA_MISMATCH:
     'The calibration profile belongs to a different camera than the candidate data — link the matching profile',
+  CV_DATASET_SPLITS_REQUIRE_REPLAN:
+    'The run configuration changed since splits were planned — re-plan splits',
+  CV_DATASET_CANDIDATES_REQUIRE_REFRESH:
+    'The source links changed since candidates were built — refresh candidates, then re-plan splits',
+  CV_DATASET_EXPORT_REQUIRES_PLANNED_SPLITS:
+    'Splits are not planned for the current configuration — plan splits before export',
 };
 
 export function formatDatasetErrorMessage(message: string): string {

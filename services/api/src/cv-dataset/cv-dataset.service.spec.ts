@@ -56,6 +56,27 @@ interface CameraFixture {
   sourceType: string;
 }
 
+/** Finds session ids whose STABLE bucket (tenant + session key, no run
+ *  id) lands inside [lower, upper) — lets tests place groups in a split
+ *  band deterministically instead of relying on hash luck. */
+function sessionsInBand(
+  prefix: string,
+  count: number,
+  lower: number,
+  upper: number,
+): string[] {
+  const found: string[] = [];
+  for (let index = 0; index < 20000 && found.length < count; index += 1) {
+    const id = `${prefix}-${index}`;
+    const bucket = splitBucket(`${TENANT}:${id}`);
+    if (bucket >= lower && bucket < upper) {
+      found.push(id);
+    }
+  }
+  expect(found).toHaveLength(count);
+  return found;
+}
+
 function buildHarness(
   options: {
     observations?: ObservationFixture[];
@@ -677,7 +698,9 @@ describe('CvDatasetService — quality report', () => {
     // Counted even though the missed-event row is EXCLUDED (no locator).
     expect(report.missedEventCount).toBe(1);
     expect(report.falseTouchCount).toBe(1);
-    expect(report.examplesBySku[0]).toMatchObject({ count: 4 });
+    // SKU classes are CONFIRMED labels only: the false-touch row's
+    // predicted SKU-A is reference metadata, not a fourth example.
+    expect(report.examplesBySku[0]).toMatchObject({ sku: 'SKU-A', count: 3 });
     // Low-coverage entries now also report INDEPENDENT group counts.
     expect(report.lowCoverageSkus[0]).toHaveProperty('groups');
     expect(report.imbalanceWarnings).toContain('SMALL_DATASET');
@@ -805,49 +828,44 @@ describe('CvDatasetService — split planner', () => {
     expect(plan.splitSummary.HOLDOUT).toBe(0);
   });
 
-  it('forces low-coverage classes into TRAIN with a warning instead of faking quality', async () => {
-    const options = {
+  it('never overrides the stable assignment for low-coverage classes', async () => {
+    // One rare-SKU session deterministically OUTSIDE the 70% TRAIN
+    // band: the stable hash keeps it there. The planner warns and the
+    // run is blocked (see the hardening suite) — the group is never
+    // dragged into TRAIN for this run's composition only.
+    const [rareSession] = sessionsInBand('session-x', 1, 7000, 10000);
+    const trainSessions = sessionsInBand('session-t', 6, 0, 7000);
+    const { service, candidates } = buildHarness({
       observations: [
-        // 6 well-covered SKU-A examples in separate sessions...
-        ...Array.from({ length: 6 }, (_, index) =>
+        ...trainSessions.map((liveSessionId, index) =>
           observation({
             journeyEventId: `evt-a-${index}`,
-            liveSessionId: `session-a-${index}`,
+            liveSessionId,
             latestReview: review({ reviewId: `rev-a-${index}` }),
           }),
         ),
-        ...Array.from({ length: 6 }, (_, index) =>
-          observation({
-            journeyEventId: `evt-r-${index}`,
-            liveSessionId: `session-a-${index}`,
-            eventType: 'PRODUCT_RETURN',
-            latestReview: review({
-              reviewId: `rev-r-${index}`,
-              expectedAction: 'RETURN',
-            }),
-          }),
-        ),
-        // ...and ONE rare SKU-RARE example.
         observation({
           journeyEventId: 'evt-rare',
-          liveSessionId: 'session-rare',
+          liveSessionId: rareSession,
           predictedProductId: 'prod-rare',
           predictedSku: 'SKU-RARE',
           latestReview: review({ reviewId: 'rev-rare' }),
         }),
       ],
-    };
-    const { service, candidates } = buildHarness(options);
+    });
     const created = await createLinkedRun(service, {
       sourceTestProtocolId: undefined,
       sourceCalibrationProfileId: undefined,
     });
     await service.refreshCandidates(TENANT, created.id);
     const plan = await service.planSplits(TENANT, created.id);
-    expect(plan.warnings).toContain('LOW_COVERAGE_SKU_FORCED_TRAIN');
     expect(plan.warnings).toContain('SMALL_DATASET');
+    expect(plan.warnings).toContain('CLASS_MISSING_TRAIN_SPLIT');
+    expect(plan.warnings).toContain('INSUFFICIENT_STABLE_SPLIT_COVERAGE');
+    expect(plan.warnings).not.toContain('LOW_COVERAGE_SKU_FORCED_TRAIN');
     const rare = candidates.find((row) => row.sourceId === 'evt-rare')!;
-    expect(rare.split).toBe('TRAIN');
+    expect(rare.split).not.toBe('TRAIN');
+    expect(rare.split).not.toBeNull();
   });
 
   it('excluded candidates never get a split and empty runs are rejected', async () => {
@@ -869,11 +887,11 @@ describe('CvDatasetService — split planner', () => {
 });
 
 describe('CvDatasetService — export manifest', () => {
-  // The mixed fixture is a SMALL dataset whose classes sit below the
-  // default minimums, so the planner forces everything into TRAIN.
-  // With nonzero validation/test percentages that would (correctly)
-  // block export as REQUESTED_*_SPLIT_EMPTY — so these runs request
-  // 100/0/0, which is explicitly allowed.
+  // The mixed fixture is a SMALL dataset: with three-way percentages
+  // the stable hash could leave a requested split empty or a class
+  // without TRAIN coverage, and export would (correctly) block. These
+  // runs request 100/0/0 — explicitly allowed — so every group lands
+  // in TRAIN deterministically.
   async function readyRun(
     harness: ReturnType<typeof buildHarness>,
     extra: Record<string, unknown> = {},
@@ -1199,9 +1217,18 @@ describe('CvDatasetService — Codex P1 hardening', () => {
   });
 
   it('requested validation/test splits must be nonempty; 100/0/0 stays allowed', async () => {
-    // 3 examples of ONE sku, below the default minimum of 5: the
-    // planner (correctly) forces everything into TRAIN.
-    const harness = buildHarness({ observations: sessions(3) });
+    // 3 sessions that all hash into the 70% TRAIN band: the stable
+    // assignment leaves the requested validation/test splits EMPTY,
+    // which must block readiness and export — never be glossed over.
+    const trainSessions = sessionsInBand('session-t', 3, 0, 7000);
+    const trainOnlyObservations = trainSessions.map((liveSessionId, index) =>
+      observation({
+        journeyEventId: `evt-${index}`,
+        liveSessionId,
+        latestReview: review({ reviewId: `rev-${index}` }),
+      }),
+    );
+    const harness = buildHarness({ observations: trainOnlyObservations });
     const created = await createLinkedRun(harness.service, {
       sourceTestProtocolId: undefined,
       sourceCalibrationProfileId: undefined,
@@ -1368,6 +1395,36 @@ describe('CvDatasetService — Codex P1 hardening', () => {
             expectedAction: 'RETURN',
           }),
         }),
+        // Product-ID equality is canonical: same product id → not a
+        // correction, even when the predicted SKU snapshot is null...
+        observation({
+          journeyEventId: 'evt-ws-id-same-null-sku',
+          predictedSku: null,
+          latestReview: review({
+            verdict: 'WRONG_SKU',
+            expectedProductId: 'prod-a',
+            expectedSku: 'SKU-A2',
+          }),
+        }),
+        // ...or when the SKU snapshots literally differ.
+        observation({
+          journeyEventId: 'evt-ws-id-same-diff-sku',
+          latestReview: review({
+            verdict: 'WRONG_SKU',
+            expectedProductId: 'prod-a',
+            expectedSku: 'SKU-A-VARIANT',
+          }),
+        }),
+        // A genuinely different product stays eligible even when the
+        // SKU snapshot text happens to match.
+        observation({
+          journeyEventId: 'evt-ws-id-diff',
+          latestReview: review({
+            verdict: 'WRONG_SKU',
+            expectedProductId: 'prod-b',
+            expectedSku: 'SKU-A',
+          }),
+        }),
       ],
     });
     const created = await createLinkedRun(harness.service, {
@@ -1375,9 +1432,21 @@ describe('CvDatasetService — Codex P1 hardening', () => {
       sourceCalibrationProfileId: undefined,
     });
     const result = await harness.service.refreshCandidates(TENANT, created.id);
-    expect(result.eligible).toBe(1);
+    expect(result.eligible).toBe(2);
     const byId = (sourceId: string) =>
       harness.candidates.find((row) => row.sourceId === sourceId)!;
+    expect(byId('evt-ws-id-same-null-sku')).toMatchObject({
+      eligibility: 'EXCLUDED',
+      exclusionReason: 'CORRECTION_NOT_DIFFERENT',
+    });
+    expect(byId('evt-ws-id-same-diff-sku')).toMatchObject({
+      eligibility: 'EXCLUDED',
+      exclusionReason: 'CORRECTION_NOT_DIFFERENT',
+    });
+    expect(byId('evt-ws-id-diff')).toMatchObject({
+      eligibility: 'ELIGIBLE',
+      skuId: 'prod-b',
+    });
     expect(byId('evt-ws-missing')).toMatchObject({
       eligibility: 'EXCLUDED',
       exclusionReason: 'MISSING_CORRECTED_SKU',
@@ -1429,21 +1498,24 @@ describe('CvDatasetService — Codex P1 hardening', () => {
     expect(new Set(a.values()).size).toBeGreaterThan(1);
   });
 
-  it('a class hashed entirely out of TRAIN is pulled back in with a warning', async () => {
-    // Pick a session id whose bucket deterministically lands OUTSIDE
-    // the 70% TRAIN band, so the rare class starts in VALIDATION/TEST.
-    let rareSession = '';
-    for (let index = 0; index < 5000; index += 1) {
-      const candidate = `session-x-${index}`;
-      if (splitBucket(`${TENANT}:${candidate}`) >= 7000) {
-        rareSession = candidate;
-        break;
-      }
-    }
-    expect(rareSession).not.toBe('');
+  it('a class stably hashed out of TRAIN stays put — the run is warned and blocked, never rearranged', async () => {
+    // Groups placed deterministically: plenty of SKU-A in the TRAIN
+    // band, one SKU-A group in each evaluation band (so no requested
+    // split is empty), and the rare class ONLY in the validation band.
+    const trainSessions = sessionsInBand('session-t', 6, 0, 7000);
+    const [validationSession] = sessionsInBand('session-v', 1, 7000, 8500);
+    const [testSession] = sessionsInBand('session-w', 1, 8500, 10000);
+    const [rareSession] = sessionsInBand('session-x', 1, 7000, 8500);
     const harness = buildHarness({
       observations: [
-        ...sessions(10),
+        ...[...trainSessions, validationSession, testSession].map(
+          (liveSessionId, index) =>
+            observation({
+              journeyEventId: `evt-a-${index}`,
+              liveSessionId,
+              latestReview: review({ reviewId: `rev-a-${index}` }),
+            }),
+        ),
         observation({
           journeyEventId: 'evt-rare',
           liveSessionId: rareSession,
@@ -1462,10 +1534,76 @@ describe('CvDatasetService — Codex P1 hardening', () => {
     await harness.service.refreshCandidates(TENANT, created.id);
     const plan = await harness.service.planSplits(TENANT, created.id);
     expect(plan.warnings).toContain('CLASS_MISSING_TRAIN_SPLIT');
+    expect(plan.warnings).toContain('INSUFFICIENT_STABLE_SPLIT_COVERAGE');
     const rare = harness.candidates.find(
       (row) => row.sourceId === 'evt-rare',
     )!;
-    expect(rare.split).toBe('TRAIN');
+    // The stable assignment is preserved — no run-specific override.
+    expect(rare.split).toBe('VALIDATION');
+    const quality = await harness.service.qualityReport(TENANT, created.id);
+    expect(quality.readiness).toBe('NOT_READY');
+    expect(quality.leakageWarnings).toContain('CLASS_MISSING_TRAIN_SPLIT');
+    await expect(
+      harness.service.setStatus(TENANT, created.id, 'READY' as never),
+    ).rejects.toThrow('run is not ready');
+    harness.runs.find((row) => row.id === created.id)!.status = 'READY';
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('INSUFFICIENT_STABLE_SPLIT_COVERAGE');
+  });
+
+  it('a rare class group keeps its stable split even as the dataset grows across runs', async () => {
+    const [rareSession] = sessionsInBand('session-x', 1, 7000, 8500);
+    const trainSessions = sessionsInBand('session-t', 4, 0, 7000);
+    const opts = {
+      observations: [
+        ...trainSessions.map((liveSessionId, index) =>
+          observation({
+            journeyEventId: `evt-a-${index}`,
+            liveSessionId,
+            latestReview: review({ reviewId: `rev-a-${index}` }),
+          }),
+        ),
+        observation({
+          journeyEventId: 'evt-rare',
+          liveSessionId: rareSession,
+          predictedProductId: 'prod-rare',
+          predictedSku: 'SKU-RARE',
+          latestReview: review({ reviewId: 'rev-rare' }),
+        }),
+      ],
+    };
+    const harness = buildHarness(opts);
+    const linkOnly = {
+      sourceTestProtocolId: undefined,
+      sourceCalibrationProfileId: undefined,
+    };
+    const runA = await createLinkedRun(harness.service, linkOnly);
+    await harness.service.refreshCandidates(TENANT, runA.id);
+    await harness.service.planSplits(TENANT, runA.id);
+    const splitIn = (runId: string) =>
+      harness.candidates.find(
+        (row) => row.runId === runId && row.sourceId === 'evt-rare',
+      )!.split;
+    const smallRunSplit = splitIn(runA.id);
+    expect(smallRunSplit).toBe('VALIDATION');
+    // A later, larger run over the same source family: the rare group
+    // must NOT migrate (previously coverage overrides forced it to
+    // TRAIN in small runs and released it in larger ones).
+    opts.observations.push(
+      ...sessionsInBand('session-m', 20, 0, 10000).map(
+        (liveSessionId, index) =>
+          observation({
+            journeyEventId: `evt-m-${index}`,
+            liveSessionId,
+            latestReview: review({ reviewId: `rev-m-${index}` }),
+          }),
+      ),
+    );
+    const runB = await createLinkedRun(harness.service, linkOnly);
+    await harness.service.refreshCandidates(TENANT, runB.id);
+    await harness.service.planSplits(TENANT, runB.id);
+    expect(splitIn(runB.id)).toBe(smallRunSplit);
   });
 
   it('many near-duplicates from one session count as ONE independent group', async () => {
@@ -1484,10 +1622,264 @@ describe('CvDatasetService — Codex P1 hardening', () => {
     });
     await harness.service.refreshCandidates(TENANT, created.id);
     const quality = await harness.service.qualityReport(TENANT, created.id);
-    // 6 examples ≥ the minimum of 5, but only ONE independent group.
-    expect(quality.lowCoverageSkus).toEqual([]);
+    // 6 raw examples ≥ the minimum of 5, but only ONE independent
+    // group — the class IS low coverage now (groups, not raw rows).
+    expect(quality.lowCoverageSkus).toEqual([
+      { sku: 'SKU-A', count: 6, groups: 1, minimum: 5 },
+    ]);
     expect(quality.imbalanceWarnings).toContain(
       'LOW_INDEPENDENT_GROUP_COVERAGE',
     );
+    expect(quality.imbalanceWarnings).toContain(
+      'INSUFFICIENT_CLASS_GROUP_COVERAGE',
+    );
+  });
+
+  it('many duplicates from FEW sessions never satisfy the class minimum', async () => {
+    // 30 near-duplicate rows across just two sessions with a minimum of
+    // 5: previously the raw count (30 ≥ 5) sailed through — now the two
+    // independent groups are what counts.
+    const harness = buildHarness({
+      observations: Array.from({ length: 30 }, (_, index) =>
+        observation({
+          journeyEventId: `evt-dup-${index}`,
+          liveSessionId: index % 2 === 0 ? 'session-one' : 'session-two',
+          latestReview: review({ reviewId: `rev-dup-${index}` }),
+        }),
+      ),
+    });
+    const created = await createLinkedRun(harness.service, {
+      sourceTestProtocolId: undefined,
+      sourceCalibrationProfileId: undefined,
+    });
+    await harness.service.refreshCandidates(TENANT, created.id);
+    const quality = await harness.service.qualityReport(TENANT, created.id);
+    expect(quality.lowCoverageSkus).toEqual([
+      { sku: 'SKU-A', count: 30, groups: 2, minimum: 5 },
+    ]);
+    expect(quality.imbalanceWarnings).toContain(
+      'INSUFFICIENT_CLASS_GROUP_COVERAGE',
+    );
+    expect(quality.readiness).toBe('WARNING');
+    // The tuning surface reflects group-based coverage too — never
+    // "tuning-ready" on the strength of raw duplicates.
+    const report = await harness.service.modelTuningReport(TENANT, created.id);
+    expect(report.classCoverageSummary.belowMinimumSkus).toBe(1);
+    expect(report.tuningReadiness).not.toBe('READY');
+  });
+
+  it('export rejects a scenario re-recorded against a different session even with the same verdict', async () => {
+    const opts = mixedFixtureOptions();
+    const harness = buildHarness(opts);
+    const created = await createLinkedRun(harness.service, FULL_TRAIN);
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.setStatus(TENANT, created.id, 'READY' as never);
+    await harness.service.planSplits(TENANT, created.id);
+    // The still-open protocol scenario is re-recorded: same PASS
+    // verdict, but the evidence now lives in a DIFFERENT session — the
+    // cached candidate points at footage the label no longer describes.
+    (opts.scenarios[0] as Record<string, unknown>).liveSessionId = 'live-9';
+    const error = await harness.service
+      .exportManifest(TENANT, created.id)
+      .then(
+        () => null,
+        (thrown: Error) => thrown,
+      );
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect(error!.message).toContain('CV_DATASET_STALE_CANDIDATES');
+    // Controlled message: no session ids, no source values.
+    expect(error!.message).not.toContain('live-9');
+    expect(error!.message).not.toContain('live-2');
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.planSplits(TENANT, created.id);
+    const result = await harness.service.exportManifest(TENANT, created.id);
+    expect(result.rowCount).toBe(6);
+  });
+
+  it('export rejects when the calibration lineage of cached candidates changes', async () => {
+    const opts = mixedFixtureOptions() as ReturnType<
+      typeof mixedFixtureOptions
+    > & { defaultCamera?: CameraFixture };
+    const harness = buildHarness(opts);
+    const created = await createLinkedRun(harness.service, FULL_TRAIN);
+    await harness.service.refreshCandidates(TENANT, created.id);
+    // Live sessions were stamped with cal-1 at refresh time.
+    expect(
+      harness.candidates.some((row) => row.calibrationProfileId === 'cal-1'),
+    ).toBe(true);
+    await harness.service.setStatus(TENANT, created.id, 'READY' as never);
+    await harness.service.planSplits(TENANT, created.id);
+    // The cameras behind the sessions change character (re-derived
+    // stamps become null): the cached calibration lineage is stale.
+    opts.defaultCamera = {
+      cameraSourceId: 'camera-1',
+      sourceType: 'FILE_REPLAY',
+    };
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('CV_DATASET_STALE_CANDIDATES');
+  });
+
+  it('false-touch predicted SKUs never count as SKU-classification labels', async () => {
+    const falseTouches = Array.from({ length: 3 }, (_, index) =>
+      observation({
+        journeyEventId: `evt-ft-${index}`,
+        liveSessionId: `session-${index}`,
+        latestReview: review({
+          reviewId: `rev-ft-${index}`,
+          verdict: 'FALSE_TOUCH',
+        }),
+      }),
+    );
+    const harness = buildHarness({ observations: falseTouches });
+    const created = await createLinkedRun(harness.service, {
+      purpose: 'SKU_CLASSIFICATION',
+      sourceTestProtocolId: undefined,
+      sourceCalibrationProfileId: undefined,
+      ...FULL_TRAIN,
+    });
+    const refreshed = await harness.service.refreshCandidates(
+      TENANT,
+      created.id,
+    );
+    expect(refreshed.eligible).toBe(3); // valid NO_OP negatives...
+    const quality = await harness.service.qualityReport(TENANT, created.id);
+    // ...but ZERO confirmed SKU labels: the predicted SKUs were never
+    // confirmed — the reviewer confirmed NO_OP, not the SKU identity.
+    expect(quality.examplesBySku).toEqual([]);
+    expect(quality.readiness).toBe('NOT_READY');
+    expect(quality.imbalanceWarnings).toContain('NO_SKU_LABELS_FOR_TASK');
+    await expect(
+      harness.service.setStatus(TENANT, created.id, 'READY' as never),
+    ).rejects.toThrow('run is not ready');
+    await harness.service.planSplits(TENANT, created.id);
+    harness.runs.find((row) => row.id === created.id)!.status = 'READY';
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('no usable labels for its purpose');
+    const report = await harness.service.modelTuningReport(TENANT, created.id);
+    expect(report.classCoverageSummary.skuClasses).toBe(0);
+    expect(report.recommendedModelTask).not.toBe('SKU_CLASSIFICATION');
+
+    // The SAME rows remain first-class negatives for false-touch
+    // filtering (with a positive to pair against)...
+    const filtering = buildHarness({
+      observations: [
+        ...falseTouches,
+        observation({
+          journeyEventId: 'evt-pickup',
+          liveSessionId: 'session-p',
+          latestReview: review({ reviewId: 'rev-p', verdict: 'CORRECT' }),
+        }),
+      ],
+    });
+    const filteringRun = await createLinkedRun(filtering.service, {
+      purpose: 'FALSE_TOUCH_FILTERING',
+      sourceTestProtocolId: undefined,
+      sourceCalibrationProfileId: undefined,
+      ...FULL_TRAIN,
+    });
+    await filtering.service.refreshCandidates(TENANT, filteringRun.id);
+    const filteringQuality = await filtering.service.qualityReport(
+      TENANT,
+      filteringRun.id,
+    );
+    expect(filteringQuality.readiness).not.toBe('NOT_READY');
+    expect(filteringQuality.imbalanceWarnings).not.toContain(
+      'INSUFFICIENT_TASK_LABELS',
+    );
+
+    // ...and MIXED stays usable while calling the missing SKU family out.
+    const mixed = buildHarness({ observations: falseTouches });
+    const mixedRun = await createLinkedRun(mixed.service, {
+      purpose: 'MIXED',
+      sourceTestProtocolId: undefined,
+      sourceCalibrationProfileId: undefined,
+      ...FULL_TRAIN,
+    });
+    await mixed.service.refreshCandidates(TENANT, mixedRun.id);
+    const mixedQuality = await mixed.service.qualityReport(TENANT, mixedRun.id);
+    expect(mixedQuality.readiness).not.toBe('NOT_READY');
+    expect(mixedQuality.imbalanceWarnings).toContain('NO_SKU_LABELS_FOR_TASK');
+  });
+
+  it('config changes atomically invalidate split plans and warn; frozen states reject edits', async () => {
+    const harness = buildHarness(mixedFixtureOptions());
+    const created = await createLinkedRun(harness.service);
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.planSplits(TENANT, created.id);
+    const plannedCount = () =>
+      harness.candidates.filter(
+        (row) => row.runId === created.id && row.split !== null,
+      ).length;
+    expect(plannedCount()).toBeGreaterThan(0);
+
+    // (1) Percent change → splits cleared + replan warning; export is
+    // blocked until replanning even if READY is forced.
+    const percentEdit = await harness.service.updateRun(TENANT, created.id, {
+      trainSplitPercent: 80,
+      validationSplitPercent: 10,
+      testSplitPercent: 10,
+    });
+    expect(percentEdit.warnings).toEqual(['CV_DATASET_SPLITS_REQUIRE_REPLAN']);
+    expect(plannedCount()).toBe(0);
+    const quality = await harness.service.qualityReport(TENANT, created.id);
+    expect(quality.leakageWarnings).toContain('SPLITS_NOT_PLANNED');
+    harness.runs.find((row) => row.id === created.id)!.status = 'READY';
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('CV_DATASET_EXPORT_REQUIRES_PLANNED_SPLITS');
+    harness.runs.find((row) => row.id === created.id)!.status = 'DRAFT';
+
+    // (2) Coverage-minimum change → same invalidation.
+    await harness.service.planSplits(TENANT, created.id);
+    const minimumEdit = await harness.service.updateRun(TENANT, created.id, {
+      minReviewedExamplesPerSku: 9,
+    });
+    expect(minimumEdit.warnings).toEqual(['CV_DATASET_SPLITS_REQUIRE_REPLAN']);
+    expect(plannedCount()).toBe(0);
+
+    // (3) Purpose change → same invalidation.
+    await harness.service.planSplits(TENANT, created.id);
+    const purposeEdit = await harness.service.updateRun(TENANT, created.id, {
+      purpose: 'ACTION_RECOGNITION' as never,
+    });
+    expect(purposeEdit.warnings).toEqual(['CV_DATASET_SPLITS_REQUIRE_REPLAN']);
+    expect(plannedCount()).toBe(0);
+
+    // (4) Metadata-only edits invalidate nothing.
+    await harness.service.planSplits(TENANT, created.id);
+    const nameEdit = await harness.service.updateRun(TENANT, created.id, {
+      name: 'Renamed dataset run',
+    });
+    expect(nameEdit.warnings).toEqual([]);
+    expect(plannedCount()).toBeGreaterThan(0);
+
+    // (5) Source-family change → the whole candidate ledger goes, and
+    // both refresh and replan are required.
+    const linkEdit = await harness.service.updateRun(TENANT, created.id, {
+      sourceTestProtocolId: null,
+    });
+    expect(linkEdit.warnings).toEqual([
+      'CV_DATASET_SPLITS_REQUIRE_REPLAN',
+      'CV_DATASET_CANDIDATES_REQUIRE_REFRESH',
+    ]);
+    expect(
+      harness.candidates.filter((row) => row.runId === created.id),
+    ).toEqual([]);
+
+    // (6) EXPORTED and ARCHIVED runs reject configuration changes.
+    harness.runs.find((row) => row.id === created.id)!.status = 'EXPORTED';
+    await expect(
+      harness.service.updateRun(TENANT, created.id, { name: 'Nope' }),
+    ).rejects.toThrow('only DRAFT runs can be edited');
+    harness.runs.find((row) => row.id === created.id)!.status = 'ARCHIVED';
+    await expect(
+      harness.service.updateRun(TENANT, created.id, {
+        trainSplitPercent: 100,
+        validationSplitPercent: 0,
+        testSplitPercent: 0,
+      }),
+    ).rejects.toThrow('only DRAFT runs can be edited');
   });
 });

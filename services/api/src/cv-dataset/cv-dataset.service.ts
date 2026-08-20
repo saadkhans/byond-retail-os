@@ -79,6 +79,11 @@ export const DATASET_STALE_CANDIDATES = 'CV_DATASET_STALE_CANDIDATES';
 export const DATASET_LINEAGE_MISMATCH = 'CV_DATASET_SOURCE_LINEAGE_MISMATCH';
 export const DATASET_CALIBRATION_MISMATCH =
   'CV_DATASET_CALIBRATION_CAMERA_MISMATCH';
+export const DATASET_SPLITS_REQUIRE_REPLAN = 'CV_DATASET_SPLITS_REQUIRE_REPLAN';
+export const DATASET_CANDIDATES_REQUIRE_REFRESH =
+  'CV_DATASET_CANDIDATES_REQUIRE_REFRESH';
+export const DATASET_EXPORT_REQUIRES_PLANNED_SPLITS =
+  'CV_DATASET_EXPORT_REQUIRES_PLANNED_SPLITS';
 
 export const DATASET_EXCLUSION_REASONS = [
   'NOT_REVIEWED',
@@ -264,6 +269,20 @@ function effectiveAction(row: {
   return row.correctedActionLabel ?? row.actionLabel;
 }
 
+/** A SKU snapshot counts as a class LABEL only when the review actually
+ *  confirmed or corrected the SKU (or a scripted scenario asserted it).
+ *  A FALSE_TOUCH row's snapshot is the model's UNCONFIRMED prediction —
+ *  the reviewer confirmed NO_OP, not the SKU identity — so it stays on
+ *  the candidate as reference metadata but is never a SKU class. */
+function confirmedSkuOf(row: {
+  skuCodeSnapshot: string | null;
+  reviewVerdict: string;
+}): string | null {
+  return row.reviewVerdict === PilotObservationVerdict.FALSE_TOUCH
+    ? null
+    : row.skuCodeSnapshot;
+}
+
 /** The INDEPENDENT-GROUP identity of a candidate. Same live session →
  *  same group (near-duplicate frames are one unit of evidence, not
  *  many); sessionless rows stand alone. Deliberately excludes the
@@ -292,6 +311,7 @@ function labelFamilies(
     skuCodeSnapshot: string | null;
     actionLabel: string;
     correctedActionLabel: string | null;
+    reviewVerdict: string;
   }[],
 ): LabelFamilies {
   let skuLabeled = 0;
@@ -300,7 +320,8 @@ function labelFamilies(
   let positives = 0;
   let missedRecovery = 0;
   for (const row of eligible) {
-    if (row.skuCodeSnapshot !== null) {
+    // FALSE_TOUCH predicted SKUs are NOT confirmed SKU labels.
+    if (confirmedSkuOf(row) !== null) {
       skuLabeled += 1;
     }
     const action = effectiveAction(row);
@@ -702,67 +723,117 @@ export class CvDatasetService {
       notes?: string | null;
     },
   ) {
-    const run = await this.requireRun(tenantId, runId);
-    if (run.status !== CvDatasetImprovementRunStatus.DRAFT) {
-      throw new BadRequestException('only DRAFT runs can be edited');
-    }
-    const data: Prisma.CvDatasetImprovementRunUncheckedUpdateManyInput = {};
-    if (input.name !== undefined) {
-      const name = this.screenText('name', input.name, DATASET_RUN_NAME_MAX_LENGTH);
-      if (!name) {
-        throw new BadRequestException('name is required');
+    await this.requireRun(tenantId, runId);
+    // Config changes and plan invalidation are ATOMIC under the run
+    // lock: a manifest can never advertise new percentages/minimums
+    // over split assignments planned for the old configuration.
+    const warnings = await this.withRunLock(tenantId, runId, async (tx) => {
+      const run = await this.lockedRun(tx, tenantId, runId);
+      if (run.status !== CvDatasetImprovementRunStatus.DRAFT) {
+        throw new BadRequestException('only DRAFT runs can be edited');
       }
-      data.name = name;
-    }
-    if (input.purpose !== undefined && input.purpose !== null) {
-      data.purpose = input.purpose;
-    }
-    if (input.notes !== undefined) {
-      data.notes = this.screenText(
-        'notes',
-        input.notes,
-        DATASET_RUN_NOTES_MAX_LENGTH,
-      );
-    }
-    const percents = {
-      trainSplitPercent: input.trainSplitPercent ?? run.trainSplitPercent,
-      validationSplitPercent:
-        input.validationSplitPercent ?? run.validationSplitPercent,
-      testSplitPercent: input.testSplitPercent ?? run.testSplitPercent,
-    };
-    this.validatePercents(percents);
-    data.trainSplitPercent = percents.trainSplitPercent;
-    data.validationSplitPercent = percents.validationSplitPercent;
-    data.testSplitPercent = percents.testSplitPercent;
-    if (input.minReviewedExamplesPerSku != null) {
-      data.minReviewedExamplesPerSku = input.minReviewedExamplesPerSku;
-    }
-    if (input.minReviewedExamplesPerAction != null) {
-      data.minReviewedExamplesPerAction = input.minReviewedExamplesPerAction;
-    }
-    const links = {
-      sourceEvaluationRunId:
-        input.sourceEvaluationRunId !== undefined
-          ? input.sourceEvaluationRunId
-          : run.sourceEvaluationRunId,
-      sourceTestProtocolId:
-        input.sourceTestProtocolId !== undefined
-          ? input.sourceTestProtocolId
-          : run.sourceTestProtocolId,
-      sourceCalibrationProfileId:
-        input.sourceCalibrationProfileId !== undefined
-          ? input.sourceCalibrationProfileId
-          : run.sourceCalibrationProfileId,
-    };
-    await this.validateSourceLinks(tenantId, links);
-    data.sourceEvaluationRunId = links.sourceEvaluationRunId;
-    data.sourceTestProtocolId = links.sourceTestProtocolId;
-    data.sourceCalibrationProfileId = links.sourceCalibrationProfileId;
-    await this.prisma.cvDatasetImprovementRun.updateMany({
-      where: { tenantId, id: runId },
-      data,
+      const data: Prisma.CvDatasetImprovementRunUncheckedUpdateManyInput = {};
+      if (input.name !== undefined) {
+        const name = this.screenText(
+          'name',
+          input.name,
+          DATASET_RUN_NAME_MAX_LENGTH,
+        );
+        if (!name) {
+          throw new BadRequestException('name is required');
+        }
+        data.name = name;
+      }
+      if (input.purpose !== undefined && input.purpose !== null) {
+        data.purpose = input.purpose;
+      }
+      if (input.notes !== undefined) {
+        data.notes = this.screenText(
+          'notes',
+          input.notes,
+          DATASET_RUN_NOTES_MAX_LENGTH,
+        );
+      }
+      const percents = {
+        trainSplitPercent: input.trainSplitPercent ?? run.trainSplitPercent,
+        validationSplitPercent:
+          input.validationSplitPercent ?? run.validationSplitPercent,
+        testSplitPercent: input.testSplitPercent ?? run.testSplitPercent,
+      };
+      this.validatePercents(percents);
+      data.trainSplitPercent = percents.trainSplitPercent;
+      data.validationSplitPercent = percents.validationSplitPercent;
+      data.testSplitPercent = percents.testSplitPercent;
+      if (input.minReviewedExamplesPerSku != null) {
+        data.minReviewedExamplesPerSku = input.minReviewedExamplesPerSku;
+      }
+      if (input.minReviewedExamplesPerAction != null) {
+        data.minReviewedExamplesPerAction = input.minReviewedExamplesPerAction;
+      }
+      const links = {
+        sourceEvaluationRunId:
+          input.sourceEvaluationRunId !== undefined
+            ? input.sourceEvaluationRunId
+            : run.sourceEvaluationRunId,
+        sourceTestProtocolId:
+          input.sourceTestProtocolId !== undefined
+            ? input.sourceTestProtocolId
+            : run.sourceTestProtocolId,
+        sourceCalibrationProfileId:
+          input.sourceCalibrationProfileId !== undefined
+            ? input.sourceCalibrationProfileId
+            : run.sourceCalibrationProfileId,
+      };
+      await this.validateSourceLinks(tenantId, links);
+      data.sourceEvaluationRunId = links.sourceEvaluationRunId;
+      data.sourceTestProtocolId = links.sourceTestProtocolId;
+      data.sourceCalibrationProfileId = links.sourceCalibrationProfileId;
+
+      // Which planning inputs actually changed?
+      const planningChanged =
+        percents.trainSplitPercent !== run.trainSplitPercent ||
+        percents.validationSplitPercent !== run.validationSplitPercent ||
+        percents.testSplitPercent !== run.testSplitPercent ||
+        (input.minReviewedExamplesPerSku != null &&
+          input.minReviewedExamplesPerSku !== run.minReviewedExamplesPerSku) ||
+        (input.minReviewedExamplesPerAction != null &&
+          input.minReviewedExamplesPerAction !==
+            run.minReviewedExamplesPerAction) ||
+        (input.purpose != null && input.purpose !== run.purpose);
+      const linksChanged =
+        links.sourceEvaluationRunId !== run.sourceEvaluationRunId ||
+        links.sourceTestProtocolId !== run.sourceTestProtocolId ||
+        links.sourceCalibrationProfileId !== run.sourceCalibrationProfileId;
+      const existing = await tx.cvDatasetCandidate.findMany({
+        where: { tenantId, runId },
+        select: { split: true },
+      });
+      const hadSplits = existing.some((row) => row.split !== null);
+
+      await tx.cvDatasetImprovementRun.updateMany({
+        where: { tenantId, id: runId },
+        data,
+      });
+      const changeWarnings: string[] = [];
+      if (linksChanged && existing.length) {
+        // The candidate ledger describes the OLD source family.
+        await tx.cvDatasetCandidate.deleteMany({ where: { tenantId, runId } });
+        if (hadSplits) {
+          changeWarnings.push(DATASET_SPLITS_REQUIRE_REPLAN);
+        }
+        changeWarnings.push(DATASET_CANDIDATES_REQUIRE_REFRESH);
+      } else if (planningChanged && hadSplits) {
+        // Existing assignments were planned for the old configuration.
+        await tx.cvDatasetCandidate.updateMany({
+          where: { tenantId, runId },
+          data: { split: null },
+        });
+        changeWarnings.push(DATASET_SPLITS_REQUIRE_REPLAN);
+      }
+      return changeWarnings;
     });
-    return this.runDetail(tenantId, runId);
+    const detail = await this.runDetail(tenantId, runId);
+    return { ...detail, warnings };
   }
 
   /** DRAFT → READY (gated on the honest, purpose-aware quality
@@ -899,15 +970,20 @@ export class CvDatasetService {
             seeds.push(excluded(review.verdict, 'MISSING_CORRECTED_SKU'));
             continue;
           }
+          // Product-ID equality is CANONICAL whenever both ids exist:
+          // the same product with a differing (or missing) SKU snapshot
+          // is still not a correction. SKU-snapshot comparison is only
+          // the fallback when the ids are not both known.
+          const bothIds =
+            correctedProductId !== null &&
+            observation.predictedProductId !== null;
+          const sameProduct =
+            bothIds && correctedProductId === observation.predictedProductId;
           const sameSku =
+            !bothIds &&
             correctedSku !== null &&
             observation.predictedSku !== null &&
             correctedSku === observation.predictedSku;
-          const sameProduct =
-            correctedSku === null &&
-            correctedProductId !== null &&
-            observation.predictedProductId !== null &&
-            correctedProductId === observation.predictedProductId;
           if (sameSku || sameProduct) {
             seeds.push(excluded(review.verdict, 'CORRECTION_NOT_DIFFERENT'));
             continue;
@@ -1174,7 +1250,9 @@ export class CvDatasetService {
         >)
         .sort((a, b) => (b.count as number) - (a.count as number));
 
-    const skuCounts = countBy(eligible.map((row) => row.skuCodeSnapshot));
+    // SKU classes are CONFIRMED labels only (false-touch predicted SKUs
+    // are reference metadata, never a class — see confirmedSkuOf).
+    const skuCounts = countBy(eligible.map((row) => confirmedSkuOf(row)));
     const actionCounts = countBy(eligible.map((row) => effectiveAction(row)));
     const scenarioCounts = countBy(
       eligible.map((row) => row.scenarioTypeSnapshot),
@@ -1202,14 +1280,15 @@ export class CvDatasetService {
     for (const row of eligible) {
       const groupKey = groupKeyOf(row);
       const action = effectiveAction(row);
-      if (row.skuCodeSnapshot) {
-        const groups = skuGroups.get(row.skuCodeSnapshot) ?? new Set<string>();
+      const confirmedSku = confirmedSkuOf(row);
+      if (confirmedSku) {
+        const groups = skuGroups.get(confirmedSku) ?? new Set<string>();
         groups.add(groupKey);
-        skuGroups.set(row.skuCodeSnapshot, groups);
+        skuGroups.set(confirmedSku, groups);
         if (row.split) {
-          const splits = skuSplits.get(row.skuCodeSnapshot) ?? new Set<string>();
+          const splits = skuSplits.get(confirmedSku) ?? new Set<string>();
           splits.add(row.split);
-          skuSplits.set(row.skuCodeSnapshot, splits);
+          skuSplits.set(confirmedSku, splits);
         }
       }
       const groups = actionGroups.get(action) ?? new Set<string>();
@@ -1243,24 +1322,28 @@ export class CvDatasetService {
       }
     }
 
+    // Minimum class coverage is measured in INDEPENDENT GROUPS, not raw
+    // candidate rows: 30 near-duplicates from two sessions are two units
+    // of evidence, and never satisfy a minimum of five. Raw counts are
+    // still reported — they are just never the readiness basis.
     const lowCoverageSkus = [...skuCounts.entries()]
-      .filter(([, count]) => count < run.minReviewedExamplesPerSku)
       .map(([sku, count]) => ({
         sku,
         count,
         groups: skuGroups.get(sku)?.size ?? 0,
         minimum: run.minReviewedExamplesPerSku,
       }))
-      .sort((a, b) => a.count - b.count);
+      .filter((entry) => entry.groups < run.minReviewedExamplesPerSku)
+      .sort((a, b) => a.groups - b.groups || a.count - b.count);
     const lowCoverageActions = [...actionCounts.entries()]
-      .filter(([, count]) => count < run.minReviewedExamplesPerAction)
       .map(([action, count]) => ({
         action,
         count,
         groups: actionGroups.get(action)?.size ?? 0,
         minimum: run.minReviewedExamplesPerAction,
       }))
-      .sort((a, b) => a.count - b.count);
+      .filter((entry) => entry.groups < run.minReviewedExamplesPerAction)
+      .sort((a, b) => a.groups - b.groups || a.count - b.count);
 
     const imbalanceWarnings: string[] = [];
     const skuLabeledTotal = [...skuCounts.values()].reduce((a, b) => a + b, 0);
@@ -1297,6 +1380,9 @@ export class CvDatasetService {
     if (lowGroupCoverage) {
       imbalanceWarnings.push('LOW_INDEPENDENT_GROUP_COVERAGE');
     }
+    if (lowCoverageSkus.length || lowCoverageActions.length) {
+      imbalanceWarnings.push('INSUFFICIENT_CLASS_GROUP_COVERAGE');
+    }
 
     const leakageWarnings: string[] = [];
     const splitsPlanned =
@@ -1319,6 +1405,7 @@ export class CvDatasetService {
     // Requested-split completeness and per-class split coverage,
     // re-derived from the PERSISTED rows so the warnings are durable.
     let requestedSplitEmpty = false;
+    let classMissingTrain = false;
     if (splitsPlanned) {
       const inSplit = (split: CvDatasetSplit) =>
         eligible.filter((row) => row.split === split).length;
@@ -1362,7 +1449,13 @@ export class CvDatasetService {
       const sku = classMissing(skuSplits, skuGroups);
       const action = classMissing(actionSplits, actionGroups);
       if (sku.missingTrain || action.missingTrain) {
+        // The STABLE assignment left a trainable class with no TRAIN
+        // examples. The plan is never silently overridden per run (that
+        // would move the same group between splits across runs) — the
+        // run is blocked instead.
+        classMissingTrain = true;
         leakageWarnings.push('CLASS_MISSING_TRAIN_SPLIT');
+        leakageWarnings.push('INSUFFICIENT_STABLE_SPLIT_COVERAGE');
       }
       if (sku.missingValidation || action.missingValidation) {
         leakageWarnings.push('CLASS_MISSING_VALIDATION_SPLIT');
@@ -1373,7 +1466,10 @@ export class CvDatasetService {
     }
 
     const readiness: DatasetReadiness =
-      eligible.length === 0 || !purposeCheck.satisfied || requestedSplitEmpty
+      eligible.length === 0 ||
+      !purposeCheck.satisfied ||
+      requestedSplitEmpty ||
+      classMissingTrain
         ? 'NOT_READY'
         : lowCoverageSkus.length ||
             lowCoverageActions.length ||
@@ -1462,6 +1558,7 @@ export class CvDatasetService {
       leakageWarnings,
       splitsPlanned,
       requestedSplitEmpty,
+      classMissingTrain,
       families,
       purposeSatisfied: purposeCheck.satisfied,
       readiness,
@@ -1508,16 +1605,19 @@ export class CvDatasetService {
   // split planner (deterministic)
   // ------------------------------------------------------------------
 
-  /** Deterministic split assignment: examples from the SAME live session
-   *  share a hash group (leakage guard), the group's sha256 bucket —
-   *  keyed by tenant + group identity only, so the same source group
-   *  gets the same split in EVERY dataset run and replan — picks the
-   *  split against the run's percentages. Low-coverage classes are
-   *  forced WHOLE-GROUP into TRAIN with a warning, any class that would
-   *  otherwise have no TRAIN examples is pulled into TRAIN, and empty
-   *  requested splits are flagged rather than glossed over. HOLDOUT is
-   *  never auto-assigned in the MVP. Only this run's candidate rows are
-   *  updated — review/scenario/source records are never mutated. */
+  /** Deterministic, STABLE split assignment: examples from the SAME
+   *  live session share a hash group (leakage guard), and the group's
+   *  sha256 bucket — keyed by tenant + group identity only, never the
+   *  dataset run id or the run's composition — picks the split against
+   *  the run's percentages. The assignment is NEVER overridden by
+   *  current-run coverage rules: a group keeps the same split in every
+   *  dataset run and every replan, so iterative comparisons stay valid
+   *  and evaluation data never drifts into TRAIN. When the stable
+   *  assignment leaves a trainable class without TRAIN examples, or a
+   *  requested split empty, the run is WARNED and BLOCKED from export —
+   *  not silently rearranged. HOLDOUT is never auto-assigned in the
+   *  MVP. Only this run's candidate rows are updated —
+   *  review/scenario/source records are never mutated. */
   async planSplits(tenantId: string, runId: string) {
     await this.requireRun(tenantId, runId);
     return this.withRunLock(tenantId, runId, async (tx) => {
@@ -1542,28 +1642,18 @@ export class CvDatasetService {
         );
       }
 
+      // Class universes (confirmed SKU labels only) — used for the
+      // WARN-ONLY class-coverage checks below, never to move a group.
       const skuCounts = new Map<string, number>();
       const actionCounts = new Map<string, number>();
       for (const row of eligible) {
-        if (row.skuCodeSnapshot) {
-          skuCounts.set(
-            row.skuCodeSnapshot,
-            (skuCounts.get(row.skuCodeSnapshot) ?? 0) + 1,
-          );
+        const confirmedSku = confirmedSkuOf(row);
+        if (confirmedSku) {
+          skuCounts.set(confirmedSku, (skuCounts.get(confirmedSku) ?? 0) + 1);
         }
         const action = effectiveAction(row);
         actionCounts.set(action, (actionCounts.get(action) ?? 0) + 1);
       }
-      const lowSkus = new Set(
-        [...skuCounts.entries()]
-          .filter(([, count]) => count < run.minReviewedExamplesPerSku)
-          .map(([sku]) => sku),
-      );
-      const lowActions = new Set(
-        [...actionCounts.entries()]
-          .filter(([, count]) => count < run.minReviewedExamplesPerAction)
-          .map(([action]) => action),
-      );
 
       // Same live session → same group → same split (leakage guard).
       const groups = new Map<string, CvDatasetCandidate[]>();
@@ -1595,30 +1685,11 @@ export class CvDatasetService {
         );
       }
 
-      // (b) low-coverage classes: too few examples to spread across
-      // splits — keep every touching group in TRAIN and say so, instead
-      // of shipping a test set whose per-class quality is meaningless.
-      for (const [groupKey, rows] of groups) {
-        const touchesLowSku = rows.some(
-          (row) => row.skuCodeSnapshot && lowSkus.has(row.skuCodeSnapshot),
-        );
-        const touchesLowAction = rows.some((row) =>
-          lowActions.has(effectiveAction(row)),
-        );
-        if (touchesLowSku) {
-          warnings.add('LOW_COVERAGE_SKU_FORCED_TRAIN');
-        }
-        if (touchesLowAction) {
-          warnings.add('LOW_COVERAGE_ACTION_FORCED_TRAIN');
-        }
-        if (touchesLowSku || touchesLowAction) {
-          splitByGroup.set(groupKey, CvDatasetSplit.TRAIN);
-        }
-      }
-
-      // (c) TRAIN guarantee: a class the hash sent entirely to
-      // VALIDATION/TEST would be untrainable — pull its groups into
-      // TRAIN (deterministic class order) and warn.
+      // (b) class TRAIN coverage — WARN ONLY, never relocate: forcing a
+      // group into TRAIN because THIS run's composition is small would
+      // move the same group between splits across runs (split drift and
+      // evaluation-data leakage). A class the stable hash left without
+      // TRAIN examples blocks readiness/export instead.
       const groupKeysForClass = (
         matches: (row: CvDatasetCandidate) => boolean,
       ) => {
@@ -1630,7 +1701,7 @@ export class CvDatasetService {
         }
         return keys;
       };
-      const forceClassIntoTrain = (
+      const warnClassMissingTrain = (
         classes: string[],
         matches: (cls: string, row: CvDatasetCandidate) => boolean,
       ) => {
@@ -1643,17 +1714,15 @@ export class CvDatasetService {
             )
           ) {
             warnings.add('CLASS_MISSING_TRAIN_SPLIT');
-            for (const key of keys) {
-              splitByGroup.set(key, CvDatasetSplit.TRAIN);
-            }
+            warnings.add('INSUFFICIENT_STABLE_SPLIT_COVERAGE');
           }
         }
       };
-      forceClassIntoTrain(
+      warnClassMissingTrain(
         [...skuCounts.keys()],
-        (cls, row) => row.skuCodeSnapshot === cls,
+        (cls, row) => confirmedSkuOf(row) === cls,
       );
-      forceClassIntoTrain(
+      warnClassMissingTrain(
         [...actionCounts.keys()],
         (cls, row) => effectiveAction(row) === cls,
       );
@@ -1702,7 +1771,7 @@ export class CvDatasetService {
       };
       classSplitWarnings(
         [...skuCounts.keys()],
-        (cls, row) => row.skuCodeSnapshot === cls,
+        (cls, row) => confirmedSkuOf(row) === cls,
       );
       classSplitWarnings(
         [...actionCounts.keys()],
@@ -1756,13 +1825,22 @@ export class CvDatasetService {
     const keyOf = (row: { sourceType: string; sourceId: string }) =>
       `${row.sourceType}:${row.sourceId}`;
     const seedByKey = new Map(seeds.map((seed) => [keyOf(seed), seed]));
-    const storedKeys = new Set(stored.map((row) => keyOf(row)));
+    const storedEligibleKeys = new Set(
+      stored
+        .filter((row) => row.eligibility === CvDatasetEligibility.ELIGIBLE)
+        .map((row) => keyOf(row)),
+    );
     let stale = false;
     for (const row of stored) {
       if (row.eligibility !== CvDatasetEligibility.ELIGIBLE) {
         continue;
       }
       const seed = seedByKey.get(keyOf(row));
+      // Labels AND evidence lineage: a scenario re-recorded with the
+      // same verdict against a different session, or a changed
+      // evaluation/protocol/calibration stamp, is just as stale as a
+      // flipped verdict — the manifest would point at the wrong
+      // footage or assert setup metadata that was never used.
       if (
         !seed ||
         seed.eligibility !== CvDatasetEligibility.ELIGIBLE ||
@@ -1770,7 +1848,11 @@ export class CvDatasetService {
         seed.skuCodeSnapshot !== row.skuCodeSnapshot ||
         seed.actionLabel !== row.actionLabel ||
         seed.correctedActionLabel !== row.correctedActionLabel ||
-        seed.reviewVerdict !== row.reviewVerdict
+        seed.reviewVerdict !== row.reviewVerdict ||
+        seed.liveSessionId !== row.liveSessionId ||
+        seed.evaluationRunId !== row.evaluationRunId ||
+        seed.protocolId !== row.protocolId ||
+        seed.calibrationProfileId !== row.calibrationProfileId
       ) {
         stale = true;
         break;
@@ -1780,7 +1862,7 @@ export class CvDatasetService {
       for (const seed of seeds) {
         if (
           seed.eligibility === CvDatasetEligibility.ELIGIBLE &&
-          !storedKeys.has(keyOf(seed))
+          !storedEligibleKeys.has(keyOf(seed))
         ) {
           stale = true;
           break;
@@ -1819,7 +1901,9 @@ export class CvDatasetService {
         );
       }
       if (!internals.splitsPlanned) {
-        throw new BadRequestException('plan splits before exporting');
+        throw new BadRequestException(
+          `${DATASET_EXPORT_REQUIRES_PLANNED_SPLITS}: plan splits before exporting`,
+        );
       }
       await this.assertCandidatesFresh(tenantId, run, internals.candidates);
       if (!internals.purposeSatisfied) {
@@ -1830,6 +1914,11 @@ export class CvDatasetService {
       if (internals.requestedSplitEmpty) {
         throw new BadRequestException(
           'export rejected: a requested validation/test split is empty — re-plan splits or set its percentage to zero',
+        );
+      }
+      if (internals.classMissingTrain) {
+        throw new BadRequestException(
+          'export rejected: a trainable class has no TRAIN examples under the stable split assignment (INSUFFICIENT_STABLE_SPLIT_COVERAGE) — collect more independent sessions or adjust the split percentages',
         );
       }
       const splitOrder: Record<string, number> = {
@@ -1853,10 +1942,14 @@ export class CvDatasetService {
         { skuId: string | null; sku: string }
       >();
       for (const row of rows) {
-        if (row.skuCodeSnapshot) {
-          skuSnapshots.set(`${row.skuId ?? ''}:${row.skuCodeSnapshot}`, {
+        // The label list carries CONFIRMED SKU classes only — a
+        // false-touch row's predicted SKU stays on its candidate as
+        // reference metadata but is not a class label.
+        const confirmedSku = confirmedSkuOf(row);
+        if (confirmedSku) {
+          skuSnapshots.set(`${row.skuId ?? ''}:${confirmedSku}`, {
             skuId: row.skuId,
-            sku: row.skuCodeSnapshot,
+            sku: confirmedSku,
           });
         }
       }
