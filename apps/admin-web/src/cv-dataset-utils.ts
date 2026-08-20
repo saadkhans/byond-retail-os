@@ -46,6 +46,21 @@ const DATASET_WARNING_LABELS: Record<string, string> = {
   LOW_COVERAGE_ACTION_FORCED_TRAIN:
     'A low-coverage action was kept in TRAIN instead of being split',
   SMALL_DATASET: 'The dataset is small — treat every metric with caution',
+  NO_SKU_LABELS_FOR_TASK: 'No SKU labels exist for the selected task',
+  NO_ACTION_LABELS_FOR_TASK: 'No action labels exist for the selected task',
+  INSUFFICIENT_TASK_LABELS:
+    'Not enough usable labels for the selected task',
+  REQUESTED_VALIDATION_SPLIT_EMPTY:
+    'Requested validation split is empty — collect more independent sessions or set it to 0',
+  REQUESTED_TEST_SPLIT_EMPTY:
+    'Requested test split is empty — collect more independent sessions or set it to 0',
+  INSUFFICIENT_GROUPS_FOR_REQUESTED_SPLITS:
+    'Too few independent session groups for the requested splits',
+  LOW_INDEPENDENT_GROUP_COVERAGE:
+    'Some classes come from very few independent sessions',
+  CLASS_MISSING_TRAIN_SPLIT: 'A class has no TRAIN examples',
+  CLASS_MISSING_VALIDATION_SPLIT: 'A class has no VALIDATION examples',
+  CLASS_MISSING_TEST_SPLIT: 'A class has no TEST examples',
 };
 
 export function formatDatasetWarning(warning: string): string {
@@ -71,6 +86,46 @@ export function formatDatasetAction(action: string): string {
 
 export function formatSplit(split: CvDatasetSplit | null): string {
   return split ?? 'Unplanned';
+}
+
+const EXCLUSION_REASON_LABELS: Record<string, string> = {
+  NOT_REVIEWED: 'Not reviewed yet',
+  UNCERTAIN_VERDICT: 'Review verdict was uncertain',
+  INCORRECT_VERDICT: 'Marked incorrect without a usable correction',
+  INCONCLUSIVE_RESULT: 'Scenario result was inconclusive',
+  MISSING_RESULT: 'Scenario has no recorded result',
+  MISSING_EVIDENCE_LOCATOR:
+    'Missed event has no safe time locator for the footage',
+  MISSING_CORRECTED_SKU: 'Wrong-SKU review is missing the corrected SKU',
+  MISSING_CORRECTED_ACTION:
+    'Wrong-action review is missing a usable corrected action',
+  CORRECTION_NOT_DIFFERENT: 'Correction matches the original prediction',
+};
+
+export function formatExclusionReason(reason: string): string {
+  return EXCLUSION_REASON_LABELS[reason] ?? reason;
+}
+
+/** Controlled backend error tokens → operator guidance. The token stays
+ *  visible so it can be quoted in reports; nothing echoes submitted values. */
+const DATASET_ERROR_GUIDANCE: Record<string, string> = {
+  CV_DATASET_STALE_CANDIDATES:
+    'Source labels changed since candidates were built — refresh candidates and re-plan splits, then export again',
+  CV_DATASET_SOURCE_LINEAGE_MISMATCH:
+    'The linked evaluation run and test protocol do not describe the same data — fix the source links',
+  CV_DATASET_CALIBRATION_CAMERA_MISMATCH:
+    'The calibration profile belongs to a different camera than the candidate data — link the matching profile',
+};
+
+export function formatDatasetErrorMessage(message: string): string {
+  const match = /^(CV_DATASET_[A-Z_]+)/.exec(message.trim());
+  if (match) {
+    const guidance = DATASET_ERROR_GUIDANCE[match[1]];
+    if (guidance) {
+      return `${match[1]}: ${guidance}`;
+    }
+  }
+  return message;
 }
 
 /** Controlled validation messages only — never echoes the input back. */

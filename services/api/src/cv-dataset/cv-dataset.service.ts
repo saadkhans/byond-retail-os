@@ -34,12 +34,18 @@ import { SPLIT_BUCKET_SPACE, splitBucket } from './dataset-hash';
  * deterministic split plan, a safe export manifest for OFFLINE tuning,
  * and an advisory tuning report. Hard rules:
  *  - reviewed/corrected examples only — unreviewed, UNCERTAIN, and
- *    INCONCLUSIVE records are EXCLUDED with a controlled reason;
+ *    INCONCLUSIVE records are EXCLUDED with a controlled reason, and a
+ *    correction verdict without a real, different correction is
+ *    excluded too;
  *  - references and enum/id snapshots only — never media, paths, URLs,
  *    credential slots, embeddings, or model weights;
  *  - this module writes ONLY its own two tables and never mutates the
  *    review/scenario/source records it reads (static guard enforced);
- *  - missing data is null/zero — never fabricated;
+ *  - missing data is null/zero — never fabricated: missed-event reviews
+ *    carry no evidence locator yet, so they are EXCLUDED, not exported
+ *    as untraceable labels;
+ *  - export re-validates the CURRENT source records under the run lock
+ *    and refuses to ship a manifest that no longer matches them;
  *  - no training is invoked and no accuracy projection is ever emitted.
  */
 
@@ -62,8 +68,17 @@ export const DATASET_TRAINING_NOTES: readonly string[] = [
   'NO_ACCURACY_GUARANTEE',
 ];
 
-/** Below this many eligible examples the dataset is flagged SMALL. */
+/** Below this many eligible examples the dataset is flagged SMALL — a
+ *  DURABLE quality warning (readiness, tuning report, and manifest all
+ *  carry it), not just a transient planner note. */
 export const SMALL_DATASET_THRESHOLD = 30;
+
+/** Controlled error tokens (messages START with these; submitted or
+ *  source values are never echoed). */
+export const DATASET_STALE_CANDIDATES = 'CV_DATASET_STALE_CANDIDATES';
+export const DATASET_LINEAGE_MISMATCH = 'CV_DATASET_SOURCE_LINEAGE_MISMATCH';
+export const DATASET_CALIBRATION_MISMATCH =
+  'CV_DATASET_CALIBRATION_CAMERA_MISMATCH';
 
 export const DATASET_EXCLUSION_REASONS = [
   'NOT_REVIEWED',
@@ -71,6 +86,10 @@ export const DATASET_EXCLUSION_REASONS = [
   'INCORRECT_VERDICT',
   'INCONCLUSIVE_RESULT',
   'MISSING_RESULT',
+  'MISSING_EVIDENCE_LOCATOR',
+  'MISSING_CORRECTED_SKU',
+  'MISSING_CORRECTED_ACTION',
+  'CORRECTION_NOT_DIFFERENT',
 ] as const;
 
 export const DATASET_NEXT_ACTIONS = [
@@ -88,6 +107,13 @@ export const DATASET_NEXT_ACTIONS = [
 export type DatasetNextAction = (typeof DATASET_NEXT_ACTIONS)[number];
 
 export type DatasetReadiness = 'READY' | 'WARNING' | 'NOT_READY';
+
+/** Action labels a trainer can actually use. UNKNOWN is not a label. */
+const USABLE_ACTION_LABELS: readonly string[] = [
+  PilotExpectedAction.PICKUP,
+  PilotExpectedAction.RETURN,
+  PilotExpectedAction.NO_OP,
+];
 
 /** Match-score buckets — coarse on purpose: the raw score is an
  *  uncalibrated pipeline value, so only order-of-magnitude bands are
@@ -115,24 +141,13 @@ function predictedActionOf(eventType: CustomerJourneyEventType): string {
   return PilotExpectedAction.UNKNOWN;
 }
 
-/** Verdicts whose rows become ELIGIBLE candidates. Superset of the Phase
- *  15 export list by FALSE_TOUCH: a confirmed false touch is a REVIEWED
- *  corrected NEGATIVE (label NO_OP) — exactly what a false-touch filter
- *  trains on. INCORRECT/UNCERTAIN stay excluded: they carry no usable
- *  label. */
-const ELIGIBLE_LIVE_VERDICTS: readonly PilotObservationVerdict[] = [
-  PilotObservationVerdict.CORRECT,
-  PilotObservationVerdict.WRONG_SKU,
-  PilotObservationVerdict.WRONG_ACTION,
-  PilotObservationVerdict.FALSE_TOUCH,
-];
-
 interface CandidateSeed {
   sourceType: CvDatasetCandidateSourceType;
   sourceId: string;
   liveSessionId: string | null;
   evaluationRunId: string | null;
   protocolId: string | null;
+  calibrationProfileId: string | null;
   skuId: string | null;
   skuCodeSnapshot: string | null;
   actionLabel: string;
@@ -249,6 +264,141 @@ function effectiveAction(row: {
   return row.correctedActionLabel ?? row.actionLabel;
 }
 
+/** The INDEPENDENT-GROUP identity of a candidate. Same live session →
+ *  same group (near-duplicate frames are one unit of evidence, not
+ *  many); sessionless rows stand alone. Deliberately excludes the
+ *  dataset run id so the same source group keeps the same split across
+ *  every dataset improvement run and every replan (stable iterative
+ *  comparisons, no evaluation-data drift into TRAIN). */
+function groupKeyOf(row: {
+  liveSessionId: string | null;
+  sourceType: CvDatasetCandidateSourceType | string;
+  sourceId: string;
+}): string {
+  return row.liveSessionId ?? `${row.sourceType}:${row.sourceId}`;
+}
+
+/** Label families a task can train on, counted over ELIGIBLE rows. */
+interface LabelFamilies {
+  skuLabeled: number;
+  actionLabeled: number;
+  falseTouchPair: boolean;
+  missedRecovery: number;
+}
+
+function labelFamilies(
+  eligible: {
+    sourceType: CvDatasetCandidateSourceType;
+    skuCodeSnapshot: string | null;
+    actionLabel: string;
+    correctedActionLabel: string | null;
+  }[],
+): LabelFamilies {
+  let skuLabeled = 0;
+  let actionLabeled = 0;
+  let noOp = 0;
+  let positives = 0;
+  let missedRecovery = 0;
+  for (const row of eligible) {
+    if (row.skuCodeSnapshot !== null) {
+      skuLabeled += 1;
+    }
+    const action = effectiveAction(row);
+    if (USABLE_ACTION_LABELS.includes(action)) {
+      actionLabeled += 1;
+    }
+    if (action === PilotExpectedAction.NO_OP) {
+      noOp += 1;
+    }
+    if (
+      action === PilotExpectedAction.PICKUP ||
+      action === PilotExpectedAction.RETURN
+    ) {
+      positives += 1;
+    }
+    if (row.sourceType === CvDatasetCandidateSourceType.MISSED_EVENT) {
+      missedRecovery += 1;
+    }
+  }
+  return {
+    skuLabeled,
+    actionLabeled,
+    falseTouchPair: noOp > 0 && positives > 0,
+    missedRecovery,
+  };
+}
+
+/** Purpose-aware label requirement: a run must not read READY (or
+ *  export) for a task it has zero usable labels for. */
+function purposeLabelCheck(
+  purpose: CvDatasetPurpose,
+  families: LabelFamilies,
+): { satisfied: boolean; warnings: string[] } {
+  switch (purpose) {
+    case CvDatasetPurpose.SKU_CLASSIFICATION:
+      return families.skuLabeled > 0
+        ? { satisfied: true, warnings: [] }
+        : { satisfied: false, warnings: ['NO_SKU_LABELS_FOR_TASK'] };
+    case CvDatasetPurpose.ACTION_RECOGNITION:
+      return families.actionLabeled > 0
+        ? { satisfied: true, warnings: [] }
+        : { satisfied: false, warnings: ['NO_ACTION_LABELS_FOR_TASK'] };
+    case CvDatasetPurpose.FALSE_TOUCH_FILTERING:
+      return families.falseTouchPair
+        ? { satisfied: true, warnings: [] }
+        : { satisfied: false, warnings: ['INSUFFICIENT_TASK_LABELS'] };
+    case CvDatasetPurpose.MISSED_EVENT_RECOVERY:
+      return families.missedRecovery > 0
+        ? { satisfied: true, warnings: [] }
+        : { satisfied: false, warnings: ['INSUFFICIENT_TASK_LABELS'] };
+    default: {
+      // MIXED / CALIBRATION_VALIDATION: at least one usable family, and
+      // the missing families are called out as warnings.
+      const any =
+        families.skuLabeled > 0 ||
+        families.actionLabeled > 0 ||
+        families.falseTouchPair ||
+        families.missedRecovery > 0;
+      if (!any) {
+        return { satisfied: false, warnings: ['INSUFFICIENT_TASK_LABELS'] };
+      }
+      const warnings: string[] = [];
+      if (families.skuLabeled === 0) {
+        warnings.push('NO_SKU_LABELS_FOR_TASK');
+      }
+      if (families.actionLabeled === 0) {
+        warnings.push('NO_ACTION_LABELS_FOR_TASK');
+      }
+      return { satisfied: true, warnings };
+    }
+  }
+}
+
+function taskUsable(task: string, families: LabelFamilies): boolean {
+  if (task === 'SKU_CLASSIFICATION') {
+    return families.skuLabeled > 0;
+  }
+  if (task === 'ACTION_RECOGNITION') {
+    return families.actionLabeled > 0;
+  }
+  if (task === 'FALSE_TOUCH_FILTERING') {
+    return families.falseTouchPair;
+  }
+  return (
+    families.skuLabeled > 0 ||
+    families.actionLabeled > 0 ||
+    families.falseTouchPair ||
+    families.missedRecovery > 0
+  );
+}
+
+/** Verdicts whose rows can become ELIGIBLE candidates. Superset of the
+ *  Phase 15 export list by FALSE_TOUCH: a confirmed false touch is a
+ *  REVIEWED corrected NEGATIVE (label NO_OP) — exactly what a
+ *  false-touch filter trains on. INCORRECT/UNCERTAIN stay excluded:
+ *  they carry no usable label. WRONG_SKU/WRONG_ACTION additionally
+ *  require a real, different correction (validated per row). */
+
 const SAFETY = {
   orders: 0,
   checkoutSessions: 0,
@@ -317,7 +467,10 @@ export class CvDatasetService {
     return run;
   }
 
-  /** Serializes refresh / plan / export / status per run. */
+  /** Serializes refresh / plan / export / status per run. Every state
+   *  read that feeds a mutation happens INSIDE this lock — never
+   *  before it — so refresh, split planning, status changes, and
+   *  export can never interleave into an inconsistent EXPORTED run. */
   private async withRunLock<T>(
     tenantId: string,
     runId: string,
@@ -330,7 +483,24 @@ export class CvDatasetService {
     });
   }
 
-  /** Tenant-scoped validation of the three optional source links. */
+  /** Re-reads the run inside the lock (the pre-lock row may be stale). */
+  private async lockedRun(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    runId: string,
+  ) {
+    const run = await tx.cvDatasetImprovementRun.findFirst({
+      where: { tenantId, id: runId },
+    });
+    if (!run) {
+      throw new NotFoundException('Dataset improvement run not found');
+    }
+    return run;
+  }
+
+  /** Tenant-scoped validation of the three optional source links, plus
+   *  the evaluation/protocol LINEAGE rule: when both are linked, the
+   *  protocol must actually be bound to that same evaluation run. */
   private async validateSourceLinks(
     tenantId: string,
     links: {
@@ -351,10 +521,18 @@ export class CvDatasetService {
     if (links.sourceTestProtocolId) {
       const protocol = await this.prisma.cvTestProtocol.findFirst({
         where: { tenantId, id: links.sourceTestProtocolId },
-        select: { id: true },
+        select: { id: true, evaluationRunId: true },
       });
       if (!protocol) {
         throw new NotFoundException('Test protocol not found');
+      }
+      if (
+        links.sourceEvaluationRunId &&
+        protocol.evaluationRunId !== links.sourceEvaluationRunId
+      ) {
+        throw new BadRequestException(
+          `${DATASET_LINEAGE_MISMATCH}: the linked test protocol is bound to a different evaluation run`,
+        );
       }
     }
     if (links.sourceCalibrationProfileId) {
@@ -382,6 +560,34 @@ export class CvDatasetService {
         'trainSplitPercent + validationSplitPercent + testSplitPercent must sum to exactly 100',
       );
     }
+  }
+
+  /** Tenant-scoped camera lookup for the live sessions behind a set of
+   *  candidates (READ only — safe metadata, no source strings). */
+  private async sessionCameras(
+    tenantId: string,
+    sessionIds: string[],
+  ): Promise<Map<string, { cameraSourceId: string; sourceType: string }>> {
+    if (!sessionIds.length) {
+      return new Map();
+    }
+    const rows = await this.prisma.liveCameraSession.findMany({
+      where: { tenantId, id: { in: sessionIds } },
+      select: {
+        id: true,
+        cameraSourceId: true,
+        cameraSource: { select: { sourceType: true } },
+      },
+    });
+    return new Map(
+      rows.map((row) => [
+        row.id,
+        {
+          cameraSourceId: row.cameraSourceId,
+          sourceType: row.cameraSource?.sourceType ?? 'UNKNOWN',
+        },
+      ]),
+    );
   }
 
   // ------------------------------------------------------------------
@@ -559,7 +765,8 @@ export class CvDatasetService {
     return this.runDetail(tenantId, runId);
   }
 
-  /** DRAFT → READY (gated on the honest quality readiness) and
+  /** DRAFT → READY (gated on the honest, purpose-aware quality
+   *  readiness — re-checked under the run lock) and
    *  anything-but-ARCHIVED → ARCHIVED. EXPORTED is stamped only by the
    *  export endpoint. */
   async setStatus(
@@ -567,38 +774,40 @@ export class CvDatasetService {
     runId: string,
     status: CvDatasetImprovementRunStatus,
   ) {
-    const run = await this.requireRun(tenantId, runId);
+    await this.requireRun(tenantId, runId);
     if (status === CvDatasetImprovementRunStatus.ARCHIVED) {
-      if (run.status === CvDatasetImprovementRunStatus.ARCHIVED) {
-        throw new BadRequestException('run is already ARCHIVED');
-      }
-      await this.withRunLock(tenantId, runId, (tx) =>
-        tx.cvDatasetImprovementRun.updateMany({
+      await this.withRunLock(tenantId, runId, async (tx) => {
+        const current = await this.lockedRun(tx, tenantId, runId);
+        if (current.status === CvDatasetImprovementRunStatus.ARCHIVED) {
+          throw new BadRequestException('run is already ARCHIVED');
+        }
+        await tx.cvDatasetImprovementRun.updateMany({
           where: { tenantId, id: runId },
           data: {
             status: CvDatasetImprovementRunStatus.ARCHIVED,
             archivedAt: new Date(),
           },
-        }),
-      );
+        });
+      });
       return this.runDetail(tenantId, runId);
     }
     if (status === CvDatasetImprovementRunStatus.READY) {
-      if (run.status !== CvDatasetImprovementRunStatus.DRAFT) {
-        throw new BadRequestException('only DRAFT runs can become READY');
-      }
-      const internals = await this.qualityInternals(tenantId, run);
-      if (internals.readiness === 'NOT_READY') {
-        throw new BadRequestException(
-          'run is not ready: minimum reviewed data is missing',
-        );
-      }
-      await this.withRunLock(tenantId, runId, (tx) =>
-        tx.cvDatasetImprovementRun.updateMany({
+      await this.withRunLock(tenantId, runId, async (tx) => {
+        const current = await this.lockedRun(tx, tenantId, runId);
+        if (current.status !== CvDatasetImprovementRunStatus.DRAFT) {
+          throw new BadRequestException('only DRAFT runs can become READY');
+        }
+        const internals = await this.qualityInternals(tenantId, current, tx);
+        if (internals.readiness === 'NOT_READY') {
+          throw new BadRequestException(
+            'run is not ready: minimum reviewed data is missing',
+          );
+        }
+        await tx.cvDatasetImprovementRun.updateMany({
           where: { tenantId, id: runId },
           data: { status: CvDatasetImprovementRunStatus.READY },
-        }),
-      );
+        });
+      });
       return this.runDetail(tenantId, runId);
     }
     throw new BadRequestException('status must be READY or ARCHIVED');
@@ -608,12 +817,13 @@ export class CvDatasetService {
   // candidate collection (reviewed/corrected only)
   // ------------------------------------------------------------------
 
-  /** Rebuilds the candidate ledger from the linked sources. Candidates
-   *  are REFERENCES + safe snapshots; the source records are never
-   *  mutated. lightingBucket/occlusionBucket/calibrationZoneLabel stay
-   *  null in the MVP — no source data exists for them, and Phase 18
-   *  never fabricates values. DATASET_EXPORT_ITEM is reserved and never
-   *  emitted here. */
+  /** Derives the candidate seeds from the CURRENT linked sources.
+   *  Candidates are REFERENCES + safe snapshots; the source records are
+   *  never mutated. lightingBucket/occlusionBucket/calibrationZoneLabel
+   *  stay null in the MVP — no source data exists for them, and Phase
+   *  18 never fabricates values. DATASET_EXPORT_ITEM is reserved and
+   *  never emitted here. Also used by export to detect STALE candidate
+   *  ledgers. */
   private async collectCandidates(
     tenantId: string,
     run: CvDatasetImprovementRun,
@@ -633,70 +843,131 @@ export class CvDatasetService {
           liveSessionId: observation.liveSessionId,
           evaluationRunId: run.sourceEvaluationRunId,
           protocolId: null,
+          calibrationProfileId: null,
           actionLabel: predictedAction,
           reviewSource: 'PILOT_EVALUATION',
           confidenceBucket: confidenceBucketOf(observation.matchScore),
           scenarioTypeSnapshot: null,
         };
+        const excluded = (
+          verdict: string,
+          exclusionReason: string,
+        ): CandidateSeed => ({
+          ...base,
+          skuId: observation.predictedProductId,
+          skuCodeSnapshot: observation.predictedSku,
+          correctedActionLabel: null,
+          reviewVerdict: verdict,
+          eligibility: CvDatasetEligibility.EXCLUDED,
+          exclusionReason,
+        });
         if (!review) {
+          seeds.push(excluded('UNREVIEWED', 'NOT_REVIEWED'));
+          continue;
+        }
+        if (review.verdict === PilotObservationVerdict.CORRECT) {
           seeds.push({
             ...base,
             skuId: observation.predictedProductId,
             skuCodeSnapshot: observation.predictedSku,
             correctedActionLabel: null,
-            reviewVerdict: 'UNREVIEWED',
-            eligibility: CvDatasetEligibility.EXCLUDED,
-            exclusionReason: 'NOT_REVIEWED',
-          });
-          continue;
-        }
-        if (ELIGIBLE_LIVE_VERDICTS.includes(review.verdict)) {
-          const isCorrect = review.verdict === PilotObservationVerdict.CORRECT;
-          const isFalseTouch =
-            review.verdict === PilotObservationVerdict.FALSE_TOUCH;
-          seeds.push({
-            ...base,
-            // The LABEL: operator-confirmed (CORRECT → the prediction) or
-            // operator-corrected (everything else → the review's truth).
-            skuId: isCorrect
-              ? observation.predictedProductId
-              : review.expectedProductId,
-            skuCodeSnapshot: isCorrect
-              ? observation.predictedSku
-              : review.expectedSku,
-            correctedActionLabel: isFalseTouch
-              ? PilotExpectedAction.NO_OP
-              : review.verdict === PilotObservationVerdict.WRONG_ACTION
-                ? review.expectedAction
-                : null,
             reviewVerdict: review.verdict,
             eligibility: CvDatasetEligibility.ELIGIBLE,
             exclusionReason: null,
           });
           continue;
         }
-        seeds.push({
-          ...base,
-          skuId: observation.predictedProductId,
-          skuCodeSnapshot: observation.predictedSku,
-          correctedActionLabel: null,
-          reviewVerdict: review.verdict,
-          eligibility: CvDatasetEligibility.EXCLUDED,
-          exclusionReason:
+        if (review.verdict === PilotObservationVerdict.FALSE_TOUCH) {
+          // A confirmed false touch is a reviewed corrected NEGATIVE.
+          seeds.push({
+            ...base,
+            skuId: observation.predictedProductId,
+            skuCodeSnapshot: observation.predictedSku,
+            correctedActionLabel: PilotExpectedAction.NO_OP,
+            reviewVerdict: review.verdict,
+            eligibility: CvDatasetEligibility.ELIGIBLE,
+            exclusionReason: null,
+          });
+          continue;
+        }
+        if (review.verdict === PilotObservationVerdict.WRONG_SKU) {
+          // A correction verdict needs a REAL correction: a corrected
+          // SKU that exists and differs from the prediction.
+          const correctedSku = review.expectedSku ?? null;
+          const correctedProductId = review.expectedProductId ?? null;
+          if (!correctedSku && !correctedProductId) {
+            seeds.push(excluded(review.verdict, 'MISSING_CORRECTED_SKU'));
+            continue;
+          }
+          const sameSku =
+            correctedSku !== null &&
+            observation.predictedSku !== null &&
+            correctedSku === observation.predictedSku;
+          const sameProduct =
+            correctedSku === null &&
+            correctedProductId !== null &&
+            observation.predictedProductId !== null &&
+            correctedProductId === observation.predictedProductId;
+          if (sameSku || sameProduct) {
+            seeds.push(excluded(review.verdict, 'CORRECTION_NOT_DIFFERENT'));
+            continue;
+          }
+          seeds.push({
+            ...base,
+            skuId: correctedProductId,
+            skuCodeSnapshot: correctedSku,
+            correctedActionLabel: null,
+            reviewVerdict: review.verdict,
+            eligibility: CvDatasetEligibility.ELIGIBLE,
+            exclusionReason: null,
+          });
+          continue;
+        }
+        if (review.verdict === PilotObservationVerdict.WRONG_ACTION) {
+          // A corrected action must be a usable label (never UNKNOWN)
+          // and must actually differ from the prediction.
+          const corrected = review.expectedAction;
+          if (!USABLE_ACTION_LABELS.includes(corrected)) {
+            seeds.push(excluded(review.verdict, 'MISSING_CORRECTED_ACTION'));
+            continue;
+          }
+          if (corrected === predictedAction) {
+            seeds.push(excluded(review.verdict, 'CORRECTION_NOT_DIFFERENT'));
+            continue;
+          }
+          seeds.push({
+            ...base,
+            skuId: review.expectedProductId ?? observation.predictedProductId,
+            skuCodeSnapshot: review.expectedSku ?? observation.predictedSku,
+            correctedActionLabel: corrected,
+            reviewVerdict: review.verdict,
+            eligibility: CvDatasetEligibility.ELIGIBLE,
+            exclusionReason: null,
+          });
+          continue;
+        }
+        seeds.push(
+          excluded(
+            review.verdict,
             review.verdict === PilotObservationVerdict.UNCERTAIN
               ? 'UNCERTAIN_VERDICT'
               : 'INCORRECT_VERDICT',
-        });
+          ),
+        );
       }
       for (const missed of missedEvents) {
-        // A missed event is a reviewed ground-truth interaction the CV
-        // never produced — recall evidence, referenced by its review id.
+        // A missed-event review names a session and a label but carries
+        // NO temporal/evidence locator (the review timestamp is when the
+        // operator wrote it, not when the interaction happened). An
+        // offline trainer cannot map it to footage, so it is EXCLUDED —
+        // counted, surfaced, never pretended training-ready.
         seeds.push({
           sourceType: CvDatasetCandidateSourceType.MISSED_EVENT,
           sourceId: missed.reviewId,
           liveSessionId: missed.liveSessionId,
           evaluationRunId: run.sourceEvaluationRunId,
           protocolId: null,
+          calibrationProfileId: null,
           skuId: missed.expectedProductId,
           skuCodeSnapshot: missed.expectedSku,
           actionLabel: missed.expectedAction,
@@ -705,19 +976,30 @@ export class CvDatasetService {
           reviewSource: 'PILOT_EVALUATION',
           confidenceBucket: null,
           scenarioTypeSnapshot: null,
-          eligibility: CvDatasetEligibility.ELIGIBLE,
-          exclusionReason: null,
+          eligibility: CvDatasetEligibility.EXCLUDED,
+          exclusionReason: 'MISSING_EVIDENCE_LOCATOR',
         });
       }
     }
     if (run.sourceTestProtocolId) {
       const protocol = await this.prisma.cvTestProtocol.findFirst({
         where: { tenantId, id: run.sourceTestProtocolId },
-        select: { id: true },
+        select: { id: true, evaluationRunId: true },
       });
       if (!protocol) {
         throw new NotFoundException('Test protocol not found');
       }
+      // LINEAGE: scenario evidence belongs to the protocol's OWN
+      // evaluation run — never to an unrelated linked run.
+      if (
+        run.sourceEvaluationRunId &&
+        protocol.evaluationRunId !== run.sourceEvaluationRunId
+      ) {
+        throw new BadRequestException(
+          `${DATASET_LINEAGE_MISMATCH}: the linked test protocol is bound to a different evaluation run`,
+        );
+      }
+      const scenarioEvaluationRunId = protocol.evaluationRunId ?? null;
       const scenarios = await this.prisma.cvTestProtocolScenario.findMany({
         where: { tenantId, protocolId: run.sourceTestProtocolId },
         orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
@@ -729,8 +1011,9 @@ export class CvDatasetService {
           sourceType: CvDatasetCandidateSourceType.PROTOCOL_SCENARIO,
           sourceId: scenario.id,
           liveSessionId: scenario.liveSessionId,
-          evaluationRunId: run.sourceEvaluationRunId,
+          evaluationRunId: scenarioEvaluationRunId,
           protocolId: run.sourceTestProtocolId,
+          calibrationProfileId: null,
           skuId: scenario.expectedProductId,
           skuCodeSnapshot: scenario.expectedSku,
           actionLabel: scenario.expectedAction,
@@ -750,30 +1033,73 @@ export class CvDatasetService {
         });
       }
     }
+    // Calibration stamping: the linked profile must describe the camera
+    // the footage actually came from. FILE_REPLAY sessions are exempt
+    // (calibration is NOT_APPLICABLE to them) and never stamped.
+    const sessionIds = [
+      ...new Set(
+        seeds
+          .map((seed) => seed.liveSessionId)
+          .filter((id): id is string => id !== null),
+      ),
+    ];
+    const cameras = await this.sessionCameras(tenantId, sessionIds);
+    if (run.sourceCalibrationProfileId) {
+      const profile = await this.prisma.cameraCalibrationProfile.findFirst({
+        where: { tenantId, id: run.sourceCalibrationProfileId },
+        select: { id: true, cameraSourceId: true },
+      });
+      if (!profile) {
+        throw new NotFoundException('Calibration profile not found');
+      }
+      for (const camera of cameras.values()) {
+        if (
+          camera.sourceType !== 'FILE_REPLAY' &&
+          camera.cameraSourceId !== profile.cameraSourceId
+        ) {
+          throw new BadRequestException(
+            `${DATASET_CALIBRATION_MISMATCH}: the linked calibration profile belongs to a different camera than the run's live sessions`,
+          );
+        }
+      }
+      for (const seed of seeds) {
+        const camera = seed.liveSessionId
+          ? cameras.get(seed.liveSessionId)
+          : undefined;
+        seed.calibrationProfileId =
+          camera &&
+          camera.sourceType !== 'FILE_REPLAY' &&
+          camera.cameraSourceId === profile.cameraSourceId
+            ? profile.id
+            : null;
+      }
+    }
     return seeds;
   }
 
-  /** Delete + rebuild the candidate ledger (never touches the source
-   *  records). Zero linked sources → zero rows, reported plainly. */
+  /** Delete + rebuild the candidate ledger under the run lock (never
+   *  touches the source records). Zero linked sources → zero rows,
+   *  reported plainly. Rejected once EXPORTED — the exported snapshot
+   *  must keep describing the manifest that was handed out. */
   async refreshCandidates(tenantId: string, runId: string) {
-    const run = await this.requireRun(tenantId, runId);
-    if (
-      run.status === CvDatasetImprovementRunStatus.ARCHIVED ||
-      run.status === CvDatasetImprovementRunStatus.EXPORTED
-    ) {
-      throw new BadRequestException(
-        `candidates cannot be refreshed on a ${run.status} run`,
-      );
-    }
-    const seeds = await this.collectCandidates(tenantId, run);
-    await this.withRunLock(tenantId, runId, async (tx) => {
+    await this.requireRun(tenantId, runId);
+    return this.withRunLock(tenantId, runId, async (tx) => {
+      const run = await this.lockedRun(tx, tenantId, runId);
+      if (
+        run.status === CvDatasetImprovementRunStatus.ARCHIVED ||
+        run.status === CvDatasetImprovementRunStatus.EXPORTED
+      ) {
+        throw new BadRequestException(
+          `candidates cannot be refreshed on a ${run.status} run`,
+        );
+      }
+      const seeds = await this.collectCandidates(tenantId, run);
       await tx.cvDatasetCandidate.deleteMany({ where: { tenantId, runId } });
       if (seeds.length) {
         await tx.cvDatasetCandidate.createMany({
           data: seeds.map((seed) => ({
             tenantId,
             runId,
-            calibrationProfileId: run.sourceCalibrationProfileId,
             lightingBucket: null,
             occlusionBucket: null,
             calibrationZoneLabel: null,
@@ -782,16 +1108,16 @@ export class CvDatasetService {
           })),
         });
       }
+      const eligible = seeds.filter(
+        (seed) => seed.eligibility === CvDatasetEligibility.ELIGIBLE,
+      ).length;
+      return {
+        runId,
+        total: seeds.length,
+        eligible,
+        excluded: seeds.length - eligible,
+      };
     });
-    const eligible = seeds.filter(
-      (seed) => seed.eligibility === CvDatasetEligibility.ELIGIBLE,
-    ).length;
-    return {
-      runId,
-      total: seeds.length,
-      eligible,
-      excluded: seeds.length - eligible,
-    };
   }
 
   async listCandidates(
@@ -819,8 +1145,9 @@ export class CvDatasetService {
   private async qualityInternals(
     tenantId: string,
     run: CvDatasetImprovementRun,
+    db: Prisma.TransactionClient | PrismaService = this.prisma,
   ) {
-    const candidates = await this.prisma.cvDatasetCandidate.findMany({
+    const candidates = await db.cvDatasetCandidate.findMany({
       where: { tenantId, runId: run.id },
     });
     const eligible = candidates.filter(
@@ -856,12 +1183,44 @@ export class CvDatasetService {
     const profileCounts = countBy(
       eligible.map((row) => row.calibrationProfileId),
     );
-    const missedEventCount = eligible.filter(
+    // Missed events are counted whether or not they are ELIGIBLE — in
+    // the MVP they are all EXCLUDED (no evidence locator), but they are
+    // still the run's recall evidence and must stay visible.
+    const missedEventCount = candidates.filter(
       (row) => row.sourceType === CvDatasetCandidateSourceType.MISSED_EVENT,
     ).length;
     const falseTouchCount = eligible.filter(
       (row) => row.reviewVerdict === PilotObservationVerdict.FALSE_TOUCH,
     ).length;
+
+    // INDEPENDENT-GROUP coverage: one session with many near-duplicate
+    // examples is ONE unit of evidence, not many.
+    const skuGroups = new Map<string, Set<string>>();
+    const actionGroups = new Map<string, Set<string>>();
+    const skuSplits = new Map<string, Set<string>>();
+    const actionSplits = new Map<string, Set<string>>();
+    for (const row of eligible) {
+      const groupKey = groupKeyOf(row);
+      const action = effectiveAction(row);
+      if (row.skuCodeSnapshot) {
+        const groups = skuGroups.get(row.skuCodeSnapshot) ?? new Set<string>();
+        groups.add(groupKey);
+        skuGroups.set(row.skuCodeSnapshot, groups);
+        if (row.split) {
+          const splits = skuSplits.get(row.skuCodeSnapshot) ?? new Set<string>();
+          splits.add(row.split);
+          skuSplits.set(row.skuCodeSnapshot, splits);
+        }
+      }
+      const groups = actionGroups.get(action) ?? new Set<string>();
+      groups.add(groupKey);
+      actionGroups.set(action, groups);
+      if (row.split) {
+        const splits = actionSplits.get(action) ?? new Set<string>();
+        splits.add(row.split);
+        actionSplits.set(action, splits);
+      }
+    }
 
     // Confusion pairs come verbatim from the Phase 15 summary — never
     // recomputed here, null when no evaluation run is linked (or the
@@ -889,6 +1248,7 @@ export class CvDatasetService {
       .map(([sku, count]) => ({
         sku,
         count,
+        groups: skuGroups.get(sku)?.size ?? 0,
         minimum: run.minReviewedExamplesPerSku,
       }))
       .sort((a, b) => a.count - b.count);
@@ -897,20 +1257,45 @@ export class CvDatasetService {
       .map(([action, count]) => ({
         action,
         count,
+        groups: actionGroups.get(action)?.size ?? 0,
         minimum: run.minReviewedExamplesPerAction,
       }))
       .sort((a, b) => a.count - b.count);
 
     const imbalanceWarnings: string[] = [];
-    const skuLabeled = [...skuCounts.values()].reduce((a, b) => a + b, 0);
+    const skuLabeledTotal = [...skuCounts.values()].reduce((a, b) => a + b, 0);
     const topSku = Math.max(0, ...skuCounts.values());
-    if (skuCounts.size > 1 && topSku > skuLabeled * 0.5) {
+    if (skuCounts.size > 1 && topSku > skuLabeledTotal * 0.5) {
       imbalanceWarnings.push('SKU_IMBALANCE');
     }
-    const actionLabeled = [...actionCounts.values()].reduce((a, b) => a + b, 0);
+    const actionLabeledTotal = [...actionCounts.values()].reduce(
+      (a, b) => a + b,
+      0,
+    );
     const topAction = Math.max(0, ...actionCounts.values());
-    if (actionCounts.size > 1 && topAction > actionLabeled * 0.5) {
+    if (actionCounts.size > 1 && topAction > actionLabeledTotal * 0.5) {
       imbalanceWarnings.push('ACTION_IMBALANCE');
+    }
+
+    // Purpose-aware label check: READY must mean "ready FOR this task".
+    const families = labelFamilies(eligible);
+    const purposeCheck = purposeLabelCheck(run.purpose, families);
+    imbalanceWarnings.push(...purposeCheck.warnings);
+
+    // Durable small-dataset warning (not just a planner note).
+    if (eligible.length > 0 && eligible.length < SMALL_DATASET_THRESHOLD) {
+      imbalanceWarnings.push('SMALL_DATASET');
+    }
+    const lowGroupCoverage =
+      [...skuGroups.entries()].some(
+        ([sku, groups]) => (skuCounts.get(sku) ?? 0) >= 2 && groups.size === 1,
+      ) ||
+      [...actionGroups.entries()].some(
+        ([action, groups]) =>
+          (actionCounts.get(action) ?? 0) >= 2 && groups.size === 1,
+      );
+    if (lowGroupCoverage) {
+      imbalanceWarnings.push('LOW_INDEPENDENT_GROUP_COVERAGE');
     }
 
     const leakageWarnings: string[] = [];
@@ -931,8 +1316,64 @@ export class CvDatasetService {
       leakageWarnings.push('SAME_SESSION_ACROSS_SPLITS');
     }
 
+    // Requested-split completeness and per-class split coverage,
+    // re-derived from the PERSISTED rows so the warnings are durable.
+    let requestedSplitEmpty = false;
+    if (splitsPlanned) {
+      const inSplit = (split: CvDatasetSplit) =>
+        eligible.filter((row) => row.split === split).length;
+      if (
+        run.validationSplitPercent > 0 &&
+        inSplit(CvDatasetSplit.VALIDATION) === 0
+      ) {
+        leakageWarnings.push('REQUESTED_VALIDATION_SPLIT_EMPTY');
+        requestedSplitEmpty = true;
+      }
+      if (run.testSplitPercent > 0 && inSplit(CvDatasetSplit.TEST) === 0) {
+        leakageWarnings.push('REQUESTED_TEST_SPLIT_EMPTY');
+        requestedSplitEmpty = true;
+      }
+      const classMissing = (
+        splitsByClass: Map<string, Set<string>>,
+        groupsByClass: Map<string, Set<string>>,
+      ) => {
+        let missingTrain = false;
+        let missingValidation = false;
+        let missingTest = false;
+        for (const [cls, splits] of splitsByClass) {
+          if (!splits.has(CvDatasetSplit.TRAIN)) {
+            missingTrain = true;
+          }
+          const groups = groupsByClass.get(cls)?.size ?? 0;
+          if (groups >= 3) {
+            if (
+              run.validationSplitPercent > 0 &&
+              !splits.has(CvDatasetSplit.VALIDATION)
+            ) {
+              missingValidation = true;
+            }
+            if (run.testSplitPercent > 0 && !splits.has(CvDatasetSplit.TEST)) {
+              missingTest = true;
+            }
+          }
+        }
+        return { missingTrain, missingValidation, missingTest };
+      };
+      const sku = classMissing(skuSplits, skuGroups);
+      const action = classMissing(actionSplits, actionGroups);
+      if (sku.missingTrain || action.missingTrain) {
+        leakageWarnings.push('CLASS_MISSING_TRAIN_SPLIT');
+      }
+      if (sku.missingValidation || action.missingValidation) {
+        leakageWarnings.push('CLASS_MISSING_VALIDATION_SPLIT');
+      }
+      if (sku.missingTest || action.missingTest) {
+        leakageWarnings.push('CLASS_MISSING_TEST_SPLIT');
+      }
+    }
+
     const readiness: DatasetReadiness =
-      eligible.length === 0
+      eligible.length === 0 || !purposeCheck.satisfied || requestedSplitEmpty
         ? 'NOT_READY'
         : lowCoverageSkus.length ||
             lowCoverageActions.length ||
@@ -940,6 +1381,21 @@ export class CvDatasetService {
             leakageWarnings.length
           ? 'WARNING'
           : 'READY';
+
+    // Which cameras is this run's footage actually from? FILE_REPLAY
+    // sources do not need calibration (Phase 17: NOT_APPLICABLE), so
+    // calibration advice only applies when a live camera is involved.
+    const sessionIds = [
+      ...new Set(
+        candidates
+          .map((row) => row.liveSessionId)
+          .filter((id): id is string => id !== null),
+      ),
+    ];
+    const cameras = await this.sessionCameras(tenantId, sessionIds);
+    const hasLiveCamera = [...cameras.values()].some(
+      (camera) => camera.sourceType !== 'FILE_REPLAY',
+    );
 
     const notReviewedCount = excluded.filter(
       (row) => row.exclusionReason === 'NOT_REVIEWED',
@@ -970,7 +1426,7 @@ export class CvDatasetService {
     if (!run.sourceTestProtocolId || !eligibleProtocol) {
       recommendedNextActions.push('RUN_MORE_PHASE16_PROTOCOLS');
     }
-    if (!run.sourceCalibrationProfileId) {
+    if (!run.sourceCalibrationProfileId && hasLiveCamera) {
       recommendedNextActions.push('IMPROVE_CAMERA_CALIBRATION');
     }
     if (readiness === 'READY' && splitsPlanned) {
@@ -1005,6 +1461,9 @@ export class CvDatasetService {
       imbalanceWarnings,
       leakageWarnings,
       splitsPlanned,
+      requestedSplitEmpty,
+      families,
+      purposeSatisfied: purposeCheck.satisfied,
       readiness,
       recommendedNextActions,
       toSorted,
@@ -1050,110 +1509,220 @@ export class CvDatasetService {
   // ------------------------------------------------------------------
 
   /** Deterministic split assignment: examples from the SAME live session
-   *  share a hash group (leakage guard), the group's sha256 bucket picks
-   *  the split against the run's percentages, and low-coverage classes
-   *  are forced WHOLE-GROUP into TRAIN with a warning rather than
-   *  pretending a 2-example test set means anything. HOLDOUT is never
-   *  auto-assigned in the MVP. Only this run's candidate rows are
+   *  share a hash group (leakage guard), the group's sha256 bucket —
+   *  keyed by tenant + group identity only, so the same source group
+   *  gets the same split in EVERY dataset run and replan — picks the
+   *  split against the run's percentages. Low-coverage classes are
+   *  forced WHOLE-GROUP into TRAIN with a warning, any class that would
+   *  otherwise have no TRAIN examples is pulled into TRAIN, and empty
+   *  requested splits are flagged rather than glossed over. HOLDOUT is
+   *  never auto-assigned in the MVP. Only this run's candidate rows are
    *  updated — review/scenario/source records are never mutated. */
   async planSplits(tenantId: string, runId: string) {
-    const run = await this.requireRun(tenantId, runId);
-    if (
-      run.status !== CvDatasetImprovementRunStatus.DRAFT &&
-      run.status !== CvDatasetImprovementRunStatus.READY
-    ) {
-      throw new BadRequestException(
-        `splits cannot be planned on a ${run.status} run`,
-      );
-    }
-    const candidates = await this.prisma.cvDatasetCandidate.findMany({
-      where: { tenantId, runId },
-    });
-    const eligible = candidates.filter(
-      (row) => row.eligibility === CvDatasetEligibility.ELIGIBLE,
-    );
-    if (eligible.length === 0) {
-      throw new BadRequestException(
-        'no eligible candidates — refresh candidates first',
-      );
-    }
-
-    const skuCounts = new Map<string, number>();
-    const actionCounts = new Map<string, number>();
-    for (const row of eligible) {
-      if (row.skuCodeSnapshot) {
-        skuCounts.set(
-          row.skuCodeSnapshot,
-          (skuCounts.get(row.skuCodeSnapshot) ?? 0) + 1,
+    await this.requireRun(tenantId, runId);
+    return this.withRunLock(tenantId, runId, async (tx) => {
+      const run = await this.lockedRun(tx, tenantId, runId);
+      if (
+        run.status !== CvDatasetImprovementRunStatus.DRAFT &&
+        run.status !== CvDatasetImprovementRunStatus.READY
+      ) {
+        throw new BadRequestException(
+          `splits cannot be planned on a ${run.status} run`,
         );
       }
-      const action = effectiveAction(row);
-      actionCounts.set(action, (actionCounts.get(action) ?? 0) + 1);
-    }
-    const lowSkus = new Set(
-      [...skuCounts.entries()]
-        .filter(([, count]) => count < run.minReviewedExamplesPerSku)
-        .map(([sku]) => sku),
-    );
-    const lowActions = new Set(
-      [...actionCounts.entries()]
-        .filter(([, count]) => count < run.minReviewedExamplesPerAction)
-        .map(([action]) => action),
-    );
-
-    // Same live session → same group → same split (leakage guard).
-    const groups = new Map<string, CvDatasetCandidate[]>();
-    for (const row of eligible) {
-      const groupKey = row.liveSessionId ?? `solo:${row.sourceId}`;
-      const rows = groups.get(groupKey) ?? [];
-      rows.push(row);
-      groups.set(groupKey, rows);
-    }
-
-    const trainCeiling = run.trainSplitPercent * (SPLIT_BUCKET_SPACE / 100);
-    const validationCeiling =
-      (run.trainSplitPercent + run.validationSplitPercent) *
-      (SPLIT_BUCKET_SPACE / 100);
-    const warnings = new Set<string>();
-    const assignment = new Map<CvDatasetSplit, string[]>([
-      [CvDatasetSplit.TRAIN, []],
-      [CvDatasetSplit.VALIDATION, []],
-      [CvDatasetSplit.TEST, []],
-    ]);
-    for (const [groupKey, rows] of groups) {
-      const bucket = splitBucket(`${tenantId}:${runId}:${groupKey}`);
-      let split: CvDatasetSplit =
-        bucket < trainCeiling
-          ? CvDatasetSplit.TRAIN
-          : bucket < validationCeiling
-            ? CvDatasetSplit.VALIDATION
-            : CvDatasetSplit.TEST;
-      const touchesLowSku = rows.some(
-        (row) => row.skuCodeSnapshot && lowSkus.has(row.skuCodeSnapshot),
+      const candidates = await tx.cvDatasetCandidate.findMany({
+        where: { tenantId, runId },
+      });
+      const eligible = candidates.filter(
+        (row) => row.eligibility === CvDatasetEligibility.ELIGIBLE,
       );
-      const touchesLowAction = rows.some((row) =>
-        lowActions.has(effectiveAction(row)),
+      if (eligible.length === 0) {
+        throw new BadRequestException(
+          'no eligible candidates — refresh candidates first',
+        );
+      }
+
+      const skuCounts = new Map<string, number>();
+      const actionCounts = new Map<string, number>();
+      for (const row of eligible) {
+        if (row.skuCodeSnapshot) {
+          skuCounts.set(
+            row.skuCodeSnapshot,
+            (skuCounts.get(row.skuCodeSnapshot) ?? 0) + 1,
+          );
+        }
+        const action = effectiveAction(row);
+        actionCounts.set(action, (actionCounts.get(action) ?? 0) + 1);
+      }
+      const lowSkus = new Set(
+        [...skuCounts.entries()]
+          .filter(([, count]) => count < run.minReviewedExamplesPerSku)
+          .map(([sku]) => sku),
       );
-      if (touchesLowSku || touchesLowAction) {
-        // Too few examples of this class to spread across splits: keep
-        // the whole group in TRAIN and say so, instead of shipping a
-        // test set whose per-class quality would be meaningless.
+      const lowActions = new Set(
+        [...actionCounts.entries()]
+          .filter(([, count]) => count < run.minReviewedExamplesPerAction)
+          .map(([action]) => action),
+      );
+
+      // Same live session → same group → same split (leakage guard).
+      const groups = new Map<string, CvDatasetCandidate[]>();
+      for (const row of eligible) {
+        const groupKey = groupKeyOf(row);
+        const rows = groups.get(groupKey) ?? [];
+        rows.push(row);
+        groups.set(groupKey, rows);
+      }
+
+      const trainCeiling = run.trainSplitPercent * (SPLIT_BUCKET_SPACE / 100);
+      const validationCeiling =
+        (run.trainSplitPercent + run.validationSplitPercent) *
+        (SPLIT_BUCKET_SPACE / 100);
+      const warnings = new Set<string>();
+      const splitByGroup = new Map<string, CvDatasetSplit>();
+
+      // (a) base hash assignment — the key deliberately has NO run id,
+      // so the same source group is stable across dataset runs (#7).
+      for (const groupKey of groups.keys()) {
+        const bucket = splitBucket(`${tenantId}:${groupKey}`);
+        splitByGroup.set(
+          groupKey,
+          bucket < trainCeiling
+            ? CvDatasetSplit.TRAIN
+            : bucket < validationCeiling
+              ? CvDatasetSplit.VALIDATION
+              : CvDatasetSplit.TEST,
+        );
+      }
+
+      // (b) low-coverage classes: too few examples to spread across
+      // splits — keep every touching group in TRAIN and say so, instead
+      // of shipping a test set whose per-class quality is meaningless.
+      for (const [groupKey, rows] of groups) {
+        const touchesLowSku = rows.some(
+          (row) => row.skuCodeSnapshot && lowSkus.has(row.skuCodeSnapshot),
+        );
+        const touchesLowAction = rows.some((row) =>
+          lowActions.has(effectiveAction(row)),
+        );
         if (touchesLowSku) {
           warnings.add('LOW_COVERAGE_SKU_FORCED_TRAIN');
         }
         if (touchesLowAction) {
           warnings.add('LOW_COVERAGE_ACTION_FORCED_TRAIN');
         }
-        split = CvDatasetSplit.TRAIN;
+        if (touchesLowSku || touchesLowAction) {
+          splitByGroup.set(groupKey, CvDatasetSplit.TRAIN);
+        }
       }
-      assignment.get(split)!.push(...rows.map((row) => row.id));
-    }
-    if (eligible.length < SMALL_DATASET_THRESHOLD) {
-      warnings.add('SMALL_DATASET');
-    }
 
-    await this.withRunLock(tenantId, runId, async (tx) => {
-      for (const [split, ids] of assignment) {
+      // (c) TRAIN guarantee: a class the hash sent entirely to
+      // VALIDATION/TEST would be untrainable — pull its groups into
+      // TRAIN (deterministic class order) and warn.
+      const groupKeysForClass = (
+        matches: (row: CvDatasetCandidate) => boolean,
+      ) => {
+        const keys: string[] = [];
+        for (const [groupKey, rows] of groups) {
+          if (rows.some(matches)) {
+            keys.push(groupKey);
+          }
+        }
+        return keys;
+      };
+      const forceClassIntoTrain = (
+        classes: string[],
+        matches: (cls: string, row: CvDatasetCandidate) => boolean,
+      ) => {
+        for (const cls of [...classes].sort()) {
+          const keys = groupKeysForClass((row) => matches(cls, row));
+          if (
+            keys.length &&
+            !keys.some(
+              (key) => splitByGroup.get(key) === CvDatasetSplit.TRAIN,
+            )
+          ) {
+            warnings.add('CLASS_MISSING_TRAIN_SPLIT');
+            for (const key of keys) {
+              splitByGroup.set(key, CvDatasetSplit.TRAIN);
+            }
+          }
+        }
+      };
+      forceClassIntoTrain(
+        [...skuCounts.keys()],
+        (cls, row) => row.skuCodeSnapshot === cls,
+      );
+      forceClassIntoTrain(
+        [...actionCounts.keys()],
+        (cls, row) => effectiveAction(row) === cls,
+      );
+
+      // (d) requested-split completeness (honesty about what the
+      // percentages actually produced) and per-class evaluation-split
+      // representation for classes with enough independent groups.
+      const splitSummary = { TRAIN: 0, VALIDATION: 0, TEST: 0, HOLDOUT: 0 };
+      for (const [groupKey, rows] of groups) {
+        splitSummary[splitByGroup.get(groupKey)!] += rows.length;
+      }
+      const requestedNonzero = [
+        run.trainSplitPercent,
+        run.validationSplitPercent,
+        run.testSplitPercent,
+      ].filter((percent) => percent > 0).length;
+      if (groups.size < requestedNonzero) {
+        warnings.add('INSUFFICIENT_GROUPS_FOR_REQUESTED_SPLITS');
+      }
+      if (run.validationSplitPercent > 0 && splitSummary.VALIDATION === 0) {
+        warnings.add('REQUESTED_VALIDATION_SPLIT_EMPTY');
+      }
+      if (run.testSplitPercent > 0 && splitSummary.TEST === 0) {
+        warnings.add('REQUESTED_TEST_SPLIT_EMPTY');
+      }
+      const classSplitWarnings = (
+        classes: string[],
+        matches: (cls: string, row: CvDatasetCandidate) => boolean,
+      ) => {
+        for (const cls of classes) {
+          const keys = groupKeysForClass((row) => matches(cls, row));
+          if (keys.length < 3) {
+            continue;
+          }
+          const splits = new Set(keys.map((key) => splitByGroup.get(key)));
+          if (
+            run.validationSplitPercent > 0 &&
+            !splits.has(CvDatasetSplit.VALIDATION)
+          ) {
+            warnings.add('CLASS_MISSING_VALIDATION_SPLIT');
+          }
+          if (run.testSplitPercent > 0 && !splits.has(CvDatasetSplit.TEST)) {
+            warnings.add('CLASS_MISSING_TEST_SPLIT');
+          }
+        }
+      };
+      classSplitWarnings(
+        [...skuCounts.keys()],
+        (cls, row) => row.skuCodeSnapshot === cls,
+      );
+      classSplitWarnings(
+        [...actionCounts.keys()],
+        (cls, row) => effectiveAction(row) === cls,
+      );
+      if (eligible.length < SMALL_DATASET_THRESHOLD) {
+        warnings.add('SMALL_DATASET');
+      }
+
+      const idsBySplit = new Map<CvDatasetSplit, string[]>([
+        [CvDatasetSplit.TRAIN, []],
+        [CvDatasetSplit.VALIDATION, []],
+        [CvDatasetSplit.TEST, []],
+      ]);
+      for (const [groupKey, rows] of groups) {
+        idsBySplit
+          .get(splitByGroup.get(groupKey)!)!
+          .push(...rows.map((row) => row.id));
+      }
+      for (const [split, ids] of idsBySplit) {
         if (ids.length) {
           await tx.cvDatasetCandidate.updateMany({
             where: { tenantId, runId, id: { in: ids } },
@@ -1161,169 +1730,242 @@ export class CvDatasetService {
           });
         }
       }
+      return {
+        runId,
+        splitSummary,
+        groupCount: groups.size,
+        warnings: [...warnings].sort(),
+      };
     });
-    return {
-      runId,
-      splitSummary: {
-        TRAIN: assignment.get(CvDatasetSplit.TRAIN)!.length,
-        VALIDATION: assignment.get(CvDatasetSplit.VALIDATION)!.length,
-        TEST: assignment.get(CvDatasetSplit.TEST)!.length,
-        HOLDOUT: 0,
-      },
-      groupCount: groups.size,
-      warnings: [...warnings].sort(),
-    };
   }
 
   // ------------------------------------------------------------------
   // export manifest
   // ------------------------------------------------------------------
 
+  /** Detects a candidate ledger that no longer matches the CURRENT
+   *  source records (a newer review flipped a verdict, a scenario was
+   *  re-recorded, a new eligible row appeared). The export must never
+   *  ship obsolete labels. */
+  private async assertCandidatesFresh(
+    tenantId: string,
+    run: CvDatasetImprovementRun,
+    stored: CvDatasetCandidate[],
+  ) {
+    const seeds = await this.collectCandidates(tenantId, run);
+    const keyOf = (row: { sourceType: string; sourceId: string }) =>
+      `${row.sourceType}:${row.sourceId}`;
+    const seedByKey = new Map(seeds.map((seed) => [keyOf(seed), seed]));
+    const storedKeys = new Set(stored.map((row) => keyOf(row)));
+    let stale = false;
+    for (const row of stored) {
+      if (row.eligibility !== CvDatasetEligibility.ELIGIBLE) {
+        continue;
+      }
+      const seed = seedByKey.get(keyOf(row));
+      if (
+        !seed ||
+        seed.eligibility !== CvDatasetEligibility.ELIGIBLE ||
+        seed.skuId !== row.skuId ||
+        seed.skuCodeSnapshot !== row.skuCodeSnapshot ||
+        seed.actionLabel !== row.actionLabel ||
+        seed.correctedActionLabel !== row.correctedActionLabel ||
+        seed.reviewVerdict !== row.reviewVerdict
+      ) {
+        stale = true;
+        break;
+      }
+    }
+    if (!stale) {
+      for (const seed of seeds) {
+        if (
+          seed.eligibility === CvDatasetEligibility.ELIGIBLE &&
+          !storedKeys.has(keyOf(seed))
+        ) {
+          stale = true;
+          break;
+        }
+      }
+    }
+    if (stale) {
+      throw new BadRequestException(
+        `${DATASET_STALE_CANDIDATES}: source reviews or scenario results changed after the last refresh — refresh candidates and re-plan splits before exporting`,
+      );
+    }
+  }
+
   /** Safe JSON manifest for OFFLINE training: references, labels, and
-   *  controlled metadata only. Requires READY (or a re-export from
-   *  EXPORTED) and a complete split plan; stamps EXPORTED. */
+   *  controlled metadata only. The ENTIRE export — status check,
+   *  candidate re-read, source re-validation, purpose-aware label
+   *  check, split completeness, manifest construction, and the
+   *  EXPORTED stamp — happens under the run lock, from ONE candidate
+   *  snapshot. */
   async exportManifest(tenantId: string, runId: string) {
-    const run = await this.requireRun(tenantId, runId);
-    if (
-      run.status !== CvDatasetImprovementRunStatus.READY &&
-      run.status !== CvDatasetImprovementRunStatus.EXPORTED
-    ) {
-      throw new BadRequestException(
-        `a ${run.status} run cannot be exported — mark it READY first`,
-      );
-    }
-    const internals = await this.qualityInternals(tenantId, run);
-    if (internals.eligible.length === 0) {
-      throw new BadRequestException(
-        'no eligible candidates — refresh candidates first',
-      );
-    }
-    if (!internals.splitsPlanned) {
-      throw new BadRequestException('plan splits before exporting');
-    }
-    const splitOrder: Record<string, number> = {
-      TRAIN: 0,
-      VALIDATION: 1,
-      TEST: 2,
-      HOLDOUT: 3,
-    };
-    const rows = [...internals.eligible].sort(
-      (a, b) =>
-        splitOrder[a.split!] - splitOrder[b.split!] ||
-        a.createdAt.getTime() - b.createdAt.getTime() ||
-        a.id.localeCompare(b.id),
-    );
-    const splitSummary = { TRAIN: 0, VALIDATION: 0, TEST: 0, HOLDOUT: 0 };
-    for (const row of rows) {
-      splitSummary[row.split!] += 1;
-    }
-    const skuSnapshots = new Map<string, { skuId: string | null; sku: string }>();
-    for (const row of rows) {
-      if (row.skuCodeSnapshot) {
-        skuSnapshots.set(`${row.skuId ?? ''}:${row.skuCodeSnapshot}`, {
-          skuId: row.skuId,
-          sku: row.skuCodeSnapshot,
-        });
+    await this.requireRun(tenantId, runId);
+    return this.withRunLock(tenantId, runId, async (tx) => {
+      const run = await this.lockedRun(tx, tenantId, runId);
+      if (
+        run.status !== CvDatasetImprovementRunStatus.READY &&
+        run.status !== CvDatasetImprovementRunStatus.EXPORTED
+      ) {
+        throw new BadRequestException(
+          `a ${run.status} run cannot be exported — mark it READY first`,
+        );
       }
-    }
-    const actionLabels = [...new Set(rows.map(effectiveAction))].sort();
-
-    // Calibration metadata snapshot (safe fields only — no zone labels,
-    // no polygons, no source metadata). Null when nothing is linked.
-    let calibration: {
-      calibrationProfileId: string;
-      name: string;
-      calibrationVersion: number;
-      orientation: string;
-      cameraMount: string;
-      zoneSummary: {
-        total: number;
-        shelfZones: number;
-        interactionZones: number;
-        ignoreZones: number;
-        entryExitZones: number;
+      const internals = await this.qualityInternals(tenantId, run, tx);
+      if (internals.eligible.length === 0) {
+        throw new BadRequestException(
+          'no eligible candidates — refresh candidates first',
+        );
+      }
+      if (!internals.splitsPlanned) {
+        throw new BadRequestException('plan splits before exporting');
+      }
+      await this.assertCandidatesFresh(tenantId, run, internals.candidates);
+      if (!internals.purposeSatisfied) {
+        throw new BadRequestException(
+          'export rejected: the run has no usable labels for its purpose — see the quality report',
+        );
+      }
+      if (internals.requestedSplitEmpty) {
+        throw new BadRequestException(
+          'export rejected: a requested validation/test split is empty — re-plan splits or set its percentage to zero',
+        );
+      }
+      const splitOrder: Record<string, number> = {
+        TRAIN: 0,
+        VALIDATION: 1,
+        TEST: 2,
+        HOLDOUT: 3,
       };
-    } | null = null;
-    if (run.sourceCalibrationProfileId) {
-      const profile = await this.prisma.cameraCalibrationProfile.findFirst({
-        where: { tenantId, id: run.sourceCalibrationProfileId },
-        select: {
-          id: true,
-          name: true,
-          calibrationVersion: true,
-          orientation: true,
-          cameraMount: true,
-        },
-      });
-      if (profile) {
-        const zones = await this.prisma.cameraCalibrationZone.findMany({
-          where: { tenantId, calibrationProfileId: profile.id },
-          select: { zoneType: true },
-        });
-        const zoneCount = (zoneType: string) =>
-          zones.filter((zone) => zone.zoneType === zoneType).length;
-        calibration = {
-          calibrationProfileId: profile.id,
-          name: profile.name,
-          calibrationVersion: profile.calibrationVersion,
-          orientation: profile.orientation,
-          cameraMount: profile.cameraMount,
-          zoneSummary: {
-            total: zones.length,
-            shelfZones: zoneCount('SHELF_ZONE'),
-            interactionZones: zoneCount('INTERACTION_ZONE'),
-            ignoreZones: zoneCount('IGNORE_ZONE'),
-            entryExitZones: zoneCount('ENTRY_EXIT_ZONE'),
-          },
-        };
+      const rows = [...internals.eligible].sort(
+        (a, b) =>
+          splitOrder[a.split!] - splitOrder[b.split!] ||
+          a.createdAt.getTime() - b.createdAt.getTime() ||
+          a.id.localeCompare(b.id),
+      );
+      const splitSummary = { TRAIN: 0, VALIDATION: 0, TEST: 0, HOLDOUT: 0 };
+      for (const row of rows) {
+        splitSummary[row.split!] += 1;
       }
-    }
+      const skuSnapshots = new Map<
+        string,
+        { skuId: string | null; sku: string }
+      >();
+      for (const row of rows) {
+        if (row.skuCodeSnapshot) {
+          skuSnapshots.set(`${row.skuId ?? ''}:${row.skuCodeSnapshot}`, {
+            skuId: row.skuId,
+            sku: row.skuCodeSnapshot,
+          });
+        }
+      }
+      const actionLabels = [...new Set(rows.map(effectiveAction))].sort();
 
-    const warnings = [
-      ...internals.imbalanceWarnings,
-      ...internals.leakageWarnings,
-      ...(internals.lowCoverageSkus.length ? ['LOW_COVERAGE_SKUS'] : []),
-      ...(internals.lowCoverageActions.length ? ['LOW_COVERAGE_ACTIONS'] : []),
-    ];
-    const generatedAt = new Date();
-    const manifest = {
-      manifestVersion: 1,
-      runId,
-      tenantId,
-      name: run.name,
-      purpose: run.purpose,
-      status: CvDatasetImprovementRunStatus.EXPORTED,
-      generatedAt,
-      splitPercents: {
-        train: run.trainSplitPercent,
-        validation: run.validationSplitPercent,
-        test: run.testSplitPercent,
-      },
-      splitSummary,
-      candidates: rows.map(toCandidateView),
-      skuSnapshots: [...skuSnapshots.values()],
-      actionLabels,
-      calibration,
-      warnings,
-      trainingNotes: DATASET_TRAINING_NOTES,
-      evidenceStatus: DATASET_EVIDENCE_STATUS,
-    };
-    await this.withRunLock(tenantId, runId, (tx) =>
-      tx.cvDatasetImprovementRun.updateMany({
+      // Calibration metadata snapshot (safe fields only — no zone
+      // labels, no polygons, no source metadata). Included only when
+      // the linked profile is actually stamped on candidate rows, i.e.
+      // it matches the camera the footage came from. Null otherwise.
+      let calibration: {
+        calibrationProfileId: string;
+        name: string;
+        calibrationVersion: number;
+        orientation: string;
+        cameraMount: string;
+        zoneSummary: {
+          total: number;
+          shelfZones: number;
+          interactionZones: number;
+          ignoreZones: number;
+          entryExitZones: number;
+        };
+      } | null = null;
+      const profileStamped =
+        run.sourceCalibrationProfileId !== null &&
+        rows.some(
+          (row) => row.calibrationProfileId === run.sourceCalibrationProfileId,
+        );
+      if (run.sourceCalibrationProfileId && profileStamped) {
+        const profile = await this.prisma.cameraCalibrationProfile.findFirst({
+          where: { tenantId, id: run.sourceCalibrationProfileId },
+          select: {
+            id: true,
+            name: true,
+            calibrationVersion: true,
+            orientation: true,
+            cameraMount: true,
+          },
+        });
+        if (profile) {
+          const zones = await this.prisma.cameraCalibrationZone.findMany({
+            where: { tenantId, calibrationProfileId: profile.id },
+            select: { zoneType: true },
+          });
+          const zoneCount = (zoneType: string) =>
+            zones.filter((zone) => zone.zoneType === zoneType).length;
+          calibration = {
+            calibrationProfileId: profile.id,
+            name: profile.name,
+            calibrationVersion: profile.calibrationVersion,
+            orientation: profile.orientation,
+            cameraMount: profile.cameraMount,
+            zoneSummary: {
+              total: zones.length,
+              shelfZones: zoneCount('SHELF_ZONE'),
+              interactionZones: zoneCount('INTERACTION_ZONE'),
+              ignoreZones: zoneCount('IGNORE_ZONE'),
+              entryExitZones: zoneCount('ENTRY_EXIT_ZONE'),
+            },
+          };
+        }
+      }
+
+      const warnings = [
+        ...internals.imbalanceWarnings,
+        ...internals.leakageWarnings,
+        ...(internals.lowCoverageSkus.length ? ['LOW_COVERAGE_SKUS'] : []),
+        ...(internals.lowCoverageActions.length
+          ? ['LOW_COVERAGE_ACTIONS']
+          : []),
+      ];
+      const generatedAt = new Date();
+      const manifest = {
+        manifestVersion: 1,
+        runId,
+        tenantId,
+        name: run.name,
+        purpose: run.purpose,
+        status: CvDatasetImprovementRunStatus.EXPORTED,
+        generatedAt,
+        splitPercents: {
+          train: run.trainSplitPercent,
+          validation: run.validationSplitPercent,
+          test: run.testSplitPercent,
+        },
+        splitSummary,
+        candidates: rows.map(toCandidateView),
+        skuSnapshots: [...skuSnapshots.values()],
+        actionLabels,
+        calibration,
+        warnings,
+        trainingNotes: DATASET_TRAINING_NOTES,
+        evidenceStatus: DATASET_EVIDENCE_STATUS,
+      };
+      await tx.cvDatasetImprovementRun.updateMany({
         where: { tenantId, id: runId },
         data: {
           status: CvDatasetImprovementRunStatus.EXPORTED,
           exportedAt: generatedAt,
         },
-      }),
-    );
-    return {
-      runId,
-      manifestVersion: 1,
-      rowCount: rows.length,
-      generatedAt,
-      manifest,
-    };
+      });
+      return {
+        runId,
+        manifestVersion: 1,
+        rowCount: rows.length,
+        generatedAt,
+        manifest,
+      };
+    });
   }
 
   // ------------------------------------------------------------------
@@ -1331,7 +1973,9 @@ export class CvDatasetService {
   // ------------------------------------------------------------------
 
   /** ADVISORY ONLY: no training is invoked, no external model API is
-   *  called, and no accuracy projection is ever produced. */
+   *  called, and no accuracy projection is ever produced. The
+   *  recommended task never names a task the dataset has zero usable
+   *  labels for. */
   async modelTuningReport(tenantId: string, runId: string) {
     const run = await this.requireRun(tenantId, runId);
     const internals = await this.qualityInternals(tenantId, run);
@@ -1343,8 +1987,26 @@ export class CvDatasetService {
       CALIBRATION_VALIDATION: 'MIXED',
       MIXED: 'MIXED',
     };
+    const mappedTask = taskByPurpose[run.purpose];
+    let recommendedModelTask = mappedTask;
+    let noUsableTask = false;
+    if (!taskUsable(mappedTask, internals.families)) {
+      const fallback = [
+        'SKU_CLASSIFICATION',
+        'ACTION_RECOGNITION',
+        'FALSE_TOUCH_FILTERING',
+      ].find((task) => taskUsable(task, internals.families));
+      if (fallback) {
+        recommendedModelTask = fallback;
+      } else {
+        recommendedModelTask = 'MIXED';
+        noUsableTask = !taskUsable('MIXED', internals.families);
+      }
+    }
     const tuningReadiness: DatasetReadiness =
-      internals.readiness === 'NOT_READY' || !internals.splitsPlanned
+      internals.readiness === 'NOT_READY' ||
+      !internals.splitsPlanned ||
+      noUsableTask
         ? 'NOT_READY'
         : internals.readiness === 'WARNING'
           ? 'WARNING'
@@ -1374,7 +2036,7 @@ export class CvDatasetService {
     );
     return {
       runId,
-      recommendedModelTask: taskByPurpose[run.purpose],
+      recommendedModelTask,
       datasetReadiness: internals.readiness,
       tuningReadiness,
       classCoverageSummary: {
@@ -1403,6 +2065,12 @@ export class CvDatasetService {
         note: 'REVIEW_MATCH_SCORE_THRESHOLDS_WITH_OPERATOR',
       },
       recommendedNextActions: internals.recommendedNextActions,
+      // Durable dataset warnings restated here so the tuning surface
+      // can never look healthier than the dataset it describes.
+      warnings: [
+        ...internals.imbalanceWarnings,
+        ...internals.leakageWarnings,
+      ],
       advisory: DATASET_TUNING_ADVISORY,
       safety: SAFETY,
     };

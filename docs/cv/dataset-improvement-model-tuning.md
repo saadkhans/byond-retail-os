@@ -39,25 +39,52 @@ and snapshots the label enums and SKU codes.
 
 Verdict mapping:
 
-| Source record                     | Eligibility | Label                                      |
-| --------------------------------- | ----------- | ------------------------------------------ |
-| Review verdict CORRECT            | ELIGIBLE    | The confirmed prediction                   |
-| Review verdict WRONG_SKU          | ELIGIBLE    | The corrected SKU                          |
-| Review verdict WRONG_ACTION       | ELIGIBLE    | The corrected action                       |
-| Review verdict FALSE_TOUCH        | ELIGIBLE    | Corrected to NO_OP (a reviewed *negative*) |
-| Missed-event review               | ELIGIBLE    | The expected action/SKU (recall evidence)  |
-| Scenario result PASS or FAIL      | ELIGIBLE    | The scenario's expected action/SKU         |
-| Unreviewed observation            | EXCLUDED    | reason NOT_REVIEWED                        |
-| Review verdict UNCERTAIN          | EXCLUDED    | reason UNCERTAIN_VERDICT                   |
-| Review verdict INCORRECT          | EXCLUDED    | reason INCORRECT_VERDICT                   |
-| Scenario result INCONCLUSIVE      | EXCLUDED    | reason INCONCLUSIVE_RESULT                 |
-| Scenario without a result         | EXCLUDED    | reason MISSING_RESULT                      |
+| Source record                       | Eligibility | Label                                      |
+| ----------------------------------- | ----------- | ------------------------------------------ |
+| Review verdict CORRECT              | ELIGIBLE    | The confirmed prediction                   |
+| Review verdict WRONG_SKU (real fix) | ELIGIBLE    | The corrected SKU                          |
+| WRONG_SKU without a corrected SKU   | EXCLUDED    | reason MISSING_CORRECTED_SKU               |
+| WRONG_SKU "corrected" to same SKU   | EXCLUDED    | reason CORRECTION_NOT_DIFFERENT            |
+| Review verdict WRONG_ACTION (real)  | ELIGIBLE    | The corrected action                       |
+| WRONG_ACTION corrected to UNKNOWN   | EXCLUDED    | reason MISSING_CORRECTED_ACTION            |
+| WRONG_ACTION same as prediction     | EXCLUDED    | reason CORRECTION_NOT_DIFFERENT            |
+| Review verdict FALSE_TOUCH          | ELIGIBLE    | Corrected to NO_OP (a reviewed *negative*) |
+| Missed-event review                 | EXCLUDED    | reason MISSING_EVIDENCE_LOCATOR            |
+| Scenario result PASS or FAIL        | ELIGIBLE    | The scenario's expected action/SKU         |
+| Unreviewed observation              | EXCLUDED    | reason NOT_REVIEWED                        |
+| Review verdict UNCERTAIN            | EXCLUDED    | reason UNCERTAIN_VERDICT                   |
+| Review verdict INCORRECT            | EXCLUDED    | reason INCORRECT_VERDICT                   |
+| Scenario result INCONCLUSIVE        | EXCLUDED    | reason INCONCLUSIVE_RESULT                 |
+| Scenario without a result           | EXCLUDED    | reason MISSING_RESULT                      |
 
 **Why unreviewed examples are excluded:** an unreviewed prediction is
 not a label — training on it would teach the model its own mistakes.
 UNCERTAIN and INCONCLUSIVE records carry no usable truth either. They
 stay visible in the excluded list (honest accounting), never in the
 export.
+
+**Why a correction must be a real correction:** WRONG_SKU means "the
+SKU was something else" — a row without a corrected SKU, or one whose
+"correction" repeats the prediction, carries no trainable truth, so it
+is excluded with a controlled reason instead of polluting the labels.
+
+**Why missed events are excluded (missing locators):** a missed-event
+review names a session and a label, but Phase 15 records no safe
+temporal locator (offset, window, or frame index) for the interaction —
+the review timestamp is when the operator wrote it, not when the event
+happened. An offline trainer could never map such a row to footage, so
+it is excluded as MISSING_EVIDENCE_LOCATOR rather than exported as an
+untraceable label. Missed events still count in the quality report as
+recall evidence and next-action input.
+
+**Lineage and calibration integrity:** if a run links both an
+evaluation run and a protocol, the protocol must be bound to that same
+evaluation run; protocol-only runs stamp the protocol's own evaluation
+lineage on scenario candidates. A linked calibration profile must
+belong to the camera the live sessions actually used, or the refresh is
+rejected. FILE_REPLAY sources are exempt — calibration is not
+applicable to them, they are never stamped, and the workflow never
+advises calibrating them.
 
 Lighting and occlusion buckets and per-zone labels exist in the schema
 but are always empty in this phase: no source data exists for them yet,
@@ -72,12 +99,27 @@ and BYOND never fabricates values.
 - missed-event and false-touch counts;
 - confusion pairs, passed through verbatim from the Phase 15 summary
   (null when no evaluation run is linked);
-- low-coverage SKUs/actions (below your configured minimums);
-- controlled imbalance warnings (`SKU_IMBALANCE`, `ACTION_IMBALANCE`)
-  and leakage warnings (`SPLITS_NOT_PLANNED`,
-  `SAME_SESSION_ACROSS_SPLITS`);
-- a readiness verdict — `NOT_READY` (no eligible data), `WARNING`
-  (usable but flawed), `READY` — plus controlled next actions.
+- low-coverage SKUs/actions (below your configured minimums), each with
+  its example count AND its independent-group count — many
+  near-duplicate examples from one live session are ONE unit of
+  evidence, and `LOW_INDEPENDENT_GROUP_COVERAGE` flags classes that
+  look covered but come from a single session;
+- controlled imbalance warnings (`SKU_IMBALANCE`, `ACTION_IMBALANCE`,
+  `SMALL_DATASET` — durable, not a one-off planner note — and the
+  task-label warnings `NO_SKU_LABELS_FOR_TASK`,
+  `NO_ACTION_LABELS_FOR_TASK`, `INSUFFICIENT_TASK_LABELS`) and leakage
+  warnings (`SPLITS_NOT_PLANNED`, `SAME_SESSION_ACROSS_SPLITS`,
+  `REQUESTED_VALIDATION_SPLIT_EMPTY`, `REQUESTED_TEST_SPLIT_EMPTY`,
+  `CLASS_MISSING_TRAIN_SPLIT` and friends);
+- a readiness verdict — `NOT_READY` (no eligible data, no usable labels
+  for the run's PURPOSE, or a requested split ended up empty),
+  `WARNING` (usable but flawed), `READY` — plus controlled next
+  actions.
+
+Readiness is **purpose-aware**: a SKU-classification run with zero
+SKU-labeled examples is `NOT_READY` no matter how many action labels it
+has, and the tuning report will not recommend a task the dataset cannot
+support.
 
 Read it honestly: a small dataset with warnings is a small dataset with
 warnings. The report never invents metrics; anything unknown is null or
@@ -88,9 +130,11 @@ zero.
 `plan-splits` assigns every eligible candidate to TRAIN, VALIDATION, or
 TEST:
 
-- **Deterministic.** The assignment hashes the tenant, run, and group
-  key with sha256 — replanning the same data yields the same splits on
-  any machine.
+- **Deterministic AND stable across runs.** The assignment hashes the
+  tenant and the group identity with sha256 — deliberately WITHOUT the
+  dataset-run id — so the same reviewed session keeps the same split in
+  every dataset improvement run and every replan. Evaluation data can
+  never drift into TRAIN between iterations.
 - **Same session stays together.** All candidates from one live session
   share one group, so near-identical frames can never sit on both sides
   of a train/test boundary (leakage guard).
@@ -98,7 +142,17 @@ TEST:
   minimum cannot support a meaningful test set; its groups all go to
   TRAIN and you get `LOW_COVERAGE_SKU_FORCED_TRAIN` /
   `LOW_COVERAGE_ACTION_FORCED_TRAIN` warnings instead of a pretend
-  metric. Fewer than 30 eligible examples adds `SMALL_DATASET`.
+  metric. Fewer than 30 eligible examples adds `SMALL_DATASET`, which
+  persists into the quality report, the tuning report, and the export
+  manifest.
+- **Every class keeps TRAIN coverage.** A class the hash would send
+  entirely to VALIDATION/TEST is pulled back into TRAIN with
+  `CLASS_MISSING_TRAIN_SPLIT` — an untrainable class is never silent.
+- **Requested splits must exist.** If your percentages request a
+  validation or test split and the planner cannot fill it, you get
+  `REQUESTED_VALIDATION_SPLIT_EMPTY` / `REQUESTED_TEST_SPLIT_EMPTY`,
+  readiness drops to `NOT_READY`, and export refuses — either collect
+  more independent groups or explicitly configure 100/0/0.
 - **HOLDOUT is never auto-assigned** in this phase; the value is
   reserved for operator-managed holdout plans.
 
@@ -109,15 +163,30 @@ mutated.
 ## 5. The export manifest
 
 Once the run is `READY` and splits are planned, `export-manifest`
-returns a single safe JSON document and stamps the run `EXPORTED`:
+returns a single safe JSON document and stamps the run `EXPORTED`. The
+whole export is atomic under the run's lock: the run status, the
+candidate rows, a **re-validation against the CURRENT source records**,
+the purpose-aware label check, and the split completeness check all
+happen against one locked snapshot, and the manifest you receive is
+built from exactly that snapshot. If someone appended a newer review or
+re-recorded a scenario after your last refresh, export refuses with
+`CV_DATASET_STALE_CANDIDATES` — refresh candidates and re-plan splits,
+then export again. Once `EXPORTED`, the run is frozen: candidate
+refresh and split planning are rejected so the stored rows keep
+describing the manifest that was handed out (archive the run and create
+a new one to iterate).
+
+The manifest contains:
 
 - run metadata, split percentages, and split summary;
 - every eligible candidate (references + label snapshots, ordered by
   split);
 - distinct SKU snapshots and action labels;
-- a safe calibration snapshot (orientation, mount, zone counts) when a
-  profile is linked;
-- the quality warnings at export time;
+- a safe calibration snapshot (orientation, mount, zone counts) — only
+  when the linked profile matches the camera the footage actually came
+  from (FILE_REPLAY candidates are never stamped);
+- the quality warnings at export time (including `SMALL_DATASET` and
+  the split-completeness warnings);
 - fixed training notes: reviewed/corrected labels only, references
   only, offline training only, no accuracy guarantee.
 
@@ -132,10 +201,13 @@ customer identity, or payment/order data.
 ## 6. The model tuning report
 
 The `model-tuning-report` is **advisory only**. It maps the run's
-purpose to a recommended model task, mirrors the dataset readiness,
-summarizes class coverage, lists the top likely confusion pairs from
-real review data, and suggests a collection plan, evaluation metrics,
-and a threshold review — all as controlled enum strings.
+purpose to a recommended model task — falling back to a task the
+dataset actually has labels for, never recommending one with zero
+usable labels — mirrors the dataset readiness, restates the durable
+dataset warnings, summarizes class coverage, lists the top likely
+confusion pairs from real review data, and suggests a collection plan,
+evaluation metrics, and a threshold review — all as controlled enum
+strings.
 
 It never invokes training, never calls an external model API, and never
 projects an accuracy number. If a report ever appears to promise an
@@ -160,11 +232,15 @@ improvement percentage, that is a bug — file it.
 - Candidates reference records, not evidence artifacts — live windows
   still persist no crops, so offline training needs your own footage
   handling.
+- Missed-event reviews carry no safe temporal locator yet, so they are
+  excluded from training eligibility (`MISSING_EVIDENCE_LOCATOR`) and
+  the MISSED_EVENT_RECOVERY purpose stays `NOT_READY` until a later
+  phase records one.
 - Lighting/occlusion buckets and zone labels are placeholders (always
   empty) until a later phase produces safe source data.
 - Confusion pairs exist only when an evaluation run is linked.
-- The split planner does not stratify by class; it balances by volume
-  and blocks leakage only.
+- The split planner does not stratify by class; it balances by volume,
+  blocks leakage, and guarantees per-class TRAIN coverage only.
 - One evaluation run, one protocol, and one calibration profile per
   dataset run in this phase.
 

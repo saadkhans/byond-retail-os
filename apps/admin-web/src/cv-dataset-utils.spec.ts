@@ -6,7 +6,9 @@ import {
   buildCreateRunBody,
   datasetReadinessTone,
   formatDatasetAction,
+  formatDatasetErrorMessage,
   formatDatasetWarning,
+  formatExclusionReason,
   formatSplit,
   runStatusTone,
   validateSplitPercents,
@@ -41,6 +43,16 @@ describe('formatDatasetWarning', () => {
       'LOW_COVERAGE_SKU_FORCED_TRAIN',
       'LOW_COVERAGE_ACTION_FORCED_TRAIN',
       'SMALL_DATASET',
+      'NO_SKU_LABELS_FOR_TASK',
+      'NO_ACTION_LABELS_FOR_TASK',
+      'INSUFFICIENT_TASK_LABELS',
+      'REQUESTED_VALIDATION_SPLIT_EMPTY',
+      'REQUESTED_TEST_SPLIT_EMPTY',
+      'INSUFFICIENT_GROUPS_FOR_REQUESTED_SPLITS',
+      'LOW_INDEPENDENT_GROUP_COVERAGE',
+      'CLASS_MISSING_TRAIN_SPLIT',
+      'CLASS_MISSING_VALIDATION_SPLIT',
+      'CLASS_MISSING_TEST_SPLIT',
     ]) {
       expect(formatDatasetWarning(warning)).not.toBe(warning);
     }
@@ -48,6 +60,56 @@ describe('formatDatasetWarning', () => {
 
   it('falls back to the raw value for unknown warnings', () => {
     expect(formatDatasetWarning('NEW_WARNING')).toBe('NEW_WARNING');
+  });
+});
+
+describe('formatExclusionReason', () => {
+  it('labels every controlled exclusion reason', () => {
+    for (const reason of [
+      'NOT_REVIEWED',
+      'UNCERTAIN_VERDICT',
+      'INCORRECT_VERDICT',
+      'INCONCLUSIVE_RESULT',
+      'MISSING_RESULT',
+      'MISSING_EVIDENCE_LOCATOR',
+      'MISSING_CORRECTED_SKU',
+      'MISSING_CORRECTED_ACTION',
+      'CORRECTION_NOT_DIFFERENT',
+    ]) {
+      expect(formatExclusionReason(reason)).not.toBe(reason);
+    }
+  });
+
+  it('falls back to the raw value for unknown reasons', () => {
+    expect(formatExclusionReason('NEW_REASON')).toBe('NEW_REASON');
+  });
+});
+
+describe('formatDatasetErrorMessage', () => {
+  it('expands known CV_DATASET_* tokens and keeps the token visible', () => {
+    for (const token of [
+      'CV_DATASET_STALE_CANDIDATES',
+      'CV_DATASET_SOURCE_LINEAGE_MISMATCH',
+      'CV_DATASET_CALIBRATION_CAMERA_MISMATCH',
+    ]) {
+      const formatted = formatDatasetErrorMessage(`${token}: server guidance`);
+      expect(formatted.startsWith(`${token}: `)).toBe(true);
+      expect(formatted).not.toBe(`${token}: server guidance`);
+    }
+  });
+
+  it('expands a bare token without trailing guidance', () => {
+    const formatted = formatDatasetErrorMessage('CV_DATASET_STALE_CANDIDATES');
+    expect(formatted.startsWith('CV_DATASET_STALE_CANDIDATES: ')).toBe(true);
+  });
+
+  it('passes through unknown tokens and ordinary messages unchanged', () => {
+    expect(formatDatasetErrorMessage('CV_DATASET_SOMETHING_NEW: detail')).toBe(
+      'CV_DATASET_SOMETHING_NEW: detail',
+    );
+    expect(formatDatasetErrorMessage('name must be at most 120 characters')).toBe(
+      'name must be at most 120 characters',
+    );
   });
 });
 

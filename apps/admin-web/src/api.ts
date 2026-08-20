@@ -1860,8 +1860,18 @@ export interface CvDatasetQualityReport {
     action: CvDatasetConfusionPair[];
     sku: CvDatasetConfusionPair[];
   } | null;
-  lowCoverageSkus: { sku: string; count: number; minimum: number }[];
-  lowCoverageActions: { action: string; count: number; minimum: number }[];
+  lowCoverageSkus: {
+    sku: string;
+    count: number;
+    groups: number;
+    minimum: number;
+  }[];
+  lowCoverageActions: {
+    action: string;
+    count: number;
+    groups: number;
+    minimum: number;
+  }[];
   imbalanceWarnings: string[];
   leakageWarnings: string[];
   readiness: CvDatasetReadiness;
@@ -1917,6 +1927,7 @@ export interface CvDatasetModelTuningReport {
   suggestedHoldoutPlan: { holdoutCount: number; note: string };
   recommendedThresholdReview: { suggested: boolean; note: string };
   recommendedNextActions: string[];
+  warnings: string[];
   advisory: string;
   safety: {
     orders: number;

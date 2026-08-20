@@ -17,6 +17,7 @@ import {
   buildCreateRunBody,
   datasetReadinessTone,
   formatDatasetAction,
+  formatDatasetErrorMessage,
   formatDatasetWarning,
   runStatusTone,
   validateSplitPercents,
@@ -280,7 +281,7 @@ export function CvDatasetImprovementDetailPage() {
       await work();
       setTick((n) => n + 1);
     } catch (err) {
-      setActionError(errorMessage(err));
+      setActionError(formatDatasetErrorMessage(errorMessage(err)));
     } finally {
       setBusy(false);
     }
@@ -370,7 +371,9 @@ export function CvDatasetImprovementDetailPage() {
 
           <div className="form-row">
             <button
-              disabled={busy || run.status === 'ARCHIVED'}
+              disabled={
+                busy || run.status === 'ARCHIVED' || run.status === 'EXPORTED'
+              }
               onClick={() =>
                 void action(async () => {
                   setRefreshResult(
@@ -385,7 +388,9 @@ export function CvDatasetImprovementDetailPage() {
               Refresh candidates
             </button>
             <button
-              disabled={busy || run.status === 'ARCHIVED'}
+              disabled={
+                busy || run.status === 'ARCHIVED' || run.status === 'EXPORTED'
+              }
               onClick={() =>
                 void action(async () => {
                   setSplitPlan(
@@ -448,6 +453,13 @@ export function CvDatasetImprovementDetailPage() {
               </button>
             ) : null}
           </div>
+          {run.status === 'EXPORTED' ? (
+            <p className="muted">
+              This run is exported and frozen — candidates and splits can no
+              longer change. Re-exporting reproduces the same dataset;
+              start a new run to build a different one.
+            </p>
+          ) : null}
 
           <h2>Candidates</h2>
           <p>
@@ -538,18 +550,22 @@ export function CvDatasetImprovementDetailPage() {
               ) : null}
               {quality.data.lowCoverageSkus.length > 0 ? (
                 <p className="muted">
-                  Low-coverage SKUs:{' '}
+                  Low-coverage SKUs (examples/min · independent groups):{' '}
                   {quality.data.lowCoverageSkus
-                    .map((row) => `${row.sku} (${row.count}/${row.minimum})`)
+                    .map(
+                      (row) =>
+                        `${row.sku} (${row.count}/${row.minimum} · ${row.groups} groups)`,
+                    )
                     .join(' · ')}
                 </p>
               ) : null}
               {quality.data.lowCoverageActions.length > 0 ? (
                 <p className="muted">
-                  Low-coverage actions:{' '}
+                  Low-coverage actions (examples/min · independent groups):{' '}
                   {quality.data.lowCoverageActions
                     .map(
-                      (row) => `${row.action} (${row.count}/${row.minimum})`,
+                      (row) =>
+                        `${row.action} (${row.count}/${row.minimum} · ${row.groups} groups)`,
                     )
                     .join(' · ')}
                 </p>
@@ -715,6 +731,15 @@ export function CvDatasetImprovementDetailPage() {
                 ({tuning.data.classCoverageSummary.belowMinimumActions} below
                 minimum)
               </p>
+              {tuning.data.warnings.length > 0 ? (
+                <ul>
+                  {tuning.data.warnings.map((warning) => (
+                    <li key={warning} className="muted">
+                      {formatDatasetWarning(warning)}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
               {tuning.data.likelyConfusionPairs.length > 0 ? (
                 <p className="muted">
                   Likely confusion:{' '}

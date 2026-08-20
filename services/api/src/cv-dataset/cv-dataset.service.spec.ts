@@ -1,5 +1,6 @@
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { CvDatasetService } from './cv-dataset.service';
+import { splitBucket } from './dataset-hash';
 
 const TENANT = 'tenant-1';
 
@@ -50,6 +51,11 @@ function review(over: Record<string, unknown> = {}): Record<string, unknown> {
   };
 }
 
+interface CameraFixture {
+  cameraSourceId: string;
+  sourceType: string;
+}
+
 function buildHarness(
   options: {
     observations?: ObservationFixture[];
@@ -57,6 +63,11 @@ function buildHarness(
     summary?: Record<string, unknown> | null;
     scenarios?: Record<string, unknown>[];
     zones?: { zoneType: string }[];
+    /** Camera behind every live session unless overridden per session. */
+    defaultCamera?: CameraFixture;
+    cameraBySession?: Record<string, CameraFixture>;
+    protocolEvaluationRunId?: string | null;
+    profileCameraSourceId?: string;
   } = {},
 ) {
   let seq = 0;
@@ -163,7 +174,13 @@ function buildHarness(
       findFirst: jest.fn(
         async (args: { where: { tenantId?: string; id?: string } }) =>
           args.where.tenantId === TENANT && args.where.id === 'proto-1'
-            ? { id: 'proto-1' }
+            ? {
+                id: 'proto-1',
+                evaluationRunId:
+                  'protocolEvaluationRunId' in options
+                    ? (options.protocolEvaluationRunId ?? null)
+                    : 'eval-1',
+              }
             : null,
       ),
       updateMany: jest.fn(),
@@ -179,6 +196,7 @@ function buildHarness(
           args.where.tenantId === TENANT && args.where.id === 'cal-1'
             ? {
                 id: 'cal-1',
+                cameraSourceId: options.profileCameraSourceId ?? 'camera-1',
                 name: 'Front shelf profile',
                 calibrationVersion: 2,
                 orientation: 'LANDSCAPE',
@@ -187,6 +205,25 @@ function buildHarness(
             : null,
       ),
       updateMany: jest.fn(),
+    },
+    liveCameraSession: {
+      findMany: jest.fn(
+        async (args: { where: { id?: { in?: string[] } } }) => {
+          const ids = args.where.id?.in ?? [];
+          return ids.map((id) => {
+            const camera = (options.cameraBySession ?? {})[id] ??
+              options.defaultCamera ?? {
+                cameraSourceId: 'camera-1',
+                sourceType: 'RTSP_SHADOW',
+              };
+            return {
+              id,
+              cameraSourceId: camera.cameraSourceId,
+              cameraSource: { sourceType: camera.sourceType },
+            };
+          });
+        },
+      ),
     },
     cameraCalibrationZone: {
       findMany: jest.fn(async () => options.zones ?? []),
@@ -479,8 +516,8 @@ describe('CvDatasetService — candidate collection (reviewed/corrected only)', 
     expect(result).toEqual({
       runId: created.id,
       total: 12,
-      eligible: 7,
-      excluded: 5,
+      eligible: 6,
+      excluded: 6,
     });
     const bydSource = (sourceId: string) =>
       candidates.find((row) => row.sourceId === sourceId)!;
@@ -522,9 +559,12 @@ describe('CvDatasetService — candidate collection (reviewed/corrected only)', 
       confidenceBucket: null,
     });
 
+    // Missed-event reviews carry no evidence locator in Phase 15, so
+    // they are EXCLUDED — visible, counted, never pretended trainable.
     expect(bydSource('rev-missed')).toMatchObject({
       sourceType: 'MISSED_EVENT',
-      eligibility: 'ELIGIBLE',
+      eligibility: 'EXCLUDED',
+      exclusionReason: 'MISSING_EVIDENCE_LOCATOR',
       actionLabel: 'RETURN',
       skuCodeSnapshot: 'SKU-B',
       reviewVerdict: 'MISSED_EVENT',
@@ -547,10 +587,13 @@ describe('CvDatasetService — candidate collection (reviewed/corrected only)', 
       exclusionReason: 'MISSING_RESULT',
     });
 
-    // Every candidate carries the run's calibration profile snapshot and
-    // the MVP nulls — never fabricated buckets.
+    // Calibration is stamped ONLY on candidates whose live session's
+    // camera matches the linked profile; sessionless rows get null. The
+    // MVP nulls are never fabricated.
     for (const row of candidates) {
-      expect(row.calibrationProfileId).toBe('cal-1');
+      expect(row.calibrationProfileId).toBe(
+        row.liveSessionId ? 'cal-1' : null,
+      );
       expect(row.lightingBucket).toBeNull();
       expect(row.occlusionBucket).toBeNull();
       expect(row.calibrationZoneLabel).toBeNull();
@@ -605,13 +648,13 @@ describe('CvDatasetService — candidate collection (reviewed/corrected only)', 
       created.id,
       'ELIGIBLE' as never,
     );
-    expect(eligible.total).toBe(7);
+    expect(eligible.total).toBe(6);
     const excluded = await service.listCandidates(
       TENANT,
       created.id,
       'EXCLUDED' as never,
     );
-    expect(excluded.total).toBe(5);
+    expect(excluded.total).toBe(6);
   });
 });
 
@@ -629,11 +672,15 @@ describe('CvDatasetService — quality report', () => {
     const created = await createLinkedRun(service);
     await service.refreshCandidates(TENANT, created.id);
     const report = await service.qualityReport(TENANT, created.id);
-    expect(report.totalEligibleExamples).toBe(7);
-    expect(report.totalExcludedExamples).toBe(5);
+    expect(report.totalEligibleExamples).toBe(6);
+    expect(report.totalExcludedExamples).toBe(6);
+    // Counted even though the missed-event row is EXCLUDED (no locator).
     expect(report.missedEventCount).toBe(1);
     expect(report.falseTouchCount).toBe(1);
-    expect(report.examplesBySku[0]).toMatchObject({ count: 3 });
+    expect(report.examplesBySku[0]).toMatchObject({ count: 4 });
+    // Low-coverage entries now also report INDEPENDENT group counts.
+    expect(report.lowCoverageSkus[0]).toHaveProperty('groups');
+    expect(report.imbalanceWarnings).toContain('SMALL_DATASET');
     expect(report.confusionPairs).toEqual({
       action: [{ predicted: 'PICKUP', expected: 'RETURN', count: 2 }],
       sku: [{ predicted: 'SKU-A', expected: 'SKU-B', count: 3 }],
@@ -822,11 +869,21 @@ describe('CvDatasetService — split planner', () => {
 });
 
 describe('CvDatasetService — export manifest', () => {
+  // The mixed fixture is a SMALL dataset whose classes sit below the
+  // default minimums, so the planner forces everything into TRAIN.
+  // With nonzero validation/test percentages that would (correctly)
+  // block export as REQUESTED_*_SPLIT_EMPTY — so these runs request
+  // 100/0/0, which is explicitly allowed.
   async function readyRun(
     harness: ReturnType<typeof buildHarness>,
     extra: Record<string, unknown> = {},
   ) {
-    const created = await createLinkedRun(harness.service, extra);
+    const created = await createLinkedRun(harness.service, {
+      trainSplitPercent: 100,
+      validationSplitPercent: 0,
+      testSplitPercent: 0,
+      ...extra,
+    });
     await harness.service.refreshCandidates(TENANT, created.id);
     return created;
   }
@@ -850,10 +907,18 @@ describe('CvDatasetService — export manifest', () => {
     ).rejects.toThrow('plan splits before exporting');
     await harness.service.planSplits(TENANT, created.id);
     const result = await harness.service.exportManifest(TENANT, created.id);
-    expect(result.rowCount).toBe(7);
+    expect(result.rowCount).toBe(6);
     expect(result.manifestVersion).toBe(1);
-    expect(result.manifest.candidates).toHaveLength(7);
+    expect(result.manifest.candidates).toHaveLength(6);
     expect(result.manifest.status).toBe('EXPORTED');
+    // Locator-less missed events can never reach a manifest.
+    expect(
+      result.manifest.candidates.every(
+        (row: { sourceType: string }) => row.sourceType !== 'MISSED_EVENT',
+      ),
+    ).toBe(true);
+    // The durable small-dataset warning ships with the manifest.
+    expect(result.manifest.warnings).toContain('SMALL_DATASET');
     expect(result.manifest.trainingNotes).toContain('NO_ACCURACY_GUARANTEE');
     expect(result.manifest.evidenceStatus).toBe(
       'REFERENCES_ONLY_NO_MEDIA_IN_PHASE18',
@@ -874,7 +939,14 @@ describe('CvDatasetService — export manifest', () => {
     expect(detail.exportedAt).not.toBeNull();
     // Re-export from EXPORTED is allowed (same data, fresh stamp).
     const again = await harness.service.exportManifest(TENANT, created.id);
-    expect(again.rowCount).toBe(7);
+    expect(again.rowCount).toBe(6);
+    // ...but the exported snapshot is frozen: no refresh, no replan.
+    await expect(
+      harness.service.refreshCandidates(TENANT, created.id),
+    ).rejects.toThrow('cannot be refreshed on a EXPORTED run');
+    await expect(
+      harness.service.planSplits(TENANT, created.id),
+    ).rejects.toThrow('cannot be planned on a EXPORTED run');
   });
 
   it('emits no source/path/credential/media/weights text anywhere in the payload', async () => {
@@ -908,19 +980,23 @@ describe('CvDatasetService — export manifest', () => {
 });
 
 describe('CvDatasetService — model tuning report (advisory only)', () => {
-  it('maps purpose to task, mirrors readiness, and never projects accuracy', async () => {
+  it('mirrors readiness, carries durable warnings, and never projects accuracy', async () => {
     const { service } = buildHarness(mixedFixtureOptions());
     const created = await createLinkedRun(service, {
-      purpose: 'MISSED_EVENT_RECOVERY',
+      trainSplitPercent: 100,
+      validationSplitPercent: 0,
+      testSplitPercent: 0,
     });
     await service.refreshCandidates(TENANT, created.id);
     const before = await service.modelTuningReport(TENANT, created.id);
-    expect(before.recommendedModelTask).toBe('ACTION_RECOGNITION');
     expect(before.tuningReadiness).toBe('NOT_READY'); // splits unplanned
     await service.planSplits(TENANT, created.id);
     const report = await service.modelTuningReport(TENANT, created.id);
+    expect(report.recommendedModelTask).toBe('MIXED');
     expect(report.tuningReadiness).toBe('WARNING');
     expect(report.datasetReadiness).toBe('WARNING');
+    // Durable small-dataset caution restated on the tuning surface.
+    expect(report.warnings).toContain('SMALL_DATASET');
     expect(report.classCoverageSummary.skuClasses).toBeGreaterThan(0);
     expect(report.recommendedThresholdReview.suggested).toBe(true); // LOW bucket exists
     expect(report.suggestedHoldoutPlan).toEqual({
@@ -937,6 +1013,28 @@ describe('CvDatasetService — model tuning report (advisory only)', () => {
     expect(report.suggestedEvaluationMetrics).toContain('MISSED_EVENT_RATE');
   });
 
+  it('MISSED_EVENT_RECOVERY without locatable missed events is NOT_READY', async () => {
+    const { service } = buildHarness(mixedFixtureOptions());
+    const created = await createLinkedRun(service, {
+      purpose: 'MISSED_EVENT_RECOVERY',
+    });
+    await service.refreshCandidates(TENANT, created.id);
+    // Missed events are all EXCLUDED (no evidence locator), so this
+    // purpose has zero usable labels — never READY, never overstated.
+    const quality = await service.qualityReport(TENANT, created.id);
+    expect(quality.readiness).toBe('NOT_READY');
+    expect(quality.imbalanceWarnings).toContain('INSUFFICIENT_TASK_LABELS');
+    const report = await service.modelTuningReport(TENANT, created.id);
+    expect(report.datasetReadiness).toBe('NOT_READY');
+    expect(report.tuningReadiness).toBe('NOT_READY');
+    // The mapped task (action recognition) has usable labels, so the
+    // recommendation stays honest without naming an unusable task.
+    expect(report.recommendedModelTask).toBe('ACTION_RECOGNITION');
+    await expect(
+      service.setStatus(TENANT, created.id, 'READY' as never),
+    ).rejects.toThrow('run is not ready');
+  });
+
   it('is NOT_READY on an empty run', async () => {
     const { service } = buildHarness();
     const created = await service.createRun(TENANT, BASE_INPUT as never);
@@ -944,5 +1042,452 @@ describe('CvDatasetService — model tuning report (advisory only)', () => {
     expect(report.datasetReadiness).toBe('NOT_READY');
     expect(report.tuningReadiness).toBe('NOT_READY');
     expect(report.likelyConfusionPairs).toEqual([]);
+  });
+});
+
+describe('CvDatasetService — Codex P1 hardening', () => {
+  const FULL_TRAIN = {
+    trainSplitPercent: 100,
+    validationSplitPercent: 0,
+    testSplitPercent: 0,
+  };
+
+  function sessions(count: number, over: Partial<ObservationFixture> = {}) {
+    return Array.from({ length: count }, (_, index) =>
+      observation({
+        journeyEventId: `evt-${index}`,
+        liveSessionId: `session-${index}`,
+        latestReview: review({ reviewId: `rev-${index}` }),
+        ...over,
+      }),
+    );
+  }
+
+  it('export rejects stale candidates after a newer source review, then recovers on refresh', async () => {
+    const opts = mixedFixtureOptions();
+    const harness = buildHarness(opts);
+    const created = await createLinkedRun(harness.service, FULL_TRAIN);
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.setStatus(TENANT, created.id, 'READY' as never);
+    await harness.service.planSplits(TENANT, created.id);
+    // An operator appends a newer UNCERTAIN review on the still-open
+    // evaluation run AFTER the candidates were refreshed.
+    (opts.observations[0].latestReview as Record<string, unknown>).verdict =
+      'UNCERTAIN';
+    const error = await harness.service
+      .exportManifest(TENANT, created.id)
+      .then(
+        () => null,
+        (thrown: Error) => thrown,
+      );
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect(error!.message).toContain('CV_DATASET_STALE_CANDIDATES');
+    expect(error!.message).toContain('refresh candidates');
+    // The controlled message never echoes source values.
+    expect(error!.message).not.toContain('UNCERTAIN');
+    expect(error!.message).not.toContain('SKU-A');
+    // Refresh + replan picks up the new truth; export then proceeds.
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.planSplits(TENANT, created.id);
+    const result = await harness.service.exportManifest(TENANT, created.id);
+    expect(result.rowCount).toBe(5);
+  });
+
+  it('export rejects stale candidates after a scenario result is re-recorded', async () => {
+    const opts = mixedFixtureOptions();
+    const harness = buildHarness(opts);
+    const created = await createLinkedRun(harness.service, FULL_TRAIN);
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.setStatus(TENANT, created.id, 'READY' as never);
+    await harness.service.planSplits(TENANT, created.id);
+    (opts.scenarios![0] as Record<string, unknown>).result = 'INCONCLUSIVE';
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('CV_DATASET_STALE_CANDIDATES');
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.planSplits(TENANT, created.id);
+    const result = await harness.service.exportManifest(TENANT, created.id);
+    expect(result.rowCount).toBe(5);
+  });
+
+  it('export validation runs on the LOCKED candidate snapshot (refresh/plan races)', async () => {
+    const harness = buildHarness(mixedFixtureOptions());
+    const created = await createLinkedRun(harness.service, FULL_TRAIN);
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.setStatus(TENANT, created.id, 'READY' as never);
+    await harness.service.planSplits(TENANT, created.id);
+    // A concurrent planner reset lands JUST as the export lock is
+    // acquired: the locked re-read must see it and refuse.
+    harness.prisma.$queryRaw.mockImplementationOnce(async () => {
+      const row = harness.candidates.find(
+        (r: Record<string, unknown>) => r.eligibility === 'ELIGIBLE',
+      )!;
+      row.split = null;
+      return [];
+    });
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('plan splits before exporting');
+    await harness.service.planSplits(TENANT, created.id);
+    // A concurrent refresh deletes a candidate row at lock time: the
+    // manifest would no longer cover an eligible source row → stale.
+    harness.prisma.$queryRaw.mockImplementationOnce(async () => {
+      const index = harness.candidates.findIndex(
+        (r: Record<string, unknown>) => r.eligibility === 'ELIGIBLE',
+      );
+      harness.candidates.splice(index, 1);
+      return [];
+    });
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('CV_DATASET_STALE_CANDIDATES');
+    // Recover, then the manifest matches the persisted snapshot exactly.
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.planSplits(TENANT, created.id);
+    const result = await harness.service.exportManifest(TENANT, created.id);
+    const persistedEligible = harness.candidates.filter(
+      (r: Record<string, unknown>) => r.eligibility === 'ELIGIBLE',
+    ).length;
+    expect(result.rowCount).toBe(persistedEligible);
+    expect(result.manifest.candidates).toHaveLength(persistedEligible);
+  });
+
+  it('SKU_CLASSIFICATION with zero SKU labels is NOT_READY and cannot export', async () => {
+    const harness = buildHarness({
+      observations: sessions(3, {
+        predictedProductId: null,
+        predictedSku: null,
+      }),
+    });
+    const created = await createLinkedRun(harness.service, {
+      purpose: 'SKU_CLASSIFICATION',
+      sourceTestProtocolId: undefined,
+      sourceCalibrationProfileId: undefined,
+      ...FULL_TRAIN,
+    });
+    await harness.service.refreshCandidates(TENANT, created.id);
+    const quality = await harness.service.qualityReport(TENANT, created.id);
+    expect(quality.readiness).toBe('NOT_READY');
+    expect(quality.imbalanceWarnings).toContain('NO_SKU_LABELS_FOR_TASK');
+    await expect(
+      harness.service.setStatus(TENANT, created.id, 'READY' as never),
+    ).rejects.toThrow('run is not ready');
+    await harness.service.planSplits(TENANT, created.id);
+    // Even a run that somehow reached READY cannot export for a task
+    // it has zero usable labels for.
+    harness.runs.find((row) => row.id === created.id)!.status = 'READY';
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('no usable labels for its purpose');
+    // The tuning report never recommends the label-less task.
+    const report = await harness.service.modelTuningReport(TENANT, created.id);
+    expect(report.recommendedModelTask).toBe('ACTION_RECOGNITION');
+    expect(report.tuningReadiness).toBe('NOT_READY');
+  });
+
+  it('ACTION_RECOGNITION with usable action labels stays usable', async () => {
+    const { service } = buildHarness(mixedFixtureOptions());
+    const created = await createLinkedRun(service, {
+      purpose: 'ACTION_RECOGNITION',
+    });
+    await service.refreshCandidates(TENANT, created.id);
+    const quality = await service.qualityReport(TENANT, created.id);
+    expect(quality.readiness).toBe('WARNING');
+    expect(quality.imbalanceWarnings).not.toContain(
+      'NO_ACTION_LABELS_FOR_TASK',
+    );
+  });
+
+  it('requested validation/test splits must be nonempty; 100/0/0 stays allowed', async () => {
+    // 3 examples of ONE sku, below the default minimum of 5: the
+    // planner (correctly) forces everything into TRAIN.
+    const harness = buildHarness({ observations: sessions(3) });
+    const created = await createLinkedRun(harness.service, {
+      sourceTestProtocolId: undefined,
+      sourceCalibrationProfileId: undefined,
+    });
+    await harness.service.refreshCandidates(TENANT, created.id);
+    const plan = await harness.service.planSplits(TENANT, created.id);
+    expect(plan.warnings).toContain('REQUESTED_VALIDATION_SPLIT_EMPTY');
+    expect(plan.warnings).toContain('REQUESTED_TEST_SPLIT_EMPTY');
+    const quality = await harness.service.qualityReport(TENANT, created.id);
+    expect(quality.leakageWarnings).toContain(
+      'REQUESTED_VALIDATION_SPLIT_EMPTY',
+    );
+    expect(quality.readiness).toBe('NOT_READY');
+    await expect(
+      harness.service.setStatus(TENANT, created.id, 'READY' as never),
+    ).rejects.toThrow('run is not ready');
+    harness.runs.find((row) => row.id === created.id)!.status = 'READY';
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('requested validation/test split is empty');
+
+    // Explicit 100/0/0 requests nothing it cannot fill.
+    const explicit = buildHarness({ observations: sessions(3) });
+    const trainOnly = await createLinkedRun(explicit.service, {
+      sourceTestProtocolId: undefined,
+      sourceCalibrationProfileId: undefined,
+      ...FULL_TRAIN,
+    });
+    await explicit.service.refreshCandidates(TENANT, trainOnly.id);
+    const trainPlan = await explicit.service.planSplits(TENANT, trainOnly.id);
+    expect(trainPlan.warnings).not.toContain('REQUESTED_VALIDATION_SPLIT_EMPTY');
+    expect(trainPlan.warnings).not.toContain('REQUESTED_TEST_SPLIT_EMPTY');
+    await explicit.service.setStatus(TENANT, trainOnly.id, 'READY' as never);
+    const result = await explicit.service.exportManifest(TENANT, trainOnly.id);
+    expect(result.rowCount).toBe(3);
+  });
+
+  it('FILE_REPLAY-backed data never gets calibration advice; live data still does', async () => {
+    const replay = buildHarness({
+      ...mixedFixtureOptions(),
+      defaultCamera: { cameraSourceId: 'camera-1', sourceType: 'FILE_REPLAY' },
+    });
+    const replayRun = await createLinkedRun(replay.service, {
+      sourceCalibrationProfileId: undefined,
+    });
+    await replay.service.refreshCandidates(TENANT, replayRun.id);
+    const replayQuality = await replay.service.qualityReport(
+      TENANT,
+      replayRun.id,
+    );
+    expect(replayQuality.recommendedNextActions).not.toContain(
+      'IMPROVE_CAMERA_CALIBRATION',
+    );
+
+    const live = buildHarness(mixedFixtureOptions());
+    const liveRun = await createLinkedRun(live.service, {
+      sourceCalibrationProfileId: undefined,
+    });
+    await live.service.refreshCandidates(TENANT, liveRun.id);
+    const liveQuality = await live.service.qualityReport(TENANT, liveRun.id);
+    expect(liveQuality.recommendedNextActions).toContain(
+      'IMPROVE_CAMERA_CALIBRATION',
+    );
+  });
+
+  it('a calibration profile for a different camera is rejected for live data, exempt for FILE_REPLAY', async () => {
+    const mismatched = buildHarness({
+      ...mixedFixtureOptions(),
+      profileCameraSourceId: 'camera-2',
+    });
+    const created = await createLinkedRun(mismatched.service);
+    const error = await mismatched.service
+      .refreshCandidates(TENANT, created.id)
+      .then(
+        () => null,
+        (thrown: Error) => thrown,
+      );
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect(error!.message).toContain('CV_DATASET_CALIBRATION_CAMERA_MISMATCH');
+    expect(error!.message).not.toContain('camera-2');
+
+    // FILE_REPLAY sessions are exempt (calibration NOT_APPLICABLE):
+    // refresh succeeds, nothing is stamped, and the manifest carries no
+    // calibration snapshot for footage it does not describe.
+    const replay = buildHarness({
+      ...mixedFixtureOptions(),
+      profileCameraSourceId: 'camera-2',
+      defaultCamera: { cameraSourceId: 'camera-1', sourceType: 'FILE_REPLAY' },
+    });
+    const replayRun = await createLinkedRun(replay.service, FULL_TRAIN);
+    await replay.service.refreshCandidates(TENANT, replayRun.id);
+    for (const row of replay.candidates) {
+      expect(row.calibrationProfileId).toBeNull();
+    }
+    await replay.service.setStatus(TENANT, replayRun.id, 'READY' as never);
+    await replay.service.planSplits(TENANT, replayRun.id);
+    const result = await replay.service.exportManifest(TENANT, replayRun.id);
+    expect(result.manifest.calibration).toBeNull();
+  });
+
+  it('evaluation/protocol lineage must be consistent; protocol-only runs keep the protocol lineage', async () => {
+    const mismatched = buildHarness({
+      ...mixedFixtureOptions(),
+      protocolEvaluationRunId: 'eval-2',
+    });
+    await expect(createLinkedRun(mismatched.service)).rejects.toThrow(
+      'CV_DATASET_SOURCE_LINEAGE_MISMATCH',
+    );
+
+    const protocolOnly = buildHarness(mixedFixtureOptions());
+    const created = await protocolOnly.service.createRun(TENANT, {
+      ...BASE_INPUT,
+      sourceTestProtocolId: 'proto-1',
+    } as never);
+    await protocolOnly.service.refreshCandidates(TENANT, created.id);
+    const scenarioRows = protocolOnly.candidates.filter(
+      (row) => row.sourceType === 'PROTOCOL_SCENARIO',
+    );
+    expect(scenarioRows.length).toBeGreaterThan(0);
+    for (const row of scenarioRows) {
+      // The protocol's OWN evaluation run — never null, never an
+      // unrelated linked run.
+      expect(row.evaluationRunId).toBe('eval-1');
+    }
+  });
+
+  it('correction verdicts without a real, different correction are EXCLUDED', async () => {
+    const harness = buildHarness({
+      observations: [
+        observation({
+          journeyEventId: 'evt-ws-missing',
+          latestReview: review({
+            verdict: 'WRONG_SKU',
+            expectedProductId: null,
+            expectedSku: null,
+          }),
+        }),
+        observation({
+          journeyEventId: 'evt-ws-same',
+          latestReview: review({
+            verdict: 'WRONG_SKU',
+            expectedProductId: 'prod-a',
+            expectedSku: 'SKU-A', // same as the prediction
+          }),
+        }),
+        observation({
+          journeyEventId: 'evt-wa-unknown',
+          latestReview: review({
+            verdict: 'WRONG_ACTION',
+            expectedAction: 'UNKNOWN',
+          }),
+        }),
+        observation({
+          journeyEventId: 'evt-wa-same',
+          latestReview: review({
+            verdict: 'WRONG_ACTION',
+            expectedAction: 'PICKUP', // same as the prediction
+          }),
+        }),
+        observation({
+          journeyEventId: 'evt-wa-valid',
+          latestReview: review({
+            verdict: 'WRONG_ACTION',
+            expectedAction: 'RETURN',
+          }),
+        }),
+      ],
+    });
+    const created = await createLinkedRun(harness.service, {
+      sourceTestProtocolId: undefined,
+      sourceCalibrationProfileId: undefined,
+    });
+    const result = await harness.service.refreshCandidates(TENANT, created.id);
+    expect(result.eligible).toBe(1);
+    const byId = (sourceId: string) =>
+      harness.candidates.find((row) => row.sourceId === sourceId)!;
+    expect(byId('evt-ws-missing')).toMatchObject({
+      eligibility: 'EXCLUDED',
+      exclusionReason: 'MISSING_CORRECTED_SKU',
+    });
+    expect(byId('evt-ws-same')).toMatchObject({
+      eligibility: 'EXCLUDED',
+      exclusionReason: 'CORRECTION_NOT_DIFFERENT',
+    });
+    expect(byId('evt-wa-unknown')).toMatchObject({
+      eligibility: 'EXCLUDED',
+      exclusionReason: 'MISSING_CORRECTED_ACTION',
+    });
+    expect(byId('evt-wa-same')).toMatchObject({
+      eligibility: 'EXCLUDED',
+      exclusionReason: 'CORRECTION_NOT_DIFFERENT',
+    });
+    expect(byId('evt-wa-valid')).toMatchObject({
+      eligibility: 'ELIGIBLE',
+      correctedActionLabel: 'RETURN',
+    });
+  });
+
+  it('the same source group gets the same split across different dataset runs', async () => {
+    const harness = buildHarness({ observations: sessions(40) });
+    const linkOnly = {
+      sourceTestProtocolId: undefined,
+      sourceCalibrationProfileId: undefined,
+    };
+    const runA = await createLinkedRun(harness.service, linkOnly);
+    const runB = await createLinkedRun(harness.service, linkOnly);
+    await harness.service.refreshCandidates(TENANT, runA.id);
+    await harness.service.refreshCandidates(TENANT, runB.id);
+    await harness.service.planSplits(TENANT, runA.id);
+    await harness.service.planSplits(TENANT, runB.id);
+    const splitsOf = (runId: string) =>
+      new Map(
+        harness.candidates
+          .filter((row) => row.runId === runId)
+          .map((row) => [row.sourceId, row.split]),
+      );
+    const a = splitsOf(runA.id);
+    const b = splitsOf(runB.id);
+    expect(a.size).toBe(40);
+    for (const [sourceId, split] of a) {
+      expect(b.get(sourceId)).toBe(split);
+    }
+    // Sanity: the hash actually spread groups across more than one
+    // split (otherwise stability would be vacuous).
+    expect(new Set(a.values()).size).toBeGreaterThan(1);
+  });
+
+  it('a class hashed entirely out of TRAIN is pulled back in with a warning', async () => {
+    // Pick a session id whose bucket deterministically lands OUTSIDE
+    // the 70% TRAIN band, so the rare class starts in VALIDATION/TEST.
+    let rareSession = '';
+    for (let index = 0; index < 5000; index += 1) {
+      const candidate = `session-x-${index}`;
+      if (splitBucket(`${TENANT}:${candidate}`) >= 7000) {
+        rareSession = candidate;
+        break;
+      }
+    }
+    expect(rareSession).not.toBe('');
+    const harness = buildHarness({
+      observations: [
+        ...sessions(10),
+        observation({
+          journeyEventId: 'evt-rare',
+          liveSessionId: rareSession,
+          predictedProductId: 'prod-rare',
+          predictedSku: 'SKU-RARE',
+          latestReview: review({ reviewId: 'rev-rare' }),
+        }),
+      ],
+    });
+    const created = await createLinkedRun(harness.service, {
+      sourceTestProtocolId: undefined,
+      sourceCalibrationProfileId: undefined,
+      minReviewedExamplesPerSku: 1,
+      minReviewedExamplesPerAction: 1,
+    });
+    await harness.service.refreshCandidates(TENANT, created.id);
+    const plan = await harness.service.planSplits(TENANT, created.id);
+    expect(plan.warnings).toContain('CLASS_MISSING_TRAIN_SPLIT');
+    const rare = harness.candidates.find(
+      (row) => row.sourceId === 'evt-rare',
+    )!;
+    expect(rare.split).toBe('TRAIN');
+  });
+
+  it('many near-duplicates from one session count as ONE independent group', async () => {
+    const harness = buildHarness({
+      observations: Array.from({ length: 6 }, (_, index) =>
+        observation({
+          journeyEventId: `evt-dup-${index}`,
+          liveSessionId: 'session-one',
+          latestReview: review({ reviewId: `rev-dup-${index}` }),
+        }),
+      ),
+    });
+    const created = await createLinkedRun(harness.service, {
+      sourceTestProtocolId: undefined,
+      sourceCalibrationProfileId: undefined,
+    });
+    await harness.service.refreshCandidates(TENANT, created.id);
+    const quality = await harness.service.qualityReport(TENANT, created.id);
+    // 6 examples ≥ the minimum of 5, but only ONE independent group.
+    expect(quality.lowCoverageSkus).toEqual([]);
+    expect(quality.imbalanceWarnings).toContain(
+      'LOW_INDEPENDENT_GROUP_COVERAGE',
+    );
   });
 });
