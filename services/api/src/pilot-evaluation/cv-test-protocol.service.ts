@@ -11,6 +11,7 @@ import {
   PilotExpectedAction,
   Prisma,
 } from '@prisma/client';
+import { containsSourceOrPathText } from '../common/free-text-safety';
 import { cvTestProtocolAdvisoryLockKey } from '../common/locks';
 import { PrismaService } from '../prisma/prisma.service';
 import { containsSensitiveFreeText } from '../video-ingest/media-safety';
@@ -30,39 +31,10 @@ import {
  * credential material.
  */
 
-/**
- * NO-SOURCE/NO-PATH screen (Codex P1): the sensitive-text predicate
- * catches credentials, but a protocol note could still persist a camera
- * URL or a local media path — violating the no-source contract the
- * moment it is echoed back. Rejects URLs of ANY scheme (rtsp/rtsps/
- * http/file/…), absolute Unix paths, Windows drive paths, UNC paths,
- * and obvious media filenames. Exported for direct testing.
- */
-export function containsSourceOrPathText(value: string): boolean {
-  return (
-    // Any URI scheme (stream, http, file, s3, …) — scheme-agnostic.
-    /[a-z][a-z0-9+.-]*:\/\//i.test(value) ||
-    // Windows drive path (C:\… or C:/…).
-    /\b[a-z]:[\\/]/i.test(value) ||
-    // Any backslash separator (UNC, drive-less, and relative Windows
-    // paths alike — backslashes have no place in operator prose).
-    /\\/.test(value) ||
-    // Absolute Unix path at start or after whitespace/punctuation.
-    /(?:^|[\s"'(=])\/(?:[\w.-]+\/)*[\w.-]+/.test(value) ||
-    // Relative / home-relative prefixes (./x, ../x, ~/x).
-    /(?:^|[\s"'(=])(?:\.{1,2}|~)\//.test(value) ||
-    // Obvious media/stream filenames anywhere.
-    /\.(mp4|mov|avi|mkv|webm|m3u8|mts|png|jpe?g|bmp|gif)\b/i.test(value) ||
-    // EVERY compact slash/backslash-separated token, with NO character-
-    // class restriction on the segments (Codex P1): a path segment can
-    // be any non-whitespace text — Unicode directories, @-scoped names,
-    // accented words — so ASCII-only \w would let tokens like Unicode
-    // folder pairs straight through. Any separator with non-whitespace
-    // on both sides rejects; this module's no-source/no-path contract
-    // outweighs prose pairs — write "pass or fail", not "pass/fail".
-    /[^\s\\/]+[\\/][^\s\\/]+/.test(value)
-  );
-}
+// NO-SOURCE/NO-PATH screen — now the SHARED predicate in
+// common/free-text-safety (Phase 17 calibration screens with the same
+// definition). Re-exported here so existing spec imports stay valid.
+export { containsSourceOrPathText } from '../common/free-text-safety';
 
 /** Free-text fields (name/description/notes) are screened with the
  *  shared sensitive-text predicate AND the no-source/no-path screen —

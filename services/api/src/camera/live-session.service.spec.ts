@@ -73,6 +73,15 @@ function buildHarness(
     /** Phase 14 — env flags served through the optional ConfigService
      *  (CV_LIVE_FAST_MODE, CV_LIVE_PILOT_RUNNER_ENABLED). */
     env?: Record<string, string>;
+    /** Phase 17 — calibration rows behind the preflight's readiness
+     *  derivation. Default: a READY calibration (active profile with
+     *  shelf + interaction zones and one expected product). Pass null
+     *  for NO calibration; pass overrides for partial setups. */
+    calibration?: {
+      profile?: Record<string, unknown> | null;
+      zones?: Record<string, unknown>[];
+      zoneProducts?: Record<string, unknown>[];
+    } | null;
   } = {},
 ) {
   const sourceRow =
@@ -108,6 +117,57 @@ function buildHarness(
     eventType: string;
     note: string | null;
   }[] = [];
+
+  // Phase 17 — calibration fixture (default: READY, so pre-Phase-17
+  // preflight expectations hold unchanged; pass calibration: null for a
+  // source with NO calibration).
+  const calibrationProfile =
+    options.calibration === null || options.calibration?.profile === null
+      ? null
+      : {
+          id: 'calib-1',
+          tenantId: TENANT,
+          cameraSourceId: 'cam-1',
+          status: 'ACTIVE',
+          frameWidth: 1280,
+          frameHeight: 720,
+          orientation: 'LANDSCAPE',
+          cameraMount: 'FRONT_SHELF',
+          ...(options.calibration?.profile ?? {}),
+        };
+  const calibrationZones: Record<string, unknown>[] =
+    options.calibration === null
+      ? []
+      : (options.calibration?.zones ?? [
+          {
+            id: 'calzone-1',
+            tenantId: TENANT,
+            calibrationProfileId: 'calib-1',
+            zoneType: 'SHELF_ZONE',
+            isActive: true,
+            qualityScore: null,
+          },
+          {
+            id: 'calzone-2',
+            tenantId: TENANT,
+            calibrationProfileId: 'calib-1',
+            zoneType: 'INTERACTION_ZONE',
+            isActive: true,
+            qualityScore: null,
+          },
+        ]);
+  const calibrationZoneProducts: Record<string, unknown>[] =
+    options.calibration === null
+      ? []
+      : (options.calibration?.zoneProducts ?? [
+          {
+            id: 'calzp-1',
+            tenantId: TENANT,
+            zoneId: 'calzone-1',
+            productId: 'prod-1',
+            expectedSku: 'SKU-1',
+          },
+        ]);
 
   const activeStatuses: string[] = [
     LiveCameraSessionStatus.STARTING,
@@ -299,6 +359,64 @@ function buildHarness(
     pilotEvaluationRun: {
       findFirst: jest.fn(async (args: { where: { id?: string } }) =>
         args.where.id === 'run-1' ? { id: 'run-1' } : null,
+      ),
+    },
+    // Phase 17 — calibration rows read by the preflight's readiness
+    // derivation (controlled enums/booleans only).
+    cameraCalibrationProfile: {
+      findFirst: jest.fn(
+        async (args: {
+          where: {
+            tenantId?: string;
+            cameraSourceId?: string;
+            status?: string;
+          };
+        }) => {
+          const row = calibrationProfile;
+          if (
+            !row ||
+            (args.where.tenantId !== undefined &&
+              row.tenantId !== args.where.tenantId) ||
+            (args.where.cameraSourceId !== undefined &&
+              row.cameraSourceId !== args.where.cameraSourceId) ||
+            (args.where.status !== undefined &&
+              row.status !== args.where.status)
+          ) {
+            return null;
+          }
+          return { ...row };
+        },
+      ),
+    },
+    cameraCalibrationZone: {
+      findMany: jest.fn(
+        async (args: {
+          where: {
+            tenantId?: string;
+            calibrationProfileId?: string;
+            isActive?: boolean;
+          };
+        }) =>
+          calibrationZones.filter(
+            (row) =>
+              (args.where.tenantId === undefined ||
+                row.tenantId === args.where.tenantId) &&
+              (args.where.calibrationProfileId === undefined ||
+                row.calibrationProfileId ===
+                  args.where.calibrationProfileId) &&
+              (args.where.isActive === undefined ||
+                row.isActive === args.where.isActive),
+          ),
+      ),
+    },
+    cameraCalibrationZoneProduct: {
+      findMany: jest.fn(
+        async (args: { where: { zoneId?: { in?: string[] } } }) =>
+          calibrationZoneProducts.filter(
+            (row) =>
+              args.where.zoneId?.in === undefined ||
+              args.where.zoneId.in.includes(row.zoneId as string),
+          ),
       ),
     },
     liveCameraSessionFinalizationIntent: {
@@ -3235,5 +3353,92 @@ describe('LiveSessionService — preflight fast-mode expectation + optional pilo
     expect(raw).not.toContain('rtsp');
     expect(raw).not.toContain('://');
     expect(raw).not.toContain('CAMERA_SECRET_SLOT');
+  });
+});
+
+describe('LiveSessionService — Phase 17 calibration readiness in preflight', () => {
+  it('an RTSP_SHADOW source with NO calibration is NOT_READY: checks.calibrationReady=false fails the preflight', async () => {
+    const harness = buildHarness({ calibration: null });
+    const preflight = await harness.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+    );
+    expect(preflight.calibrationReady).toBe(false);
+    expect(preflight.ready).toBe(false);
+    expect(preflight.calibration).toMatchObject({
+      readiness: 'NOT_READY',
+      activeProfileId: null,
+    });
+    expect(preflight.calibration?.warnings).toContain(
+      'NO_ACTIVE_CALIBRATION_PROFILE',
+    );
+    // Controlled output only — warnings are enum strings.
+    const raw = JSON.stringify(preflight);
+    expect(raw).not.toContain('rtsp');
+    expect(raw).not.toContain('://');
+    expect(raw).not.toContain('CAMERA_SECRET_SLOT');
+    expect(raw).not.toContain('.mp4');
+  });
+
+  it('READY and WARNING calibrations both pass the calibrationReady check', async () => {
+    const ready = buildHarness({});
+    const readyPreflight = await ready.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+    );
+    expect(readyPreflight.calibrationReady).toBe(true);
+    expect(readyPreflight.ready).toBe(true);
+    expect(readyPreflight.calibration).toMatchObject({
+      readiness: 'READY',
+      warnings: [],
+      activeProfileId: 'calib-1',
+    });
+
+    // Missing expected products → WARNING, still usable for testing.
+    const warned = buildHarness({ calibration: { zoneProducts: [] } });
+    const warnedPreflight = await warned.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+    );
+    expect(warnedPreflight.calibration?.readiness).toBe('WARNING');
+    expect(warnedPreflight.calibration?.warnings).toEqual([
+      'NO_EXPECTED_PRODUCTS',
+    ]);
+    expect(warnedPreflight.calibrationReady).toBe(true);
+    expect(warnedPreflight.ready).toBe(true);
+  });
+
+  it('FILE_REPLAY behavior is unchanged: calibration is NOT_APPLICABLE and no calibrationReady check joins the readiness set', async () => {
+    const harness = buildHarness({
+      source: { sourceType: CameraSourceType.FILE_REPLAY },
+      calibration: null,
+    });
+    const preflight = await harness.service.liveTestPreflight(
+      TENANT,
+      'cam-1',
+    );
+    // Replay needs no calibration (Codex P1): the informational block
+    // says NOT_APPLICABLE with NO warnings — never a prompt to create
+    // calibration for a replay source…
+    expect(preflight.calibration?.readiness).toBe('NOT_APPLICABLE');
+    expect(preflight.calibration?.warnings).toEqual([]);
+    // …and the CHECK exists only for RTSP_SHADOW: replay readiness is
+    // exactly the pre-Phase-17 set (here failing only on source type).
+    expect(preflight).not.toHaveProperty('calibrationReady');
+    expect(preflight.sourceTypeSupported).toBe(false);
+    expect(preflight.sourceExists).toBe(true);
+    expect(preflight.sourceActive).toBe(true);
+  });
+
+  it('a missing source keeps existing behavior and reports calibration: null', async () => {
+    const harness = buildHarness({});
+    const preflight = await harness.service.liveTestPreflight(
+      TENANT,
+      'cam-x',
+    );
+    expect(preflight.sourceExists).toBe(false);
+    expect(preflight.ready).toBe(false);
+    expect(preflight.calibration).toBeNull();
+    expect(preflight).not.toHaveProperty('calibrationReady');
   });
 });

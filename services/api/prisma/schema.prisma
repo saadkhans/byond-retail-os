@@ -255,6 +255,9 @@ model Tenant {
   cvTestProtocolScenarios        CvTestProtocolScenario[]
   pilotEvaluationSessions        PilotEvaluationSession[]
   pilotObservationReviews        PilotObservationReview[]
+  cameraCalibrationProfiles      CameraCalibrationProfile[]
+  cameraCalibrationZones         CameraCalibrationZone[]
+  cameraCalibrationZoneProducts  CameraCalibrationZoneProduct[]
 }
 
 model User {
@@ -393,6 +396,7 @@ model Location {
   cameraSources       CameraSource[]
   pilotEvaluationRuns PilotEvaluationRun[]
   cvTestProtocols     CvTestProtocol[]
+  cameraCalibrationProfiles CameraCalibrationProfile[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -549,6 +553,7 @@ model Product {
   journeyEventReviews     CustomerJourneyEventReview[] @relation("JourneyReviewCorrectedProduct")
   pilotReviewExpectations PilotObservationReview[]     @relation("PilotReviewExpectedProduct")
   cvScenarioExpectations  CvTestProtocolScenario[]     @relation("CvScenarioExpectedProduct")
+  calibrationZoneExpectations CameraCalibrationZoneProduct[] @relation("CameraCalibrationZoneExpectedProduct")
 
   @@unique([tenantId, sku])
   @@unique([id, tenantId])
@@ -937,9 +942,11 @@ model CameraSource {
   location         Location            @relation(fields: [locationId], references: [id], onDelete: Restrict)
   unit             RetailUnit?         @relation(fields: [unitId], references: [id], onDelete: Restrict)
   replayVideoAsset VideoAsset?         @relation("CameraReplayAsset", fields: [replayVideoAssetId], references: [id], onDelete: SetNull)
-  pilotRuns        CameraPilotRun[]
-  liveSessions     LiveCameraSession[]
-  cvTestProtocols  CvTestProtocol[]
+  pilotRuns           CameraPilotRun[]
+  liveSessions        LiveCameraSession[]
+  cvTestProtocols     CvTestProtocol[]
+  calibrationProfiles CameraCalibrationProfile[]
+  calibrationZones    CameraCalibrationZone[]
 
   @@unique([id, tenantId])
   @@unique([tenantId, locationId, name])
@@ -2618,4 +2625,124 @@ model CvTestProtocolScenario {
 
   @@unique([id, tenantId])
   @@index([tenantId, protocolId, createdAt])
+}
+
+// ---------------------------------------------------------------------
+// Phase 17 — camera calibration & pilot hardening (SHADOW ONLY).
+// A calibration profile captures SAFE, structured setup metadata for one
+// camera source (frame geometry, mount, orientation) plus normalized
+// shelf/interaction/ignore zones used ONLY to make live CV testing more
+// reliable and repeatable. NEVER stored here: RTSP URLs, file paths,
+// credential slots, raw frames, or raw video. Zones are calibration and
+// test aids — no CV decision, basket, order, payment, or inventory path
+// reads or writes these tables.
+// ---------------------------------------------------------------------
+
+enum CameraCalibrationProfileStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum CameraCalibrationOrientation {
+  LANDSCAPE
+  PORTRAIT
+  UNKNOWN
+}
+
+enum CameraCalibrationMount {
+  OVERHEAD
+  FRONT_SHELF
+  ANGLED_SHELF
+  UNKNOWN
+}
+
+enum CameraCalibrationZoneType {
+  SHELF_ZONE
+  INTERACTION_ZONE
+  IGNORE_ZONE
+  ENTRY_EXIT_ZONE
+}
+
+model CameraCalibrationProfile {
+  id                 String                          @id @default(cuid())
+  tenantId           String
+  cameraSourceId     String
+  locationId         String?
+  name               String
+  status             CameraCalibrationProfileStatus  @default(DRAFT)
+  calibrationVersion Int                             @default(1)
+  frameWidth         Int?
+  frameHeight        Int?
+  orientation        CameraCalibrationOrientation    @default(UNKNOWN)
+  cameraMount        CameraCalibrationMount          @default(UNKNOWN)
+  // Screened free text (reject-on-write): never a URL, path, credential,
+  // or connection string — same policy as camera connectionNote.
+  notes              String?
+  createdById        String?
+  createdAt          DateTime                        @default(now())
+  updatedAt          DateTime                        @updatedAt
+  activatedAt        DateTime?
+  archivedAt         DateTime?
+
+  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  // SAME-TENANT composite relations (Codex P1): the FK itself carries the
+  // tenant, so a malformed row can never resolve another tenant's source
+  // or store.
+  cameraSource CameraSource @relation(fields: [cameraSourceId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  location     Location?    @relation(fields: [locationId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  zones        CameraCalibrationZone[]
+
+  // At most ONE ACTIVE profile per camera source: partial unique index in
+  // migration SQL (Prisma cannot express the WHERE status = 'ACTIVE').
+  @@unique([id, tenantId])
+  @@index([tenantId, cameraSourceId, createdAt(sort: Desc)])
+  @@index([tenantId, status])
+}
+
+// One normalized zone (coordinates in 0..1, never raw pixels). Polygon is
+// controlled JSON: an array of {x, y} points, validated on write (3..20
+// points, each coordinate in [0, 1]).
+model CameraCalibrationZone {
+  id                   String                    @id @default(cuid())
+  tenantId             String
+  calibrationProfileId String
+  cameraSourceId       String
+  zoneType             CameraCalibrationZoneType
+  label                String
+  polygon              Json
+  qualityScore         Float?
+  isActive             Boolean                   @default(true)
+  sortOrder            Int                       @default(0)
+  createdAt            DateTime                  @default(now())
+  updatedAt            DateTime                  @updatedAt
+
+  tenant             Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  calibrationProfile CameraCalibrationProfile @relation(fields: [calibrationProfileId, tenantId], references: [id, tenantId], onDelete: Cascade)
+  cameraSource       CameraSource             @relation(fields: [cameraSourceId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  expectedProducts   CameraCalibrationZoneProduct[]
+
+  @@unique([id, tenantId])
+  @@index([tenantId, calibrationProfileId, sortOrder])
+}
+
+// Expected product on a SHELF_ZONE (testing aid only). expectedSku is a
+// server-side snapshot of the product's SKU at link time, so the label
+// survives renames — the same pattern as CvTestProtocolScenario.
+model CameraCalibrationZoneProduct {
+  id          String   @id @default(cuid())
+  tenantId    String
+  zoneId      String
+  productId   String
+  expectedSku String
+  createdAt   DateTime @default(now())
+
+  tenant  Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  zone    CameraCalibrationZone @relation(fields: [zoneId, tenantId], references: [id, tenantId], onDelete: Cascade)
+  // SAME-TENANT composite product relation (Codex P1).
+  product Product               @relation("CameraCalibrationZoneExpectedProduct", fields: [productId, tenantId], references: [id, tenantId], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, zoneId, productId])
+  @@index([tenantId, productId])
 }

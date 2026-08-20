@@ -18,6 +18,10 @@ import {
 import { Page, formatDate, useLoad } from '../components';
 import { formatAccuracy } from '../pilot-evaluation-utils';
 import { protocolStatusTone, scenarioResultTone } from '../cv-test-protocol-utils';
+import {
+  formatWarning,
+  preflightCalibrationSummary,
+} from '../camera-calibration-utils';
 
 function errorMessage(err: unknown): string {
   return err instanceof ApiError ? err.message : 'Unexpected error';
@@ -411,26 +415,51 @@ export function CvTestProtocolDetailPage() {
             ) : null}
           </p>
           {preflight ? (
-            <p className="muted">
-              Preflight:{' '}
-              <span className={`badge ${preflight.ready ? 'ok' : 'down'}`}>
-                {preflight.ready ? 'READY' : 'NOT READY'}
-              </span>{' '}
-              source {preflight.sourceExists ? 'ok' : 'missing'} · active{' '}
-              {preflight.sourceActive ? 'yes' : 'no'} · configured{' '}
-              {preflight.sourceConfigured ? 'yes' : 'no'} · ffmpeg{' '}
-              {preflight.ffmpegAvailable ? 'yes' : 'no'} · free{' '}
-              {preflight.noActiveLiveSession ? 'yes' : 'session active'} ·
-              fast mode {preflight.fastModeActive ? 'ON' : 'OFF'}
-              {preflight.fastModeMatches === false
-                ? ' (MISMATCH with expectation)'
-                : ''}{' '}
-              · pilot runner{' '}
-              {preflight.pilotRunnerEnabled ? 'enabled' : 'disabled (manual ok)'}
-              {preflight.evaluationRunExists === false
-                ? ' · evaluation run missing'
-                : ''}
-            </p>
+            (() => {
+              const calibration = preflightCalibrationSummary(preflight);
+              return (
+                <>
+                  <p className="muted">
+                    Preflight:{' '}
+                    <span className={`badge ${preflight.ready ? 'ok' : 'down'}`}>
+                      {preflight.ready ? 'READY' : 'NOT READY'}
+                    </span>{' '}
+                    source {preflight.sourceExists ? 'ok' : 'missing'} · active{' '}
+                    {preflight.sourceActive ? 'yes' : 'no'} · configured{' '}
+                    {preflight.sourceConfigured ? 'yes' : 'no'} · ffmpeg{' '}
+                    {preflight.ffmpegAvailable ? 'yes' : 'no'} · free{' '}
+                    {preflight.noActiveLiveSession ? 'yes' : 'session active'} ·
+                    fast mode {preflight.fastModeActive ? 'ON' : 'OFF'}
+                    {preflight.fastModeMatches === false
+                      ? ' (MISMATCH with expectation)'
+                      : ''}{' '}
+                    · pilot runner{' '}
+                    {preflight.pilotRunnerEnabled
+                      ? 'enabled'
+                      : 'disabled (manual ok)'}
+                    {preflight.evaluationRunExists === false
+                      ? ' · evaluation run missing'
+                      : ''}{' '}
+                    · calibration{' '}
+                    <span className={`badge ${calibration.tone}`}>
+                      {calibration.label}
+                    </span>{' '}
+                    <Link to={`/camera-calibration/${preflight.cameraSourceId}`}>
+                      calibration →
+                    </Link>
+                  </p>
+                  {calibration.warnings.length > 0 ? (
+                    <ul>
+                      {calibration.warnings.map((warning) => (
+                        <li key={warning} className="muted">
+                          {formatWarning(warning)}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </>
+              );
+            })()
           ) : null}
 
           {open ? (

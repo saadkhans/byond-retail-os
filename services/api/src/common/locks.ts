@@ -257,3 +257,20 @@ export function cvTestProtocolAdvisoryLockKey(
 ): string {
   return `cv-test-protocol:${tenantId}:${protocolId}`;
 }
+
+/**
+ * Serializes Phase 17 calibration-profile activation per CAMERA SOURCE:
+ * activation is a read-then-write over the WHOLE source (archive the
+ * current ACTIVE profile, verify this profile's required zones, promote
+ * it), so two concurrent activations of different profiles on the same
+ * source must not interleave and leave two ACTIVE rows. The partial
+ * unique index (one ACTIVE per source) backstops the race at the
+ * database level. Keyed by source, not profile — profile-keyed locks
+ * would not exclude each other.
+ */
+export function cameraCalibrationAdvisoryLockKey(
+  tenantId: string,
+  cameraSourceId: string,
+): string {
+  return `camera-calibration:${tenantId}:${cameraSourceId}`;
+}
