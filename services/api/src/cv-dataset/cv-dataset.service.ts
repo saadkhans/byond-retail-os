@@ -395,6 +395,29 @@ function purposeLabelCheck(
   }
 }
 
+/** Which class families does this purpose actually TRAIN on? The
+ *  split-coverage GATES (missing-TRAIN blocks and the evaluation-split
+ *  warnings) apply only to the families the task trains: a
+ *  SKU_CLASSIFICATION run must not be blocked because an irrelevant
+ *  corrected-action class hashed outside TRAIN, and vice versa.
+ *  Group-minimum warnings stay global — they describe the dataset, not
+ *  the task. Stable split ASSIGNMENT is purpose-independent. */
+function purposeTrainsSkuClasses(purpose: CvDatasetPurpose): boolean {
+  return (
+    purpose === CvDatasetPurpose.SKU_CLASSIFICATION ||
+    purpose === CvDatasetPurpose.MIXED ||
+    purpose === CvDatasetPurpose.CALIBRATION_VALIDATION
+  );
+}
+
+function purposeTrainsActionClasses(purpose: CvDatasetPurpose): boolean {
+  // ACTION_RECOGNITION, FALSE_TOUCH_FILTERING (NO_OP negatives +
+  // positive actions), MISSED_EVENT_RECOVERY (action-family recovery
+  // labels), MIXED, and CALIBRATION_VALIDATION all train action-family
+  // classes; only a pure SKU task does not.
+  return purpose !== CvDatasetPurpose.SKU_CLASSIFICATION;
+}
+
 function taskUsable(task: string, families: LabelFamilies): boolean {
   if (task === 'SKU_CLASSIFICATION') {
     return families.skuLabeled > 0;
@@ -592,20 +615,36 @@ export class CvDatasetService {
     if (!sessionIds.length) {
       return new Map();
     }
-    const rows = await this.prisma.liveCameraSession.findMany({
+    // Two explicitly tenant-scoped queries — NEVER the nested
+    // session→cameraSource relation, which is not tenant-checked: a
+    // malformed session row pointing at another tenant's camera must
+    // not let that camera's sourceType drive the FILE_REPLAY
+    // calibration exemption or readiness advice. A cameraSourceId that
+    // does not resolve within the tenant is treated as UNKNOWN, which
+    // is never FILE_REPLAY-exempt and never matches a calibration
+    // profile's camera.
+    const sessions = await this.prisma.liveCameraSession.findMany({
       where: { tenantId, id: { in: sessionIds } },
-      select: {
-        id: true,
-        cameraSourceId: true,
-        cameraSource: { select: { sourceType: true } },
-      },
+      select: { id: true, cameraSourceId: true },
     });
+    const cameraSourceIds = [
+      ...new Set(sessions.map((row) => row.cameraSourceId)),
+    ];
+    const sources = cameraSourceIds.length
+      ? await this.prisma.cameraSource.findMany({
+          where: { tenantId, id: { in: cameraSourceIds } },
+          select: { id: true, sourceType: true },
+        })
+      : [];
+    const sourceTypeById = new Map(
+      sources.map((row) => [row.id, row.sourceType as string]),
+    );
     return new Map(
-      rows.map((row) => [
+      sessions.map((row) => [
         row.id,
         {
           cameraSourceId: row.cameraSourceId,
-          sourceType: row.cameraSource?.sourceType ?? 'UNKNOWN',
+          sourceType: sourceTypeById.get(row.cameraSourceId) ?? 'UNKNOWN',
         },
       ]),
     );
@@ -1446,8 +1485,19 @@ export class CvDatasetService {
         }
         return { missingTrain, missingValidation, missingTest };
       };
-      const sku = classMissing(skuSplits, skuGroups);
-      const action = classMissing(actionSplits, actionGroups);
+      // Coverage gates are PURPOSE-SCOPED: only the class families the
+      // run's task trains can block it (see purposeTrains*Classes).
+      const noneMissing = {
+        missingTrain: false,
+        missingValidation: false,
+        missingTest: false,
+      };
+      const sku = purposeTrainsSkuClasses(run.purpose)
+        ? classMissing(skuSplits, skuGroups)
+        : noneMissing;
+      const action = purposeTrainsActionClasses(run.purpose)
+        ? classMissing(actionSplits, actionGroups)
+        : noneMissing;
       if (sku.missingTrain || action.missingTrain) {
         // The STABLE assignment left a trainable class with no TRAIN
         // examples. The plan is never silently overridden per run (that
@@ -1718,14 +1768,21 @@ export class CvDatasetService {
           }
         }
       };
-      warnClassMissingTrain(
-        [...skuCounts.keys()],
-        (cls, row) => confirmedSkuOf(row) === cls,
-      );
-      warnClassMissingTrain(
-        [...actionCounts.keys()],
-        (cls, row) => effectiveAction(row) === cls,
-      );
+      // Purpose-scoped (#P1): only the families the task trains can
+      // warn/block — an irrelevant family hashing outside TRAIN must
+      // not block an unrelated task. Assignment above is untouched.
+      if (purposeTrainsSkuClasses(run.purpose)) {
+        warnClassMissingTrain(
+          [...skuCounts.keys()],
+          (cls, row) => confirmedSkuOf(row) === cls,
+        );
+      }
+      if (purposeTrainsActionClasses(run.purpose)) {
+        warnClassMissingTrain(
+          [...actionCounts.keys()],
+          (cls, row) => effectiveAction(row) === cls,
+        );
+      }
 
       // (d) requested-split completeness (honesty about what the
       // percentages actually produced) and per-class evaluation-split
@@ -1769,14 +1826,18 @@ export class CvDatasetService {
           }
         }
       };
-      classSplitWarnings(
-        [...skuCounts.keys()],
-        (cls, row) => confirmedSkuOf(row) === cls,
-      );
-      classSplitWarnings(
-        [...actionCounts.keys()],
-        (cls, row) => effectiveAction(row) === cls,
-      );
+      if (purposeTrainsSkuClasses(run.purpose)) {
+        classSplitWarnings(
+          [...skuCounts.keys()],
+          (cls, row) => confirmedSkuOf(row) === cls,
+        );
+      }
+      if (purposeTrainsActionClasses(run.purpose)) {
+        classSplitWarnings(
+          [...actionCounts.keys()],
+          (cls, row) => effectiveAction(row) === cls,
+        );
+      }
       if (eligible.length < SMALL_DATASET_THRESHOLD) {
         warnings.add('SMALL_DATASET');
       }
@@ -1872,6 +1933,64 @@ export class CvDatasetService {
     if (stale) {
       throw new BadRequestException(
         `${DATASET_STALE_CANDIDATES}: source reviews or scenario results changed after the last refresh — refresh candidates and re-plan splits before exporting`,
+      );
+    }
+    await this.assertCalibrationContentFresh(tenantId, run, stored);
+  }
+
+  /** Calibration CONTENT freshness: the manifest snapshots the linked
+   *  profile's orientation/mount/version and zone counts, so profile or
+   *  zone EDITS after the candidate refresh would attribute setup
+   *  metadata to footage that never used it — including on re-export of
+   *  an EXPORTED run, whose frozen ledger keeps the original refresh
+   *  time. The ledger's newest createdAt is the refresh instant
+   *  (refresh rebuilds every row). Applies only when the profile is
+   *  actually stamped on candidate rows — FILE_REPLAY-only runs are
+   *  never stamped and stay exempt. Known MVP gap (no stored snapshot,
+   *  and no schema change here): DELETING a pre-refresh zone leaves no
+   *  newer timestamp and is not detectable — documented in the operator
+   *  guide. */
+  private async assertCalibrationContentFresh(
+    tenantId: string,
+    run: CvDatasetImprovementRun,
+    stored: CvDatasetCandidate[],
+  ) {
+    if (!run.sourceCalibrationProfileId || !stored.length) {
+      return;
+    }
+    const stamped = stored.some(
+      (row) =>
+        row.eligibility === CvDatasetEligibility.ELIGIBLE &&
+        row.calibrationProfileId === run.sourceCalibrationProfileId,
+    );
+    if (!stamped) {
+      return;
+    }
+    const refreshTime = Math.max(
+      ...stored.map((row) => row.createdAt.getTime()),
+    );
+    const profile = await this.prisma.cameraCalibrationProfile.findFirst({
+      where: { tenantId, id: run.sourceCalibrationProfileId },
+      select: { updatedAt: true },
+    });
+    const zones = profile
+      ? await this.prisma.cameraCalibrationZone.findMany({
+          where: {
+            tenantId,
+            calibrationProfileId: run.sourceCalibrationProfileId,
+          },
+          select: { updatedAt: true },
+        })
+      : [];
+    if (
+      !profile ||
+      profile.updatedAt.getTime() > refreshTime ||
+      zones.some((zone) => zone.updatedAt.getTime() > refreshTime)
+    ) {
+      // Controlled message — profile names, zone labels, and camera
+      // identifiers are never echoed.
+      throw new BadRequestException(
+        `${DATASET_STALE_CANDIDATES}: the linked calibration profile changed after the last refresh — refresh candidates and re-plan splits before exporting`,
       );
     }
   }

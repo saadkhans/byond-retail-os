@@ -175,6 +175,13 @@ TEST:
   percentages instead of silently rearranging groups. Fewer than 30
   eligible examples adds `SMALL_DATASET`, which persists into the
   quality report, the tuning report, and the export manifest.
+- **Coverage gates follow the run's purpose.** Only the class families
+  the selected task actually trains can block it: a SKU-classification
+  run is never blocked because an action class hashed outside TRAIN,
+  and action-family tasks (action recognition, false-touch filtering,
+  missed-event recovery) are never blocked by a SKU-only gap. MIXED and
+  calibration-validation runs gate on both families. The stable
+  assignment itself is identical for every purpose.
 - **Requested splits must exist.** If your percentages request a
   validation or test split and the planner cannot fill it, you get
   `REQUESTED_VALIDATION_SPLIT_EMPTY` / `REQUESTED_TEST_SPLIT_EMPTY`,
@@ -202,7 +209,16 @@ calibration stamp. A scenario re-recorded with the same verdict against
 a different session, or a calibration stamp that no longer matches the
 cameras, is just as stale as a flipped verdict: export refuses with
 `CV_DATASET_STALE_CANDIDATES` — refresh candidates and re-plan splits,
-then export again. Once `EXPORTED`, the run is frozen: candidate
+then export again. Calibration **content** is checked too: when the
+manifest would carry a calibration snapshot, editing the profile
+(orientation, mount, version) or adding/updating any of its zones after
+the last candidate refresh also rejects the export — including a
+re-export of an already `EXPORTED` run, which can therefore never
+silently return a different calibration snapshot. Known limitation:
+deleting a calibration zone leaves no newer timestamp behind, so a
+deletion-only change is not detected in this phase — refresh candidates
+after any calibration change as a habit. FILE_REPLAY-only runs are
+never stamped, so calibration edits never block them. Once `EXPORTED`, the run is frozen: candidate
 refresh and split planning are rejected so the stored rows keep
 describing the manifest that was handed out (archive the run and create
 a new one to iterate).

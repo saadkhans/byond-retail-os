@@ -54,6 +54,9 @@ function review(over: Record<string, unknown> = {}): Record<string, unknown> {
 interface CameraFixture {
   cameraSourceId: string;
   sourceType: string;
+  /** Owning tenant of the CameraSource row — defaults to TENANT. A
+   *  foreign tenant simulates a malformed session→camera reference. */
+  tenantId?: string;
 }
 
 /** Finds session ids whose STABLE bucket (tenant + session key, no run
@@ -83,7 +86,10 @@ function buildHarness(
     missedEvents?: Record<string, unknown>[];
     summary?: Record<string, unknown> | null;
     scenarios?: Record<string, unknown>[];
-    zones?: { zoneType: string }[];
+    zones?: { zoneType: string; updatedAt?: Date }[];
+    /** cal-1's updatedAt — read at call time, so tests can mutate the
+     *  options object to simulate an edit after refresh. */
+    profileUpdatedAt?: Date;
     /** Camera behind every live session unless overridden per session. */
     defaultCamera?: CameraFixture;
     cameraBySession?: Record<string, CameraFixture>;
@@ -222,6 +228,9 @@ function buildHarness(
                 calibrationVersion: 2,
                 orientation: 'LANDSCAPE',
                 cameraMount: 'FRONT_SHELF',
+                updatedAt:
+                  options.profileUpdatedAt ??
+                  new Date('2026-08-20T08:00:00.000Z'),
               }
             : null,
       ),
@@ -240,14 +249,47 @@ function buildHarness(
             return {
               id,
               cameraSourceId: camera.cameraSourceId,
+              // Deliberately present, as an UNSCOPED include would
+              // return it — the service must ignore this and resolve
+              // sourceType through the tenant-scoped cameraSource query.
               cameraSource: { sourceType: camera.sourceType },
             };
           });
         },
       ),
     },
+    cameraSource: {
+      findMany: jest.fn(
+        async (args: {
+          where: { tenantId?: string; id?: { in?: string[] } };
+        }) => {
+          const ids = args.where.id?.in ?? [];
+          const fixtures = [
+            ...Object.values(options.cameraBySession ?? {}),
+            options.defaultCamera ?? {
+              cameraSourceId: 'camera-1',
+              sourceType: 'RTSP_SHADOW',
+            },
+          ];
+          const rows: { id: string; sourceType: string }[] = [];
+          for (const id of new Set(ids)) {
+            const camera = fixtures.find((fix) => fix.cameraSourceId === id);
+            if (camera && (camera.tenantId ?? TENANT) === args.where.tenantId) {
+              rows.push({ id, sourceType: camera.sourceType });
+            }
+          }
+          return rows;
+        },
+      ),
+      updateMany: jest.fn(),
+    },
     cameraCalibrationZone: {
-      findMany: jest.fn(async () => options.zones ?? []),
+      findMany: jest.fn(async () =>
+        (options.zones ?? []).map((zone) => ({
+          updatedAt: new Date('2026-08-20T08:00:00.000Z'),
+          ...zone,
+        })),
+      ),
       updateMany: jest.fn(),
     },
     pilotObservationReview: {
@@ -1881,5 +1923,310 @@ describe('CvDatasetService — Codex P1 hardening', () => {
         testSplitPercent: 0,
       }),
     ).rejects.toThrow('only DRAFT runs can be edited');
+  });
+});
+
+describe('CvDatasetService — Codex P1 final cleanup', () => {
+  const maxCandidateCreatedAt = (
+    harness: ReturnType<typeof buildHarness>,
+    runId: string,
+  ) =>
+    Math.max(
+      ...harness.candidates
+        .filter((row) => row.runId === runId)
+        .map((row) => (row.createdAt as Date).getTime()),
+    );
+
+  it('SKU_CLASSIFICATION is not blocked by an action-only class outside TRAIN; MIXED still is; assignment is purpose-independent', async () => {
+    const [trainSession] = sessionsInBand('p18-sku-train', 1, 0, 7000);
+    const [testSession] = sessionsInBand('p18-sku-test', 1, 7000, 10000);
+    const options = {
+      observations: [
+        observation({
+          journeyEventId: 'evt-sku-t',
+          liveSessionId: trainSession,
+          latestReview: review({ reviewId: 'r-t', verdict: 'CORRECT' }),
+        }),
+        // The corrected RETURN action class lives ONLY in the TEST-band
+        // session — irrelevant to a pure SKU task, blocking for MIXED.
+        observation({
+          journeyEventId: 'evt-sku-x',
+          liveSessionId: testSession,
+          latestReview: review({
+            reviewId: 'r-x',
+            verdict: 'WRONG_ACTION',
+            expectedAction: 'RETURN',
+            expectedProductId: 'prod-a',
+            expectedSku: 'SKU-A',
+          }),
+        }),
+      ],
+    };
+    const percents = {
+      trainSplitPercent: 70,
+      validationSplitPercent: 0,
+      testSplitPercent: 30,
+    };
+    const skuHarness = buildHarness(options);
+    const skuRun = await skuHarness.service.createRun(TENANT, {
+      ...BASE_INPUT,
+      ...percents,
+      purpose: 'SKU_CLASSIFICATION' as never,
+      sourceEvaluationRunId: 'eval-1',
+    });
+    await skuHarness.service.refreshCandidates(TENANT, skuRun.id);
+    const skuPlan = await skuHarness.service.planSplits(TENANT, skuRun.id);
+    expect(skuPlan.warnings).not.toContain('CLASS_MISSING_TRAIN_SPLIT');
+    expect(skuPlan.warnings).not.toContain('INSUFFICIENT_STABLE_SPLIT_COVERAGE');
+    const skuQuality = await skuHarness.service.qualityReport(TENANT, skuRun.id);
+    expect(skuQuality.readiness).not.toBe('NOT_READY');
+    await skuHarness.service.setStatus(TENANT, skuRun.id, 'READY' as never);
+    const exported = await skuHarness.service.exportManifest(TENANT, skuRun.id);
+    expect(exported.rowCount).toBe(2);
+
+    const mixedHarness = buildHarness(options);
+    const mixedRun = await mixedHarness.service.createRun(TENANT, {
+      ...BASE_INPUT,
+      ...percents,
+      purpose: 'MIXED' as never,
+      sourceEvaluationRunId: 'eval-1',
+    });
+    await mixedHarness.service.refreshCandidates(TENANT, mixedRun.id);
+    const mixedPlan = await mixedHarness.service.planSplits(TENANT, mixedRun.id);
+    expect(mixedPlan.warnings).toContain('CLASS_MISSING_TRAIN_SPLIT');
+    expect(mixedPlan.warnings).toContain('INSUFFICIENT_STABLE_SPLIT_COVERAGE');
+    const mixedQuality = await mixedHarness.service.qualityReport(
+      TENANT,
+      mixedRun.id,
+    );
+    expect(mixedQuality.readiness).toBe('NOT_READY');
+    // The purpose scopes only the GATES — the stable assignment itself
+    // is identical for both runs.
+    expect(mixedPlan.splitSummary).toEqual(skuPlan.splitSummary);
+  });
+
+  it('ACTION_RECOGNITION and FALSE_TOUCH_FILTERING are not blocked by a SKU-only TRAIN gap', async () => {
+    const [trainSession] = sessionsInBand('p18-act-train', 1, 0, 7000);
+    const [testSession] = sessionsInBand('p18-act-test', 1, 7000, 10000);
+    const options = {
+      observations: [
+        observation({
+          journeyEventId: 'evt-act-a',
+          liveSessionId: trainSession,
+          latestReview: review({ reviewId: 'r-a', verdict: 'CORRECT' }),
+        }),
+        observation({
+          journeyEventId: 'evt-act-b',
+          liveSessionId: trainSession,
+          matchScore: 0.2,
+          latestReview: review({ reviewId: 'r-b', verdict: 'FALSE_TOUCH' }),
+        }),
+        // SKU-B exists only in the TEST-band session — irrelevant to
+        // action-family tasks.
+        observation({
+          journeyEventId: 'evt-act-c',
+          liveSessionId: testSession,
+          predictedProductId: 'prod-b',
+          predictedSku: 'SKU-B',
+          latestReview: review({ reviewId: 'r-c', verdict: 'CORRECT' }),
+        }),
+      ],
+    };
+    for (const purpose of ['ACTION_RECOGNITION', 'FALSE_TOUCH_FILTERING']) {
+      const harness = buildHarness(options);
+      const created = await harness.service.createRun(TENANT, {
+        ...BASE_INPUT,
+        trainSplitPercent: 70,
+        validationSplitPercent: 0,
+        testSplitPercent: 30,
+        purpose: purpose as never,
+        sourceEvaluationRunId: 'eval-1',
+      });
+      await harness.service.refreshCandidates(TENANT, created.id);
+      const plan = await harness.service.planSplits(TENANT, created.id);
+      expect(plan.warnings).not.toContain('CLASS_MISSING_TRAIN_SPLIT');
+      expect(plan.warnings).not.toContain(
+        'INSUFFICIENT_STABLE_SPLIT_COVERAGE',
+      );
+      const quality = await harness.service.qualityReport(TENANT, created.id);
+      expect(quality.readiness).not.toBe('NOT_READY');
+      await harness.service.setStatus(TENANT, created.id, 'READY' as never);
+      const exported = await harness.service.exportManifest(TENANT, created.id);
+      expect(exported.rowCount).toBe(3);
+    }
+  });
+
+  it('export rejects profile edits after refresh, recovers on refresh+replan, and rejects a changed re-export', async () => {
+    const options = {
+      ...mixedFixtureOptions(),
+      zones: [{ zoneType: 'SHELF_ZONE' }],
+    } as ReturnType<typeof mixedFixtureOptions> & {
+      zones: { zoneType: string; updatedAt?: Date }[];
+      profileUpdatedAt?: Date;
+    };
+    const harness = buildHarness(options);
+    const created = await createLinkedRun(harness.service, {
+      trainSplitPercent: 100,
+      validationSplitPercent: 0,
+      testSplitPercent: 0,
+    });
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.setStatus(TENANT, created.id, 'READY' as never);
+    await harness.service.planSplits(TENANT, created.id);
+
+    // Orientation/mount/version edits bump the profile's updatedAt —
+    // any such edit after the refresh instant rejects the export.
+    options.profileUpdatedAt = new Date(
+      maxCandidateCreatedAt(harness, created.id) + 500,
+    );
+    let error: Error | null = null;
+    await harness.service
+      .exportManifest(TENANT, created.id)
+      .catch((thrown: Error) => (error = thrown));
+    expect(String(error)).toContain('CV_DATASET_STALE_CANDIDATES');
+    expect(String(error)).toContain('refresh candidates and re-plan splits');
+    // Controlled message: no profile name, zone text, or camera id.
+    expect(String(error)).not.toContain('Front shelf profile');
+    expect(String(error)).not.toContain('camera-1');
+
+    // Refresh + replan captures the new calibration state → export OK.
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.planSplits(TENANT, created.id);
+    const exported = await harness.service.exportManifest(TENANT, created.id);
+    expect(exported.manifest.calibration).toMatchObject({
+      calibrationProfileId: 'cal-1',
+    });
+
+    // A calibration change AFTER export can never silently alter the
+    // manifest — re-export is rejected instead.
+    options.profileUpdatedAt = new Date(
+      maxCandidateCreatedAt(harness, created.id) + 500,
+    );
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('CV_DATASET_STALE_CANDIDATES');
+  });
+
+  it('export rejects zones added/updated after refresh; FILE_REPLAY runs stay exempt', async () => {
+    const options = {
+      ...mixedFixtureOptions(),
+      zones: [{ zoneType: 'SHELF_ZONE' }],
+    } as ReturnType<typeof mixedFixtureOptions> & {
+      zones: { zoneType: string; updatedAt?: Date }[];
+    };
+    const harness = buildHarness(options);
+    const created = await createLinkedRun(harness.service, {
+      trainSplitPercent: 100,
+      validationSplitPercent: 0,
+      testSplitPercent: 0,
+    });
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.setStatus(TENANT, created.id, 'READY' as never);
+    await harness.service.planSplits(TENANT, created.id);
+    options.zones.push({
+      zoneType: 'INTERACTION_ZONE',
+      updatedAt: new Date(maxCandidateCreatedAt(harness, created.id) + 500),
+    });
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('CV_DATASET_STALE_CANDIDATES');
+
+    // FILE_REPLAY-only footage is never stamped with the profile, so
+    // calibration edits cannot invalidate its export (NOT_APPLICABLE).
+    const replayHarness = buildHarness({
+      ...mixedFixtureOptions(),
+      defaultCamera: { cameraSourceId: 'camera-1', sourceType: 'FILE_REPLAY' },
+      profileUpdatedAt: new Date('2026-08-21T00:00:00.000Z'),
+    });
+    const replayRun = await createLinkedRun(replayHarness.service, {
+      trainSplitPercent: 100,
+      validationSplitPercent: 0,
+      testSplitPercent: 0,
+    });
+    await replayHarness.service.refreshCandidates(TENANT, replayRun.id);
+    await replayHarness.service.setStatus(TENANT, replayRun.id, 'READY' as never);
+    await replayHarness.service.planSplits(TENANT, replayRun.id);
+    const exported = await replayHarness.service.exportManifest(
+      TENANT,
+      replayRun.id,
+    );
+    expect(exported.manifest.calibration).toBeNull();
+  });
+
+  it('a foreign tenant camera source can never masquerade as FILE_REPLAY', async () => {
+    const foreignCamera = {
+      'live-1': {
+        cameraSourceId: 'camera-x',
+        sourceType: 'FILE_REPLAY',
+        tenantId: 'tenant-2',
+      },
+    };
+    const observations = [
+      observation({
+        journeyEventId: 'evt-f',
+        liveSessionId: 'live-1',
+        latestReview: review({ reviewId: 'r-f', verdict: 'CORRECT' }),
+      }),
+    ];
+
+    // (1) Readiness advice: the unresolved camera reads UNKNOWN — a
+    // live-like source — so calibration advice IS recommended, even
+    // though the nested (unscoped) relation claims FILE_REPLAY.
+    const foreignHarness = buildHarness({
+      observations,
+      cameraBySession: foreignCamera,
+    });
+    const foreignRun = await foreignHarness.service.createRun(TENANT, {
+      ...BASE_INPUT,
+      sourceEvaluationRunId: 'eval-1',
+    });
+    await foreignHarness.service.refreshCandidates(TENANT, foreignRun.id);
+    const foreignQuality = await foreignHarness.service.qualityReport(
+      TENANT,
+      foreignRun.id,
+    );
+    expect(foreignQuality.recommendedNextActions).toContain(
+      'IMPROVE_CAMERA_CALIBRATION',
+    );
+
+    // Same-tenant FILE_REPLAY keeps the exemption.
+    const replayHarness = buildHarness({
+      observations,
+      cameraBySession: {
+        'live-1': { cameraSourceId: 'camera-x', sourceType: 'FILE_REPLAY' },
+      },
+    });
+    const replayRun = await replayHarness.service.createRun(TENANT, {
+      ...BASE_INPUT,
+      sourceEvaluationRunId: 'eval-1',
+    });
+    await replayHarness.service.refreshCandidates(TENANT, replayRun.id);
+    const replayQuality = await replayHarness.service.qualityReport(
+      TENANT,
+      replayRun.id,
+    );
+    expect(replayQuality.recommendedNextActions).not.toContain(
+      'IMPROVE_CAMERA_CALIBRATION',
+    );
+
+    // (2) Calibration stamping: the unresolved camera is non-matching,
+    // so a linked profile rejects the refresh — the foreign FILE_REPLAY
+    // type cannot bypass the camera-match rule either. No camera id is
+    // echoed.
+    const mismatchHarness = buildHarness({
+      observations,
+      cameraBySession: foreignCamera,
+    });
+    const mismatchRun = await mismatchHarness.service.createRun(TENANT, {
+      ...BASE_INPUT,
+      sourceEvaluationRunId: 'eval-1',
+      sourceCalibrationProfileId: 'cal-1',
+    });
+    let error: Error | null = null;
+    await mismatchHarness.service
+      .refreshCandidates(TENANT, mismatchRun.id)
+      .catch((thrown: Error) => (error = thrown));
+    expect(String(error)).toContain('CV_DATASET_CALIBRATION_CAMERA_MISMATCH');
+    expect(String(error)).not.toContain('camera-x');
   });
 });
