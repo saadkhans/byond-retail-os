@@ -25,6 +25,10 @@ import {
   CvTestProtocolDetailPage,
   CvTestProtocolsPage,
 } from './pages/CvTestProtocolsPage';
+import {
+  CvDatasetImprovementDetailPage,
+  CvDatasetImprovementPage,
+} from './pages/CvDatasetImprovementPage';
 import { CatalogPage } from './pages/CatalogPage';
 import {
   CheckoutSessionDetailPage,
@@ -112,6 +116,7 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/live-sessions">Live sessions</NavLink>
         <NavLink to="/pilot-evaluations">Pilot evaluations</NavLink>
         <NavLink to="/cv-test-protocols">Test protocols</NavLink>
+        <NavLink to="/cv-dataset-improvement">Dataset improvement</NavLink>
         <NavLink to="/review-queue">Review queue</NavLink>
         <div className="spacer" />
         <div className="who">{user?.email}</div>
@@ -235,6 +240,14 @@ export function App() {
                     <Route
                       path="cv-test-protocols/:id"
                       element={<CvTestProtocolDetailPage />}
+                    />
+                    <Route
+                      path="cv-dataset-improvement"
+                      element={<CvDatasetImprovementPage />}
+                    />
+                    <Route
+                      path="cv-dataset-improvement/:id"
+                      element={<CvDatasetImprovementDetailPage />}
                     />
                     <Route
                       path="live-sessions/:id"

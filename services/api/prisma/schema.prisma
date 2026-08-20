@@ -258,6 +258,8 @@ model Tenant {
   cameraCalibrationProfiles      CameraCalibrationProfile[]
   cameraCalibrationZones         CameraCalibrationZone[]
   cameraCalibrationZoneProducts  CameraCalibrationZoneProduct[]
+  cvDatasetImprovementRuns       CvDatasetImprovementRun[]
+  cvDatasetCandidates            CvDatasetCandidate[]
 }
 
 model User {
@@ -2466,11 +2468,12 @@ model PilotEvaluationRun {
   createdAt   DateTime                 @default(now())
   completedAt DateTime?
 
-  tenant        Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location      Location?                @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  sessions      PilotEvaluationSession[]
-  reviews       PilotObservationReview[]
-  testProtocols CvTestProtocol[]
+  tenant                 Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location               Location?                 @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  sessions               PilotEvaluationSession[]
+  reviews                PilotObservationReview[]
+  testProtocols          CvTestProtocol[]
+  datasetImprovementRuns CvDatasetImprovementRun[]
 
   @@unique([id, tenantId])
   @@index([tenantId, createdAt(sort: Desc)])
@@ -2584,10 +2587,11 @@ model CvTestProtocol {
   // SAME-TENANT composite location relation (Codex P1): the store join
   // carries the tenant in the FK itself — a malformed row can never
   // resolve another tenant's store name.
-  location      Location?                @relation(fields: [locationId, tenantId], references: [id, tenantId], onDelete: Restrict)
-  cameraSource  CameraSource?            @relation(fields: [cameraSourceId], references: [id], onDelete: Restrict)
-  evaluationRun PilotEvaluationRun?      @relation(fields: [evaluationRunId], references: [id], onDelete: Restrict)
-  scenarios     CvTestProtocolScenario[]
+  location               Location?                 @relation(fields: [locationId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  cameraSource           CameraSource?             @relation(fields: [cameraSourceId], references: [id], onDelete: Restrict)
+  evaluationRun          PilotEvaluationRun?       @relation(fields: [evaluationRunId], references: [id], onDelete: Restrict)
+  scenarios              CvTestProtocolScenario[]
+  datasetImprovementRuns CvDatasetImprovementRun[]
 
   @@unique([id, tenantId])
   @@index([tenantId, createdAt(sort: Desc)])
@@ -2692,6 +2696,7 @@ model CameraCalibrationProfile {
   cameraSource CameraSource @relation(fields: [cameraSourceId, tenantId], references: [id, tenantId], onDelete: Restrict)
   location     Location?    @relation(fields: [locationId, tenantId], references: [id, tenantId], onDelete: Restrict)
   zones        CameraCalibrationZone[]
+  datasetImprovementRuns CvDatasetImprovementRun[]
 
   // At most ONE ACTIVE profile per camera source: partial unique index in
   // migration SQL (Prisma cannot express the WHERE status = 'ACTIVE').
@@ -2745,4 +2750,136 @@ model CameraCalibrationZoneProduct {
   @@unique([id, tenantId])
   @@unique([tenantId, zoneId, productId])
   @@index([tenantId, productId])
+}
+
+// ---------------------------------------------------------------------
+// Phase 18 — dataset improvement & model tuning (SHADOW ONLY, advisory).
+// A dataset improvement run turns REVIEWED/CORRECTED Phase 15/16 labels
+// into training-ready METADATA: candidate references, quality reporting,
+// deterministic split planning, and a safe export manifest for OFFLINE
+// tuning. Candidates are references to existing safe records — never a
+// copy of media. NEVER stored here: raw frames, crops, video, embeddings,
+// model weights, RTSP URLs, file paths, or credential slots. No training
+// runs inside the app; nothing in this phase touches checkout, order,
+// payment, or inventory state, and it never mutates the review/scenario
+// records it reads.
+// ---------------------------------------------------------------------
+
+enum CvDatasetImprovementRunStatus {
+  DRAFT
+  READY
+  EXPORTED
+  ARCHIVED
+}
+
+enum CvDatasetPurpose {
+  SKU_CLASSIFICATION
+  ACTION_RECOGNITION
+  FALSE_TOUCH_FILTERING
+  MISSED_EVENT_RECOVERY
+  CALIBRATION_VALIDATION
+  MIXED
+}
+
+enum CvDatasetCandidateSourceType {
+  LIVE_REVIEW
+  MISSED_EVENT
+  PROTOCOL_SCENARIO
+  // Reserved for re-importing Phase 15 dataset-export rows in a later
+  // phase — never emitted by the MVP candidate collector.
+  DATASET_EXPORT_ITEM
+}
+
+enum CvDatasetSplit {
+  TRAIN
+  VALIDATION
+  TEST
+  // Reserved for operator-managed holdout plans — the MVP split planner
+  // never auto-assigns it.
+  HOLDOUT
+}
+
+enum CvDatasetEligibility {
+  ELIGIBLE
+  EXCLUDED
+}
+
+model CvDatasetImprovementRun {
+  id                          String                        @id @default(cuid())
+  tenantId                    String
+  sourceEvaluationRunId       String?
+  sourceTestProtocolId        String?
+  sourceCalibrationProfileId  String?
+  name                        String
+  status                      CvDatasetImprovementRunStatus @default(DRAFT)
+  purpose                     CvDatasetPurpose
+  trainSplitPercent           Int
+  validationSplitPercent      Int
+  testSplitPercent            Int
+  minReviewedExamplesPerSku   Int
+  minReviewedExamplesPerAction Int
+  // Screened free text (reject-on-write): never a URL, path, credential,
+  // or slot name — same policy as calibration notes.
+  notes                       String?
+  createdById                 String?
+  createdAt                   DateTime                      @default(now())
+  updatedAt                   DateTime                      @updatedAt
+  exportedAt                  DateTime?
+  archivedAt                  DateTime?
+
+  tenant             Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  // SAME-TENANT composite relations (Codex P1): the FK itself carries the
+  // tenant, so a malformed row can never resolve another tenant's
+  // evaluation run, protocol, or calibration profile.
+  sourceEvaluationRun      PilotEvaluationRun?       @relation(fields: [sourceEvaluationRunId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  sourceTestProtocol       CvTestProtocol?           @relation(fields: [sourceTestProtocolId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  sourceCalibrationProfile CameraCalibrationProfile? @relation(fields: [sourceCalibrationProfileId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  candidates               CvDatasetCandidate[]
+
+  @@unique([id, tenantId])
+  @@index([tenantId, createdAt(sort: Desc)])
+  @@index([tenantId, status])
+}
+
+// One candidate example: a REFERENCE to an existing reviewed/corrected
+// record (pilot review, missed-event review, or protocol scenario) plus
+// safe label snapshots. sourceId/liveSessionId are deliberately plain
+// references (no FK) — candidates are a planning ledger over records
+// that may themselves be append-only; the ledger is rebuilt by refresh,
+// never treated as ground truth. lightingBucket/occlusionBucket/
+// calibrationZoneLabel are ALWAYS null in the MVP: no source data exists
+// for them yet, and Phase 18 never fabricates values.
+model CvDatasetCandidate {
+  id                   String                       @id @default(cuid())
+  tenantId             String
+  runId                String
+  sourceType           CvDatasetCandidateSourceType
+  sourceId             String
+  liveSessionId        String?
+  evaluationRunId      String?
+  protocolId           String?
+  calibrationProfileId String?
+  skuId                String?
+  skuCodeSnapshot      String?
+  actionLabel          String
+  correctedActionLabel String?
+  reviewVerdict        String
+  reviewSource         String
+  confidenceBucket     String?
+  lightingBucket       String?
+  occlusionBucket      String?
+  calibrationZoneLabel String?
+  scenarioTypeSnapshot String?
+  split                CvDatasetSplit?
+  eligibility          CvDatasetEligibility
+  exclusionReason      String?
+  createdAt            DateTime                     @default(now())
+  updatedAt            DateTime                     @updatedAt
+
+  tenant Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  run    CvDatasetImprovementRun @relation(fields: [runId, tenantId], references: [id, tenantId], onDelete: Cascade)
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, runId, sourceType, sourceId])
+  @@index([tenantId, runId, eligibility])
 }

@@ -274,3 +274,18 @@ export function cameraCalibrationAdvisoryLockKey(
 ): string {
   return `camera-calibration:${tenantId}:${cameraSourceId}`;
 }
+
+/**
+ * Serializes Phase 18 dataset-improvement-run mutations — candidate
+ * refresh (delete+rebuild), split planning, status transitions, and the
+ * export stamp — for the SAME run. Without it, a refresh racing a
+ * plan-splits call could interleave the rebuild with split assignment
+ * and leave candidates half-planned, or an export could stamp EXPORTED
+ * over a candidate set that was being rebuilt.
+ */
+export function cvDatasetRunAdvisoryLockKey(
+  tenantId: string,
+  runId: string,
+): string {
+  return `cv-dataset-run:${tenantId}:${runId}`;
+}

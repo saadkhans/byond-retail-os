@@ -1741,3 +1741,189 @@ export interface PilotHardeningReport {
     basis: string;
   };
 }
+
+/** Phase 18 — dataset improvement & model tuning (advisory, shadow only).
+ *  Runs organize reviewed/corrected examples into training-ready metadata;
+ *  they never carry raw media, source URLs, paths, or credentials. */
+export type CvDatasetRunStatus = 'DRAFT' | 'READY' | 'EXPORTED' | 'ARCHIVED';
+export type CvDatasetPurpose =
+  | 'SKU_CLASSIFICATION'
+  | 'ACTION_RECOGNITION'
+  | 'FALSE_TOUCH_FILTERING'
+  | 'MISSED_EVENT_RECOVERY'
+  | 'CALIBRATION_VALIDATION'
+  | 'MIXED';
+export type CvDatasetCandidateSourceType =
+  | 'LIVE_REVIEW'
+  | 'MISSED_EVENT'
+  | 'PROTOCOL_SCENARIO'
+  | 'DATASET_EXPORT_ITEM';
+export type CvDatasetSplit = 'TRAIN' | 'VALIDATION' | 'TEST' | 'HOLDOUT';
+export type CvDatasetEligibility = 'ELIGIBLE' | 'EXCLUDED';
+export type CvDatasetReadiness = 'READY' | 'WARNING' | 'NOT_READY';
+
+export interface CvDatasetRunView {
+  id: string;
+  name: string;
+  status: CvDatasetRunStatus;
+  purpose: CvDatasetPurpose;
+  sourceEvaluationRunId: string | null;
+  sourceTestProtocolId: string | null;
+  sourceCalibrationProfileId: string | null;
+  trainSplitPercent: number;
+  validationSplitPercent: number;
+  testSplitPercent: number;
+  minReviewedExamplesPerSku: number;
+  minReviewedExamplesPerAction: number;
+  notes: string | null;
+  createdAt: string;
+  updatedAt: string;
+  exportedAt: string | null;
+  archivedAt: string | null;
+}
+
+export interface CvDatasetCandidateSummary {
+  total: number;
+  eligible: number;
+  excluded: number;
+  bySplit: {
+    TRAIN: number;
+    VALIDATION: number;
+    TEST: number;
+    HOLDOUT: number;
+    UNPLANNED: number;
+  };
+}
+
+export interface CvDatasetRunDetail extends CvDatasetRunView {
+  candidateSummary: CvDatasetCandidateSummary;
+}
+
+export interface CvDatasetCandidateView {
+  id: string;
+  sourceType: CvDatasetCandidateSourceType;
+  sourceId: string;
+  liveSessionId: string | null;
+  evaluationRunId: string | null;
+  protocolId: string | null;
+  calibrationProfileId: string | null;
+  skuId: string | null;
+  skuCodeSnapshot: string | null;
+  actionLabel: string;
+  correctedActionLabel: string | null;
+  reviewVerdict: string;
+  reviewSource: string;
+  confidenceBucket: string | null;
+  lightingBucket: string | null;
+  occlusionBucket: string | null;
+  calibrationZoneLabel: string | null;
+  scenarioTypeSnapshot: string | null;
+  split: CvDatasetSplit | null;
+  eligibility: CvDatasetEligibility;
+  exclusionReason: string | null;
+  createdAt: string;
+}
+
+export interface CvDatasetCandidatesResponse {
+  total: number;
+  items: CvDatasetCandidateView[];
+}
+
+export interface CvDatasetRefreshResult {
+  runId: string;
+  total: number;
+  eligible: number;
+  excluded: number;
+}
+
+export interface CvDatasetConfusionPair {
+  predicted: string;
+  expected: string;
+  count: number;
+}
+
+export interface CvDatasetQualityReport {
+  runId: string;
+  totalEligibleExamples: number;
+  totalExcludedExamples: number;
+  examplesBySku: { sku: string; count: number }[];
+  examplesByAction: { action: string; count: number }[];
+  examplesByScenarioType: { scenarioType: string; count: number }[];
+  examplesBySourceType: { sourceType: string; count: number }[];
+  examplesByCalibrationProfile: {
+    calibrationProfileId: string;
+    count: number;
+  }[];
+  missedEventCount: number;
+  falseTouchCount: number;
+  confusionPairs: {
+    action: CvDatasetConfusionPair[];
+    sku: CvDatasetConfusionPair[];
+  } | null;
+  lowCoverageSkus: { sku: string; count: number; minimum: number }[];
+  lowCoverageActions: { action: string; count: number; minimum: number }[];
+  imbalanceWarnings: string[];
+  leakageWarnings: string[];
+  readiness: CvDatasetReadiness;
+  recommendedNextActions: string[];
+  safety: {
+    orders: number;
+    checkoutSessions: number;
+    paymentIntents: number;
+    paymentEvents: number;
+    inventoryMovements: number;
+    basis: string;
+  };
+}
+
+export interface CvDatasetSplitPlanResult {
+  runId: string;
+  splitSummary: {
+    TRAIN: number;
+    VALIDATION: number;
+    TEST: number;
+    HOLDOUT: number;
+  };
+  groupCount: number;
+  warnings: string[];
+}
+
+export interface CvDatasetExportManifestResult {
+  runId: string;
+  manifestVersion: number;
+  rowCount: number;
+  generatedAt: string;
+  manifest: Record<string, unknown>;
+}
+
+export interface CvDatasetModelTuningReport {
+  runId: string;
+  recommendedModelTask:
+    | 'SKU_CLASSIFICATION'
+    | 'ACTION_RECOGNITION'
+    | 'FALSE_TOUCH_FILTERING'
+    | 'MIXED';
+  datasetReadiness: CvDatasetReadiness;
+  tuningReadiness: CvDatasetReadiness;
+  classCoverageSummary: {
+    skuClasses: number;
+    actionClasses: number;
+    belowMinimumSkus: number;
+    belowMinimumActions: number;
+  };
+  likelyConfusionPairs: CvDatasetConfusionPair[];
+  suggestedCollectionPlan: string[];
+  suggestedEvaluationMetrics: string[];
+  suggestedHoldoutPlan: { holdoutCount: number; note: string };
+  recommendedThresholdReview: { suggested: boolean; note: string };
+  recommendedNextActions: string[];
+  advisory: string;
+  safety: {
+    orders: number;
+    checkoutSessions: number;
+    paymentIntents: number;
+    paymentEvents: number;
+    inventoryMovements: number;
+    basis: string;
+  };
+}
