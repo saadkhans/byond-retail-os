@@ -16,6 +16,7 @@ import {
   PilotObservationVerdict,
   Prisma,
 } from '@prisma/client';
+import { createHash } from 'node:crypto';
 import { cvDatasetRunAdvisoryLockKey } from '../common/locks';
 import {
   containsCredentialSlotText,
@@ -295,6 +296,93 @@ function groupKeyOf(row: {
   sourceId: string;
 }): string {
   return row.liveSessionId ?? `${row.sourceType}:${row.sourceId}`;
+}
+
+/** The action-family CLASS a row belongs to for the purpose-scoped
+ *  split-coverage gates. FALSE_TOUCH_FILTERING is a BINARY task — NO_OP
+ *  negatives vs positive touches, where PICKUP and RETURN both provide
+ *  positive-touch coverage — so its gates must never demand TRAIN
+ *  coverage for every individual action label (a RETURN-only group
+ *  hashing into TEST must not block a run whose PICKUP examples already
+ *  cover the positive class). Every other purpose gates per individual
+ *  label. Returns null for labels outside the binary family. */
+function actionGateClassOf(
+  purpose: CvDatasetPurpose,
+  action: string,
+): string | null {
+  if (purpose !== CvDatasetPurpose.FALSE_TOUCH_FILTERING) {
+    return action;
+  }
+  if (action === PilotExpectedAction.NO_OP) {
+    return 'NEGATIVE_NO_OP';
+  }
+  if (
+    action === PilotExpectedAction.PICKUP ||
+    action === PilotExpectedAction.RETURN
+  ) {
+    return 'POSITIVE_TOUCH';
+  }
+  return null;
+}
+
+/** The manifest's calibration section — SAFE metadata only (no zone
+ *  labels, polygons, product details, or camera identifiers). Built
+ *  from the SAME single profile+zone read that freshness validation
+ *  fingerprints, so the manifest can never describe different content
+ *  than what was validated. */
+export interface CalibrationSnapshot {
+  calibrationProfileId: string;
+  name: string;
+  calibrationVersion: number;
+  orientation: string;
+  cameraMount: string;
+  zoneSummary: {
+    total: number;
+    shelfZones: number;
+    interactionZones: number;
+    ignoreZones: number;
+    entryExitZones: number;
+  };
+}
+
+/** sha256 over SAFE calibration content. Any profile metadata edit and
+ *  any zone ADDITION, UPDATE, or DELETION changes the digest: zone ids
+ *  and counts move on membership changes, updatedAt moves on edits.
+ *  Zone ids feed the digest but are never surfaced in responses or
+ *  errors. Nothing sensitive is hashed — no labels, polygons, expected
+ *  products, sources, paths, or credentials. */
+export function calibrationContentFingerprint(
+  profile: {
+    id: string;
+    calibrationVersion: number;
+    orientation: string;
+    cameraMount: string;
+    updatedAt: Date;
+  },
+  zones: { id: string; zoneType: string; updatedAt: Date }[],
+): string {
+  const zoneCountByType: Record<string, number> = {};
+  for (const zone of [...zones].sort((a, b) =>
+    a.zoneType.localeCompare(b.zoneType),
+  )) {
+    zoneCountByType[zone.zoneType] = (zoneCountByType[zone.zoneType] ?? 0) + 1;
+  }
+  const canonical = JSON.stringify({
+    calibrationProfileId: profile.id,
+    calibrationVersion: profile.calibrationVersion,
+    orientation: profile.orientation,
+    cameraMount: profile.cameraMount,
+    profileUpdatedAt: profile.updatedAt.toISOString(),
+    zoneCount: zones.length,
+    zoneCountByType,
+    zoneIds: zones.map((zone) => zone.id).sort(),
+    maxZoneUpdatedAt: zones.length
+      ? new Date(
+          Math.max(...zones.map((zone) => zone.updatedAt.getTime())),
+        ).toISOString()
+      : null,
+  });
+  return createHash('sha256').update(canonical, 'utf8').digest('hex');
 }
 
 /** Label families a task can train on, counted over ELIGIBLE rows. */
@@ -650,6 +738,56 @@ export class CvDatasetService {
     );
   }
 
+  /** ONE tenant-scoped read of the linked calibration profile + zones,
+   *  returning the manifest snapshot AND its content fingerprint
+   *  together. Export validates the fingerprint and then populates the
+   *  manifest from this exact object — there is deliberately no second
+   *  profile/zone read a concurrent edit could slip between. Null when
+   *  the profile no longer exists. */
+  private async readCalibrationSnapshot(
+    db: Prisma.TransactionClient | PrismaService,
+    tenantId: string,
+    profileId: string,
+  ): Promise<{ snapshot: CalibrationSnapshot; fingerprint: string } | null> {
+    const profile = await db.cameraCalibrationProfile.findFirst({
+      where: { tenantId, id: profileId },
+      select: {
+        id: true,
+        name: true,
+        calibrationVersion: true,
+        orientation: true,
+        cameraMount: true,
+        updatedAt: true,
+      },
+    });
+    if (!profile) {
+      return null;
+    }
+    const zones = await db.cameraCalibrationZone.findMany({
+      where: { tenantId, calibrationProfileId: profileId },
+      select: { id: true, zoneType: true, updatedAt: true },
+    });
+    const zoneCount = (zoneType: string) =>
+      zones.filter((zone) => zone.zoneType === zoneType).length;
+    return {
+      snapshot: {
+        calibrationProfileId: profile.id,
+        name: profile.name,
+        calibrationVersion: profile.calibrationVersion,
+        orientation: profile.orientation,
+        cameraMount: profile.cameraMount,
+        zoneSummary: {
+          total: zones.length,
+          shelfZones: zoneCount('SHELF_ZONE'),
+          interactionZones: zoneCount('INTERACTION_ZONE'),
+          ignoreZones: zoneCount('IGNORE_ZONE'),
+          entryExitZones: zoneCount('ENTRY_EXIT_ZONE'),
+        },
+      },
+      fingerprint: calibrationContentFingerprint(profile, zones),
+    };
+  }
+
   // ------------------------------------------------------------------
   // run CRUD
   // ------------------------------------------------------------------
@@ -855,7 +993,12 @@ export class CvDatasetService {
       });
       const changeWarnings: string[] = [];
       if (linksChanged && existing.length) {
-        // The candidate ledger describes the OLD source family.
+        // The candidate ledger (and its refresh-time calibration
+        // fingerprint) describes the OLD source family.
+        await tx.cvDatasetImprovementRun.updateMany({
+          where: { tenantId, id: runId },
+          data: { calibrationFingerprint: null },
+        });
         await tx.cvDatasetCandidate.deleteMany({ where: { tenantId, runId } });
         if (hadSplits) {
           changeWarnings.push(DATASET_SPLITS_REQUIRE_REPLAN);
@@ -1223,6 +1366,32 @@ export class CvDatasetService {
           })),
         });
       }
+      // Capture the refresh-time calibration CONTENT fingerprint when
+      // the linked profile is actually stamped on eligible candidates.
+      // Export recomputes and compares, so profile edits and zone
+      // additions/updates/DELETIONS after this instant reject the
+      // export instead of silently changing the manifest. Null when no
+      // profile is linked or nothing is stamped (FILE_REPLAY footage is
+      // never stamped — calibration stays NOT_APPLICABLE to it).
+      const profileStamped =
+        run.sourceCalibrationProfileId !== null &&
+        seeds.some(
+          (seed) =>
+            seed.eligibility === CvDatasetEligibility.ELIGIBLE &&
+            seed.calibrationProfileId === run.sourceCalibrationProfileId,
+        );
+      const calibration =
+        profileStamped && run.sourceCalibrationProfileId
+          ? await this.readCalibrationSnapshot(
+              tx,
+              tenantId,
+              run.sourceCalibrationProfileId,
+            )
+          : null;
+      await tx.cvDatasetImprovementRun.updateMany({
+        where: { tenantId, id: runId },
+        data: { calibrationFingerprint: calibration?.fingerprint ?? null },
+      });
       const eligible = seeds.filter(
         (seed) => seed.eligibility === CvDatasetEligibility.ELIGIBLE,
       ).length;
@@ -1316,6 +1485,13 @@ export class CvDatasetService {
     const actionGroups = new Map<string, Set<string>>();
     const skuSplits = new Map<string, Set<string>>();
     const actionSplits = new Map<string, Set<string>>();
+    // GATE maps: keyed by the purpose's trainable action class — for
+    // FALSE_TOUCH_FILTERING that is the BINARY NO_OP-vs-positive-touch
+    // pair, for every other purpose the individual label (identical to
+    // actionGroups/actionSplits then). Only the gates read these; the
+    // per-label maps keep describing the dataset (minimums, imbalance).
+    const gateActionGroups = new Map<string, Set<string>>();
+    const gateActionSplits = new Map<string, Set<string>>();
     for (const row of eligible) {
       const groupKey = groupKeyOf(row);
       const action = effectiveAction(row);
@@ -1337,6 +1513,19 @@ export class CvDatasetService {
         const splits = actionSplits.get(action) ?? new Set<string>();
         splits.add(row.split);
         actionSplits.set(action, splits);
+      }
+      const gateClass = actionGateClassOf(run.purpose, action);
+      if (gateClass !== null) {
+        const gateGroups =
+          gateActionGroups.get(gateClass) ?? new Set<string>();
+        gateGroups.add(groupKey);
+        gateActionGroups.set(gateClass, gateGroups);
+        if (row.split) {
+          const gateSplits =
+            gateActionSplits.get(gateClass) ?? new Set<string>();
+          gateSplits.add(row.split);
+          gateActionSplits.set(gateClass, gateSplits);
+        }
       }
     }
 
@@ -1495,8 +1684,10 @@ export class CvDatasetService {
       const sku = purposeTrainsSkuClasses(run.purpose)
         ? classMissing(skuSplits, skuGroups)
         : noneMissing;
+      // Gate on the purpose's trainable action CLASSES (binary for
+      // FALSE_TOUCH_FILTERING), never on every individual label.
       const action = purposeTrainsActionClasses(run.purpose)
-        ? classMissing(actionSplits, actionGroups)
+        ? classMissing(gateActionSplits, gateActionGroups)
         : noneMissing;
       if (sku.missingTrain || action.missingTrain) {
         // The STABLE assignment left a trainable class with no TRAIN
@@ -1771,6 +1962,18 @@ export class CvDatasetService {
       // Purpose-scoped (#P1): only the families the task trains can
       // warn/block — an irrelevant family hashing outside TRAIN must
       // not block an unrelated task. Assignment above is untouched.
+      // Action gating runs over the purpose's trainable CLASSES: the
+      // binary NO_OP-vs-positive-touch pair for FALSE_TOUCH_FILTERING,
+      // the individual labels for every other purpose.
+      const actionGateClasses = [
+        ...new Set(
+          [...actionCounts.keys()]
+            .map((action) => actionGateClassOf(run.purpose, action))
+            .filter((cls): cls is string => cls !== null),
+        ),
+      ];
+      const actionGateMatch = (cls: string, row: CvDatasetCandidate) =>
+        actionGateClassOf(run.purpose, effectiveAction(row)) === cls;
       if (purposeTrainsSkuClasses(run.purpose)) {
         warnClassMissingTrain(
           [...skuCounts.keys()],
@@ -1778,10 +1981,7 @@ export class CvDatasetService {
         );
       }
       if (purposeTrainsActionClasses(run.purpose)) {
-        warnClassMissingTrain(
-          [...actionCounts.keys()],
-          (cls, row) => effectiveAction(row) === cls,
-        );
+        warnClassMissingTrain(actionGateClasses, actionGateMatch);
       }
 
       // (d) requested-split completeness (honesty about what the
@@ -1833,10 +2033,7 @@ export class CvDatasetService {
         );
       }
       if (purposeTrainsActionClasses(run.purpose)) {
-        classSplitWarnings(
-          [...actionCounts.keys()],
-          (cls, row) => effectiveAction(row) === cls,
-        );
+        classSplitWarnings(actionGateClasses, actionGateMatch);
       }
       if (eligible.length < SMALL_DATASET_THRESHOLD) {
         warnings.add('SMALL_DATASET');
@@ -1935,64 +2132,49 @@ export class CvDatasetService {
         `${DATASET_STALE_CANDIDATES}: source reviews or scenario results changed after the last refresh — refresh candidates and re-plan splits before exporting`,
       );
     }
-    await this.assertCalibrationContentFresh(tenantId, run, stored);
   }
 
-  /** Calibration CONTENT freshness: the manifest snapshots the linked
-   *  profile's orientation/mount/version and zone counts, so profile or
-   *  zone EDITS after the candidate refresh would attribute setup
-   *  metadata to footage that never used it — including on re-export of
-   *  an EXPORTED run, whose frozen ledger keeps the original refresh
-   *  time. The ledger's newest createdAt is the refresh instant
-   *  (refresh rebuilds every row). Applies only when the profile is
-   *  actually stamped on candidate rows — FILE_REPLAY-only runs are
-   *  never stamped and stay exempt. Known MVP gap (no stored snapshot,
-   *  and no schema change here): DELETING a pre-refresh zone leaves no
-   *  newer timestamp and is not detectable — documented in the operator
-   *  guide. */
-  private async assertCalibrationContentFresh(
+  /** Calibration CONTENT freshness + the manifest's calibration
+   *  section, from ONE read. The stored refresh-time fingerprint covers
+   *  profile metadata AND zone membership (sorted ids, counts by type,
+   *  updatedAt), so profile edits and zone additions, updates, and
+   *  DELETIONS after the refresh all reject the export — including
+   *  re-export of an EXPORTED run, whose frozen ledger keeps the
+   *  original fingerprint. The returned snapshot is the SAME object the
+   *  fingerprint validated, so the manifest can never carry different
+   *  content than what passed validation. Applies only when the linked
+   *  profile is stamped on eligible rows — FILE_REPLAY-only runs are
+   *  never stamped and stay exempt (calibration is NOT_APPLICABLE). */
+  private async validatedCalibrationSnapshot(
+    db: Prisma.TransactionClient | PrismaService,
     tenantId: string,
     run: CvDatasetImprovementRun,
-    stored: CvDatasetCandidate[],
-  ) {
-    if (!run.sourceCalibrationProfileId || !stored.length) {
-      return;
+    eligible: CvDatasetCandidate[],
+  ): Promise<CalibrationSnapshot | null> {
+    const profileId = run.sourceCalibrationProfileId;
+    if (!profileId) {
+      return null;
     }
-    const stamped = stored.some(
-      (row) =>
-        row.eligibility === CvDatasetEligibility.ELIGIBLE &&
-        row.calibrationProfileId === run.sourceCalibrationProfileId,
+    const stamped = eligible.some(
+      (row) => row.calibrationProfileId === profileId,
     );
     if (!stamped) {
-      return;
+      return null;
     }
-    const refreshTime = Math.max(
-      ...stored.map((row) => row.createdAt.getTime()),
-    );
-    const profile = await this.prisma.cameraCalibrationProfile.findFirst({
-      where: { tenantId, id: run.sourceCalibrationProfileId },
-      select: { updatedAt: true },
-    });
-    const zones = profile
-      ? await this.prisma.cameraCalibrationZone.findMany({
-          where: {
-            tenantId,
-            calibrationProfileId: run.sourceCalibrationProfileId,
-          },
-          select: { updatedAt: true },
-        })
-      : [];
+    const current = await this.readCalibrationSnapshot(db, tenantId, profileId);
+    const storedFingerprint = run.calibrationFingerprint ?? null;
     if (
-      !profile ||
-      profile.updatedAt.getTime() > refreshTime ||
-      zones.some((zone) => zone.updatedAt.getTime() > refreshTime)
+      !current ||
+      storedFingerprint === null ||
+      current.fingerprint !== storedFingerprint
     ) {
-      // Controlled message — profile names, zone labels, and camera
+      // Controlled message — profile names, zone labels/ids, and camera
       // identifiers are never echoed.
       throw new BadRequestException(
-        `${DATASET_STALE_CANDIDATES}: the linked calibration profile changed after the last refresh — refresh candidates and re-plan splits before exporting`,
+        `${DATASET_STALE_CANDIDATES}: the linked calibration profile or its zones changed after the last refresh — refresh candidates and re-plan splits before exporting`,
       );
     }
+    return current.snapshot;
   }
 
   /** Safe JSON manifest for OFFLINE training: references, labels, and
@@ -2025,6 +2207,14 @@ export class CvDatasetService {
         );
       }
       await this.assertCandidatesFresh(tenantId, run, internals.candidates);
+      // ONE calibration read: fingerprint validation and the manifest
+      // section come from the same snapshot object (see helper doc).
+      const calibration = await this.validatedCalibrationSnapshot(
+        tx,
+        tenantId,
+        run,
+        internals.eligible,
+      );
       if (!internals.purposeSatisfied) {
         throw new BadRequestException(
           'export rejected: the run has no usable labels for its purpose — see the quality report',
@@ -2074,64 +2264,10 @@ export class CvDatasetService {
       }
       const actionLabels = [...new Set(rows.map(effectiveAction))].sort();
 
-      // Calibration metadata snapshot (safe fields only — no zone
-      // labels, no polygons, no source metadata). Included only when
-      // the linked profile is actually stamped on candidate rows, i.e.
-      // it matches the camera the footage came from. Null otherwise.
-      let calibration: {
-        calibrationProfileId: string;
-        name: string;
-        calibrationVersion: number;
-        orientation: string;
-        cameraMount: string;
-        zoneSummary: {
-          total: number;
-          shelfZones: number;
-          interactionZones: number;
-          ignoreZones: number;
-          entryExitZones: number;
-        };
-      } | null = null;
-      const profileStamped =
-        run.sourceCalibrationProfileId !== null &&
-        rows.some(
-          (row) => row.calibrationProfileId === run.sourceCalibrationProfileId,
-        );
-      if (run.sourceCalibrationProfileId && profileStamped) {
-        const profile = await this.prisma.cameraCalibrationProfile.findFirst({
-          where: { tenantId, id: run.sourceCalibrationProfileId },
-          select: {
-            id: true,
-            name: true,
-            calibrationVersion: true,
-            orientation: true,
-            cameraMount: true,
-          },
-        });
-        if (profile) {
-          const zones = await this.prisma.cameraCalibrationZone.findMany({
-            where: { tenantId, calibrationProfileId: profile.id },
-            select: { zoneType: true },
-          });
-          const zoneCount = (zoneType: string) =>
-            zones.filter((zone) => zone.zoneType === zoneType).length;
-          calibration = {
-            calibrationProfileId: profile.id,
-            name: profile.name,
-            calibrationVersion: profile.calibrationVersion,
-            orientation: profile.orientation,
-            cameraMount: profile.cameraMount,
-            zoneSummary: {
-              total: zones.length,
-              shelfZones: zoneCount('SHELF_ZONE'),
-              interactionZones: zoneCount('INTERACTION_ZONE'),
-              ignoreZones: zoneCount('IGNORE_ZONE'),
-              entryExitZones: zoneCount('ENTRY_EXIT_ZONE'),
-            },
-          };
-        }
-      }
-
+      // The calibration section was captured above, in the SAME read
+      // its fingerprint validation used — no re-read here, so a
+      // concurrent profile/zone edit can only reject the export, never
+      // slip changed metadata into the manifest.
       const warnings = [
         ...internals.imbalanceWarnings,
         ...internals.leakageWarnings,

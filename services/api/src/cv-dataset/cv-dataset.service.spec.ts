@@ -86,7 +86,7 @@ function buildHarness(
     missedEvents?: Record<string, unknown>[];
     summary?: Record<string, unknown> | null;
     scenarios?: Record<string, unknown>[];
-    zones?: { zoneType: string; updatedAt?: Date }[];
+    zones?: { id?: string; zoneType: string; updatedAt?: Date }[];
     /** cal-1's updatedAt — read at call time, so tests can mutate the
      *  options object to simulate an edit after refresh. */
     profileUpdatedAt?: Date;
@@ -285,7 +285,8 @@ function buildHarness(
     },
     cameraCalibrationZone: {
       findMany: jest.fn(async () =>
-        (options.zones ?? []).map((zone) => ({
+        (options.zones ?? []).map((zone, index) => ({
+          id: `zone-${index}`,
           updatedAt: new Date('2026-08-20T08:00:00.000Z'),
           ...zone,
         })),
@@ -2228,5 +2229,233 @@ describe('CvDatasetService — Codex P1 final cleanup', () => {
       .catch((thrown: Error) => (error = thrown));
     expect(String(error)).toContain('CV_DATASET_CALIBRATION_CAMERA_MISMATCH');
     expect(String(error)).not.toContain('camera-x');
+  });
+});
+
+describe('CvDatasetService — Codex P1 round 4 (calibration fingerprint + binary false-touch gates)', () => {
+  const FULL_TRAIN = {
+    trainSplitPercent: 100,
+    validationSplitPercent: 0,
+    testSplitPercent: 0,
+  };
+
+  it('deleting a calibration zone after refresh rejects export; refresh + replan recovers', async () => {
+    const options = {
+      ...mixedFixtureOptions(),
+      zones: [{ zoneType: 'SHELF_ZONE' }, { zoneType: 'INTERACTION_ZONE' }],
+    } as ReturnType<typeof mixedFixtureOptions> & {
+      zones: { id?: string; zoneType: string; updatedAt?: Date }[];
+    };
+    const harness = buildHarness(options);
+    const created = await createLinkedRun(harness.service, FULL_TRAIN);
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.setStatus(TENANT, created.id, 'READY' as never);
+    await harness.service.planSplits(TENANT, created.id);
+    // A deletion leaves NO newer timestamp anywhere — remaining zones
+    // and the profile are untouched. Only the content fingerprint
+    // (zone ids + counts by type) can catch it.
+    options.zones.pop();
+    let error: Error | null = null;
+    await harness.service
+      .exportManifest(TENANT, created.id)
+      .catch((thrown: Error) => (error = thrown));
+    expect(String(error)).toContain('CV_DATASET_STALE_CANDIDATES');
+    expect(String(error)).toContain('refresh candidates and re-plan splits');
+    // Controlled message: no profile name, zone type/id, camera id.
+    expect(String(error)).not.toContain('Front shelf profile');
+    expect(String(error)).not.toContain('SHELF_ZONE');
+    expect(String(error)).not.toContain('camera-1');
+    // Refresh + replan captures the post-deletion content → export OK,
+    // and the manifest describes the CURRENT single-zone state.
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.planSplits(TENANT, created.id);
+    const exported = await harness.service.exportManifest(TENANT, created.id);
+    expect(exported.manifest.calibration).toMatchObject({
+      calibrationProfileId: 'cal-1',
+      zoneSummary: { total: 1, shelfZones: 1, interactionZones: 0 },
+    });
+  });
+
+  it('adding a zone after refresh rejects export through the fingerprint too', async () => {
+    const options = {
+      ...mixedFixtureOptions(),
+      zones: [{ zoneType: 'SHELF_ZONE' }],
+    } as ReturnType<typeof mixedFixtureOptions> & {
+      zones: { id?: string; zoneType: string; updatedAt?: Date }[];
+    };
+    const harness = buildHarness(options);
+    const created = await createLinkedRun(harness.service, FULL_TRAIN);
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.setStatus(TENANT, created.id, 'READY' as never);
+    await harness.service.planSplits(TENANT, created.id);
+    // Same timestamp as the existing zone — membership alone differs.
+    options.zones.push({ zoneType: 'IGNORE_ZONE' });
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('CV_DATASET_STALE_CANDIDATES');
+  });
+
+  it('validates and builds the manifest calibration section from ONE read', async () => {
+    const options = {
+      ...mixedFixtureOptions(),
+      zones: [{ zoneType: 'SHELF_ZONE' }],
+    } as ReturnType<typeof mixedFixtureOptions> & {
+      zones: { id?: string; zoneType: string; updatedAt?: Date }[];
+    };
+    const harness = buildHarness(options);
+    const created = await createLinkedRun(harness.service, FULL_TRAIN);
+    await harness.service.refreshCandidates(TENANT, created.id);
+    await harness.service.setStatus(TENANT, created.id, 'READY' as never);
+    await harness.service.planSplits(TENANT, created.id);
+    harness.prisma.cameraCalibrationZone.findMany.mockClear();
+    harness.prisma.cameraCalibrationProfile.findFirst.mockClear();
+    const exported = await harness.service.exportManifest(TENANT, created.id);
+    // ONE zone read: the fingerprint validation and the manifest
+    // calibration section share the same snapshot object, so there is
+    // no window where a concurrent profile/zone edit could pass
+    // validation yet change the emitted metadata.
+    expect(
+      harness.prisma.cameraCalibrationZone.findMany,
+    ).toHaveBeenCalledTimes(1);
+    // Profile reads: the candidate re-derivation (camera match) plus
+    // the single snapshot read — never a separate later manifest read.
+    expect(
+      harness.prisma.cameraCalibrationProfile.findFirst,
+    ).toHaveBeenCalledTimes(2);
+    expect(exported.manifest.calibration).toMatchObject({
+      calibrationProfileId: 'cal-1',
+      calibrationVersion: 2,
+      zoneSummary: { total: 1, shelfZones: 1 },
+    });
+  });
+
+  it('FALSE_TOUCH_FILTERING gates on binary NO_OP-vs-positive-touch classes, not every action label', async () => {
+    const [trainSession] = sessionsInBand('p18-ftf-train', 1, 0, 7000);
+    const [testSession] = sessionsInBand('p18-ftf-test', 1, 7000, 10000);
+    const options = {
+      observations: [
+        // POSITIVE (PICKUP) and NEGATIVE (NO_OP) both in the TRAIN band…
+        observation({
+          journeyEventId: 'evt-pos',
+          liveSessionId: trainSession,
+          latestReview: review({ reviewId: 'r-pos', verdict: 'CORRECT' }),
+        }),
+        observation({
+          journeyEventId: 'evt-neg',
+          liveSessionId: trainSession,
+          matchScore: 0.2,
+          latestReview: review({ reviewId: 'r-neg', verdict: 'FALSE_TOUCH' }),
+        }),
+        // …while the RETURN label exists ONLY in the TEST band. PICKUP
+        // already provides positive-touch TRAIN coverage, so a binary
+        // task must not block on the missing RETURN label.
+        observation({
+          journeyEventId: 'evt-ret',
+          liveSessionId: testSession,
+          eventType: 'PRODUCT_RETURN',
+          latestReview: review({
+            reviewId: 'r-ret',
+            verdict: 'CORRECT',
+            expectedAction: 'RETURN',
+          }),
+        }),
+      ],
+    };
+    const percents = {
+      trainSplitPercent: 70,
+      validationSplitPercent: 0,
+      testSplitPercent: 30,
+    };
+    const filtering = buildHarness(options);
+    const filteringRun = await filtering.service.createRun(TENANT, {
+      ...BASE_INPUT,
+      ...percents,
+      purpose: 'FALSE_TOUCH_FILTERING' as never,
+      sourceEvaluationRunId: 'eval-1',
+    });
+    await filtering.service.refreshCandidates(TENANT, filteringRun.id);
+    const filteringPlan = await filtering.service.planSplits(
+      TENANT,
+      filteringRun.id,
+    );
+    expect(filteringPlan.warnings).not.toContain('CLASS_MISSING_TRAIN_SPLIT');
+    expect(filteringPlan.warnings).not.toContain(
+      'INSUFFICIENT_STABLE_SPLIT_COVERAGE',
+    );
+    const filteringQuality = await filtering.service.qualityReport(
+      TENANT,
+      filteringRun.id,
+    );
+    expect(filteringQuality.readiness).not.toBe('NOT_READY');
+    await filtering.service.setStatus(TENANT, filteringRun.id, 'READY' as never);
+    const exported = await filtering.service.exportManifest(
+      TENANT,
+      filteringRun.id,
+    );
+    expect(exported.rowCount).toBe(3);
+
+    // ACTION_RECOGNITION stays strict per individual label: the same
+    // data blocks it because the RETURN class has no TRAIN coverage…
+    const strict = buildHarness(options);
+    const strictRun = await strict.service.createRun(TENANT, {
+      ...BASE_INPUT,
+      ...percents,
+      purpose: 'ACTION_RECOGNITION' as never,
+      sourceEvaluationRunId: 'eval-1',
+    });
+    await strict.service.refreshCandidates(TENANT, strictRun.id);
+    const strictPlan = await strict.service.planSplits(TENANT, strictRun.id);
+    expect(strictPlan.warnings).toContain('CLASS_MISSING_TRAIN_SPLIT');
+    const strictQuality = await strict.service.qualityReport(
+      TENANT,
+      strictRun.id,
+    );
+    expect(strictQuality.readiness).toBe('NOT_READY');
+    // …and the stable ASSIGNMENT is identical across both purposes:
+    // the gates are purpose-scoped, the splits never move.
+    expect(strictPlan.splitSummary).toEqual(filteringPlan.splitSummary);
+  });
+
+  it('FALSE_TOUCH_FILTERING still blocks when a binary class itself has no TRAIN coverage', async () => {
+    const [trainSession] = sessionsInBand('p18-ftf2-train', 1, 0, 7000);
+    const [testSession] = sessionsInBand('p18-ftf2-test', 1, 7000, 10000);
+    // negativeInTrain=true → positives only in TEST; false → negatives
+    // only in TEST. Both directions must block.
+    for (const negativeInTrain of [true, false]) {
+      const trainVerdict = negativeInTrain ? 'FALSE_TOUCH' : 'CORRECT';
+      const testVerdict = negativeInTrain ? 'CORRECT' : 'FALSE_TOUCH';
+      const harness = buildHarness({
+        observations: [
+          observation({
+            journeyEventId: 'evt-train',
+            liveSessionId: trainSession,
+            latestReview: review({ reviewId: 'r-1', verdict: trainVerdict }),
+          }),
+          observation({
+            journeyEventId: 'evt-test',
+            liveSessionId: testSession,
+            latestReview: review({ reviewId: 'r-2', verdict: testVerdict }),
+          }),
+        ],
+      });
+      const created = await harness.service.createRun(TENANT, {
+        ...BASE_INPUT,
+        trainSplitPercent: 70,
+        validationSplitPercent: 0,
+        testSplitPercent: 30,
+        purpose: 'FALSE_TOUCH_FILTERING' as never,
+        sourceEvaluationRunId: 'eval-1',
+      });
+      await harness.service.refreshCandidates(TENANT, created.id);
+      const plan = await harness.service.planSplits(TENANT, created.id);
+      expect(plan.warnings).toContain('CLASS_MISSING_TRAIN_SPLIT');
+      expect(plan.warnings).toContain('INSUFFICIENT_STABLE_SPLIT_COVERAGE');
+      const quality = await harness.service.qualityReport(TENANT, created.id);
+      expect(quality.readiness).toBe('NOT_READY');
+      harness.runs.find((row) => row.id === created.id)!.status = 'READY';
+      await expect(
+        harness.service.exportManifest(TENANT, created.id),
+      ).rejects.toThrow('INSUFFICIENT_STABLE_SPLIT_COVERAGE');
+    }
   });
 });

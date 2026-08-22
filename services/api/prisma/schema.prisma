@@ -2821,6 +2821,14 @@ model CvDatasetImprovementRun {
   // Screened free text (reject-on-write): never a URL, path, credential,
   // or slot name — same policy as calibration notes.
   notes                       String?
+  // sha256 over SAFE calibration content (profile id/version/orientation/
+  // mount/updatedAt + zone counts, sorted zone ids, max zone updatedAt),
+  // captured at candidate refresh when the linked profile is stamped on
+  // eligible candidates. Export recomputes and compares, so profile edits
+  // AND zone additions/updates/deletions after the refresh reject the
+  // export instead of silently changing the manifest. Null when no
+  // profile is linked or nothing is stamped (FILE_REPLAY exemption).
+  calibrationFingerprint      String?
   createdById                 String?
   createdAt                   DateTime                      @default(now())
   updatedAt                   DateTime                      @updatedAt
