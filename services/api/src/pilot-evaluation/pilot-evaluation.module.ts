@@ -309,5 +309,8 @@ export class CvTestProtocolController {
   imports: [PlatformModulesModule],
   controllers: [PilotEvaluationController, CvTestProtocolController],
   providers: [PilotEvaluationService, CvTestProtocolService],
+  // Exported for Phase 18: the dataset-improvement module reuses the
+  // observations/summary derivations verbatim instead of re-querying.
+  exports: [PilotEvaluationService],
 })
 export class PilotEvaluationModule {}
