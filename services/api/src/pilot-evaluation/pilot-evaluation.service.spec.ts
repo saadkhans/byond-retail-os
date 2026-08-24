@@ -181,28 +181,53 @@ function buildHarness(
       }),
     },
     customerJourneyEvent: {
-      findMany: jest.fn(async (args: { where: Record<string, unknown> }) =>
-        journeyEvents.filter((e) =>
-          whereMatch(e, {
-            tenantId: args.where.tenantId,
-            sourceType: args.where.sourceType,
-          }) &&
-          ((args.where.journeyId as { in: string[] }).in ?? []).includes(
-            e.journeyId as string,
-          ) &&
-          ((args.where.eventType as { in: string[] }).in ?? []).includes(
-            e.eventType as string,
-          ),
-        ),
-      ),
+      // observations() now queries with an OR of provenance scopes
+      // (session journeys → LIVE_SHADOW; review-referenced ids →
+      // FUSION_SHADOW); honor both that shape and the legacy flat one.
+      findMany: jest.fn(async (args: { where: Record<string, unknown> }) => {
+        const eventTypeIn =
+          (args.where.eventType as { in: string[] }).in ?? [];
+        const scopes =
+          (args.where.OR as Record<string, unknown>[] | undefined) ?? [
+            args.where,
+          ];
+        return journeyEvents.filter(
+          (e) =>
+            whereMatch(e, { tenantId: args.where.tenantId }) &&
+            eventTypeIn.includes(e.eventType as string) &&
+            scopes.some((scope) => {
+              const journeyIn = (
+                scope.journeyId as { in: string[] } | undefined
+              )?.in;
+              const idIn = (scope.id as { in: string[] } | undefined)?.in;
+              if (
+                scope.sourceType !== undefined &&
+                e.sourceType !== scope.sourceType
+              ) {
+                return false;
+              }
+              if (journeyIn && !journeyIn.includes(e.journeyId as string)) {
+                return false;
+              }
+              if (idIn && !idIn.includes(e.id as string)) {
+                return false;
+              }
+              return true;
+            }),
+        );
+      }),
       findFirst: jest.fn(async (args: { where: Record<string, unknown> }) => {
-        const { eventType, ...rest } = args.where;
+        const { eventType, sourceType, ...rest } = args.where;
+        const sourceIn = (sourceType as { in: string[] } | undefined)?.in;
         const row = journeyEvents.find(
           (e) =>
             whereMatch(e, rest) &&
             ((eventType as { in: string[] }).in ?? []).includes(
               e.eventType as string,
-            ),
+            ) &&
+            (sourceIn
+              ? sourceIn.includes(e.sourceType as string)
+              : sourceType === undefined || e.sourceType === sourceType),
         );
         return row ?? null;
       }),
@@ -647,5 +672,106 @@ describe('PilotEvaluationService — dataset export', () => {
     expect(populated.manifest).not.toContain('://');
     expect(populated.manifest).not.toContain('CAMERA_');
     expect(populated.manifest).not.toContain('credential');
+  });
+});
+
+describe('PilotEvaluationService — video-bootstrap (FUSION_SHADOW) observations', () => {
+  const VIDEO_EVENT = {
+    id: 'event-video-1',
+    tenantId: TENANT,
+    journeyId: 'journey-video',
+    eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+    occurredAt: new Date('2026-08-20T10:00:00.000Z'),
+    productId: 'prod-a',
+    sku: 'SKU-A',
+    productName: 'Product A',
+    matchScore: 0.35,
+    sourceType: 'FUSION_SHADOW',
+    videoAssetId: 'va-1',
+  };
+
+  it('records a review on a video-shadow event with NO attached session and surfaces it as an observation', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+    });
+    const run = await harness.service.createRun(
+      TENANT,
+      { name: 'One SKU bootstrap — SKU-A' },
+      'user-1',
+    );
+    const review = await harness.service.reviewObservation(
+      TENANT,
+      run.evaluationRunId,
+      {
+        verdict: PilotObservationVerdict.WRONG_SKU,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: 'event-video-1',
+        expectedProductId: 'prod-c',
+      },
+      'user-1',
+    );
+    const stored = harness.reviews.find(
+      (row) => row.id === review.reviewId,
+    ) as Record<string, unknown>;
+    // No live session exists for a video clip — the review row itself is
+    // the run linkage, and the prediction snapshots are server-side.
+    expect(stored.liveSessionId).toBeNull();
+    expect(stored.predictedSku).toBe('SKU-A');
+    expect(stored.expectedSku).toBe('SKU-C');
+
+    // The reviewed video event is now an observation of the run — the
+    // exact rows Phase 18 candidate refresh consumes.
+    const result = await harness.service.observations(
+      TENANT,
+      run.evaluationRunId,
+    );
+    expect(result.observations).toHaveLength(1);
+    expect(result.observations[0].journeyEventId).toBe('event-video-1');
+    expect(result.observations[0].liveSessionId).toBeNull();
+    expect(result.observations[0].latestReview?.verdict).toBe(
+      PilotObservationVerdict.WRONG_SKU,
+    );
+  });
+
+  it('refuses a video-shadow event that lacks video provenance', async () => {
+    const harness = buildHarness({
+      journeyEvents: [
+        { ...VIDEO_EVENT, id: 'event-video-2', videoAssetId: null },
+      ],
+      products: PRODUCTS,
+    });
+    const run = await harness.service.createRun(
+      TENANT,
+      { name: 'One SKU bootstrap — SKU-A' },
+      'user-1',
+    );
+    await expect(
+      harness.service.reviewObservation(TENANT, run.evaluationRunId, {
+        verdict: PilotObservationVerdict.CORRECT,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: 'event-video-2',
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('still refuses a LIVE_SHADOW event whose session is not attached to the run', async () => {
+    const harness = buildHarness({
+      liveSessions: LIVE_SESSIONS,
+      journeyEvents: EVENTS,
+      products: PRODUCTS,
+    });
+    const run = await harness.service.createRun(
+      TENANT,
+      { name: 'Unattached' },
+      'user-1',
+    );
+    await expect(
+      harness.service.reviewObservation(TENANT, run.evaluationRunId, {
+        verdict: PilotObservationVerdict.CORRECT,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: 'event-1',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
   });
 });

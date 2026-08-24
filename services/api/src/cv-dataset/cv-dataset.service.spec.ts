@@ -664,6 +664,37 @@ describe('CvDatasetService — candidate collection (reviewed/corrected only)', 
     }
   });
 
+  it('a video-bootstrap observation (no live session) yields an ELIGIBLE candidate', async () => {
+    // One-SKU bootstrap reviews reference FUSION_SHADOW video events —
+    // no LiveCameraSession exists, so liveSessionId is null and the
+    // group key falls back to the event itself (groupKeyOf).
+    const { service, candidates } = buildHarness({
+      observations: [
+        observation({
+          journeyEventId: 'evt-video',
+          liveSessionId: null,
+          matchScore: 0.35,
+          latestReview: review({
+            verdict: 'WRONG_SKU',
+            expectedProductId: 'prod-c',
+            expectedSku: 'SKU-C',
+          }) as never,
+        }),
+      ],
+    });
+    const created = await createLinkedRun(service, {
+      sourceTestProtocolId: null,
+      sourceCalibrationProfileId: null,
+    });
+    const result = await service.refreshCandidates(TENANT, created.id);
+    expect(result.eligible).toBe(1);
+    const row = candidates.find((c) => c.sourceId === 'evt-video')!;
+    expect(row.eligibility).toBe('ELIGIBLE');
+    expect(row.liveSessionId).toBeNull();
+    expect(row.skuCodeSnapshot).toBe('SKU-C');
+    expect(row.reviewSource).toBe('PILOT_EVALUATION');
+  });
+
   it('never mutates the reviewed/corrected source records it reads', async () => {
     const { service, prisma } = buildHarness(mixedFixtureOptions());
     const created = await createLinkedRun(service);

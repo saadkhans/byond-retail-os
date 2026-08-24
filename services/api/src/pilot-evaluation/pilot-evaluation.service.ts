@@ -285,21 +285,45 @@ export class PilotEvaluationService {
         .filter((row) => row.journeyId !== null)
         .map((row) => [row.journeyId as string, row.liveSessionId]),
     );
-    const events = journeyIds.length
-      ? await this.prisma.customerJourneyEvent.findMany({
-          where: {
-            tenantId,
-            journeyId: { in: journeyIds },
-            sourceType: 'LIVE_SHADOW',
-            eventType: { in: LIVE_OBSERVATION_EVENT_TYPES },
-          },
-          orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
-        })
-      : [];
     const reviews = await this.prisma.pilotObservationReview.findMany({
       where: { tenantId, evaluationRunId },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     });
+    // Observations come from two provenances:
+    // - LIVE_SHADOW events on journeys of the run's attached sessions.
+    // - FUSION_SHADOW events (video bootstrap) that this run's own
+    //   reviews reference — video journeys have no live session, so the
+    //   review row is the only linkage that can surface them here.
+    const reviewedEventIds = [
+      ...new Set(
+        reviews
+          .map((review) => review.journeyEventId)
+          .filter((id): id is string => id !== null),
+      ),
+    ];
+    const eventScopes = [
+      ...(journeyIds.length
+        ? [{ journeyId: { in: journeyIds }, sourceType: 'LIVE_SHADOW' as const }]
+        : []),
+      ...(reviewedEventIds.length
+        ? [
+            {
+              id: { in: reviewedEventIds },
+              sourceType: 'FUSION_SHADOW' as const,
+            },
+          ]
+        : []),
+    ];
+    const events = eventScopes.length
+      ? await this.prisma.customerJourneyEvent.findMany({
+          where: {
+            tenantId,
+            eventType: { in: LIVE_OBSERVATION_EVENT_TYPES },
+            OR: eventScopes,
+          },
+          orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
+        })
+      : [];
     const latestByEvent = new Map<string, (typeof reviews)[number]>();
     const missed: (typeof reviews)[number][] = [];
     for (const review of reviews) {
@@ -438,8 +462,15 @@ export class PilotEvaluationService {
       return { reviewId: review.id, verdict: review.verdict };
     }
 
-    // Every other verdict labels ONE concrete live observation belonging
-    // to a journey of an attached session (tenant-scoped end to end).
+    // Every other verdict labels ONE concrete shadow observation.
+    // Two provenances are accepted (tenant-scoped end to end):
+    // - LIVE_SHADOW: must belong to a journey of a live session attached
+    //   to this run (unchanged Phase 15 rule).
+    // - FUSION_SHADOW: a shadow event imported from a CONTROLLED TEST
+    //   VIDEO's fusion run (one-SKU bootstrap). No live session exists
+    //   for a video clip, so the review row itself is the run linkage
+    //   and liveSessionId stays null; the event's videoAssetId is the
+    //   evidence locator provenance.
     if (!input.journeyEventId) {
       throw new BadRequestException('journeyEventId is required');
     }
@@ -447,24 +478,34 @@ export class PilotEvaluationService {
       where: {
         tenantId,
         id: input.journeyEventId,
-        sourceType: 'LIVE_SHADOW',
+        sourceType: { in: ['LIVE_SHADOW', 'FUSION_SHADOW'] },
         eventType: { in: LIVE_OBSERVATION_EVENT_TYPES },
       },
     });
     if (!event) {
       throw new NotFoundException('Live observation not found');
     }
-    const owning = sessions.find((row) => row.journeyId === event.journeyId);
-    if (!owning) {
-      throw new ConflictException(
-        'observation does not belong to a session attached to this run',
+    let liveSessionId: string | null = null;
+    if (event.sourceType === 'LIVE_SHADOW') {
+      const owning = sessions.find((row) => row.journeyId === event.journeyId);
+      if (!owning) {
+        throw new ConflictException(
+          'observation does not belong to a session attached to this run',
+        );
+      }
+      liveSessionId = owning.liveSessionId;
+    } else if (!event.videoAssetId) {
+      // FUSION_SHADOW without video provenance has no evidence locator
+      // an offline trainer could map to footage — refuse to label it.
+      throw new BadRequestException(
+        'a video-shadow observation needs video provenance',
       );
     }
     const review = await this.prisma.pilotObservationReview.create({
       data: {
         tenantId,
         evaluationRunId,
-        liveSessionId: owning.liveSessionId,
+        liveSessionId,
         journeyEventId: event.id,
         verdict: input.verdict,
         expectedAction: input.expectedAction,

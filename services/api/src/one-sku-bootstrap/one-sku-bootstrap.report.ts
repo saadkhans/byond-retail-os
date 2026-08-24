@@ -33,10 +33,15 @@ export const MIN_REVIEWED_FALSE_TOUCHES = 2;
 /** Newest-first cap on ground-truthed clips considered by the report. */
 export const BOOTSTRAP_MAX_CLIPS = 100;
 
-/** Mirrors PickupDetectionConfig.DEFAULT_ANALYSIS_WIDTH — crop boxes in
- *  fusion evidence are in this downscaled analysis geometry, NOT native
- *  video pixels. */
-export const ANALYSIS_TARGET_WIDTH = 192;
+/**
+ * Mirrors the fusion pipeline's FULL analysis frame: geometryFull is
+ * analysisGeometryFor(probe, Math.min(source.width, 640)) — a bare 640
+ * literal at pickup-fusion.service.ts's geometryFull call. Evidence crop
+ * boxes (fullBox) live in THIS space — not the 192-wide detection frame
+ * and not native pixels (Codex P1: a 192-wide mirror made valid crops
+ * look out of frame).
+ */
+export const FUSION_FULL_FRAME_TARGET_WIDTH = 640;
 
 export const SCORE_NOTE =
   'Scores are uncalibrated ranking signals, not probabilities; counts ' +
@@ -59,6 +64,11 @@ export interface SafeCropSummary {
   occlusion: number;
   brightness: number;
   selected: boolean;
+  /** false for an OPERATOR crop: no pixel analysis ran on it, so the
+   *  sharpness/occlusion/brightness numbers are placeholders and the
+   *  quality-based warnings are skipped — the operator's visual check
+   *  is the quality evidence. */
+  qualityKnown: boolean;
 }
 
 export type CropQualityWarning =
@@ -66,7 +76,17 @@ export type CropQualityWarning =
   | 'HIGH_OCCLUSION'
   | 'LOW_SHARPNESS'
   | 'CROP_MISALIGNED'
-  | 'NO_CLEAR_PRODUCT_FRAME';
+  | 'NO_CLEAR_PRODUCT_FRAME'
+  /** Frame geometry unavailable — area/alignment UNVERIFIED (advisory:
+   *  never a false CROP_MISALIGNED, never blocks the CLEAN_CROP gate). */
+  | 'UNKNOWN_GEOMETRY';
+
+/** Warnings that gate CLEAN_CROP; UNKNOWN_GEOMETRY is advisory only. */
+export function gatingCropWarnings(
+  warnings: CropQualityWarning[],
+): CropQualityWarning[] {
+  return warnings.filter((warning) => warning !== 'UNKNOWN_GEOMETRY');
+}
 
 export interface SafeFusionSummary {
   createdAt: Date;
@@ -74,10 +94,20 @@ export interface SafeFusionSummary {
   topSku: string | null;
   topScore: number | null;
   yoloReady: boolean | null;
+  /** Which crop the report's evidence reflects: the pipeline's automatic
+   *  selection, or a newer OPERATOR manual crop that supersedes it. */
+  cropSource: 'AUTO' | 'OPERATOR';
+  /** Artifact id of the effective crop (previewable via the existing
+   *  video-asset artifact image endpoint) — an OPAQUE id, never a path. */
+  cropArtifactId: string | null;
   vlmInvoked: boolean;
   vlmStatus: string | null;
   vlmVerdict: string | null;
   vlmSelectedSku: string | null;
+  /** Whitelist-validated support enum ('SUPPORTS' | 'CONTRADICTS' | ...). */
+  vlmVisualSupport: string | null;
+  /** Classified reason CODES only — never model text. */
+  vlmReasonCodes: string[];
   vlmRequiresHumanReview: boolean | null;
   barcodeMatchedSku: string | null;
   ocrStatus: string | null;
@@ -93,7 +123,8 @@ export type BootstrapFailureReason =
   | 'NOT_STOCKED'
   | 'MISSING_REFERENCES'
   | 'NO_BARCODE_OCR'
-  | 'BACKGROUND_HEAVY_CROP';
+  | 'BACKGROUND_HEAVY_CROP'
+  | 'MISSED_POSITIVE_EVENT';
 
 export interface GateItem {
   key: string;
@@ -106,15 +137,19 @@ export interface GateItem {
 
 // ------------------------------------------------------------ geometry
 
-/** Mirror of analysisGeometryFor's math (even dims, min 16) so crop box
- *  area can be compared against the SAME frame the box lives in. */
-export function analysisDimsFor(
+/** Mirror of analysisGeometryFor's math (even dims, min 16) at the FULL
+ *  fusion width, so crop boxes are compared against the SAME frame the
+ *  pipeline computed them in. */
+export function fusionFrameDimsFor(
   native: { width: number | null; height: number | null } | null,
 ): { width: number; height: number } | null {
   if (!native || !native.width || !native.height) {
     return null;
   }
-  const width = Math.max(16, Math.min(ANALYSIS_TARGET_WIDTH, native.width));
+  const width = Math.max(
+    16,
+    Math.min(FUSION_FULL_FRAME_TARGET_WIDTH, native.width),
+  );
   const evenWidth = width - (width % 2);
   const scaledHeight = Math.round((native.height * evenWidth) / native.width);
   const evenHeight = Math.max(16, scaledHeight - (scaledHeight % 2));
@@ -133,8 +168,13 @@ export function deriveCropWarnings(
     return ['NO_CLEAR_PRODUCT_FRAME'];
   }
   const warnings: CropQualityWarning[] = [];
-  const highOcclusion = selected.occlusion > HIGH_OCCLUSION_THRESHOLD;
-  const lowSharpness = selected.sharpness < WEAK_SHARPNESS_THRESHOLD;
+  // Quality checks apply only to pipeline-analyzed crops — an operator
+  // crop (qualityKnown false) carries no pixel metrics; the operator's
+  // visual confirmation stands in for them.
+  const highOcclusion =
+    selected.qualityKnown && selected.occlusion > HIGH_OCCLUSION_THRESHOLD;
+  const lowSharpness =
+    selected.qualityKnown && selected.sharpness < WEAK_SHARPNESS_THRESHOLD;
   if (highOcclusion) {
     warnings.push('HIGH_OCCLUSION');
   }
@@ -144,7 +184,11 @@ export function deriveCropWarnings(
   const box = selected.box;
   if (box.width <= 0 || box.height <= 0) {
     warnings.push('CROP_MISALIGNED');
-  } else if (analysisDims) {
+  } else if (!analysisDims) {
+    // No probed frame geometry: alignment/area are UNVERIFIED. Surface
+    // that honestly instead of a false CROP_MISALIGNED or a false clean.
+    warnings.push('UNKNOWN_GEOMETRY');
+  } else {
     const outOfFrame =
       box.x < 0 ||
       box.y < 0 ||
@@ -216,6 +260,7 @@ function safeCrop(value: unknown): SafeCropSummary | null {
     occlusion: num(quality?.occlusion) ?? 0,
     brightness: num(quality?.brightness) ?? 0,
     selected: crop.selected === true,
+    qualityKnown: true,
   };
 }
 
@@ -265,10 +310,21 @@ export function safeFusionSummary(
     topSku: str(top?.sku),
     topScore: num(top?.fusedScore),
     yoloReady: boolOrNull(detector?.yoloReady),
+    cropSource: 'AUTO',
+    cropArtifactId: str(evidence?.cropArtifactId),
     vlmInvoked: vlm?.invoked === true,
     vlmStatus: str(vlm?.status),
     vlmVerdict: str(vlm?.verdict),
     vlmSelectedSku: str(vlm?.selectedSku),
+    vlmVisualSupport: str(vlm?.visualSupport),
+    // Reason codes are already a classified fixed vocabulary upstream —
+    // keep only short UPPER_SNAKE tokens so free text can never ride in.
+    vlmReasonCodes: (Array.isArray(vlm?.reasonCodes) ? vlm.reasonCodes : [])
+      .filter(
+        (code): code is string =>
+          typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code),
+      )
+      .slice(0, 16),
     vlmRequiresHumanReview: boolOrNull(vlm?.requiresHumanReview),
     barcodeMatchedSku: str(barcode?.matchedSku),
     ocrStatus: str(ocr?.status),
@@ -278,10 +334,55 @@ export function safeFusionSummary(
   };
 }
 
+// -------------------------------------------------- operator crop (P1)
+
+export interface OperatorCropEvidence {
+  artifactId: string;
+  timestampMs: number;
+  /** NATIVE pixel space — manual crops are validated against the probed
+   *  source dimensions, unlike fusion's analysis-frame boxes. */
+  box: BoxLike;
+  createdAt: Date;
+}
+
+/**
+ * A manual crop created AFTER the latest fusion run supersedes the
+ * pipeline's automatic crop as this clip's evidence: the preview, the
+ * warnings, and the CLEAN_CROP gate all follow it. Geometry checks run
+ * against the NATIVE frame (the space manual crops live in); quality
+ * metrics are unknown by construction — the operator's visual check is
+ * the review. The association is fully persisted already: the artifact
+ * row carries asset/timestamp/box/reason, and the SKU label comes from
+ * the clip's ground truth.
+ */
+export function applyOperatorCrop(
+  summary: SafeFusionSummary,
+  crop: OperatorCropEvidence,
+  nativeDims: { width: number; height: number } | null,
+): SafeFusionSummary {
+  const selectedCrop: SafeCropSummary = {
+    phase: 'operator',
+    timestampMs: crop.timestampMs,
+    box: crop.box,
+    sharpness: 0,
+    occlusion: 0,
+    brightness: 0,
+    selected: true,
+    qualityKnown: false,
+  };
+  return {
+    ...summary,
+    cropSource: 'OPERATOR',
+    cropArtifactId: crop.artifactId,
+    selectedCrop,
+    cropWarnings: deriveCropWarnings(selectedCrop, nativeDims),
+  };
+}
+
 // ------------------------------------------------------ failure rollup
 
 export function deriveFailureReasons(
-  clips: { fusion: SafeFusionSummary | null }[],
+  clips: { fusion: SafeFusionSummary | null; missedPositiveEvent?: boolean }[],
   references: { inferenceReady: boolean },
 ): { reason: BootstrapFailureReason; count: number }[] {
   const counts = new Map<BootstrapFailureReason, number>();
@@ -292,6 +393,9 @@ export function deriveFailureReasons(
     bump('MISSING_REFERENCES');
   }
   for (const clip of clips) {
+    if (clip.missedPositiveEvent === true) {
+      bump('MISSED_POSITIVE_EVENT');
+    }
     const fusion = clip.fusion;
     if (!fusion) {
       continue;
@@ -335,6 +439,10 @@ export interface GateInput {
   reviewedReturnExamples: number;
   reviewedFalseTouchExamples: number;
   unreviewedClips: number;
+  /** Pilot reviews recorded on the linked bootstrap evaluation run —
+   *  null when no run is linked yet. Phase 18 refreshes its candidates
+   *  from exactly these rows, so readiness is meaningless without them. */
+  linkedEvaluationReviewCount: number | null;
 }
 
 /** The one-SKU checklist. Guidance only — nothing here blocks any
@@ -379,12 +487,15 @@ export function evaluateGates(input: GateInput): {
       label: 'Latest selected crop has no quality warnings',
       satisfied:
         input.latestFusion !== null &&
-        input.latestFusion.cropWarnings.length === 0,
+        gatingCropWarnings(input.latestFusion.cropWarnings).length === 0,
       required: true,
       detail: input.latestFusion
-        ? input.latestFusion.cropWarnings.length === 0
-          ? 'clean'
-          : input.latestFusion.cropWarnings.join(', ')
+        ? (input.latestFusion.cropSource === 'OPERATOR'
+            ? 'operator-selected crop · '
+            : '') +
+          (input.latestFusion.cropWarnings.length === 0
+            ? 'clean'
+            : input.latestFusion.cropWarnings.join(', '))
         : 'no fusion run yet',
     },
     {
@@ -421,6 +532,20 @@ export function evaluateGates(input: GateInput): {
         input.unreviewedClips === 0
           ? 'all reviewed'
           : `${input.unreviewedClips} awaiting review`,
+    },
+    {
+      key: 'EVALUATION_RUN_LINKED',
+      label:
+        'Reviewed examples recorded on the bootstrap evaluation run ' +
+        '(the Phase 18 candidate source)',
+      satisfied:
+        input.linkedEvaluationReviewCount !== null &&
+        input.linkedEvaluationReviewCount >= 1,
+      required: true,
+      detail:
+        input.linkedEvaluationReviewCount === null
+          ? 'no evaluation run linked yet'
+          : `${input.linkedEvaluationReviewCount} pilot review(s) recorded`,
     },
   ];
   return {

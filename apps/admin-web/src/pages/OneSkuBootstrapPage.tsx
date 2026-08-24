@@ -1,12 +1,13 @@
-import { FormEvent, useEffect, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { CSSProperties, FormEvent, useEffect, useRef, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
 import {
   ApiError,
+  CvTestScenario,
+  GroundTruthView,
   OneSkuBootstrapReport,
   OneSkuVideoRow,
   Paginated,
   Product,
-  ReferenceLibraryStatus,
   VideoArtifact,
   VideoAsset,
   api,
@@ -14,6 +15,7 @@ import {
   apiUpload,
 } from '../api';
 import { Page, useDebounced, useLoad } from '../components';
+import { TEST_TYPE_LABEL } from '../cv-evaluation-utils';
 import {
   CROP_WARNING_LABELS,
   FAILURE_REASON_LABELS,
@@ -22,13 +24,19 @@ import {
   ManualCropFieldErrors,
   REFERENCE_ANGLES,
   basketDeltaLabel,
+  deriveStatusHeader,
   gateProgress,
+  nextBestAction,
+  oneSkuEvaluationRunPath,
   oneSkuReportPath,
+  oneSkuReviewPath,
   overlayRectStyle,
   validateManualCrop,
 } from '../one-sku-bootstrap-utils';
-import { FusionEvidencePanel } from './FusionEvidencePanel';
-import { PickupDetectionPanel } from './PickupDetectionPanel';
+import {
+  GroundTruthFieldErrors,
+  validateGroundTruth,
+} from '../pickup-detection-utils';
 import { mergeProducts, productSearchPaths } from './ReferenceLibraryPage';
 import { ACCEPTED_EXTENSIONS, UPLOAD_ATTESTATIONS } from './VideoAssetsPage';
 
@@ -38,34 +46,453 @@ function errorMessage(err: unknown): string {
 
 const fieldErrorStyle = { color: '#c0392b', fontSize: '0.85em' };
 const border = '1px solid var(--border, #d8d8e0)';
+const stepCard: CSSProperties = {
+  border,
+  borderRadius: 8,
+  padding: '0.9rem 1.1rem',
+  margin: '0.9rem 0',
+};
+
+function StepHeading({ n, title }: { n: number; title: string }) {
+  return (
+    <h2 style={{ display: 'flex', alignItems: 'center', gap: '0.55rem', margin: '0 0 0.5rem' }}>
+      <span
+        aria-hidden
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: '1.7rem',
+          height: '1.7rem',
+          borderRadius: '50%',
+          background: 'var(--accent, #4c6ef5)',
+          color: '#fff',
+          fontSize: '0.95rem',
+        }}
+      >
+        {n}
+      </span>
+      {title}
+    </h2>
+  );
+}
 
 function WarningBadges({ warnings }: { warnings: string[] }) {
   if (warnings.length === 0) {
     return <span className="badge ok">clean crop</span>;
   }
   return (
-    <>
+    <span style={{ display: 'inline-flex', flexWrap: 'wrap', gap: '0.3rem' }}>
       {warnings.map((warning) => (
-        <span
-          key={warning}
-          className="badge warn"
-          title={CROP_WARNING_LABELS[warning] ?? warning}
-          style={{ marginRight: '0.25rem' }}
-        >
-          {warning}
+        <span key={warning} className="badge warn">
+          {CROP_WARNING_LABELS[warning] ?? warning}{' '}
+          <span style={{ opacity: 0.65, fontSize: '0.8em' }}>{warning}</span>
         </span>
       ))}
-    </>
+    </span>
+  );
+}
+
+/** Static first-SKU standard operating procedure. */
+function SopPanel() {
+  return (
+    <aside style={{ ...stepCard, background: 'var(--panel, rgba(76,110,245,0.06))' }}>
+      <strong>First SKU SOP</strong>
+      <ol style={{ margin: '0.4rem 0 0 1.2rem', lineHeight: 1.7 }}>
+        <li>Upload 8–12 reference images (all angles below)</li>
+        <li>Record 5 pickup videos</li>
+        <li>Record 2 return videos</li>
+        <li>Record 2 false-touch videos (touch, no removal)</li>
+        <li>Review every result (correct / wrong SKU / false touch)</li>
+        <li>Send reviewed examples to Dataset Improvement</li>
+      </ol>
+    </aside>
+  );
+}
+
+/** Safe per-clip summary — ONLY classified fields from the bootstrap
+ *  report (never raw fusion evidence, OCR/barcode text, or VLM
+ *  provider/environment details). */
+function CropQualityCard({
+  row,
+  onManualCrop,
+}: {
+  row: OneSkuVideoRow;
+  onManualCrop: () => void;
+}) {
+  const fusion = row.fusion;
+  const [cropUrl, setCropUrl] = useState<string | null>(null);
+  const cropArtifactId = fusion?.cropArtifactId ?? null;
+
+  useEffect(() => {
+    if (!cropArtifactId) {
+      setCropUrl(null);
+      return;
+    }
+    let revoked: string | null = null;
+    let cancelled = false;
+    void apiObjectUrl(
+      `/video-assets/${row.videoAssetId}/artifacts/${cropArtifactId}/image`,
+    ).then((url) => {
+      if (cancelled) {
+        if (url) URL.revokeObjectURL(url);
+        return;
+      }
+      revoked = url;
+      setCropUrl(url);
+    });
+    return () => {
+      cancelled = true;
+      if (revoked) URL.revokeObjectURL(revoked);
+    };
+  }, [row.videoAssetId, cropArtifactId]);
+
+  if (!fusion) {
+    return (
+      <p className="muted">
+        No fusion run yet — run the shadow analysis to see crop quality.
+      </p>
+    );
+  }
+  const crop = fusion.selectedCrop;
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', alignItems: 'flex-start' }}>
+      <div style={{ minWidth: '9rem' }}>
+        {cropUrl ? (
+          <img
+            src={cropUrl}
+            alt="Selected crop"
+            style={{ maxWidth: '9rem', maxHeight: '9rem', border, borderRadius: 6 }}
+          />
+        ) : (
+          <div
+            style={{
+              width: '9rem',
+              height: '6rem',
+              border,
+              borderRadius: 6,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+            className="muted"
+          >
+            no crop image
+          </div>
+        )}
+        <p className="muted" style={{ margin: '0.25rem 0 0' }}>
+          {fusion.cropSource === 'OPERATOR'
+            ? 'operator-selected crop'
+            : 'automatic crop'}
+        </p>
+      </div>
+      <dl className="detail" style={{ flex: 1, minWidth: '16rem' }}>
+        <dt>Quality</dt>
+        <dd>
+          <WarningBadges warnings={fusion.cropWarnings} />
+        </dd>
+        {crop ? (
+          <>
+            <dt>Bounding box</dt>
+            <dd>
+              {crop.box.width}×{crop.box.height} @ ({crop.box.x}, {crop.box.y}) ·{' '}
+              {crop.timestampMs} ms
+            </dd>
+            <dt>Metrics</dt>
+            <dd>
+              {crop.qualityKnown
+                ? `sharpness ${crop.sharpness.toFixed(1)} · occlusion ${Math.round(crop.occlusion * 100)}% · brightness ${Math.round(crop.brightness)}`
+                : 'visually confirmed by operator (no pixel metrics)'}
+            </dd>
+          </>
+        ) : null}
+        <dt>Top prediction</dt>
+        <dd>
+          {fusion.topSku ?? 'UNKNOWN'}
+          {fusion.topScore !== null ? ` (${Math.round(fusion.topScore * 100)}%)` : ''}{' '}
+          · {fusion.policy}
+        </dd>
+        <dt>VLM verdict</dt>
+        <dd>
+          {fusion.vlmInvoked
+            ? `${fusion.vlmVerdict ?? fusion.vlmStatus ?? '—'}` +
+              (fusion.vlmVisualSupport ? ` · visual ${fusion.vlmVisualSupport}` : '') +
+              (fusion.vlmReasonCodes.length ? ` · ${fusion.vlmReasonCodes.join(', ')}` : '') +
+              (fusion.vlmRequiresHumanReview ? ' · needs human review' : '')
+            : 'not invoked'}
+        </dd>
+      </dl>
+      <button onClick={onManualCrop}>Draw a manual crop instead</button>
+    </div>
+  );
+}
+
+/** Ground truth for the SELECTED clip — expected SKU is pinned to the
+ *  bootstrap SKU (spec: chosen automatically). */
+function BootstrapGroundTruthForm({
+  assetId,
+  product,
+  durationMs,
+  onSaved,
+}: {
+  assetId: string;
+  product: { id: string; sku: string };
+  durationMs: number | null;
+  onSaved: () => void;
+}) {
+  const [kind, setKind] = useState<'PICKUP' | 'RETURN' | 'NONE'>('PICKUP');
+  const [timestampMs, setTimestampMs] = useState('');
+  const [quantity, setQuantity] = useState('1');
+  const [testType, setTestType] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [apiErrorText, setApiErrorText] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<GroundTruthFieldErrors>({});
+  const [notice, setNotice] = useState<string | null>(null);
+  const [reload, setReload] = useState(0);
+
+  const existing = useLoad<GroundTruthView | null>(
+    () => api(`/video-assets/${assetId}/ground-truth`),
+    [assetId, reload],
+  );
+  useEffect(() => {
+    const truth = existing.data;
+    if (truth) {
+      setKind(truth.eventKind);
+      setTimestampMs(
+        truth.actualTimestampMs !== null ? String(truth.actualTimestampMs) : '',
+      );
+      setQuantity(String(truth.quantity));
+      setTestType(truth.testType ?? '');
+    }
+  }, [existing.data?.videoAssetId, existing.data?.updatedAt]);
+
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    setApiErrorText(null);
+    setNotice(null);
+    const validated = validateGroundTruth({
+      eventKind: kind,
+      productId: kind === 'NONE' ? '' : product.id,
+      timestampMs,
+      quantity,
+      durationMs,
+    });
+    if (!validated.ok) {
+      setFieldErrors(validated.errors);
+      return;
+    }
+    setFieldErrors({});
+    setSaving(true);
+    try {
+      await api(`/video-assets/${assetId}/ground-truth`, {
+        method: 'PUT',
+        body: { ...validated.payload, ...(testType ? { testType } : {}) },
+      });
+      setNotice(`Ground truth saved (${kind}${kind === 'NONE' ? '' : ` · ${product.sku}`}).`);
+      setReload((n) => n + 1);
+      onSaved();
+    } catch (err) {
+      setApiErrorText(errorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div>
+      <h3 style={{ margin: '0 0 0.25rem' }}>Ground truth (what really happens)</h3>
+      {apiErrorText ? <div className="error">{apiErrorText}</div> : null}
+      {notice ? <p className="muted">✓ {notice}</p> : null}
+      <form className="toolbar" style={{ flexWrap: 'wrap', alignItems: 'flex-start' }} onSubmit={(e) => void save(e)}>
+        <select value={kind} onChange={(e) => setKind(e.target.value as typeof kind)}>
+          <option value="PICKUP">Pickup</option>
+          <option value="RETURN">Return</option>
+          <option value="NONE">False touch / nothing removed</option>
+        </select>
+        {kind !== 'NONE' ? (
+          <>
+            <span className="badge">{product.sku}</span>
+            <label>
+              Instant (ms){' '}
+              <input
+                type="text"
+                style={{ width: '6rem' }}
+                value={timestampMs}
+                onChange={(e) => setTimestampMs(e.target.value)}
+              />
+              {fieldErrors.timestampMs ? (
+                <div style={fieldErrorStyle}>{fieldErrors.timestampMs}</div>
+              ) : null}
+            </label>
+            <label>
+              Qty{' '}
+              <input
+                type="text"
+                style={{ width: '3rem' }}
+                value={quantity}
+                onChange={(e) => setQuantity(e.target.value)}
+              />
+              {fieldErrors.quantity ? (
+                <div style={fieldErrorStyle}>{fieldErrors.quantity}</div>
+              ) : null}
+            </label>
+          </>
+        ) : null}
+        <select value={testType} onChange={(e) => setTestType(e.target.value)}>
+          <option value="">— scenario label (optional) —</option>
+          {(Object.keys(TEST_TYPE_LABEL) as CvTestScenario[]).map((scenario) => (
+            <option key={scenario} value={scenario}>
+              {TEST_TYPE_LABEL[scenario]}
+            </option>
+          ))}
+        </select>
+        <button className="primary" type="submit" disabled={saving}>
+          {saving ? 'Saving…' : 'Save ground truth'}
+        </button>
+      </form>
+    </div>
   );
 }
 
 /**
- * Manual crop tool: extract ONE frame at a timestamp, preview it with the
- * crop rectangle overlaid, then create the crop through the existing
- * strict endpoint (closed reason enum + integers only — no field exists
- * for free text, paths, or URLs). SKU labeling comes from the clip's
- * ground truth, never from the crop itself.
+ * RECORD-ONLY corrections: each button posts a bootstrap review through
+ * the one-sku-bootstrap API, which appends a Phase 15 pilot review on the
+ * clip's imported shadow journey event. This page NEVER uses the
+ * vision-event review endpoint (whose approve/override path can mutate
+ * checkout basket lines), and session-bound clips are excluded.
  */
+function CorrectionPanel({
+  row,
+  productId,
+  products,
+  onRecorded,
+}: {
+  row: OneSkuVideoRow;
+  productId: string;
+  products: Product[];
+  onRecorded: (message: string) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [correctedProductId, setCorrectedProductId] = useState(productId);
+  const [actionErrorText, setActionErrorText] = useState<string | null>(null);
+
+  if (row.sessionBound) {
+    return (
+      <p>
+        <span className="badge down">session-bound</span>{' '}
+        <span className="muted">
+          This clip is attached to a checkout session and is read-only for
+          bootstrap corrections.
+        </span>
+      </p>
+    );
+  }
+  const isNone = row.eventKind === 'NONE';
+  const expectedAction = row.eventKind === 'RETURN' ? 'RETURN' : 'PICKUP';
+
+  async function record(body: Record<string, unknown>, message: string) {
+    setBusy(true);
+    setActionErrorText(null);
+    try {
+      await api(oneSkuReviewPath(productId, row.videoAssetId), {
+        method: 'POST',
+        body,
+      });
+      onRecorded(message);
+    } catch (err) {
+      setActionErrorText(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div>
+      <h3 style={{ margin: '0 0 0.25rem' }}>Correct / approve evidence</h3>
+      {actionErrorText ? <div className="error">{actionErrorText}</div> : null}
+      {row.bootstrapReviewVerdict ? (
+        <p className="muted">
+          Latest bootstrap review: <span className="badge ok">{row.bootstrapReviewVerdict}</span>{' '}
+          (a changed mind appends a newer review)
+        </p>
+      ) : null}
+      <div className="toolbar" style={{ flexWrap: 'wrap' }}>
+        {!isNone ? (
+          <>
+            <button
+              className="primary"
+              disabled={busy}
+              onClick={() =>
+                void record(
+                  { verdict: 'CORRECT', expectedAction },
+                  'Recorded: prediction confirmed correct.',
+                )
+              }
+            >
+              Correct
+            </button>
+            <select
+              value={correctedProductId}
+              onChange={(e) => setCorrectedProductId(e.target.value)}
+              title="The product that was ACTUALLY handled"
+            >
+              {products.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.sku}
+                </option>
+              ))}
+            </select>
+            <button
+              disabled={busy}
+              onClick={() =>
+                void record(
+                  {
+                    verdict: 'WRONG_SKU',
+                    expectedAction,
+                    expectedProductId: correctedProductId,
+                  },
+                  'Recorded: wrong SKU, corrected label saved.',
+                )
+              }
+            >
+              Incorrect → corrected SKU
+            </button>
+          </>
+        ) : null}
+        <button
+          disabled={busy}
+          onClick={() =>
+            void record(
+              { verdict: 'FALSE_TOUCH', expectedAction: 'NO_OP' },
+              'Recorded: false touch — nothing was removed.',
+            )
+          }
+        >
+          False touch / nothing removed
+        </button>
+        <button
+          disabled={busy}
+          onClick={() =>
+            void record(
+              { verdict: 'UNCERTAIN', expectedAction: 'UNKNOWN' },
+              'Recorded: uncertain — excluded from the dataset.',
+            )
+          }
+        >
+          Uncertain
+        </button>
+      </div>
+      <p className="muted">
+        Corrections append pilot-review records only (the Phase 18 dataset
+        source) — no basket, order, payment, or inventory change ever
+        results from them.
+      </p>
+    </div>
+  );
+}
+
+/** Manual crop tool (unchanged endpoint contract: integers + closed
+ *  reason enum + required idempotency key — no free text). */
 function ManualCropTool({
   assetId,
   durationMs,
@@ -85,14 +512,13 @@ function ManualCropTool({
   });
   const [errors, setErrors] = useState<ManualCropFieldErrors>({});
   const [busy, setBusy] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionErrorText, setActionErrorText] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [frame, setFrame] = useState<VideoArtifact | null>(null);
   const [frameUrl, setFrameUrl] = useState<string | null>(null);
   const [frameKey, setFrameKey] = useState(() => crypto.randomUUID());
   const [cropKey, setCropKey] = useState(() => crypto.randomUUID());
 
-  // Authenticated blob for the extracted frame preview.
   useEffect(() => {
     if (!frame) {
       setFrameUrl(null);
@@ -121,7 +547,7 @@ function ManualCropTool({
   }
 
   async function extractFrame() {
-    setActionError(null);
+    setActionErrorText(null);
     setNotice(null);
     const validated = validateManualCrop(
       { ...draft, x: '0', y: '0', width: '1', height: '1' },
@@ -152,14 +578,14 @@ function ManualCropTool({
         )
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
       if (!extracted) {
-        setActionError('Frame extracted but not found in artifacts yet — retry.');
+        setActionErrorText('Frame extracted but not found in artifacts yet — retry.');
         return;
       }
       setFrame(extracted);
       setFrameKey(crypto.randomUUID());
       setNotice(`Frame extracted at ${extracted.timestampMs} ms.`);
     } catch (err) {
-      setActionError(errorMessage(err));
+      setActionErrorText(errorMessage(err));
     } finally {
       setBusy(false);
     }
@@ -167,7 +593,7 @@ function ManualCropTool({
 
   async function createCrop(event: FormEvent) {
     event.preventDefault();
-    setActionError(null);
+    setActionErrorText(null);
     setNotice(null);
     const validated = validateManualCrop(draft, durationMs);
     if (!validated.ok) {
@@ -183,12 +609,12 @@ function ManualCropTool({
       });
       setCropKey(crypto.randomUUID());
       setNotice(
-        'Crop created as operator-reviewed evidence. Its SKU label comes ' +
-          'from this clip’s ground truth.',
+        'Manual crop saved — the report now uses it as this clip’s ' +
+          'operator-selected evidence (SKU label comes from ground truth).',
       );
       onCropCreated?.();
     } catch (err) {
-      setActionError(errorMessage(err));
+      setActionErrorText(errorMessage(err));
     } finally {
       setBusy(false);
     }
@@ -204,15 +630,16 @@ function ManualCropTool({
       : null;
 
   return (
-    <section style={{ marginTop: '1rem' }}>
-      <h3>Manual crop (when the automatic crop is bad)</h3>
+    <div>
+      <h3 style={{ margin: '0 0 0.25rem' }}>Manual crop</h3>
       <p className="muted">
         Pick the instant the product is clearly visible, extract that frame,
         then enter the crop box in native pixels — the rectangle previews on
-        the frame so you can adjust before saving. Coordinates only; no
-        free-text, file paths, or source references are stored.
+        the frame. Coordinates only; no free text, file paths, or source
+        references are stored. Saving replaces the automatic crop as this
+        clip’s evidence.
       </p>
-      {actionError ? <div className="error">{actionError}</div> : null}
+      {actionErrorText ? <div className="error">{actionErrorText}</div> : null}
       {notice ? <p className="muted">✓ {notice}</p> : null}
       <div className="toolbar" style={{ flexWrap: 'wrap' }}>
         <label>
@@ -236,7 +663,7 @@ function ManualCropTool({
           style={{
             position: 'relative',
             display: 'inline-block',
-            maxWidth: '32rem',
+            maxWidth: 'min(32rem, 100%)',
             border,
             borderRadius: 6,
             overflow: 'hidden',
@@ -299,24 +726,24 @@ function ManualCropTool({
           {busy ? 'Working…' : 'Create crop'}
         </button>
       </form>
-    </section>
+    </div>
   );
 }
 
 export function OneSkuBootstrapPage() {
+  const navigate = useNavigate();
   const [search, setSearch] = useState('');
   const debouncedSearch = useDebounced(search, 300);
   const [selectedProductId, setSelectedProductId] = useState('');
   const [selectedAssetId, setSelectedAssetId] = useState('');
   const [reload, setReload] = useState(0);
   const [busy, setBusy] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionErrorText, setActionErrorText] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [angles, setAngles] = useState<Record<string, boolean>>({});
+  const [manualCropOpen, setManualCropOpen] = useState(false);
 
-  // Test-video upload state (same attestation contract as /video-assets).
   const videoInput = useRef<HTMLInputElement>(null);
-  const referenceInput = useRef<HTMLInputElement>(null);
   const [uploadLocationId, setUploadLocationId] = useState('');
   const [attested, setAttested] = useState<Record<string, boolean>>({});
   const allAttested = UPLOAD_ATTESTATIONS.every(({ field }) => attested[field]);
@@ -343,14 +770,6 @@ export function OneSkuBootstrapPage() {
     [selectedProductId, reload],
   );
 
-  const refStatus = useLoad<ReferenceLibraryStatus | null>(
-    () =>
-      selectedProductId
-        ? api(`/catalog/products/${selectedProductId}/reference-images`)
-        : Promise.resolve(null),
-    [selectedProductId, reload],
-  );
-
   const selectedAsset = useLoad<VideoAsset | null>(
     () =>
       selectedAssetId
@@ -362,16 +781,20 @@ export function OneSkuBootstrapPage() {
   const data = report.data ?? null;
   const selectedRow: OneSkuVideoRow | null =
     data?.videos.find((row) => row.videoAssetId === selectedAssetId) ?? null;
+  const chips = data ? deriveStatusHeader(data) : null;
+  const action = data ? nextBestAction(data) : null;
+  const gates = data?.gates ?? null;
+  const progress = gates ? gateProgress(gates.items) : null;
 
   async function run(work: () => Promise<void>) {
     setBusy(true);
-    setActionError(null);
+    setActionErrorText(null);
     setNotice(null);
     try {
       await work();
       setReload((n) => n + 1);
     } catch (err) {
-      setActionError(errorMessage(err));
+      setActionErrorText(errorMessage(err));
     } finally {
       setBusy(false);
     }
@@ -419,13 +842,13 @@ export function OneSkuBootstrapPage() {
     event.preventDefault();
     const file = videoInput.current?.files?.[0];
     if (!file) {
-      setActionError('Choose a test video file first.');
+      setActionErrorText('Choose a test video file first.');
       return;
     }
     if (!allAttested) {
-      setActionError(
+      setActionErrorText(
         'Confirm all four operator attestations first — they are your ' +
-          'declarations that this is controlled internal test media.',
+          'declarations for THIS clip.',
       );
       return;
     }
@@ -449,6 +872,9 @@ export function OneSkuBootstrapPage() {
       if (videoInput.current) {
         videoInput.current.value = '';
       }
+      // Attestations are PER CLIP: every upload needs a fresh, explicit
+      // confirmation (Codex P1) — clear them along with the file.
+      setAttested({});
       setNotice(
         'Test video uploaded (quarantined). Complete the audited screening ' +
           'decision on the video page, then validate it here.',
@@ -462,17 +888,49 @@ export function OneSkuBootstrapPage() {
         method: 'POST',
         body: {},
       });
-      setNotice('Video validated — detection and fusion can run now.');
+      setNotice('Video validated — run the shadow analysis below.');
     });
   }
 
-  const gates = data?.gates ?? null;
-  const progress = gates ? gateProgress(gates.items) : null;
+  async function runAnalysis() {
+    await run(async () => {
+      await api(`/video-assets/${selectedAssetId}/pickup-detection/run`, {
+        method: 'POST',
+        body: {},
+      });
+      await api(`/video-assets/${selectedAssetId}/fusion-run`, {
+        method: 'POST',
+        body: {},
+      });
+      setNotice(
+        'Shadow analysis started (detection + fusion). Refresh in a few ' +
+          'seconds to see results.',
+      );
+    });
+  }
+
+  async function ensureEvaluationRun() {
+    await run(async () => {
+      const result = await api<{ evaluationRunId: string; created: boolean }>(
+        oneSkuEvaluationRunPath(selectedProductId),
+        { method: 'POST', body: {} },
+      );
+      setNotice(
+        result.created
+          ? 'Bootstrap evaluation run created — corrections now feed it.'
+          : 'Bootstrap evaluation run already linked.',
+      );
+    });
+  }
+
   const assetStatus = selectedAsset.data?.status ?? null;
-  const panelsReady =
+  const analysisReady =
     assetStatus === 'VALIDATED' ||
     assetStatus === 'PROCESSING' ||
     assetStatus === 'READY';
+  const selectedProduct = data
+    ? { id: data.product.id, sku: data.product.sku }
+    : null;
 
   return (
     <Page
@@ -481,275 +939,299 @@ export function OneSkuBootstrapPage() {
       loading={products.loading && !products.data}
     >
       <p className="muted">
-        Guided shadow-mode workflow: prove out ONE real SKU end to end —
-        references, embeddings, inventory, a clean test clip, ground truth,
-        review — before scaling to 5+ SKUs. Nothing here blocks the normal
-        pages, and nothing writes checkout, order, payment, or inventory
-        records.
+        Guided shadow-mode workflow: prove out ONE real SKU end to end
+        before scaling to 5+. Nothing here blocks the normal pages, and
+        nothing writes checkout, order, payment, or inventory records.
       </p>
-      {actionError ? <div className="error">{actionError}</div> : null}
+      {actionErrorText ? <div className="error">{actionErrorText}</div> : null}
       {notice ? <p className="muted">✓ {notice}</p> : null}
 
-      <h2>1 · Pick the SKU under test</h2>
-      <div className="toolbar">
-        <input
-          type="search"
-          placeholder="Search name, SKU, or barcode…"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          style={{ minWidth: '16rem' }}
-        />
-        <select
-          value={selectedProductId}
-          onChange={(e) => {
-            setSelectedProductId(e.target.value);
-            setSelectedAssetId('');
-            setAngles({});
-          }}
-        >
-          <option value="">— choose a SKU —</option>
-          {(products.data ?? []).map((product) => (
-            <option key={product.id} value={product.id}>
-              {product.sku} — {product.name}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      {selectedProductId && data ? (
-        <>
-          <h2>
-            2 · Readiness — {data.product.sku}{' '}
-            {gates?.readyForDatasetImprovement ? (
-              <span className="badge ok">READY FOR DATASET IMPROVEMENT</span>
-            ) : (
-              <span className="badge warn">
-                {progress ? `${progress.satisfied}/${progress.total} gates` : '…'}
-              </span>
-            )}
-          </h2>
-          <div className="cards">
-            <div className="card">
-              <div className="value">
-                {data.references.referenceCount}/{data.references.minRequired}
-              </div>
-              <div className="label">
-                reference images{' '}
-                {data.references.inferenceReady ? '(inference-ready)' : ''}
-              </div>
-            </div>
-            <div className="card">
-              <div className="value">{data.references.embeddingCount}</div>
-              <div className="label">
-                embeddings ({data.references.embeddingModelKey}@
-                {data.references.embeddingModelVersion})
-              </div>
-            </div>
-            <div className="card">
-              <div className="value">{data.inventory.totalOnHand}</div>
-              <div className="label">
-                on hand{' '}
-                {data.inventory.levels
-                  .map((level) => `${level.locationCode}: ${level.quantity}`)
-                  .join(' · ') || '(not stocked)'}
-              </div>
-            </div>
-            <div className="card">
-              <div className="value">{data.counts.totalClips}</div>
-              <div className="label">ground-truthed test clips</div>
-            </div>
-            <div className="card">
-              <div className="value">
-                {data.counts.reviewedPickupExamples}/
-                {data.counts.reviewedReturnExamples}/
-                {data.counts.reviewedFalseTouchExamples}
-              </div>
-              <div className="label">
-                reviewed pickup / return / false-touch examples
-              </div>
-            </div>
-          </div>
-
-          <h2>3 · Reference images</h2>
-          <p className="muted">
-            Capture the checklist below with the REAL product (tick as you
-            go — guidance only, images are not angle-labeled). Upload at
-            least {data.references.minRequired}; {data.references.recommended}
-            + recommended. Then rebuild embeddings so retrieval actually uses
-            them. Manage or delete images in the{' '}
-            <Link to="/reference-library">Reference library</Link>.
-          </p>
-          <div className="toolbar" style={{ flexWrap: 'wrap' }}>
-            {REFERENCE_ANGLES.map(({ key, label }) => (
-              <label
-                key={key}
-                style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}
-              >
-                <input
-                  type="checkbox"
-                  checked={angles[key] ?? false}
-                  onChange={(e) =>
-                    setAngles((current) => ({
-                      ...current,
-                      [key]: e.target.checked,
-                    }))
-                  }
-                />
-                {label}
-              </label>
+      <section style={stepCard}>
+        <StepHeading n={1} title="Select SKU" />
+        <div className="toolbar" style={{ flexWrap: 'wrap' }}>
+          <input
+            type="search"
+            placeholder="Search name, SKU, or barcode…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            style={{ minWidth: 'min(16rem, 100%)' }}
+          />
+          <select
+            value={selectedProductId}
+            onChange={(e) => {
+              setSelectedProductId(e.target.value);
+              setSelectedAssetId('');
+              setAngles({});
+              setManualCropOpen(false);
+            }}
+          >
+            <option value="">— choose a SKU —</option>
+            {(products.data ?? []).map((product) => (
+              <option key={product.id} value={product.id}>
+                {product.sku} — {product.name}
+              </option>
             ))}
-          </div>
-          <div className="toolbar">
-            <input
-              ref={referenceInput}
-              type="file"
-              accept="image/png,image/jpeg"
-              multiple
-              onChange={(e) => {
-                void uploadReferences(e.target.files);
-                e.target.value = '';
-              }}
-            />
-            <button disabled={busy} onClick={() => void reindex(false)}>
-              Re-index embeddings
-            </button>
-            <button disabled={busy} onClick={() => void reindex(true)}>
-              Rebuild embeddings
-            </button>
-            {refStatus.data ? (
+          </select>
+        </div>
+      </section>
+
+      {selectedProductId && data && selectedProduct ? (
+        <>
+          <div
+            style={{
+              display: 'flex',
+              flexWrap: 'wrap',
+              gap: '0.4rem',
+              alignItems: 'center',
+              margin: '0.5rem 0',
+            }}
+          >
+            {(chips ?? []).map((chip) => (
+              <span key={chip.key} className={`badge ${chip.tone}`} title={chip.detail}>
+                {chip.label}: {chip.detail}
+              </span>
+            ))}
+            {progress ? (
               <span className="muted">
-                {refStatus.data.referenceCount} image(s),{' '}
-                {refStatus.data.embeddingCount} embedded
+                {progress.satisfied}/{progress.total} gates
               </span>
             ) : null}
           </div>
-
-          <h2>4 · Test clips for this SKU</h2>
-          {data.videos.length === 0 ? (
-            <p className="muted">
-              No ground-truthed clips yet — upload one below, then set its
-              ground truth to {data.product.sku}.
-            </p>
-          ) : (
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Video</th>
-                  <th>Expected</th>
-                  <th>Δ basket</th>
-                  <th>Predicted</th>
-                  <th>Match</th>
-                  <th>Crop quality</th>
-                  <th>Review</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.videos.map((row) => (
-                  <tr key={row.videoAssetId}>
-                    <td>
-                      <Link to={`/video-assets/${row.videoAssetId}`}>
-                        {row.originalFilename}
-                      </Link>
-                    </td>
-                    <td>
-                      {row.eventKind}
-                      {row.expectedSku ? ` · ${row.expectedSku}` : ''}
-                      {row.testType ? (
-                        <span className="muted"> ({row.testType})</span>
-                      ) : null}
-                    </td>
-                    <td>{basketDeltaLabel(row.expectedBasketDelta)}</td>
-                    <td>{row.predictedSku ?? '—'}</td>
-                    <td>
-                      {row.predictionMatchesExpected === null ? (
-                        <span className="muted">no run</span>
-                      ) : row.predictionMatchesExpected ? (
-                        <span className="badge ok">correct</span>
-                      ) : (
-                        <span className="badge down">incorrect</span>
-                      )}
-                    </td>
-                    <td>
-                      {row.fusion ? (
-                        <WarningBadges warnings={row.fusion.cropWarnings} />
-                      ) : (
-                        <span className="muted">—</span>
-                      )}
-                    </td>
-                    <td>
-                      {row.reviewed ? (
-                        <span className="badge ok">
-                          reviewed{row.reviewDecision ? ` (${row.reviewDecision})` : ''}
-                        </span>
-                      ) : row.needsReview ? (
-                        <span className="badge warn">needs review</span>
-                      ) : (
-                        <span className="badge warn">pending</span>
-                      )}
-                    </td>
-                    <td>
-                      <button
-                        disabled={busy}
-                        onClick={() => setSelectedAssetId(row.videoAssetId)}
-                      >
-                        Work on this clip
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-
-          <h2>5 · Upload a new test video</h2>
-          <form className="toolbar" style={{ flexWrap: 'wrap' }} onSubmit={(e) => void uploadTestVideo(e)}>
-            <input ref={videoInput} type="file" accept={ACCEPTED_EXTENSIONS} />
-            <select
-              value={uploadLocationId}
-              onChange={(e) => setUploadLocationId(e.target.value)}
-              title="Store context so fusion can validate the SKU is stocked"
+          {action ? (
+            <p
+              style={{
+                ...stepCard,
+                margin: '0.5rem 0',
+                borderLeft: '4px solid var(--accent, #4c6ef5)',
+              }}
             >
-              <option value="">— store context (recommended) —</option>
-              {data.inventory.levels.map((level) => (
-                <option key={level.locationId} value={level.locationId}>
-                  {level.locationName} ({level.locationCode})
-                </option>
+              <strong>Next:</strong> {action.label}
+            </p>
+          ) : null}
+
+          <SopPanel />
+
+          <section style={stepCard}>
+            <StepHeading n={2} title="Reference readiness" />
+            <p className="muted">
+              {data.references.referenceCount}/{data.references.minRequired}{' '}
+              images ({data.references.recommended}+ recommended) ·{' '}
+              {data.references.embeddingCount} embedded ·{' '}
+              {data.references.inferenceReady ? (
+                <span className="badge ok">inference-ready</span>
+              ) : (
+                <span className="badge warn">below minimum</span>
+              )}{' '}
+              · manage in the <Link to="/reference-library">Reference library</Link>
+            </p>
+            <div className="toolbar" style={{ flexWrap: 'wrap' }}>
+              {REFERENCE_ANGLES.map(({ key, label }) => (
+                <label
+                  key={key}
+                  style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={angles[key] ?? false}
+                    onChange={(e) =>
+                      setAngles((current) => ({
+                        ...current,
+                        [key]: e.target.checked,
+                      }))
+                    }
+                  />
+                  {label}
+                </label>
               ))}
-            </select>
-            {UPLOAD_ATTESTATIONS.map(({ field, label, title }) => (
-              <label
-                key={field}
-                style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}
-                title={title}
+            </div>
+            <div className="toolbar" style={{ flexWrap: 'wrap' }}>
+              <input
+                type="file"
+                accept="image/png,image/jpeg"
+                multiple
+                onChange={(e) => {
+                  void uploadReferences(e.target.files);
+                  e.target.value = '';
+                }}
+              />
+              <button disabled={busy} onClick={() => void reindex(false)}>
+                Re-index embeddings
+              </button>
+              <button disabled={busy} onClick={() => void reindex(true)}>
+                Rebuild embeddings
+              </button>
+            </div>
+          </section>
+
+          <section style={stepCard}>
+            <StepHeading n={3} title="Inventory readiness" />
+            {data.inventory.stocked ? (
+              <p>
+                <span className="badge ok">stocked</span>{' '}
+                {data.inventory.levels
+                  .map((level) => `${level.locationName} (${level.locationCode}): ${level.quantity}`)
+                  .join(' · ')}
+              </p>
+            ) : (
+              <p>
+                <span className="badge warn">not stocked</span>{' '}
+                <span className="muted">
+                  Add stock on the <Link to="/inventory">Inventory</Link> page so
+                  fusion’s store check can validate the SKU (CV never mutates
+                  inventory).
+                </span>
+              </p>
+            )}
+          </section>
+
+          <section style={stepCard}>
+            <StepHeading n={4} title="Upload test video" />
+            <form
+              className="toolbar"
+              style={{ flexWrap: 'wrap' }}
+              onSubmit={(e) => void uploadTestVideo(e)}
+            >
+              <input ref={videoInput} type="file" accept={ACCEPTED_EXTENSIONS} />
+              <select
+                value={uploadLocationId}
+                onChange={(e) => setUploadLocationId(e.target.value)}
+                title="Store context so fusion can validate the SKU is stocked"
               >
-                <input
-                  type="checkbox"
-                  checked={attested[field] ?? false}
-                  onChange={(e) =>
-                    setAttested((current) => ({
-                      ...current,
-                      [field]: e.target.checked,
-                    }))
-                  }
-                />
-                {label}
-              </label>
-            ))}
-            <button className="primary" type="submit" disabled={busy || !allAttested}>
-              {busy ? 'Working…' : 'Upload test video'}
-            </button>
-          </form>
-          <p className="muted">
-            Record the product clearly visible BEFORE the pickup, keep the
-            hand off the label at the pickup instant, and fill most of the
-            frame with the scene — the pipeline's crop should not end up
-            mostly table or background.
-          </p>
+                <option value="">— store context (recommended) —</option>
+                {data.inventory.levels.map((level) => (
+                  <option key={level.locationId} value={level.locationId}>
+                    {level.locationName} ({level.locationCode})
+                  </option>
+                ))}
+              </select>
+              {UPLOAD_ATTESTATIONS.map(({ field, label, title }) => (
+                <label
+                  key={field}
+                  style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}
+                  title={title}
+                >
+                  <input
+                    type="checkbox"
+                    checked={attested[field] ?? false}
+                    onChange={(e) =>
+                      setAttested((current) => ({
+                        ...current,
+                        [field]: e.target.checked,
+                      }))
+                    }
+                  />
+                  {label}
+                </label>
+              ))}
+              <button className="primary" type="submit" disabled={busy || !allAttested}>
+                {busy ? 'Working…' : 'Upload test video'}
+              </button>
+            </form>
+            <p className="muted">
+              Attestations are per clip — they reset after every upload. Keep
+              the product clearly visible BEFORE the pickup and fill the frame
+              with the scene, not the table.
+            </p>
+
+            {data.videos.length > 0 ? (
+              <div style={{ overflowX: 'auto' }}>
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Video</th>
+                      <th>Expected</th>
+                      <th>Δ basket</th>
+                      <th>Predicted</th>
+                      <th>Match</th>
+                      <th>Crop</th>
+                      <th>Review</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.videos.map((row) => (
+                      <tr key={row.videoAssetId}>
+                        <td>
+                          <Link to={`/video-assets/${row.videoAssetId}`}>
+                            {row.originalFilename}
+                          </Link>
+                          {row.sessionBound ? (
+                            <span className="badge down" style={{ marginLeft: '0.3rem' }}>
+                              session-bound
+                            </span>
+                          ) : null}
+                        </td>
+                        <td>
+                          {row.eventKind}
+                          {row.expectedSku ? ` · ${row.expectedSku}` : ''}
+                        </td>
+                        <td>{basketDeltaLabel(row.expectedBasketDelta)}</td>
+                        <td>{row.predictedSku ?? '—'}</td>
+                        <td>
+                          {row.missedPositiveEvent ? (
+                            <span className="badge down">missed event</span>
+                          ) : row.predictionMatchesExpected === null ? (
+                            <span className="muted">no run</span>
+                          ) : row.predictionMatchesExpected ? (
+                            <span className="badge ok">correct</span>
+                          ) : (
+                            <span className="badge down">incorrect</span>
+                          )}
+                        </td>
+                        <td>
+                          {row.fusion ? (
+                            row.fusion.cropWarnings.length === 0 ? (
+                              <span className="badge ok">clean</span>
+                            ) : (
+                              <span className="badge warn">
+                                {row.fusion.cropWarnings.length} warning(s)
+                              </span>
+                            )
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
+                        </td>
+                        <td>
+                          {row.reviewed ? (
+                            <span className="badge ok">
+                              reviewed
+                              {row.bootstrapReviewVerdict
+                                ? ` (${row.bootstrapReviewVerdict})`
+                                : ''}
+                            </span>
+                          ) : (
+                            <span className="badge warn">
+                              {row.missedPositiveEvent ? 'needs correction' : 'needs review'}
+                            </span>
+                          )}
+                        </td>
+                        <td>
+                          <button
+                            disabled={busy}
+                            onClick={() => {
+                              setSelectedAssetId(row.videoAssetId);
+                              setManualCropOpen(false);
+                            }}
+                          >
+                            Open
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="muted">
+                No ground-truthed clips yet — upload one and set its ground
+                truth below.
+              </p>
+            )}
+          </section>
 
           {selectedAssetId ? (
-            <>
-              <h2>6 · Selected clip workflow</h2>
+            <section style={stepCard}>
+              <StepHeading n={5} title="Review crop quality" />
               {selectedAsset.data ? (
                 <div className="toolbar" style={{ flexWrap: 'wrap' }}>
                   <span>
@@ -766,115 +1248,164 @@ export function OneSkuBootstrapPage() {
                       Validate video
                     </button>
                   ) : null}
+                  {analysisReady ? (
+                    <button className="primary" disabled={busy} onClick={() => void runAnalysis()}>
+                      Run shadow analysis
+                    </button>
+                  ) : null}
                   <button disabled={busy} onClick={() => setReload((n) => n + 1)}>
                     Refresh
                   </button>
                 </div>
               ) : null}
-              {selectedRow?.fusion ? (
-                <p>
-                  Latest crop quality:{' '}
-                  <WarningBadges warnings={selectedRow.fusion.cropWarnings} />
-                  {selectedRow.fusion.selectedCrop ? (
-                    <span className="muted">
-                      {' '}
-                      sharpness{' '}
-                      {selectedRow.fusion.selectedCrop.sharpness.toFixed(1)},
-                      occlusion{' '}
-                      {Math.round(selectedRow.fusion.selectedCrop.occlusion * 100)}
-                      %, box {selectedRow.fusion.selectedCrop.box.width}×
-                      {selectedRow.fusion.selectedCrop.box.height}
-                    </span>
-                  ) : null}
-                </p>
-              ) : null}
-              {panelsReady ? (
-                <>
-                  <PickupDetectionPanel
-                    assetId={selectedAssetId}
-                    durationMs={selectedAsset.data?.durationMs ?? null}
-                    defaultProductId={selectedProductId}
-                    onGroundTruthSaved={() => setReload((n) => n + 1)}
-                  />
-                  <FusionEvidencePanel assetId={selectedAssetId} refreshKey={reload} />
-                  <ManualCropTool
-                    assetId={selectedAssetId}
-                    durationMs={selectedAsset.data?.durationMs ?? null}
-                    onCropCreated={() => setReload((n) => n + 1)}
-                  />
-                </>
+              {analysisReady ? (
+                <BootstrapGroundTruthForm
+                  assetId={selectedAssetId}
+                  product={selectedProduct}
+                  durationMs={selectedAsset.data?.durationMs ?? null}
+                  onSaved={() => setReload((n) => n + 1)}
+                />
               ) : (
                 <p className="muted">
-                  Detection, fusion, ground truth, and manual crops unlock
-                  once the clip is screened and validated.
+                  Ground truth, analysis, and corrections unlock once the clip
+                  is screened and validated.
                 </p>
               )}
-            </>
+              {selectedRow ? (
+                <CropQualityCard
+                  row={selectedRow}
+                  onManualCrop={() => setManualCropOpen(true)}
+                />
+              ) : null}
+              {manualCropOpen && analysisReady ? (
+                <ManualCropTool
+                  assetId={selectedAssetId}
+                  durationMs={selectedAsset.data?.durationMs ?? null}
+                  onCropCreated={() => setReload((n) => n + 1)}
+                />
+              ) : null}
+            </section>
           ) : null}
 
-          <h2>7 · Quality gates</h2>
-          <table className="table">
-            <tbody>
-              {(gates?.items ?? []).map((item) => (
-                <tr key={item.key}>
-                  <td>
-                    {item.satisfied ? (
-                      <span className="badge ok">✓</span>
-                    ) : (
-                      <span className={item.required ? 'badge down' : 'badge warn'}>
-                        ✗
-                      </span>
-                    )}
-                  </td>
-                  <td>
-                    {item.label}
-                    {!item.required ? (
-                      <span className="muted"> (recommended)</span>
-                    ) : null}
-                  </td>
-                  <td className="muted">{item.detail}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {gates?.readyForDatasetImprovement ? (
-            <p>
-              <span className="badge ok">Ready for dataset improvement</span>{' '}
-              — create a run on the{' '}
-              <Link to="/cv-dataset-improvement">Dataset improvement</Link>{' '}
-              page (corrections flow through the existing reviewed pilot
-              evaluation records).
-            </p>
+          {selectedRow && !selectedRow.sessionBound ? (
+            <section style={stepCard}>
+              <StepHeading n={6} title="Correct / approve evidence" />
+              <CorrectionPanel
+                row={selectedRow}
+                productId={selectedProductId}
+                products={products.data ?? []}
+                onRecorded={(message) => {
+                  setNotice(message);
+                  setReload((n) => n + 1);
+                }}
+              />
+            </section>
+          ) : selectedRow?.sessionBound ? (
+            <section style={stepCard}>
+              <StepHeading n={6} title="Correct / approve evidence" />
+              <p>
+                <span className="badge down">session-bound</span>{' '}
+                <span className="muted">
+                  This clip is attached to a checkout session — read-only here.
+                  Use a clip uploaded without a session for bootstrap evidence.
+                </span>
+              </p>
+            </section>
           ) : null}
 
-          <h2>8 · One-SKU report</h2>
-          <dl className="detail">
-            <dt>Latest top prediction</dt>
-            <dd>
-              {data.latest
-                ? `${data.latest.predictedSku ?? 'UNKNOWN'} ` +
-                  `(${data.latest.topScore !== null ? Math.round(data.latest.topScore * 100) : '—'}% · ` +
-                  `${data.latest.policy})`
-                : '— no fusion run yet'}
-            </dd>
-            <dt>Latest VLM verdict</dt>
-            <dd>
-              {data.latest?.vlmVerdict ??
-                (data.latest?.vlmStatus ? data.latest.vlmStatus : '— not invoked')}
-            </dd>
-            <dt>Common failure reasons</dt>
-            <dd>
-              {data.failureReasons.length === 0
-                ? '— none observed'
-                : data.failureReasons
-                    .map(
-                      (entry) =>
-                        `${FAILURE_REASON_LABELS[entry.reason] ?? entry.reason} ×${entry.count}`,
+          <section style={stepCard}>
+            <StepHeading n={7} title="Send to dataset improvement" />
+            <div style={{ overflowX: 'auto' }}>
+              <table className="table">
+                <tbody>
+                  {(gates?.items ?? []).map((item) => (
+                    <tr key={item.key}>
+                      <td>
+                        {item.satisfied ? (
+                          <span className="badge ok">✓</span>
+                        ) : (
+                          <span className={item.required ? 'badge down' : 'badge warn'}>
+                            ✗
+                          </span>
+                        )}
+                      </td>
+                      <td>
+                        {item.label}
+                        {!item.required ? (
+                          <span className="muted"> (recommended)</span>
+                        ) : null}
+                      </td>
+                      <td className="muted">{item.detail}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="toolbar" style={{ flexWrap: 'wrap' }}>
+              {data.linkedEvaluationRun ? (
+                <span>
+                  Linked run: <strong>{data.linkedEvaluationRun.name}</strong>{' '}
+                  <span className="badge">{data.linkedEvaluationRun.status}</span>{' '}
+                  <span className="muted">
+                    {data.linkedEvaluationRun.reviewCount} review(s)
+                  </span>
+                </span>
+              ) : (
+                <button disabled={busy} onClick={() => void ensureEvaluationRun()}>
+                  Create bootstrap evaluation run
+                </button>
+              )}
+              {data.linkedEvaluationRun ? (
+                <button
+                  className="primary"
+                  disabled={busy}
+                  onClick={() =>
+                    navigate(
+                      `/cv-dataset-improvement?sourceEvaluationRunId=${encodeURIComponent(
+                        data.linkedEvaluationRun?.evaluationRunId ?? '',
+                      )}`,
                     )
-                    .join(' · ')}
-            </dd>
-          </dl>
-          <p className="muted">{data.scoreNote}</p>
+                  }
+                >
+                  Send reviewed examples to Dataset Improvement →
+                </button>
+              ) : null}
+            </div>
+            {gates?.readyForDatasetImprovement ? (
+              <p>
+                <span className="badge ok">Ready for dataset improvement</span>{' '}
+                — create a run sourced from the linked evaluation run and
+                refresh its candidates there.
+              </p>
+            ) : null}
+            <dl className="detail">
+              <dt>Latest top prediction</dt>
+              <dd>
+                {data.latest
+                  ? `${data.latest.predictedSku ?? 'UNKNOWN'} ` +
+                    `(${data.latest.topScore !== null ? Math.round(data.latest.topScore * 100) : '—'}% · ` +
+                    `${data.latest.policy})`
+                  : '— no fusion run yet'}
+              </dd>
+              <dt>Latest VLM verdict</dt>
+              <dd>
+                {data.latest?.vlmVerdict ??
+                  (data.latest?.vlmStatus ? data.latest.vlmStatus : '— not invoked')}
+              </dd>
+              <dt>Common failure reasons</dt>
+              <dd>
+                {data.failureReasons.length === 0
+                  ? '— none observed'
+                  : data.failureReasons
+                      .map(
+                        (entry) =>
+                          `${FAILURE_REASON_LABELS[entry.reason] ?? entry.reason} ×${entry.count}`,
+                      )
+                      .join(' · ')}
+              </dd>
+            </dl>
+            <p className="muted">{data.scoreNote}</p>
+          </section>
         </>
       ) : selectedProductId && report.loading ? (
         <p className="muted">Loading readiness…</p>

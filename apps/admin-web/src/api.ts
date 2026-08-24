@@ -1958,6 +1958,7 @@ export interface OneSkuCropSummary {
   occlusion: number;
   brightness: number;
   selected: boolean;
+  qualityKnown: boolean;
 }
 
 export type OneSkuCropWarning =
@@ -1965,7 +1966,8 @@ export type OneSkuCropWarning =
   | 'HIGH_OCCLUSION'
   | 'LOW_SHARPNESS'
   | 'CROP_MISALIGNED'
-  | 'NO_CLEAR_PRODUCT_FRAME';
+  | 'NO_CLEAR_PRODUCT_FRAME'
+  | 'UNKNOWN_GEOMETRY';
 
 export interface OneSkuFusionSummary {
   createdAt: string;
@@ -1973,10 +1975,14 @@ export interface OneSkuFusionSummary {
   topSku: string | null;
   topScore: number | null;
   yoloReady: boolean | null;
+  cropSource: 'AUTO' | 'OPERATOR';
+  cropArtifactId: string | null;
   vlmInvoked: boolean;
   vlmStatus: string | null;
   vlmVerdict: string | null;
   vlmSelectedSku: string | null;
+  vlmVisualSupport: string | null;
+  vlmReasonCodes: string[];
   vlmRequiresHumanReview: boolean | null;
   barcodeMatchedSku: string | null;
   ocrStatus: string | null;
@@ -1996,8 +2002,11 @@ export interface OneSkuVideoRow {
   quantity: number;
   actualTimestampMs: number | null;
   expectedBasketDelta: number;
+  sessionBound: boolean;
+  missedPositiveEvent: boolean;
   reviewed: boolean;
   reviewDecision: string | null;
+  bootstrapReviewVerdict: string | null;
   visionEventStatus: string | null;
   needsReview: boolean;
   predictedSku: string | null;
@@ -2043,6 +2052,12 @@ export interface OneSkuBootstrapReport {
     reviewedFalseTouchExamples: number;
     unreviewedClips: number;
   };
+  linkedEvaluationRun: {
+    evaluationRunId: string;
+    name: string;
+    status: string;
+    reviewCount: number;
+  } | null;
   latest: {
     predictedSku: string | null;
     topScore: number | null;

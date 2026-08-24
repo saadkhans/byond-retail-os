@@ -834,6 +834,14 @@ export class JourneyService {
        *  processing outruns the footage. Callers pass the replay window's
        *  peak (or midpoint/start); absent, the base itself is used. */
       fallbackPeakMs?: number;
+      /** One-SKU bootstrap ONLY (service-internal — never exposed on the
+       *  HTTP DTO): import the run's TOP fused candidate as a product
+       *  event even when the policy demoted the run to review. The event
+       *  is still the pipeline's own prediction (below threshold), the
+       *  note records the demoting policy, and the whole point is to let
+       *  an operator record a Phase 15 CORRECT/WRONG_SKU correction
+       *  against a low-confidence clip. Shadow-only either way. */
+      proposeBelowThreshold?: boolean;
     },
   ) {
     const journey = await this.prisma.customerJourney.findFirst({
@@ -905,7 +913,11 @@ export class JourneyService {
           ).toISOString()
         : undefined;
     const top = evidence.fused?.[0];
-    if (run.policy === FusionPolicyResult.AUTO_PROPOSE && top) {
+    const proposes =
+      run.policy === FusionPolicyResult.AUTO_PROPOSE ||
+      (options?.proposeBelowThreshold === true &&
+        run.policy !== FusionPolicyResult.FAILED);
+    if (proposes && top) {
       return this.appendEvent(
         tenantId,
         journeyId,
@@ -920,7 +932,10 @@ export class JourneyService {
           sourceType: 'FUSION_SHADOW',
           videoAssetId,
           fusionRunId: run.id,
-          note: `policy ${run.policy}`,
+          note:
+            run.policy === FusionPolicyResult.AUTO_PROPOSE
+              ? `policy ${run.policy}`
+              : `policy ${run.policy} (bootstrap import of top candidate)`,
           dedupScope: options?.fusionRunId ? 'run' : 'video',
         },
         actorId,
