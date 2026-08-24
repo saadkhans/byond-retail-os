@@ -1232,6 +1232,62 @@ describe('CvDatasetService — Codex P1 hardening', () => {
     expect(result.rowCount).toBe(5);
   });
 
+  it('export rejects stale crop evidence: null→crop, crop→crop, crop→null (Codex P1)', async () => {
+    const opts = mixedFixtureOptions();
+    const harness = buildHarness(opts);
+    const created = await createLinkedRun(harness.service, FULL_TRAIN);
+    const reviewRow = opts.observations[0].latestReview as Record<
+      string,
+      unknown
+    >;
+    const refreshAndReady = async () => {
+      await harness.service.refreshCandidates(TENANT, created.id);
+      await harness.service.planSplits(TENANT, created.id);
+    };
+    await refreshAndReady();
+    await harness.service.setStatus(TENANT, created.id, 'READY' as never);
+
+    // null → crop A: an operator crop appears AFTER the refresh.
+    reviewRow.operatorCropArtifactId = 'artifact-crop-a';
+    const nullToCrop = await harness.service
+      .exportManifest(TENANT, created.id)
+      .then(
+        () => null,
+        (thrown: Error) => thrown,
+      );
+    expect(nullToCrop).toBeInstanceOf(BadRequestException);
+    expect(nullToCrop!.message).toContain('CV_DATASET_STALE_CANDIDATES');
+    expect(nullToCrop!.message).toContain('refresh candidates');
+    // Controlled message: never echoes the artifact id or any path.
+    expect(nullToCrop!.message).not.toContain('artifact-crop-a');
+
+    // crop A → crop B: refresh picked up A, then a replacement crop
+    // was reviewed — stale again.
+    await refreshAndReady();
+    reviewRow.operatorCropArtifactId = 'artifact-crop-b';
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('CV_DATASET_STALE_CANDIDATES');
+
+    // crop B → null: refresh picked up B, then the crop reference was
+    // lost — losing the crop is stale too.
+    await refreshAndReady();
+    reviewRow.operatorCropArtifactId = null;
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('CV_DATASET_STALE_CANDIDATES');
+
+    // Finally: settle on crop A, refresh + replan, and the export
+    // succeeds naming the CURRENT crop (opaque id, references-only).
+    reviewRow.operatorCropArtifactId = 'artifact-crop-a';
+    await refreshAndReady();
+    const withCrop = await harness.service.exportManifest(TENANT, created.id);
+    const exported = (
+      withCrop.manifest.candidates as { evidenceCropArtifactId: string | null }[]
+    ).find((row) => row.evidenceCropArtifactId !== null);
+    expect(exported?.evidenceCropArtifactId).toBe('artifact-crop-a');
+  });
+
   it('export validation runs on the LOCKED candidate snapshot (refresh/plan races)', async () => {
     const harness = buildHarness(mixedFixtureOptions());
     const created = await createLinkedRun(harness.service, FULL_TRAIN);

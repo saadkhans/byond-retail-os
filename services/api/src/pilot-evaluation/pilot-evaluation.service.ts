@@ -397,6 +397,16 @@ export class PilotEvaluationService {
       operatorCropArtifactId?: string | null;
     },
     actorId?: string,
+    options?: {
+      /** SERVICE-INTERNAL capability (never reachable from the HTTP
+       *  endpoint, whose controller passes only DTO fields): accept a
+       *  FUSION_SHADOW (video bootstrap) event. Only the one-SKU
+       *  bootstrap flow sets this, AFTER validating the SKU, the linked
+       *  bootstrap run, the asset, and its LATEST fusion run — without
+       *  it, a public review request could attach any tenant-local
+       *  video event to any open run and forge Phase 18 linkage. */
+      allowVideoShadowEvent?: boolean;
+    },
   ) {
     const run = await this.requireRun(tenantId, evaluationRunId);
     if (run.status !== PilotEvaluationRunStatus.OPEN) {
@@ -506,12 +516,27 @@ export class PilotEvaluationService {
         );
       }
       liveSessionId = owning.liveSessionId;
-    } else if (!event.videoAssetId) {
-      // FUSION_SHADOW without video provenance has no evidence locator
-      // an offline trainer could map to footage — refuse to label it.
-      throw new BadRequestException(
-        'a video-shadow observation needs video provenance',
-      );
+    } else {
+      // FUSION_SHADOW (video bootstrap) events have no attached-session
+      // linkage to prove they belong to this run — only the bootstrap
+      // workflow, which validates the SKU/run/asset/latest-fusion chain
+      // itself, may label them (Codex P2). The PUBLIC review endpoint
+      // never sets this capability, so an arbitrary caller cannot
+      // attach an unrelated clip to an open run and have Phase 18
+      // collect it as forged linkage.
+      if (options?.allowVideoShadowEvent !== true) {
+        throw new ConflictException(
+          'video-shadow observations can only be reviewed through the ' +
+            'one-SKU bootstrap workflow',
+        );
+      }
+      if (!event.videoAssetId) {
+        // FUSION_SHADOW without video provenance has no evidence locator
+        // an offline trainer could map to footage — refuse to label it.
+        throw new BadRequestException(
+          'a video-shadow observation needs video provenance',
+        );
+      }
     }
     // Operator crop evidence (one-SKU bootstrap): STRUCTURED, validated
     // reference — tenant-scoped, a CROP artifact, operator-created, and

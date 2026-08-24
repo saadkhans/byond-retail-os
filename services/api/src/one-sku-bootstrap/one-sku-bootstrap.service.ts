@@ -61,9 +61,25 @@ import {
  * or provider error text (see safeFusionSummary's allowlist).
  */
 
-/** Deterministic per-SKU evaluation-run name — the find-or-create key. */
+/** Deterministic per-SKU evaluation-run name — the find-or-create key.
+ *  Successor runs (created when the previous one went terminal) carry a
+ *  " (n)" suffix. */
 export function bootstrapRunName(sku: string): string {
   return `One SKU bootstrap — ${sku}`;
+}
+
+/** Does `name` belong to THIS SKU's bootstrap-run family? Exact match
+ *  or a " (n)" successor — a bare startsWith would also match a LONGER
+ *  SKU whose code has this SKU as a prefix. */
+export function isBootstrapRunNameFor(name: string, sku: string): boolean {
+  const base = bootstrapRunName(sku);
+  if (name === base) {
+    return true;
+  }
+  if (!name.startsWith(`${base} `)) {
+    return false;
+  }
+  return /^\(\d+\)$/.test(name.slice(base.length + 1));
 }
 
 /** Verdicts a bootstrap correction may record. MISSED_EVENT is excluded
@@ -194,8 +210,31 @@ export class OneSkuBootstrapService {
     return product;
   }
 
-  /** Find-or-create the per-SKU bootstrap evaluation run (Phase 15) —
-   *  the ONLY source Phase 18 candidate refresh can read reviews from. */
+  /** This SKU's bootstrap-run family, newest first: the base-named run
+   *  plus any " (n)" successors (exact-SKU filtered — see
+   *  isBootstrapRunNameFor). */
+  private async bootstrapRunFamily(tenantId: string, sku: string) {
+    const rows = await this.prisma.pilotEvaluationRun.findMany({
+      where: { tenantId, name: { startsWith: bootstrapRunName(sku) } },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 50,
+      select: {
+        id: true,
+        name: true,
+        status: true,
+        _count: { select: { reviews: true } },
+      },
+    });
+    return rows.filter((row) => isBootstrapRunNameFor(row.name, sku));
+  }
+
+  /**
+   * Find-or-create the per-SKU bootstrap evaluation run (Phase 15) —
+   * the ONLY source Phase 18 candidate refresh can read reviews from.
+   * Only an OPEN run is ever reused (Codex P2): reviews are append-only
+   * on OPEN runs, so a COMPLETED/CANCELLED run is terminal history and
+   * a new suffixed successor is opened instead of writing to it.
+   */
   async ensureEvaluationRun(
     tenantId: string,
     productId: string,
@@ -207,20 +246,19 @@ export class OneSkuBootstrapService {
     created: boolean;
   }> {
     const product = await this.requireProduct(tenantId, productId);
-    const name = bootstrapRunName(product.sku);
-    const existing = await this.prisma.pilotEvaluationRun.findFirst({
-      where: { tenantId, name },
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      select: { id: true, name: true, status: true },
-    });
-    if (existing) {
+    const family = await this.bootstrapRunFamily(tenantId, product.sku);
+    const open = family.find((run) => run.status === 'OPEN');
+    if (open) {
       return {
-        evaluationRunId: existing.id,
-        name: existing.name,
-        status: existing.status,
+        evaluationRunId: open.id,
+        name: open.name,
+        status: open.status,
         created: false,
       };
     }
+    const base = bootstrapRunName(product.sku);
+    const name =
+      family.length === 0 ? base : `${base} (${family.length + 1})`;
     const created = await this.evaluations.createRun(
       tenantId,
       {
@@ -491,6 +529,10 @@ export class OneSkuBootstrapService {
         notes: input.notes ?? null,
       },
       actorId,
+      // The bootstrap flow validated the SKU, the linked bootstrap run,
+      // the asset, and its LATEST fusion run above — the only path
+      // allowed to label a video-shadow observation.
+      { allowVideoShadowEvent: true },
     );
     return {
       evaluationRunId: evaluation.evaluationRunId,
@@ -506,7 +548,7 @@ export class OneSkuBootstrapService {
   ): Promise<OneSkuBootstrapReport> {
     const product = await this.requireProduct(tenantId, productId);
 
-    const [referenceCount, embeddingCount, levels, linkedRun] =
+    const [referenceCount, embeddingCount, levels, runFamily] =
       await Promise.all([
         this.prisma.productReferenceImage.count({
           where: { tenantId, productId },
@@ -523,17 +565,13 @@ export class OneSkuBootstrapService {
           },
           take: 50,
         }),
-        this.prisma.pilotEvaluationRun.findFirst({
-          where: { tenantId, name: bootstrapRunName(product.sku) },
-          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-          select: {
-            id: true,
-            name: true,
-            status: true,
-            _count: { select: { reviews: true } },
-          },
-        }),
+        this.bootstrapRunFamily(tenantId, product.sku),
       ]);
+    // Only an OPEN run is the ACTIVE linked run (Codex P2): a
+    // COMPLETED/CANCELLED run is terminal history — new corrections go
+    // to a successor, so readiness must not lean on a run that can no
+    // longer accept reviews.
+    const linkedRun = runFamily.find((run) => run.status === 'OPEN') ?? null;
 
     // This SKU's PICKUP/RETURN clips plus every NONE (false-touch) clip:
     // NONE ground truth force-nulls productId, so negatives are shared.

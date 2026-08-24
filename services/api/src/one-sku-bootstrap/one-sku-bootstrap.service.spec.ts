@@ -9,6 +9,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import {
   OneSkuBootstrapService,
   bootstrapRunName,
+  isBootstrapRunNameFor,
 } from './one-sku-bootstrap.service';
 
 const TENANT = 'tenant-1';
@@ -135,6 +136,8 @@ interface HarnessData {
   events?: Row[];
   operatorCrops?: Row[];
   evaluationRun?: Row | null;
+  /** Full bootstrap-run family (newest first) — overrides evaluationRun. */
+  evaluationRuns?: Row[];
   videoAsset?: Row | null;
   groundTruth?: Row | null;
   importedEvents?: Row[];
@@ -163,7 +166,11 @@ function buildHarness(data: HarnessData) {
       findMany: jest.fn(async () => data.levels ?? []),
     },
     pilotEvaluationRun: {
-      findFirst: jest.fn(async () => data.evaluationRun ?? null),
+      // The run FAMILY lookup (base name + " (n)" successors), newest
+      // first — mirrors the startsWith query.
+      findMany: jest.fn(async () =>
+        data.evaluationRuns ?? (data.evaluationRun ? [data.evaluationRun] : []),
+      ),
     },
     pilotObservationReview: {
       findMany: jest.fn(async () => data.pilotReviews ?? []),
@@ -238,7 +245,7 @@ describe('OneSkuBootstrapService.report', () => {
       prisma.productReferenceImage.count,
       prisma.productReferenceEmbedding.count,
       prisma.inventoryLevel.findMany,
-      prisma.pilotEvaluationRun.findFirst,
+      prisma.pilotEvaluationRun.findMany,
       prisma.videoGroundTruth.findMany,
       prisma.pickupFusionRun.findMany,
       prisma.inferenceJob.findMany,
@@ -648,6 +655,81 @@ describe('OneSkuBootstrapService.ensureEvaluationRun', () => {
       'user-1',
     );
   });
+
+  it.each([['COMPLETED'], ['CANCELLED']])(
+    'replaces a terminal (%s) run with a NEW suffixed OPEN successor',
+    async (status) => {
+      const { service, evaluations } = buildHarness({
+        evaluationRuns: [{ ...LINKED_RUN, status }],
+      });
+      const result = await service.ensureEvaluationRun(TENANT, PRODUCT.id);
+      // Never writes to the terminal run: a fresh OPEN run is created
+      // with a unique name so deterministic naming cannot block it.
+      expect(result.created).toBe(true);
+      expect(evaluations.createRun).toHaveBeenCalledWith(
+        TENANT,
+        expect.objectContaining({
+          name: `${bootstrapRunName(PRODUCT.sku)} (2)`,
+        }),
+        undefined,
+      );
+    },
+  );
+
+  it('reuses the OPEN successor even when a terminal run is newer-named', async () => {
+    const { service, evaluations } = buildHarness({
+      evaluationRuns: [
+        {
+          id: 'eval-2',
+          name: `${bootstrapRunName(PRODUCT.sku)} (2)`,
+          status: 'OPEN',
+          _count: { reviews: 3 },
+        },
+        { ...LINKED_RUN, status: 'COMPLETED' },
+      ],
+    });
+    const result = await service.ensureEvaluationRun(TENANT, PRODUCT.id);
+    expect(result).toEqual({
+      evaluationRunId: 'eval-2',
+      name: `${bootstrapRunName(PRODUCT.sku)} (2)`,
+      status: 'OPEN',
+      created: false,
+    });
+    expect(evaluations.createRun).not.toHaveBeenCalled();
+  });
+});
+
+describe('isBootstrapRunNameFor', () => {
+  it('matches the base name and " (n)" successors only', () => {
+    expect(isBootstrapRunNameFor(bootstrapRunName('SKU-A'), 'SKU-A')).toBe(true);
+    expect(
+      isBootstrapRunNameFor(`${bootstrapRunName('SKU-A')} (2)`, 'SKU-A'),
+    ).toBe(true);
+    expect(
+      isBootstrapRunNameFor(`${bootstrapRunName('SKU-A')} extra`, 'SKU-A'),
+    ).toBe(false);
+  });
+
+  it('never matches a LONGER SKU that has this SKU as a prefix', () => {
+    // startsWith alone would leak SKU-A2's run into SKU-A's family.
+    expect(isBootstrapRunNameFor(bootstrapRunName('SKU-A2'), 'SKU-A')).toBe(
+      false,
+    );
+  });
+});
+
+describe('OneSkuBootstrapService report — terminal runs are not the active link', () => {
+  it('links only an OPEN family run; terminal runs leave the gate unsatisfied', async () => {
+    const { service } = buildHarness({
+      evaluationRuns: [{ ...LINKED_RUN, status: 'COMPLETED' }],
+    });
+    const report = await service.report(TENANT, PRODUCT.id);
+    expect(report.linkedEvaluationRun).toBeNull();
+    expect(
+      report.gates.items.find((item) => item.key === 'EVALUATION_RUN_LINKED')
+        ?.satisfied,
+    ).toBe(false);
+  });
 });
 
 describe('OneSkuBootstrapService.reviewClip', () => {
@@ -752,6 +834,7 @@ describe('OneSkuBootstrapService.reviewClip', () => {
       'eval-1',
       expect.objectContaining({ verdict: 'CORRECT' }),
       undefined,
+      { allowVideoShadowEvent: true },
     );
 
     // Ground truth RETURN + predicted PICKUP → WRONG_ACTION with RETURN.
@@ -774,6 +857,7 @@ describe('OneSkuBootstrapService.reviewClip', () => {
         expectedAction: 'RETURN',
       }),
       undefined,
+      { allowVideoShadowEvent: true },
     );
   });
 
@@ -856,6 +940,7 @@ describe('OneSkuBootstrapService.reviewClip', () => {
         expectedProductId: 'prod-other',
       }),
       'user-1',
+      { allowVideoShadowEvent: true },
     );
     expect(result.journeyEventId).toBe('jevt-1');
   });
@@ -880,6 +965,7 @@ describe('OneSkuBootstrapService.reviewClip', () => {
         notes: 'operator confirmed the can is visible',
       }),
       undefined,
+      { allowVideoShadowEvent: true },
     );
   });
 
@@ -895,6 +981,7 @@ describe('OneSkuBootstrapService.reviewClip', () => {
       'eval-1',
       expect.objectContaining({ operatorCropArtifactId: null }),
       undefined,
+      { allowVideoShadowEvent: true },
     );
   });
 
@@ -960,6 +1047,7 @@ describe('OneSkuBootstrapService.reviewClip', () => {
         expectedProductId: PRODUCT.id,
       }),
       undefined,
+      { allowVideoShadowEvent: true },
     );
   });
 

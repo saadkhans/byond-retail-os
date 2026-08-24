@@ -719,6 +719,7 @@ describe('PilotEvaluationService — video-bootstrap (FUSION_SHADOW) observation
         expectedProductId: 'prod-c',
       },
       'user-1',
+      { allowVideoShadowEvent: true },
     );
     const stored = harness.reviews.find(
       (row) => row.id === review.reviewId,
@@ -756,12 +757,42 @@ describe('PilotEvaluationService — video-bootstrap (FUSION_SHADOW) observation
       'user-1',
     );
     await expect(
+      harness.service.reviewObservation(
+        TENANT,
+        run.evaluationRunId,
+        {
+          verdict: PilotObservationVerdict.CORRECT,
+          expectedAction: PilotExpectedAction.PICKUP,
+          journeyEventId: 'event-video-2',
+        },
+        undefined,
+        { allowVideoShadowEvent: true },
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('REJECTS a video-shadow event on the public path (no bootstrap capability)', async () => {
+    // The HTTP review endpoint calls reviewObservation WITHOUT the
+    // service-internal capability — an arbitrary caller can never
+    // attach a tenant-local video event to an open run and have
+    // Phase 18 collect it as forged linkage (Codex P2).
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+    });
+    const run = await harness.service.createRun(
+      TENANT,
+      { name: 'One SKU bootstrap — SKU-A' },
+      'user-1',
+    );
+    await expect(
       harness.service.reviewObservation(TENANT, run.evaluationRunId, {
         verdict: PilotObservationVerdict.CORRECT,
         expectedAction: PilotExpectedAction.PICKUP,
-        journeyEventId: 'event-video-2',
+        journeyEventId: 'event-video-1',
       }),
-    ).rejects.toBeInstanceOf(BadRequestException);
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(harness.reviews).toHaveLength(0);
   });
 
   it('still refuses a LIVE_SHADOW event whose session is not attached to the run', async () => {
@@ -834,6 +865,7 @@ describe('PilotEvaluationService — structured operator-crop evidence', () => {
         notes: 'clean view',
       },
       'user-1',
+      { allowVideoShadowEvent: true },
     );
     const stored = harness.reviews.find(
       (row) => row.id === review.reviewId,
@@ -861,7 +893,7 @@ describe('PilotEvaluationService — structured operator-crop evidence', () => {
         expectedAction: PilotExpectedAction.PICKUP,
         journeyEventId: VIDEO_EVENT.id,
         operatorCropArtifactId: CROP.id,
-      }),
+      }, undefined, { allowVideoShadowEvent: true }),
     ).rejects.toBeInstanceOf(NotFoundException);
   });
 
@@ -878,7 +910,7 @@ describe('PilotEvaluationService — structured operator-crop evidence', () => {
         expectedAction: PilotExpectedAction.PICKUP,
         journeyEventId: VIDEO_EVENT.id,
         operatorCropArtifactId: CROP.id,
-      }),
+      }, undefined, { allowVideoShadowEvent: true }),
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 
@@ -895,7 +927,7 @@ describe('PilotEvaluationService — structured operator-crop evidence', () => {
         expectedAction: PilotExpectedAction.PICKUP,
         journeyEventId: VIDEO_EVENT.id,
         operatorCropArtifactId: CROP.id,
-      }),
+      }, undefined, { allowVideoShadowEvent: true }),
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 });

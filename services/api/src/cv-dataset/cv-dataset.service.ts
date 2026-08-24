@@ -2113,7 +2113,12 @@ export class CvDatasetService {
       // same verdict against a different session, or a changed
       // evaluation/protocol/calibration stamp, is just as stale as a
       // flipped verdict — the manifest would point at the wrong
-      // footage or assert setup metadata that was never used.
+      // footage or assert setup metadata that was never used. The
+      // operator-crop reference is part of that lineage (Codex P1): a
+      // replacement crop reviewed after the refresh — including
+      // null→crop, crop→different crop, and crop→null — must force a
+      // refresh, or the export would name a crop the operator no
+      // longer stands behind.
       if (
         !seed ||
         seed.eligibility !== CvDatasetEligibility.ELIGIBLE ||
@@ -2125,7 +2130,8 @@ export class CvDatasetService {
         seed.liveSessionId !== row.liveSessionId ||
         seed.evaluationRunId !== row.evaluationRunId ||
         seed.protocolId !== row.protocolId ||
-        seed.calibrationProfileId !== row.calibrationProfileId
+        seed.calibrationProfileId !== row.calibrationProfileId ||
+        seed.evidenceCropArtifactId !== row.evidenceCropArtifactId
       ) {
         stale = true;
         break;
@@ -2144,7 +2150,7 @@ export class CvDatasetService {
     }
     if (stale) {
       throw new BadRequestException(
-        `${DATASET_STALE_CANDIDATES}: source reviews or scenario results changed after the last refresh — refresh candidates and re-plan splits before exporting`,
+        `${DATASET_STALE_CANDIDATES}: source reviews, scenario results, or crop evidence changed after the last refresh — refresh candidates and re-plan splits before exporting`,
       );
     }
   }
