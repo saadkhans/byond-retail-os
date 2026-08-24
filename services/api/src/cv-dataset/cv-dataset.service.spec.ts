@@ -693,6 +693,36 @@ describe('CvDatasetService — candidate collection (reviewed/corrected only)', 
     expect(row.liveSessionId).toBeNull();
     expect(row.skuCodeSnapshot).toBe('SKU-C');
     expect(row.reviewSource).toBe('PILOT_EVALUATION');
+    // No operator crop on the review → the candidate resolves to the
+    // event's own automatic fusion crop.
+    expect(row.evidenceCropArtifactId).toBeNull();
+  });
+
+  it('carries the review’s STRUCTURED operator-crop reference into the candidate', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [
+        observation({
+          journeyEventId: 'evt-video-crop',
+          liveSessionId: null,
+          matchScore: 0.35,
+          latestReview: review({
+            verdict: 'CORRECT',
+            operatorCropArtifactId: 'artifact-manual-1',
+          }) as never,
+        }),
+      ],
+    });
+    const created = await createLinkedRun(service, {
+      sourceTestProtocolId: null,
+      sourceCalibrationProfileId: null,
+    });
+    await service.refreshCandidates(TENANT, created.id);
+    const row = candidates.find((c) => c.sourceId === 'evt-video-crop')!;
+    expect(row.eligibility).toBe('ELIGIBLE');
+    // The Phase 18 candidate references the crop the operator ACTUALLY
+    // approved — an opaque artifact id, never the rejected automatic
+    // crop and never a path/URL.
+    expect(row.evidenceCropArtifactId).toBe('artifact-manual-1');
   });
 
   it('never mutates the reviewed/corrected source records it reads', async () => {

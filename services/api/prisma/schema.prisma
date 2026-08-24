@@ -2513,6 +2513,12 @@ model PilotObservationReview {
   predictedProductId String?
   predictedSku       String?
   predictedAction    PilotExpectedAction?
+  // One-SKU bootstrap: OPAQUE id of the operator-approved manual CROP
+  // VideoArtifact that supersedes the fusion run's automatic crop as
+  // this observation's evidence. STRUCTURED (never parsed from notes),
+  // validated tenant-scoped + same-video at write time, and carried into
+  // Phase 18 candidates as evidenceCropArtifactId. Never a path or URL.
+  operatorCropArtifactId String?
   notes              String?
   reviewedById       String?
   createdAt          DateTime                @default(now())
@@ -2878,6 +2884,11 @@ model CvDatasetCandidate {
   occlusionBucket      String?
   calibrationZoneLabel String?
   scenarioTypeSnapshot String?
+  // OPAQUE id of the operator-approved crop artifact this candidate's
+  // evidence resolves to (copied from the source review's structured
+  // operatorCropArtifactId at refresh). Null = the source event's own
+  // automatic fusion crop. Reference marker only — never a path/URL.
+  evidenceCropArtifactId String?
   split                CvDatasetSplit?
   eligibility          CvDatasetEligibility
   exclusionReason      String?

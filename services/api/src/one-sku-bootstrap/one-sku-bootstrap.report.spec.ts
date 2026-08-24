@@ -7,7 +7,6 @@ import {
   fusionFrameDimsFor,
   gatingCropWarnings,
   isPhase18EligibleReview,
-  operatorCropMarker,
   predictedActionOfEventType,
   safeFusionSummary,
 } from './one-sku-bootstrap.report';
@@ -287,12 +286,6 @@ describe('applyOperatorCrop', () => {
   it('reports UNKNOWN_GEOMETRY when native dims are unknown', () => {
     const applied = applyOperatorCrop(fusionFixture(), crop, null, true);
     expect(applied.cropWarnings).toEqual(['UNKNOWN_GEOMETRY']);
-  });
-});
-
-describe('operatorCropMarker', () => {
-  it('is an opaque bracketed id — no slashes or free text', () => {
-    expect(operatorCropMarker('ckabc123')).toBe('[operator-crop:ckabc123]');
   });
 });
 

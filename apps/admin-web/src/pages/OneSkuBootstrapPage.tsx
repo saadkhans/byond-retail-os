@@ -489,22 +489,44 @@ function CorrectionPanel({
                 </option>
               ))}
             </select>
-            <button
-              className={wrongSkuOnly ? 'primary' : undefined}
-              disabled={busy}
-              onClick={() =>
-                void record(
-                  {
-                    verdict: 'WRONG_SKU',
-                    expectedAction: gtAction,
-                    expectedProductId: correctedProductId,
-                  },
-                  'Recorded: wrong SKU, corrected label saved.',
-                )
-              }
-            >
-              Record wrong SKU
-            </button>
+            {wrongSkuOnly ? (
+              <button
+                className="primary"
+                disabled={busy}
+                onClick={() =>
+                  void record(
+                    {
+                      verdict: 'WRONG_SKU',
+                      expectedAction: gtAction,
+                      expectedProductId: correctedProductId,
+                    },
+                    'Recorded: wrong SKU, corrected label saved.',
+                  )
+                }
+              >
+                Record wrong SKU
+              </button>
+            ) : (
+              // Both labels wrong: Phase 18's WRONG_ACTION path corrects
+              // BOTH when the corrected product rides along — WRONG_SKU
+              // would keep the detector's known-wrong action.
+              <button
+                className="primary"
+                disabled={busy}
+                onClick={() =>
+                  void record(
+                    {
+                      verdict: 'WRONG_ACTION',
+                      expectedAction: gtAction,
+                      expectedProductId: correctedProductId,
+                    },
+                    `Recorded: wrong SKU AND action — corrected to ${gtAction} with the corrected product.`,
+                  )
+                }
+              >
+                Record wrong SKU + action (corrected: {gtAction})
+              </button>
+            )}
           </>
         ) : null}
         <button
@@ -533,10 +555,9 @@ function CorrectionPanel({
       </div>
       {bothWrong ? (
         <p className="muted">
-          Both SKU and action differ from ground truth — a single review
-          cannot correct both for the dataset. Recording wrong SKU fixes the
-          label; the action will follow the prediction, so recapturing the
-          clip is recommended.
+          Both SKU and action differ from ground truth — the wrong SKU +
+          action correction fixes BOTH labels for the dataset (Phase 18
+          takes the corrected product and the corrected action together).
         </p>
       ) : null}
       <p className="muted">

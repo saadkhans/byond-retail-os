@@ -30,7 +30,6 @@ import {
   evaluateGates,
   fusionFrameDimsFor,
   isPhase18EligibleReview,
-  operatorCropMarker,
   predictedActionOfEventType,
   safeFusionSummary,
 } from './one-sku-bootstrap.report';
@@ -419,6 +418,20 @@ export class OneSkuBootstrapService {
             'would exclude this as CORRECTION_NOT_DIFFERENT',
         );
       }
+      // Both-wrong (Codex P1): WRONG_ACTION with expectedProductId
+      // corrects BOTH labels in Phase 18 — when the predicted product
+      // also differs from ground truth, the corrected product is
+      // mandatory or the candidate would keep the known-wrong SKU.
+      if (
+        truth.eventKind !== GroundTruthEventKind.NONE &&
+        event.productId !== truth.productId &&
+        !input.expectedProductId
+      ) {
+        throw new BadRequestException(
+          'the predicted product also differs from the ground truth — ' +
+            'include the corrected product so both labels are fixed',
+        );
+      }
     }
     if (input.verdict === PilotObservationVerdict.WRONG_SKU) {
       if (!input.expectedProductId) {
@@ -433,12 +446,27 @@ export class OneSkuBootstrapService {
             'would exclude this as CORRECTION_NOT_DIFFERENT',
         );
       }
+      // Both-wrong must NOT be persisted as WRONG_SKU (Codex P1):
+      // Phase 18's WRONG_SKU path leaves correctedActionLabel null, so
+      // the candidate would keep the detector's known-wrong action.
+      if (
+        truth.eventKind !== GroundTruthEventKind.NONE &&
+        predictedAction !== truth.eventKind
+      ) {
+        throw new BadRequestException(
+          'the predicted action also differs from the ground truth — ' +
+            'record WRONG_ACTION with the corrected action AND the ' +
+            'corrected product so both labels are fixed',
+        );
+      }
     }
 
     // Operator crop override (Codex P1): a manual crop newer than the
-    // reviewed fusion run is bound into the review record itself, so the
-    // evidence Phase 18 consumes names the crop the operator actually
-    // approved (an OPAQUE artifact id — never a path).
+    // reviewed fusion run is bound into the review record as STRUCTURED
+    // data (PilotObservationReview.operatorCropArtifactId — an OPAQUE
+    // artifact id, never a path, never free-form notes). Phase 18
+    // candidate refresh copies it into evidenceCropArtifactId so the
+    // export names the crop the operator actually approved.
     const operatorCrop = await this.prisma.videoArtifact.findFirst({
       where: {
         tenantId,
@@ -450,12 +478,6 @@ export class OneSkuBootstrapService {
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       select: { id: true },
     });
-    const callerNotes = (input.notes ?? '').trim().slice(0, 250);
-    const notes = operatorCrop
-      ? [callerNotes, operatorCropMarker(operatorCrop.id)]
-          .filter((part) => part.length > 0)
-          .join(' ')
-      : callerNotes;
 
     const review = await this.evaluations.reviewObservation(
       tenantId,
@@ -465,7 +487,8 @@ export class OneSkuBootstrapService {
         expectedAction: input.expectedAction,
         journeyEventId: event.id,
         expectedProductId: input.expectedProductId ?? null,
-        notes: notes || null,
+        operatorCropArtifactId: operatorCrop?.id ?? null,
+        notes: input.notes ?? null,
       },
       actorId,
     );
@@ -680,7 +703,7 @@ export class OneSkuBootstrapService {
               expectedAction: true,
               expectedProductId: true,
               expectedSku: true,
-              notes: true,
+              operatorCropArtifactId: true,
               createdAt: true,
             },
           });
@@ -783,8 +806,9 @@ export class OneSkuBootstrapService {
         : null;
       // A NEWER manual crop supersedes the automatic crop as evidence
       // (preview, warnings, CLEAN_CROP). Manual boxes are native-pixel.
-      // It only counts as CONNECTED evidence once a review recorded
-      // after it carries its marker in the notes.
+      // It only counts as CONNECTED evidence once the latest-run review
+      // structurally references THIS crop (operatorCropArtifactId —
+      // the same field Phase 18 copies into its candidates).
       const operatorCrop = latestOperatorCropByAsset.get(truth.videoAssetId);
       if (
         fusion &&
@@ -798,9 +822,7 @@ export class OneSkuBootstrapService {
       ) {
         const connected =
           pilotReview !== undefined &&
-          (pilotReview.notes ?? '').includes(
-            operatorCropMarker(operatorCrop.id),
-          );
+          pilotReview.operatorCropArtifactId === operatorCrop.id;
         fusion = applyOperatorCrop(
           fusion,
           {

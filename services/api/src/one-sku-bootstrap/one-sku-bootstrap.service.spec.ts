@@ -6,7 +6,6 @@ import {
 import { JourneyService } from '../journey/journey.service';
 import { PilotEvaluationService } from '../pilot-evaluation/pilot-evaluation.service';
 import { PrismaService } from '../prisma/prisma.service';
-import { operatorCropMarker } from './one-sku-bootstrap.report';
 import {
   OneSkuBootstrapService,
   bootstrapRunName,
@@ -108,7 +107,7 @@ function pilotReview(over: Row = {}): Row {
     expectedAction: 'PICKUP',
     expectedProductId: null,
     expectedSku: null,
-    notes: null,
+    operatorCropArtifactId: null,
     createdAt: new Date('2026-08-24T11:00:00Z'),
     ...over,
   };
@@ -509,7 +508,8 @@ describe('OneSkuBootstrapService.report', () => {
       cropHeight: 600,
       createdAt: new Date('2026-08-24T11:00:00Z'),
     };
-    // Case 1: review notes carry the marker → connected, CLEAN_CROP can pass.
+    // Case 1: the review STRUCTURALLY references the crop → connected,
+    // CLEAN_CROP can pass (same field Phase 18 copies into candidates).
     const connected = buildHarness({
       evaluationRun: LINKED_RUN,
       truths: [truthRow()],
@@ -517,7 +517,7 @@ describe('OneSkuBootstrapService.report', () => {
       importedEvents: [importedEvent()],
       pilotReviews: [
         pilotReview({
-          notes: `looks right ${operatorCropMarker('artifact-manual-1')}`,
+          operatorCropArtifactId: 'artifact-manual-1',
           createdAt: new Date('2026-08-24T12:00:00Z'),
         }),
       ],
@@ -533,7 +533,8 @@ describe('OneSkuBootstrapService.report', () => {
         ?.satisfied,
     ).toBe(true);
 
-    // Case 2: no marker → display-only crop, CLEAN_CROP must fail.
+    // Case 2: no structured reference → display-only crop, CLEAN_CROP
+    // must fail.
     const unconnected = buildHarness({
       evaluationRun: LINKED_RUN,
       truths: [truthRow()],
@@ -859,7 +860,7 @@ describe('OneSkuBootstrapService.reviewClip', () => {
     expect(result.journeyEventId).toBe('jevt-1');
   });
 
-  it('binds a newer operator crop into the review notes as the evidence override', async () => {
+  it('binds a newer operator crop STRUCTURALLY — never via notes', async () => {
     const { service, evaluations } = buildHarness({
       ...reviewClipBase,
       journeyEventLookups: [importedEvent()],
@@ -873,9 +874,90 @@ describe('OneSkuBootstrapService.reviewClip', () => {
       TENANT,
       'eval-1',
       expect.objectContaining({
-        notes:
-          'operator confirmed the can is visible ' +
-          operatorCropMarker('artifact-manual-1'),
+        operatorCropArtifactId: 'artifact-manual-1',
+        // Notes pass through UNMODIFIED — the association is structured
+        // data, not a parsed marker.
+        notes: 'operator confirmed the can is visible',
+      }),
+      undefined,
+    );
+  });
+
+  it('passes operatorCropArtifactId null when no newer manual crop exists', async () => {
+    const { service, evaluations } = buildHarness({
+      ...reviewClipBase,
+      journeyEventLookups: [importedEvent()],
+      reviewOperatorCrop: null,
+    });
+    await service.reviewClip(TENANT, PRODUCT.id, 'va-1', reviewInput);
+    expect(evaluations.reviewObservation).toHaveBeenCalledWith(
+      TENANT,
+      'eval-1',
+      expect.objectContaining({ operatorCropArtifactId: null }),
+      undefined,
+    );
+  });
+
+  it('rejects WRONG_SKU when the predicted ACTION is also wrong (must be WRONG_ACTION)', async () => {
+    // Ground truth RETURN, prediction imported as PRODUCT_PICKUP with a
+    // different product: persisting WRONG_SKU would keep the wrong action.
+    const { service, evaluations } = buildHarness({
+      ...reviewClipBase,
+      groundTruth: { eventKind: 'RETURN', productId: PRODUCT.id },
+      journeyEventLookups: [
+        importedEvent({ productId: 'prod-other', sku: 'SKU-OTHER' }),
+      ],
+    });
+    await expect(
+      service.reviewClip(TENANT, PRODUCT.id, 'va-1', {
+        verdict: 'WRONG_SKU' as never,
+        expectedAction: 'RETURN' as never,
+        expectedProductId: PRODUCT.id,
+        notes: null,
+      }),
+    ).rejects.toThrow(/WRONG_ACTION/);
+    expect(evaluations.reviewObservation).not.toHaveBeenCalled();
+  });
+
+  it('requires the corrected product on WRONG_ACTION when the SKU is also wrong', async () => {
+    const { service } = buildHarness({
+      ...reviewClipBase,
+      groundTruth: { eventKind: 'RETURN', productId: PRODUCT.id },
+      journeyEventLookups: [
+        importedEvent({ productId: 'prod-other', sku: 'SKU-OTHER' }),
+      ],
+    });
+    await expect(
+      service.reviewClip(TENANT, PRODUCT.id, 'va-1', {
+        verdict: 'WRONG_ACTION' as never,
+        expectedAction: 'RETURN' as never,
+        expectedProductId: null,
+        notes: null,
+      }),
+    ).rejects.toThrow(/corrected product/);
+  });
+
+  it('records a both-wrong correction as WRONG_ACTION with BOTH corrected fields', async () => {
+    const { service, evaluations } = buildHarness({
+      ...reviewClipBase,
+      groundTruth: { eventKind: 'RETURN', productId: PRODUCT.id },
+      journeyEventLookups: [
+        importedEvent({ productId: 'prod-other', sku: 'SKU-OTHER' }),
+      ],
+    });
+    await service.reviewClip(TENANT, PRODUCT.id, 'va-1', {
+      verdict: 'WRONG_ACTION' as never,
+      expectedAction: 'RETURN' as never,
+      expectedProductId: PRODUCT.id,
+      notes: null,
+    });
+    expect(evaluations.reviewObservation).toHaveBeenCalledWith(
+      TENANT,
+      'eval-1',
+      expect.objectContaining({
+        verdict: 'WRONG_ACTION',
+        expectedAction: 'RETURN',
+        expectedProductId: PRODUCT.id,
       }),
       undefined,
     );

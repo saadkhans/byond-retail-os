@@ -353,6 +353,7 @@ export class PilotEvaluationService {
                 expectedAction: review.expectedAction,
                 expectedProductId: review.expectedProductId,
                 expectedSku: review.expectedSku,
+                operatorCropArtifactId: review.operatorCropArtifactId,
                 notes: review.notes,
                 reviewedById: review.reviewedById,
                 reviewedAt: review.createdAt,
@@ -388,6 +389,12 @@ export class PilotEvaluationService {
       liveSessionId?: string | null;
       expectedProductId?: string | null;
       notes?: string | null;
+      /** One-SKU bootstrap (service-internal — not on the HTTP DTO):
+       *  OPAQUE id of the operator-approved manual CROP artifact that
+       *  supersedes the automatic crop as this observation's evidence.
+       *  Validated below: tenant-scoped, a CROP, operator-created, and
+       *  belonging to the SAME video as the reviewed event. */
+      operatorCropArtifactId?: string | null;
     },
     actorId?: string,
   ) {
@@ -427,6 +434,11 @@ export class PilotEvaluationService {
       if (input.journeyEventId) {
         throw new BadRequestException(
           'MISSED_EVENT reviews must not reference a journey event',
+        );
+      }
+      if (input.operatorCropArtifactId) {
+        throw new BadRequestException(
+          'a missed event has no crop evidence to attach',
         );
       }
       const liveSessionId = input.liveSessionId ?? null;
@@ -501,6 +513,38 @@ export class PilotEvaluationService {
         'a video-shadow observation needs video provenance',
       );
     }
+    // Operator crop evidence (one-SKU bootstrap): STRUCTURED, validated
+    // reference — tenant-scoped, a CROP artifact, operator-created, and
+    // on the SAME video the reviewed event came from. A cross-tenant or
+    // cross-video id can never be attached.
+    let operatorCropArtifactId: string | null = null;
+    if (input.operatorCropArtifactId) {
+      const artifact = await this.prisma.videoArtifact.findFirst({
+        where: {
+          tenantId,
+          id: input.operatorCropArtifactId,
+          artifactType: 'CROP',
+        },
+        select: { id: true, videoAssetId: true, createdById: true },
+      });
+      if (!artifact) {
+        throw new NotFoundException('Crop artifact not found');
+      }
+      if (artifact.createdById === null) {
+        throw new BadRequestException(
+          'only an operator-created manual crop can be attached as evidence',
+        );
+      }
+      if (
+        event.videoAssetId === null ||
+        artifact.videoAssetId !== event.videoAssetId
+      ) {
+        throw new BadRequestException(
+          'the crop artifact does not belong to the reviewed observation’s video',
+        );
+      }
+      operatorCropArtifactId = artifact.id;
+    }
     const review = await this.prisma.pilotObservationReview.create({
       data: {
         tenantId,
@@ -515,6 +559,7 @@ export class PilotEvaluationService {
         predictedProductId: event.productId,
         predictedSku: event.sku,
         predictedAction: predictedActionOf(event.eventType),
+        operatorCropArtifactId,
         notes: notes || null,
         reviewedById: actorId ?? null,
       },

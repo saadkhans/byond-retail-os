@@ -28,6 +28,7 @@ function buildHarness(
     liveSessions?: Record<string, unknown>[];
     journeyEvents?: Record<string, unknown>[];
     products?: { id: string; tenantId: string; sku: string }[];
+    videoArtifacts?: Record<string, unknown>[];
   } = {},
 ) {
   let seq = 0;
@@ -178,6 +179,14 @@ function buildHarness(
       findFirst: jest.fn(async (args: { where: Record<string, unknown> }) => {
         const row = liveSessions.find((l) => whereMatch(l, args.where));
         return row ? { id: row.id } : null;
+      }),
+    },
+    videoArtifact: {
+      findFirst: jest.fn(async (args: { where: Record<string, unknown> }) => {
+        const row = (options.videoArtifacts ?? []).find((a) =>
+          whereMatch(a, args.where),
+        );
+        return row ?? null;
       }),
     },
     customerJourneyEvent: {
@@ -773,5 +782,120 @@ describe('PilotEvaluationService — video-bootstrap (FUSION_SHADOW) observation
         journeyEventId: 'event-1',
       }),
     ).rejects.toBeInstanceOf(ConflictException);
+  });
+});
+
+describe('PilotEvaluationService — structured operator-crop evidence', () => {
+  const VIDEO_EVENT = {
+    id: 'event-video-crop',
+    tenantId: TENANT,
+    journeyId: 'journey-video',
+    eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+    occurredAt: new Date('2026-08-20T10:00:00.000Z'),
+    productId: 'prod-a',
+    sku: 'SKU-A',
+    productName: 'Product A',
+    matchScore: 0.35,
+    sourceType: 'FUSION_SHADOW',
+    videoAssetId: 'va-1',
+  };
+  const CROP = {
+    id: 'artifact-manual-1',
+    tenantId: TENANT,
+    videoAssetId: 'va-1',
+    artifactType: 'CROP',
+    createdById: 'user-1',
+  };
+
+  async function makeRun(harness: ReturnType<typeof buildHarness>) {
+    const run = await harness.service.createRun(
+      TENANT,
+      { name: 'One SKU bootstrap — SKU-A' },
+      'user-1',
+    );
+    return run.evaluationRunId;
+  }
+
+  it('stores the crop reference STRUCTURALLY and surfaces it in observations()', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+      videoArtifacts: [CROP],
+    });
+    const runId = await makeRun(harness);
+    const review = await harness.service.reviewObservation(
+      TENANT,
+      runId,
+      {
+        verdict: PilotObservationVerdict.CORRECT,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: VIDEO_EVENT.id,
+        operatorCropArtifactId: CROP.id,
+        notes: 'clean view',
+      },
+      'user-1',
+    );
+    const stored = harness.reviews.find(
+      (row) => row.id === review.reviewId,
+    ) as Record<string, unknown>;
+    expect(stored.operatorCropArtifactId).toBe(CROP.id);
+    // Notes stay free text — the association is NEVER parsed from them.
+    expect(stored.notes).toBe('clean view');
+
+    const result = await harness.service.observations(TENANT, runId);
+    expect(result.observations[0].latestReview?.operatorCropArtifactId).toBe(
+      CROP.id,
+    );
+  });
+
+  it('rejects a crop from another tenant (tenant isolation)', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+      videoArtifacts: [{ ...CROP, tenantId: 'tenant-2' }],
+    });
+    const runId = await makeRun(harness);
+    await expect(
+      harness.service.reviewObservation(TENANT, runId, {
+        verdict: PilotObservationVerdict.CORRECT,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: VIDEO_EVENT.id,
+        operatorCropArtifactId: CROP.id,
+      }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('rejects a crop that belongs to a DIFFERENT video than the observation', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+      videoArtifacts: [{ ...CROP, videoAssetId: 'va-other' }],
+    });
+    const runId = await makeRun(harness);
+    await expect(
+      harness.service.reviewObservation(TENANT, runId, {
+        verdict: PilotObservationVerdict.CORRECT,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: VIDEO_EVENT.id,
+        operatorCropArtifactId: CROP.id,
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('rejects a pipeline-created crop (only operator crops are evidence overrides)', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+      videoArtifacts: [{ ...CROP, createdById: null }],
+    });
+    const runId = await makeRun(harness);
+    await expect(
+      harness.service.reviewObservation(TENANT, runId, {
+        verdict: PilotObservationVerdict.CORRECT,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: VIDEO_EVENT.id,
+        operatorCropArtifactId: CROP.id,
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
   });
 });

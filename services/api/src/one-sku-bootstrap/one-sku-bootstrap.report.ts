@@ -108,9 +108,9 @@ export interface SafeFusionSummary {
   cropArtifactId: string | null;
   /** true when the effective crop is part of the evidence Phase 18 will
    *  consume: AUTO crops always are (the fusion run persisted them); an
-   *  OPERATOR crop only once a bootstrap review recorded AFTER it binds
-   *  it into the reviewed evidence (the review notes carry the crop
-   *  artifact id). CLEAN_CROP never passes on an unconnected crop. */
+   *  OPERATOR crop only once the latest-run review STRUCTURALLY
+   *  references it (operatorCropArtifactId — copied by Phase 18 into
+   *  evidenceCropArtifactId). CLEAN_CROP never passes unconnected. */
   cropEvidenceConnected: boolean;
   vlmInvoked: boolean;
   vlmStatus: string | null;
@@ -369,13 +369,6 @@ export interface OperatorCropEvidence {
   createdAt: Date;
 }
 
-/** The review-notes marker that binds an operator crop into the
- *  reviewed evidence Phase 18 consumes. Opaque artifact id only — the
- *  bracket shape keeps it greppable and screen-safe (no slashes). */
-export function operatorCropMarker(artifactId: string): string {
-  return `[operator-crop:${artifactId}]`;
-}
-
 /**
  * A manual crop created AFTER the latest fusion run supersedes the
  * pipeline's automatic crop as this clip's evidence: the preview, the
@@ -384,10 +377,11 @@ export function operatorCropMarker(artifactId: string): string {
  * metrics are unknown by construction — the operator's visual check is
  * the review.
  *
- * `connected` says whether a bootstrap review recorded AFTER this crop
- * has bound it into the reviewed evidence (its notes carry the marker
- * above). An unconnected operator crop is display-only and must never
- * satisfy CLEAN_CROP.
+ * `connected` says whether the latest-run bootstrap review STRUCTURALLY
+ * references this crop (PilotObservationReview.operatorCropArtifactId —
+ * the same field Phase 18 copies into evidenceCropArtifactId). An
+ * unconnected operator crop is display-only and must never satisfy
+ * CLEAN_CROP.
  */
 export function applyOperatorCrop(
   summary: SafeFusionSummary,

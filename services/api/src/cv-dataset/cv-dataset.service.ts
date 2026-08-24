@@ -162,6 +162,10 @@ interface CandidateSeed {
   reviewSource: string;
   confidenceBucket: string | null;
   scenarioTypeSnapshot: string | null;
+  /** OPAQUE id of the operator-approved crop artifact the source
+   *  review named as this candidate's evidence (null = the event's own
+   *  automatic fusion crop). Reference marker only — never a path. */
+  evidenceCropArtifactId: string | null;
   eligibility: CvDatasetEligibility;
   exclusionReason: string | null;
 }
@@ -205,6 +209,9 @@ export interface DatasetCandidateView {
   occlusionBucket: string | null;
   calibrationZoneLabel: string | null;
   scenarioTypeSnapshot: string | null;
+  /** Operator-approved crop reference (OPAQUE artifact id) — null when
+   *  the candidate's evidence is the event's automatic fusion crop. */
+  evidenceCropArtifactId: string | null;
   split: CvDatasetSplit | null;
   eligibility: CvDatasetEligibility;
   exclusionReason: string | null;
@@ -253,6 +260,7 @@ function toCandidateView(row: CvDatasetCandidate): DatasetCandidateView {
     occlusionBucket: row.occlusionBucket,
     calibrationZoneLabel: row.calibrationZoneLabel,
     scenarioTypeSnapshot: row.scenarioTypeSnapshot,
+    evidenceCropArtifactId: row.evidenceCropArtifactId,
     split: row.split,
     eligibility: row.eligibility,
     exclusionReason: row.exclusionReason,
@@ -1101,6 +1109,11 @@ export class CvDatasetService {
           reviewSource: 'PILOT_EVALUATION',
           confidenceBucket: confidenceBucketOf(observation.matchScore),
           scenarioTypeSnapshot: null,
+          // STRUCTURED operator-crop evidence override from the review
+          // (one-SKU bootstrap) — the candidate resolves to the crop the
+          // operator approved, not the rejected automatic one. Never
+          // parsed from notes.
+          evidenceCropArtifactId: review?.operatorCropArtifactId ?? null,
         };
         const excluded = (
           verdict: string,
@@ -1234,6 +1247,7 @@ export class CvDatasetService {
           reviewSource: 'PILOT_EVALUATION',
           confidenceBucket: null,
           scenarioTypeSnapshot: null,
+          evidenceCropArtifactId: null,
           eligibility: CvDatasetEligibility.EXCLUDED,
           exclusionReason: 'MISSING_EVIDENCE_LOCATOR',
         });
@@ -1280,6 +1294,7 @@ export class CvDatasetService {
           reviewSource: 'CV_TEST_PROTOCOL',
           confidenceBucket: null,
           scenarioTypeSnapshot: scenario.scenarioType,
+          evidenceCropArtifactId: null,
           eligibility: decided
             ? CvDatasetEligibility.ELIGIBLE
             : CvDatasetEligibility.EXCLUDED,
