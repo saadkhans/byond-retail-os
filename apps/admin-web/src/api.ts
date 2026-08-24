@@ -1945,3 +1945,113 @@ export interface CvDatasetModelTuningReport {
     basis: string;
   };
 }
+
+// ---------------------------------------------------------------------------
+// One-SKU bootstrap (read-only guidance report over existing shadow rows).
+// ---------------------------------------------------------------------------
+
+export interface OneSkuCropSummary {
+  phase: string;
+  timestampMs: number;
+  box: { x: number; y: number; width: number; height: number };
+  sharpness: number;
+  occlusion: number;
+  brightness: number;
+  selected: boolean;
+}
+
+export type OneSkuCropWarning =
+  | 'PRODUCT_TOO_SMALL'
+  | 'HIGH_OCCLUSION'
+  | 'LOW_SHARPNESS'
+  | 'CROP_MISALIGNED'
+  | 'NO_CLEAR_PRODUCT_FRAME';
+
+export interface OneSkuFusionSummary {
+  createdAt: string;
+  policy: string;
+  topSku: string | null;
+  topScore: number | null;
+  yoloReady: boolean | null;
+  vlmInvoked: boolean;
+  vlmStatus: string | null;
+  vlmVerdict: string | null;
+  vlmSelectedSku: string | null;
+  vlmRequiresHumanReview: boolean | null;
+  barcodeMatchedSku: string | null;
+  ocrStatus: string | null;
+  expectedSkuInventoryVerdict: string | null;
+  selectedCrop: OneSkuCropSummary | null;
+  cropWarnings: OneSkuCropWarning[];
+}
+
+export interface OneSkuVideoRow {
+  videoAssetId: string;
+  originalFilename: string;
+  assetStatus: string;
+  durationMs: number | null;
+  eventKind: GroundTruthEventKind;
+  testType: string | null;
+  expectedSku: string | null;
+  quantity: number;
+  actualTimestampMs: number | null;
+  expectedBasketDelta: number;
+  reviewed: boolean;
+  reviewDecision: string | null;
+  visionEventStatus: string | null;
+  needsReview: boolean;
+  predictedSku: string | null;
+  predictionMatchesExpected: boolean | null;
+  fusion: OneSkuFusionSummary | null;
+}
+
+export interface OneSkuGateItem {
+  key: string;
+  label: string;
+  satisfied: boolean;
+  required: boolean;
+  detail: string;
+}
+
+export interface OneSkuBootstrapReport {
+  product: { id: string; sku: string; name: string; status: string };
+  references: {
+    referenceCount: number;
+    minRequired: number;
+    recommended: number;
+    inferenceReady: boolean;
+    embeddingCount: number;
+    embeddingModelKey: string;
+    embeddingModelVersion: string;
+    embeddingsBuilt: boolean;
+  };
+  inventory: {
+    stocked: boolean;
+    totalOnHand: number;
+    levels: {
+      locationId: string;
+      locationName: string;
+      locationCode: string;
+      quantity: number;
+    }[];
+  };
+  videos: OneSkuVideoRow[];
+  counts: {
+    totalClips: number;
+    reviewedPickupExamples: number;
+    reviewedReturnExamples: number;
+    reviewedFalseTouchExamples: number;
+    unreviewedClips: number;
+  };
+  latest: {
+    predictedSku: string | null;
+    topScore: number | null;
+    policy: string;
+    vlmVerdict: string | null;
+    vlmStatus: string | null;
+    runCreatedAt: string;
+  } | null;
+  failureReasons: { reason: string; count: number }[];
+  gates: { items: OneSkuGateItem[]; readyForDatasetImprovement: boolean };
+  scoreNote: string;
+}

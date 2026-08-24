@@ -1,0 +1,300 @@
+import {
+  analysisDimsFor,
+  deriveCropWarnings,
+  deriveFailureReasons,
+  evaluateGates,
+  safeFusionSummary,
+} from './one-sku-bootstrap.report';
+
+const cleanCrop = {
+  phase: 'peak',
+  timestampMs: 1200,
+  box: { x: 40, y: 20, width: 60, height: 70 },
+  sharpness: 24,
+  occlusion: 0.05,
+  brightness: 128,
+  selected: true,
+};
+
+const DIMS = { width: 192, height: 108 };
+
+describe('analysisDimsFor', () => {
+  it('mirrors the pipeline analysis geometry (192-wide, aspect kept, even)', () => {
+    expect(analysisDimsFor({ width: 1920, height: 1080 })).toEqual({
+      width: 192,
+      height: 108,
+    });
+  });
+
+  it('never upscales a small source', () => {
+    expect(analysisDimsFor({ width: 100, height: 80 })).toEqual({
+      width: 100,
+      height: 80,
+    });
+  });
+
+  it('returns null without probed dimensions', () => {
+    expect(analysisDimsFor(null)).toBeNull();
+    expect(analysisDimsFor({ width: null, height: 720 })).toBeNull();
+  });
+});
+
+describe('deriveCropWarnings', () => {
+  it('flags a missing selected crop as NO_CLEAR_PRODUCT_FRAME', () => {
+    expect(deriveCropWarnings(null, DIMS)).toEqual(['NO_CLEAR_PRODUCT_FRAME']);
+  });
+
+  it('passes a clean, well-sized crop with no warnings', () => {
+    expect(deriveCropWarnings(cleanCrop, DIMS)).toEqual([]);
+  });
+
+  it('classifies the observed failure: blurry background crop with heavy occlusion', () => {
+    // The Nescafe-mapped-to-SKU-LIME-GREEN case: sharpness 0.9-2.4,
+    // occlusion 51-56%, crop mostly table — must warn loudly.
+    const warnings = deriveCropWarnings(
+      { ...cleanCrop, sharpness: 1.4, occlusion: 0.53 },
+      DIMS,
+    );
+    expect(warnings).toContain('HIGH_OCCLUSION');
+    expect(warnings).toContain('LOW_SHARPNESS');
+    expect(warnings).toContain('NO_CLEAR_PRODUCT_FRAME');
+  });
+
+  it('flags a tiny product box as PRODUCT_TOO_SMALL', () => {
+    const warnings = deriveCropWarnings(
+      { ...cleanCrop, box: { x: 10, y: 10, width: 10, height: 4 } },
+      DIMS,
+    );
+    expect(warnings).toEqual(['PRODUCT_TOO_SMALL']);
+  });
+
+  it('flags a box outside the analysis frame as CROP_MISALIGNED', () => {
+    const warnings = deriveCropWarnings(
+      { ...cleanCrop, box: { x: 170, y: 90, width: 60, height: 70 } },
+      DIMS,
+    );
+    expect(warnings).toEqual(['CROP_MISALIGNED']);
+  });
+
+  it('flags a degenerate box as CROP_MISALIGNED even without frame dims', () => {
+    const warnings = deriveCropWarnings(
+      { ...cleanCrop, box: { x: 0, y: 0, width: 0, height: 12 } },
+      null,
+    );
+    expect(warnings).toEqual(['CROP_MISALIGNED']);
+  });
+
+  it('skips area checks when frame dimensions are unknown', () => {
+    expect(
+      deriveCropWarnings(
+        { ...cleanCrop, box: { x: 10, y: 10, width: 4, height: 4 } },
+        null,
+      ),
+    ).toEqual([]);
+  });
+});
+
+describe('safeFusionSummary', () => {
+  const run = (evidence: unknown) => ({
+    createdAt: new Date('2026-08-24T10:00:00Z'),
+    policy: 'NEEDS_VLM',
+    evidence,
+  });
+
+  const fullEvidence = {
+    detector: { adapterKey: 'classical', warnings: [], yoloReady: false },
+    crops: [
+      { ...cleanCrop, selected: false, quality: undefined },
+      {
+        phase: 'peak',
+        timestampMs: 1500,
+        box: { x: 30, y: 25, width: 50, height: 60 },
+        quality: { sharpness: 1.9, occlusion: 0.55, brightness: 90 },
+        selected: true,
+      },
+    ],
+    fused: [{ sku: 'WATER-BOTTLE-500ML', fusedScore: 0.44, rank: 1 }],
+    vlm: {
+      invoked: true,
+      status: 'VERDICT',
+      verdict: 'AMBIGUOUS',
+      selectedSku: null,
+      requiresHumanReview: true,
+    },
+    barcode: { results: [{ value: '5901234123457', format: 'EAN13' }], matchedSku: null },
+    ocr: {
+      rawText: 'RAW-FRAME-TEXT-MUST-NOT-LEAK',
+      normalizedText: 'normalized-must-not-leak',
+      status: 'TIMEOUT',
+    },
+    inventoryValidation: [
+      { sku: 'SKU-LIME-GREEN', verdict: 'NOT_STOCKED', onHandQuantity: 0 },
+    ],
+    stages: [{ stage: 'decode', note: 'C:/secret/path/leak.mp4' }],
+  };
+
+  it('extracts only the allowlisted fields and derives crop warnings', () => {
+    const summary = safeFusionSummary(run(fullEvidence), 'SKU-LIME-GREEN', DIMS);
+    expect(summary.topSku).toBe('WATER-BOTTLE-500ML');
+    expect(summary.topScore).toBe(0.44);
+    expect(summary.yoloReady).toBe(false);
+    expect(summary.vlmVerdict).toBe('AMBIGUOUS');
+    expect(summary.vlmRequiresHumanReview).toBe(true);
+    expect(summary.barcodeMatchedSku).toBeNull();
+    expect(summary.ocrStatus).toBe('TIMEOUT');
+    expect(summary.expectedSkuInventoryVerdict).toBe('NOT_STOCKED');
+    expect(summary.selectedCrop?.occlusion).toBe(0.55);
+    expect(summary.cropWarnings).toContain('HIGH_OCCLUSION');
+    expect(summary.cropWarnings).toContain('LOW_SHARPNESS');
+  });
+
+  it('NEVER leaks OCR text, barcode decode values, or path-like strings', () => {
+    const serialized = JSON.stringify(
+      safeFusionSummary(run(fullEvidence), 'SKU-LIME-GREEN', DIMS),
+    );
+    expect(serialized).not.toContain('RAW-FRAME-TEXT-MUST-NOT-LEAK');
+    expect(serialized).not.toContain('normalized-must-not-leak');
+    expect(serialized).not.toContain('5901234123457');
+    expect(serialized).not.toContain('secret/path');
+    expect(serialized).not.toContain('storageKey');
+  });
+
+  it('tolerates malformed or empty evidence without throwing', () => {
+    for (const evidence of [null, undefined, 42, 'text', [], {}, { crops: 'x' }]) {
+      const summary = safeFusionSummary(run(evidence), 'SKU-A', DIMS);
+      expect(summary.topSku).toBeNull();
+      expect(summary.selectedCrop).toBeNull();
+      expect(summary.cropWarnings).toEqual(['NO_CLEAR_PRODUCT_FRAME']);
+    }
+  });
+});
+
+describe('deriveFailureReasons', () => {
+  const summary = (over: Record<string, unknown>) => ({
+    fusion: {
+      createdAt: new Date(),
+      policy: 'NEEDS_VLM',
+      topSku: null,
+      topScore: null,
+      yoloReady: false,
+      vlmInvoked: true,
+      vlmStatus: 'VERDICT',
+      vlmVerdict: null,
+      vlmSelectedSku: null,
+      vlmRequiresHumanReview: null,
+      barcodeMatchedSku: 'SKU-A',
+      ocrStatus: 'OK',
+      expectedSkuInventoryVerdict: null,
+      selectedCrop: null,
+      cropWarnings: [],
+      ...over,
+    } as never,
+  });
+
+  it('rolls up the common failure reasons, most frequent first', () => {
+    const reasons = deriveFailureReasons(
+      [
+        summary({ vlmVerdict: 'AMBIGUOUS' }),
+        summary({ cropWarnings: ['HIGH_OCCLUSION', 'LOW_SHARPNESS'] }),
+        summary({ cropWarnings: ['HIGH_OCCLUSION'] }),
+        summary({ expectedSkuInventoryVerdict: 'NOT_STOCKED' }),
+        summary({ barcodeMatchedSku: null, ocrStatus: 'TIMEOUT' }),
+        { fusion: null },
+      ],
+      { inferenceReady: false },
+    );
+    const byReason = Object.fromEntries(
+      reasons.map((entry) => [entry.reason, entry.count]),
+    );
+    expect(byReason).toEqual({
+      AMBIGUOUS_CROP: 1,
+      HIGH_OCCLUSION: 2,
+      BACKGROUND_HEAVY_CROP: 1,
+      NOT_STOCKED: 1,
+      NO_BARCODE_OCR: 1,
+      MISSING_REFERENCES: 1,
+    });
+    expect(reasons[0].reason).toBe('HIGH_OCCLUSION');
+  });
+
+  it('reports nothing for a healthy SKU', () => {
+    expect(deriveFailureReasons([], { inferenceReady: true })).toEqual([]);
+  });
+});
+
+describe('evaluateGates', () => {
+  const healthy = {
+    referenceCount: 9,
+    minRequiredReferences: 5,
+    embeddingCount: 9,
+    stockedQuantity: 12,
+    latestFusion: {
+      createdAt: new Date(),
+      policy: 'AUTO_PROPOSE',
+      topSku: 'SKU-A',
+      topScore: 0.7,
+      yoloReady: false,
+      vlmInvoked: false,
+      vlmStatus: null,
+      vlmVerdict: null,
+      vlmSelectedSku: null,
+      vlmRequiresHumanReview: null,
+      barcodeMatchedSku: null,
+      ocrStatus: 'OK',
+      expectedSkuInventoryVerdict: 'PLAUSIBLE',
+      selectedCrop: cleanCrop,
+      cropWarnings: [],
+    },
+    reviewedPickupExamples: 5,
+    reviewedReturnExamples: 2,
+    reviewedFalseTouchExamples: 2,
+    unreviewedClips: 0,
+  };
+
+  it('is ready when every required gate passes', () => {
+    const gates = evaluateGates(healthy);
+    expect(gates.readyForDatasetImprovement).toBe(true);
+    expect(gates.items.every((item) => !item.required || item.satisfied)).toBe(
+      true,
+    );
+  });
+
+  it('treats the 8-image recommendation as advisory only', () => {
+    const gates = evaluateGates({ ...healthy, referenceCount: 6, embeddingCount: 6 });
+    const recommended = gates.items.find(
+      (item) => item.key === 'REFERENCES_RECOMMENDED',
+    );
+    expect(recommended?.satisfied).toBe(false);
+    expect(recommended?.required).toBe(false);
+    expect(gates.readyForDatasetImprovement).toBe(true);
+  });
+
+  it.each([
+    ['referenceCount', { referenceCount: 4 }],
+    ['embeddingCount', { embeddingCount: 3 }],
+    ['stockedQuantity', { stockedQuantity: 0 }],
+    ['latestFusion', { latestFusion: null }],
+    ['reviewedPickupExamples', { reviewedPickupExamples: 4 }],
+    ['reviewedReturnExamples', { reviewedReturnExamples: 1 }],
+    ['reviewedFalseTouchExamples', { reviewedFalseTouchExamples: 1 }],
+    ['unreviewedClips', { unreviewedClips: 2 }],
+  ])('is not ready when %s falls short', (_field, override) => {
+    expect(
+      evaluateGates({ ...healthy, ...override }).readyForDatasetImprovement,
+    ).toBe(false);
+  });
+
+  it('fails the clean-crop gate while the latest crop carries warnings', () => {
+    const gates = evaluateGates({
+      ...healthy,
+      latestFusion: {
+        ...healthy.latestFusion,
+        cropWarnings: ['HIGH_OCCLUSION', 'LOW_SHARPNESS'],
+      },
+    });
+    const crop = gates.items.find((item) => item.key === 'CLEAN_CROP');
+    expect(crop?.satisfied).toBe(false);
+    expect(crop?.detail).toContain('HIGH_OCCLUSION');
+    expect(gates.readyForDatasetImprovement).toBe(false);
+  });
+});

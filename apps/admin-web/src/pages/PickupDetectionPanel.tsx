@@ -34,11 +34,15 @@ function GroundTruthForm({
   products,
   durationMs,
   onSaved,
+  defaultProductId,
 }: {
   assetId: string;
   products: Product[];
   durationMs: number | null;
   onSaved?: () => void;
+  /** Pre-fills the product picker for a form with NO saved truth yet
+   *  (one-SKU bootstrap). A saved row always wins — see the effect. */
+  defaultProductId?: string;
 }) {
   const [reload, setReload] = useState(0);
   const [saving, setSaving] = useState(false);
@@ -46,7 +50,7 @@ function GroundTruthForm({
   const [fieldErrors, setFieldErrors] = useState<GroundTruthFieldErrors>({});
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
   const [kind, setKind] = useState<GroundTruthEventKind>('PICKUP');
-  const [productId, setProductId] = useState('');
+  const [productId, setProductId] = useState(defaultProductId ?? '');
   const [timestampMs, setTimestampMs] = useState('');
   const [quantity, setQuantity] = useState('1');
   const [testType, setTestType] = useState('');
@@ -231,10 +235,14 @@ export function PickupDetectionPanel({
   assetId,
   durationMs,
   onGroundTruthSaved,
+  defaultProductId,
 }: {
   assetId: string;
   durationMs: number | null;
   onGroundTruthSaved?: () => void;
+  /** One-SKU bootstrap: pre-select the SKU under test in the
+   *  ground-truth form (existing saved truth still wins). */
+  defaultProductId?: string;
 }) {
   const [tick, setTick] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -434,6 +442,7 @@ export function PickupDetectionPanel({
         products={products.data?.items ?? []}
         durationMs={durationMs}
         onSaved={onGroundTruthSaved}
+        defaultProductId={defaultProductId}
       />
 
       {mediaUrl ? (
