@@ -373,3 +373,14 @@ describe('nextBestAction', () => {
     expect(nextBestAction(slice()).key).toBe('SEND_TO_DATASET');
   });
 });
+
+import { EXCLUDED_REASON_LABELS } from './one-sku-bootstrap-utils';
+
+describe('excluded-clip labels', () => {
+  it('explains both bootstrap exclusion reasons in operator language', () => {
+    expect(EXCLUDED_REASON_LABELS.SESSION_BOUND).toContain('checkout/session');
+    expect(EXCLUDED_REASON_LABELS.MISSING_STORE_CONTEXT).toContain(
+      'store context',
+    );
+  });
+});

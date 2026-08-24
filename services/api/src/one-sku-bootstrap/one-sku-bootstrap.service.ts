@@ -29,6 +29,9 @@ import {
   deriveFailureReasons,
   evaluateGates,
   fusionFrameDimsFor,
+  isPhase18EligibleReview,
+  operatorCropMarker,
+  predictedActionOfEventType,
   safeFusionSummary,
 } from './one-sku-bootstrap.report';
 
@@ -47,6 +50,12 @@ import {
  * Corrections NEVER go through the vision-event review endpoint, whose
  * APPROVE/OVERRIDE path can mutate checkout-session basket lines —
  * session-bound clips are flagged and excluded outright.
+ *
+ * READINESS DISCIPLINE (Codex P1): a clip counts as reviewed ONLY when
+ * the LINKED bootstrap evaluation run holds a review that (a) is bound
+ * to the clip's LATEST fusion run's imported event and (b) mirrors
+ * Phase 18's candidate-eligibility rules — the gates and the Phase 18
+ * candidate refresh must agree about the same evidence.
  *
  * Response safety: only ids, SKUs, sanitized filenames, classified codes,
  * and numbers leave this service — never storage keys, OCR/barcode text,
@@ -69,6 +78,10 @@ export const BOOTSTRAP_REVIEW_VERDICTS = [
   PilotObservationVerdict.UNCERTAIN,
 ] as const;
 
+export type BootstrapExclusionReason =
+  | 'SESSION_BOUND'
+  | 'MISSING_STORE_CONTEXT';
+
 export interface BootstrapVideoRow {
   videoAssetId: string;
   originalFilename: string;
@@ -83,17 +96,24 @@ export interface BootstrapVideoRow {
    *  (+quantity pickup, -quantity return, 0 false touch). Display only —
    *  no basket, order, or inventory row is ever written from CV. */
   expectedBasketDelta: number;
-  /** Bound to a checkout session: EXCLUDED from bootstrap corrections
-   *  (the vision-event review path could mutate basket lines). */
-  sessionBound: boolean;
+  /** Set when the clip is EXCLUDED from bootstrap review/readiness:
+   *  SESSION_BOUND (checkout-session path — correction could mutate a
+   *  basket) or MISSING_STORE_CONTEXT (no shadow journey possible).
+   *  Excluded rows never count toward any gate. */
+  excludedReason: BootstrapExclusionReason | null;
   /** PICKUP/RETURN ground truth whose succeeded analysis produced NO
    *  event — needs a human missed-event correction, never auto-reviewed. */
   missedPositiveEvent: boolean;
   reviewed: boolean;
+  /** A review exists only for an OLDER fusion run of this clip — the
+   *  newest evidence needs a fresh review. */
+  staleReview: boolean;
   reviewDecision: string | null;
-  /** Latest bootstrap pilot-review verdict on this clip's imported
-   *  journey event (the record-only correction path), if any. */
+  /** Latest bootstrap pilot-review verdict bound to the clip's LATEST
+   *  fusion run (the linked evaluation run only), if any. */
   bootstrapReviewVerdict: string | null;
+  /** Whether that review mirrors a Phase 18 ELIGIBLE candidate. */
+  bootstrapReviewEligible: boolean;
   visionEventStatus: string | null;
   needsReview: boolean;
   predictedSku: string | null;
@@ -126,7 +146,9 @@ export interface OneSkuBootstrapReport {
   };
   videos: BootstrapVideoRow[];
   counts: {
+    /** Bootstrap-safe clips only — excluded rows are not counted. */
     totalClips: number;
+    excludedClips: number;
     reviewedPickupExamples: number;
     reviewedReturnExamples: number;
     /** NONE ground truth carries no SKU, so false-touch examples are
@@ -227,6 +249,12 @@ export class OneSkuBootstrapService {
    * This path can NEVER touch a checkout basket: session-bound clips
    * are refused outright, and neither delegated service writes checkout,
    * order, payment, or inventory rows.
+   *
+   * Verdict validation mirrors Phase 18 eligibility (Codex P1): CORRECT
+   * only when the imported event matches the ground truth in BOTH sku
+   * and action; WRONG_SKU/WRONG_ACTION must actually change something.
+   * A newer operator crop is bound into the review notes as the
+   * evidence override marker.
    */
   async reviewClip(
     tenantId: string,
@@ -276,6 +304,16 @@ export class OneSkuBootstrapService {
           'shadow journey can be opened in the same store',
       );
     }
+    const truth = await this.prisma.videoGroundTruth.findFirst({
+      where: { tenantId, videoAssetId },
+      select: { eventKind: true, productId: true },
+    });
+    if (!truth) {
+      throw new ConflictException(
+        'set the clip’s ground truth first — corrections label the ' +
+          'prediction against it',
+      );
+    }
     const run = await this.prisma.pickupFusionRun.findFirst({
       where: {
         tenantId,
@@ -283,7 +321,7 @@ export class OneSkuBootstrapService {
         runScope: FusionRunScope.WHOLE_CLIP,
       },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      select: { id: true },
+      select: { id: true, createdAt: true },
     });
     if (!run) {
       throw new ConflictException(
@@ -311,7 +349,7 @@ export class OneSkuBootstrapService {
           },
         },
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        select: { id: true },
+        select: { id: true, productId: true, sku: true, eventType: true },
       });
 
     let event = await findImportedEvent();
@@ -340,6 +378,85 @@ export class OneSkuBootstrapService {
       }
     }
 
+    // Verdict/ground-truth consistency (Codex P1): CORRECT must mean the
+    // prediction matches ground truth in BOTH sku and action — Phase 18
+    // keeps the event's predicted action for CORRECT, so confirming a
+    // wrong-action prediction would mislabel the candidate.
+    const predictedAction = predictedActionOfEventType(event.eventType);
+    if (input.verdict === PilotObservationVerdict.CORRECT) {
+      if (truth.eventKind === GroundTruthEventKind.NONE) {
+        throw new BadRequestException(
+          'the ground truth says nothing was removed — record FALSE_TOUCH, ' +
+            'not CORRECT',
+        );
+      }
+      if (event.productId !== truth.productId) {
+        throw new BadRequestException(
+          'the predicted product differs from the ground truth — record ' +
+            'WRONG_SKU with the corrected product',
+        );
+      }
+      if (predictedAction !== truth.eventKind) {
+        throw new BadRequestException(
+          'the predicted action differs from the ground truth — record ' +
+            'WRONG_ACTION with the corrected action',
+        );
+      }
+    }
+    if (input.verdict === PilotObservationVerdict.WRONG_ACTION) {
+      if (
+        input.expectedAction !== PilotExpectedAction.PICKUP &&
+        input.expectedAction !== PilotExpectedAction.RETURN &&
+        input.expectedAction !== PilotExpectedAction.NO_OP
+      ) {
+        throw new BadRequestException(
+          'WRONG_ACTION needs a corrected PICKUP, RETURN, or NO_OP',
+        );
+      }
+      if (input.expectedAction === predictedAction) {
+        throw new BadRequestException(
+          'the corrected action equals the predicted action — Phase 18 ' +
+            'would exclude this as CORRECTION_NOT_DIFFERENT',
+        );
+      }
+    }
+    if (input.verdict === PilotObservationVerdict.WRONG_SKU) {
+      if (!input.expectedProductId) {
+        throw new BadRequestException(
+          'WRONG_SKU needs the corrected product — Phase 18 would exclude ' +
+            'this as MISSING_CORRECTED_SKU',
+        );
+      }
+      if (input.expectedProductId === event.productId) {
+        throw new BadRequestException(
+          'the corrected product equals the predicted product — Phase 18 ' +
+            'would exclude this as CORRECTION_NOT_DIFFERENT',
+        );
+      }
+    }
+
+    // Operator crop override (Codex P1): a manual crop newer than the
+    // reviewed fusion run is bound into the review record itself, so the
+    // evidence Phase 18 consumes names the crop the operator actually
+    // approved (an OPAQUE artifact id — never a path).
+    const operatorCrop = await this.prisma.videoArtifact.findFirst({
+      where: {
+        tenantId,
+        videoAssetId,
+        artifactType: 'CROP',
+        createdById: { not: null },
+        createdAt: { gt: run.createdAt },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      select: { id: true },
+    });
+    const callerNotes = (input.notes ?? '').trim().slice(0, 250);
+    const notes = operatorCrop
+      ? [callerNotes, operatorCropMarker(operatorCrop.id)]
+          .filter((part) => part.length > 0)
+          .join(' ')
+      : callerNotes;
+
     const review = await this.evaluations.reviewObservation(
       tenantId,
       evaluation.evaluationRunId,
@@ -348,7 +465,7 @@ export class OneSkuBootstrapService {
         expectedAction: input.expectedAction,
         journeyEventId: event.id,
         expectedProductId: input.expectedProductId ?? null,
-        notes: input.notes ?? null,
+        notes: notes || null,
       },
       actorId,
     );
@@ -412,6 +529,7 @@ export class OneSkuBootstrapService {
             durationMs: true,
             width: true,
             height: true,
+            locationId: true,
             sessionId: true,
             deletedAt: true,
           },
@@ -438,6 +556,7 @@ export class OneSkuBootstrapService {
             },
             orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
             select: {
+              id: true,
               videoAssetId: true,
               createdAt: true,
               policy: true,
@@ -522,9 +641,10 @@ export class OneSkuBootstrapService {
           });
     const eventById = new Map(events.map((event) => [event.id, event]));
 
-    // Bootstrap pilot reviews (the record-only correction path): a pilot
-    // review on a clip's imported FUSION_SHADOW journey event marks the
-    // clip reviewed WITHOUT ever touching the vision-event/basket path.
+    // Bootstrap pilot reviews (Codex P1 — run-scoped and evidence-bound):
+    // only reviews of the LINKED evaluation run count, and each must be
+    // tied to the clip's LATEST fusion run's imported event — a review of
+    // older evidence, or from another run, satisfies nothing here.
     const journeyEvents =
       assetIds.length === 0
         ? []
@@ -534,42 +654,83 @@ export class OneSkuBootstrapService {
               videoAssetId: { in: assetIds },
               sourceType: 'FUSION_SHADOW',
             },
-            select: { id: true, videoAssetId: true },
+            select: {
+              id: true,
+              videoAssetId: true,
+              fusionRunId: true,
+              productId: true,
+              sku: true,
+              eventType: true,
+            },
           });
     const journeyEventIds = journeyEvents.map((event) => event.id);
     const pilotReviews =
-      journeyEventIds.length === 0
+      linkedRun === null || journeyEventIds.length === 0
         ? []
         : await this.prisma.pilotObservationReview.findMany({
-            where: { tenantId, journeyEventId: { in: journeyEventIds } },
+            where: {
+              tenantId,
+              evaluationRunId: linkedRun.id,
+              journeyEventId: { in: journeyEventIds },
+            },
             orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-            select: { journeyEventId: true, verdict: true, createdAt: true },
+            select: {
+              journeyEventId: true,
+              verdict: true,
+              expectedAction: true,
+              expectedProductId: true,
+              expectedSku: true,
+              notes: true,
+              createdAt: true,
+            },
           });
-    const latestPilotReviewByEvent = new Map<
+    const latestReviewByEvent = new Map<
       string,
       (typeof pilotReviews)[number]
     >();
     for (const review of pilotReviews) {
       if (review.journeyEventId !== null) {
         // ascending order → the newest review wins.
-        latestPilotReviewByEvent.set(review.journeyEventId, review);
+        latestReviewByEvent.set(review.journeyEventId, review);
       }
     }
-    const latestPilotReviewByAsset = new Map<
+    // Latest-run-bound review per asset, plus a stale marker when only
+    // older-run evidence was ever reviewed.
+    const latestRunReviewByAsset = new Map<
       string,
       (typeof pilotReviews)[number]
+    >();
+    const hasOlderReviewByAsset = new Set<string>();
+    for (const event of journeyEvents) {
+      if (event.videoAssetId === null) {
+        continue;
+      }
+      const review = latestReviewByEvent.get(event.id);
+      if (!review) {
+        continue;
+      }
+      const latestRun = latestRunByAsset.get(event.videoAssetId);
+      if (latestRun && event.fusionRunId === latestRun.id) {
+        const current = latestRunReviewByAsset.get(event.videoAssetId);
+        if (!current || review.createdAt > current.createdAt) {
+          latestRunReviewByAsset.set(event.videoAssetId, review);
+        }
+      } else {
+        hasOlderReviewByAsset.add(event.videoAssetId);
+      }
+    }
+    // The latest-run event per asset (for the eligibility mirror).
+    const latestRunEventByAsset = new Map<
+      string,
+      (typeof journeyEvents)[number]
     >();
     for (const event of journeyEvents) {
       if (event.videoAssetId === null) {
         continue;
       }
-      const review = latestPilotReviewByEvent.get(event.id);
-      if (!review) {
-        continue;
-      }
-      const current = latestPilotReviewByAsset.get(event.videoAssetId);
-      if (!current || review.createdAt > current.createdAt) {
-        latestPilotReviewByAsset.set(event.videoAssetId, review);
+      const latestRun = latestRunByAsset.get(event.videoAssetId);
+      if (latestRun && event.fusionRunId === latestRun.id) {
+        latestRunEventByAsset.set(event.videoAssetId, event);
       }
     }
 
@@ -587,11 +748,43 @@ export class OneSkuBootstrapService {
               height: truth.videoAsset.height,
             }
           : null;
+
+      const excludedReason: BootstrapExclusionReason | null =
+        truth.videoAsset.sessionId !== null
+          ? 'SESSION_BOUND'
+          : truth.videoAsset.locationId === null
+            ? 'MISSING_STORE_CONTEXT'
+            : null;
+
+      const pilotReview = latestRunReviewByAsset.get(truth.videoAssetId);
+      const reviewedEvent = latestRunEventByAsset.get(truth.videoAssetId);
+      const reviewEligible =
+        pilotReview !== undefined &&
+        reviewedEvent !== undefined &&
+        isPhase18EligibleReview(
+          {
+            verdict: pilotReview.verdict,
+            expectedAction: pilotReview.expectedAction,
+            expectedProductId: pilotReview.expectedProductId,
+            expectedSku: pilotReview.expectedSku,
+          },
+          {
+            productId: reviewedEvent.productId,
+            sku: reviewedEvent.sku,
+            eventType: reviewedEvent.eventType,
+          },
+        );
+      const staleReview =
+        pilotReview === undefined &&
+        hasOlderReviewByAsset.has(truth.videoAssetId);
+
       let fusion = run
         ? safeFusionSummary(run, expectedSku, fusionFrameDimsFor(native))
         : null;
       // A NEWER manual crop supersedes the automatic crop as evidence
       // (preview, warnings, CLEAN_CROP). Manual boxes are native-pixel.
+      // It only counts as CONNECTED evidence once a review recorded
+      // after it carries its marker in the notes.
       const operatorCrop = latestOperatorCropByAsset.get(truth.videoAssetId);
       if (
         fusion &&
@@ -603,6 +796,11 @@ export class OneSkuBootstrapService {
         operatorCrop.cropWidth !== null &&
         operatorCrop.cropHeight !== null
       ) {
+        const connected =
+          pilotReview !== undefined &&
+          (pilotReview.notes ?? '').includes(
+            operatorCropMarker(operatorCrop.id),
+          );
         fusion = applyOperatorCrop(
           fusion,
           {
@@ -617,35 +815,30 @@ export class OneSkuBootstrapService {
             createdAt: operatorCrop.createdAt,
           },
           native,
+          connected,
         );
       }
 
       const isNone = truth.eventKind === GroundTruthEventKind.NONE;
-      const pilotReview = latestPilotReviewByAsset.get(truth.videoAssetId);
 
-      // Reviewed rules (Codex P1 — missed positives must not count):
-      // - PICKUP/RETURN: a human record must exist — either a reviewed
-      //   vision event (other pages) or a bootstrap PILOT review on the
-      //   clip's imported journey event. A succeeded analysis that
-      //   produced NO event and carries no correction is a MISSED
-      //   POSITIVE — never auto-reviewed.
-      // - NONE (false touch): analysis ran and either produced no event
-      //   (the operator's NONE label IS the record), the produced event
-      //   was human-reviewed, or a bootstrap review labeled it.
+      // Reviewed rules (Codex P1): only Phase 18-ELIGIBLE bootstrap
+      // reviews on the LATEST evidence count. The one event-less
+      // exception: a NONE clip whose analysis proposed nothing has no
+      // reviewable observation — the operator's NONE label is the record.
       const hasAnalysis =
         run !== undefined || job?.status === InferenceJobStatus.SUCCEEDED;
-      const visionReviewed = event !== undefined && event.review !== null;
       const missedPositiveEvent =
         !isNone &&
         job?.status === InferenceJobStatus.SUCCEEDED &&
         event === undefined &&
-        pilotReview === undefined;
-      const reviewed = isNone
-        ? hasAnalysis &&
-          (event === undefined ||
-            event.review !== null ||
-            pilotReview !== undefined)
-        : visionReviewed || pilotReview !== undefined;
+        !reviewEligible;
+      const reviewed = reviewEligible
+        ? true
+        : isNone &&
+          hasAnalysis &&
+          event === undefined &&
+          fusion?.policy !== 'AUTO_PROPOSE' &&
+          reviewedEvent === undefined;
 
       const predictionMatchesExpected =
         fusion === null
@@ -670,45 +863,58 @@ export class OneSkuBootstrapService {
             : truth.eventKind === GroundTruthEventKind.RETURN
               ? -truth.quantity
               : 0,
-        sessionBound: truth.videoAsset.sessionId !== null,
+        excludedReason,
         missedPositiveEvent,
         reviewed,
+        staleReview,
         reviewDecision: event?.review?.decision ?? null,
         bootstrapReviewVerdict: pilotReview?.verdict ?? null,
+        bootstrapReviewEligible: reviewEligible,
         visionEventStatus: event?.status ?? null,
         needsReview:
-          event?.status === 'PENDING_REVIEW' ||
-          fusion?.vlmRequiresHumanReview === true ||
-          missedPositiveEvent,
+          !reviewed &&
+          (event?.status === 'PENDING_REVIEW' ||
+            fusion?.vlmRequiresHumanReview === true ||
+            missedPositiveEvent ||
+            staleReview),
         predictedSku: fusion?.topSku ?? null,
         predictionMatchesExpected,
         fusion,
       };
     });
 
-    const reviewedPickupExamples = videos.filter(
+    // Every count and gate reads BOOTSTRAP-SAFE clips only: excluded
+    // rows (session-bound / no store context) are displayed but can
+    // neither satisfy nor block readiness.
+    const includedRows = videos.filter((row) => row.excludedReason === null);
+    const excludedClips = videos.length - includedRows.length;
+
+    const reviewedPickupExamples = includedRows.filter(
       (row) =>
         row.eventKind === GroundTruthEventKind.PICKUP &&
         row.expectedSku === product.sku &&
-        row.reviewed,
+        row.bootstrapReviewEligible &&
+        row.bootstrapReviewVerdict !== PilotObservationVerdict.FALSE_TOUCH,
     ).length;
-    const reviewedReturnExamples = videos.filter(
+    const reviewedReturnExamples = includedRows.filter(
       (row) =>
         row.eventKind === GroundTruthEventKind.RETURN &&
         row.expectedSku === product.sku &&
-        row.reviewed,
+        row.bootstrapReviewEligible &&
+        row.bootstrapReviewVerdict !== PilotObservationVerdict.FALSE_TOUCH,
     ).length;
-    const reviewedFalseTouchExamples = videos.filter(
-      (row) => row.eventKind === GroundTruthEventKind.NONE && row.reviewed,
+    const reviewedFalseTouchExamples = includedRows.filter(
+      (row) =>
+        row.bootstrapReviewEligible &&
+        row.bootstrapReviewVerdict === PilotObservationVerdict.FALSE_TOUCH,
     ).length;
-    const unreviewedClips = videos.filter((row) => !row.reviewed).length;
+    const unreviewedClips = includedRows.filter((row) => !row.reviewed).length;
 
-    // Latest fusion evidence by RUN timestamp (Codex P1): the videos
-    // array is ordered by ground-truth updatedAt, which says nothing
-    // about run recency — an edited old clip must not surface stale
-    // evidence for the headline prediction or the CLEAN_CROP gate.
+    // Latest fusion evidence by RUN timestamp (Codex P1) over INCLUDED
+    // rows: an edited old clip must not surface stale evidence, and an
+    // excluded clip must not drive the CLEAN_CROP gate.
     let latestFusion: SafeFusionSummary | null = null;
-    for (const row of videos) {
+    for (const row of includedRows) {
       if (
         row.fusion !== null &&
         (latestFusion === null || row.fusion.createdAt > latestFusion.createdAt)
@@ -750,7 +956,8 @@ export class OneSkuBootstrapService {
       },
       videos,
       counts: {
-        totalClips: videos.length,
+        totalClips: includedRows.length,
+        excludedClips,
         reviewedPickupExamples,
         reviewedReturnExamples,
         reviewedFalseTouchExamples,
@@ -774,7 +981,7 @@ export class OneSkuBootstrapService {
             runCreatedAt: latestFusion.createdAt,
           }
         : null,
-      failureReasons: deriveFailureReasons(videos, { inferenceReady }),
+      failureReasons: deriveFailureReasons(includedRows, { inferenceReady }),
       gates: evaluateGates({
         referenceCount,
         minRequiredReferences: PICKUP_MIN_REFERENCE_IMAGES,

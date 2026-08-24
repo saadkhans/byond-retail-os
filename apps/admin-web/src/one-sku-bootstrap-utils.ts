@@ -46,6 +46,15 @@ export const CROP_WARNING_LABELS: Record<string, string> = {
   UNKNOWN_GEOMETRY: 'Frame size unknown — alignment unverified',
 };
 
+export const EXCLUDED_REASON_LABELS: Record<string, string> = {
+  SESSION_BOUND:
+    'Excluded because this clip is bound to a checkout/session path; ' +
+    'use a fresh bootstrap upload.',
+  MISSING_STORE_CONTEXT:
+    'Missing store context — cannot be reviewed for dataset improvement; ' +
+    're-upload the clip with a store selected.',
+};
+
 export const FAILURE_REASON_LABELS: Record<string, string> = {
   AMBIGUOUS_CROP: 'VLM found the crop ambiguous',
   HIGH_OCCLUSION: 'High occlusion in selected crop',

@@ -25,10 +25,12 @@ export const HIGH_OCCLUSION_THRESHOLD = 0.3;
 /** Selected crop should cover at least this fraction of the analysis frame. */
 export const MIN_CROP_AREA_FRACTION = 0.02;
 
-/** One-SKU dataset gates (guidance, mirrors the Phase 18 minimums). */
+/** One-SKU dataset gates — ALIGNED with Phase 18's default
+ *  minReviewedExamplesPerAction (5): bootstrap must never declare
+ *  dataset-ready below what dataset improvement will accept. */
 export const MIN_REVIEWED_PICKUPS = 5;
-export const MIN_REVIEWED_RETURNS = 2;
-export const MIN_REVIEWED_FALSE_TOUCHES = 2;
+export const MIN_REVIEWED_RETURNS = 5;
+export const MIN_REVIEWED_FALSE_TOUCHES = 5;
 
 /** Newest-first cap on ground-truthed clips considered by the report. */
 export const BOOTSTRAP_MAX_CLIPS = 100;
@@ -94,12 +96,22 @@ export interface SafeFusionSummary {
   topSku: string | null;
   topScore: number | null;
   yoloReady: boolean | null;
+  /** The detector's event kind for the primary window ('PICKUP' |
+   *  'RETURN' | null) — what the imported journey event's action will
+   *  be. Classified code only. */
+  detectedKind: string | null;
   /** Which crop the report's evidence reflects: the pipeline's automatic
    *  selection, or a newer OPERATOR manual crop that supersedes it. */
   cropSource: 'AUTO' | 'OPERATOR';
   /** Artifact id of the effective crop (previewable via the existing
    *  video-asset artifact image endpoint) — an OPAQUE id, never a path. */
   cropArtifactId: string | null;
+  /** true when the effective crop is part of the evidence Phase 18 will
+   *  consume: AUTO crops always are (the fusion run persisted them); an
+   *  OPERATOR crop only once a bootstrap review recorded AFTER it binds
+   *  it into the reviewed evidence (the review notes carry the crop
+   *  artifact id). CLEAN_CROP never passes on an unconnected crop. */
+  cropEvidenceConnected: boolean;
   vlmInvoked: boolean;
   vlmStatus: string | null;
   vlmVerdict: string | null;
@@ -304,14 +316,26 @@ export function safeFusionSummary(
     }
   }
 
+  const detectorEvents = Array.isArray(detector?.events)
+    ? detector.events
+    : [];
+  const primaryEvent = asRecord(detectorEvents[0]);
+  const detectedKindRaw = str(primaryEvent?.kind);
+
   return {
     createdAt: run.createdAt,
     policy: run.policy,
     topSku: str(top?.sku),
     topScore: num(top?.fusedScore),
     yoloReady: boolOrNull(detector?.yoloReady),
+    detectedKind:
+      detectedKindRaw === 'PICKUP' || detectedKindRaw === 'RETURN'
+        ? detectedKindRaw
+        : null,
     cropSource: 'AUTO',
     cropArtifactId: str(evidence?.cropArtifactId),
+    // The automatic crop IS the fusion run's persisted evidence.
+    cropEvidenceConnected: true,
     vlmInvoked: vlm?.invoked === true,
     vlmStatus: str(vlm?.status),
     vlmVerdict: str(vlm?.verdict),
@@ -345,20 +369,31 @@ export interface OperatorCropEvidence {
   createdAt: Date;
 }
 
+/** The review-notes marker that binds an operator crop into the
+ *  reviewed evidence Phase 18 consumes. Opaque artifact id only — the
+ *  bracket shape keeps it greppable and screen-safe (no slashes). */
+export function operatorCropMarker(artifactId: string): string {
+  return `[operator-crop:${artifactId}]`;
+}
+
 /**
  * A manual crop created AFTER the latest fusion run supersedes the
  * pipeline's automatic crop as this clip's evidence: the preview, the
  * warnings, and the CLEAN_CROP gate all follow it. Geometry checks run
  * against the NATIVE frame (the space manual crops live in); quality
  * metrics are unknown by construction — the operator's visual check is
- * the review. The association is fully persisted already: the artifact
- * row carries asset/timestamp/box/reason, and the SKU label comes from
- * the clip's ground truth.
+ * the review.
+ *
+ * `connected` says whether a bootstrap review recorded AFTER this crop
+ * has bound it into the reviewed evidence (its notes carry the marker
+ * above). An unconnected operator crop is display-only and must never
+ * satisfy CLEAN_CROP.
  */
 export function applyOperatorCrop(
   summary: SafeFusionSummary,
   crop: OperatorCropEvidence,
   nativeDims: { width: number; height: number } | null,
+  connected: boolean,
 ): SafeFusionSummary {
   const selectedCrop: SafeCropSummary = {
     phase: 'operator',
@@ -374,9 +409,86 @@ export function applyOperatorCrop(
     ...summary,
     cropSource: 'OPERATOR',
     cropArtifactId: crop.artifactId,
+    cropEvidenceConnected: connected,
     selectedCrop,
     cropWarnings: deriveCropWarnings(selectedCrop, nativeDims),
   };
+}
+
+// ------------------------------------ Phase 18 eligibility mirror (P1)
+
+/** Journey event action the way Phase 15/18 snapshot it. */
+export function predictedActionOfEventType(eventType: string): string {
+  return eventType === 'PRODUCT_PICKUP'
+    ? 'PICKUP'
+    : eventType === 'PRODUCT_RETURN'
+      ? 'RETURN'
+      : 'UNKNOWN';
+}
+
+export interface BootstrapReviewSnapshot {
+  verdict: string;
+  expectedAction: string;
+  expectedProductId: string | null;
+  expectedSku: string | null;
+}
+
+export interface ReviewedEventSnapshot {
+  productId: string | null;
+  sku: string | null;
+  eventType: string;
+}
+
+const USABLE_ACTION_LABELS = ['PICKUP', 'RETURN', 'NO_OP'];
+
+/**
+ * MIRROR of CvDatasetService.collectCandidates' per-verdict eligibility
+ * rules: only reviews that would yield an ELIGIBLE Phase 18 candidate
+ * may satisfy bootstrap readiness — a gate that passes on rows Phase 18
+ * will exclude is a lie.
+ */
+export function isPhase18EligibleReview(
+  review: BootstrapReviewSnapshot,
+  event: ReviewedEventSnapshot,
+): boolean {
+  switch (review.verdict) {
+    case 'CORRECT':
+    case 'FALSE_TOUCH':
+      return true;
+    case 'WRONG_SKU': {
+      if (!review.expectedSku && !review.expectedProductId) {
+        return false; // MISSING_CORRECTED_SKU
+      }
+      // CORRECTION_NOT_DIFFERENT: productId equality is canonical when
+      // both sides are known; SKU-string comparison is the fallback.
+      if (
+        review.expectedProductId &&
+        event.productId &&
+        review.expectedProductId === event.productId
+      ) {
+        return false;
+      }
+      if (
+        !review.expectedProductId &&
+        review.expectedSku &&
+        event.sku &&
+        review.expectedSku === event.sku
+      ) {
+        return false;
+      }
+      return true;
+    }
+    case 'WRONG_ACTION': {
+      if (!USABLE_ACTION_LABELS.includes(review.expectedAction)) {
+        return false; // MISSING_CORRECTED_ACTION
+      }
+      return (
+        review.expectedAction !== predictedActionOfEventType(event.eventType)
+      ); // else CORRECTION_NOT_DIFFERENT
+    }
+    default:
+      return false; // UNCERTAIN_VERDICT / INCORRECT_VERDICT / MISSED_EVENT
+  }
 }
 
 // ------------------------------------------------------ failure rollup
@@ -484,18 +596,24 @@ export function evaluateGates(input: GateInput): {
     },
     {
       key: 'CLEAN_CROP',
-      label: 'Latest selected crop has no quality warnings',
+      label:
+        'Latest selected crop has no quality warnings and is part of ' +
+        'the reviewed evidence',
       satisfied:
         input.latestFusion !== null &&
-        gatingCropWarnings(input.latestFusion.cropWarnings).length === 0,
+        gatingCropWarnings(input.latestFusion.cropWarnings).length === 0 &&
+        input.latestFusion.cropEvidenceConnected,
       required: true,
       detail: input.latestFusion
-        ? (input.latestFusion.cropSource === 'OPERATOR'
-            ? 'operator-selected crop · '
-            : '') +
-          (input.latestFusion.cropWarnings.length === 0
-            ? 'clean'
-            : input.latestFusion.cropWarnings.join(', '))
+        ? input.latestFusion.cropSource === 'OPERATOR' &&
+          !input.latestFusion.cropEvidenceConnected
+          ? 'manual crop not connected to evidence — record a correction to bind it'
+          : (input.latestFusion.cropSource === 'OPERATOR'
+              ? 'operator-selected crop · '
+              : '') +
+            (input.latestFusion.cropWarnings.length === 0
+              ? 'clean'
+              : input.latestFusion.cropWarnings.join(', '))
         : 'no fusion run yet',
     },
     {

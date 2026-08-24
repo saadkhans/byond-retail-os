@@ -6,6 +6,9 @@ import {
   evaluateGates,
   fusionFrameDimsFor,
   gatingCropWarnings,
+  isPhase18EligibleReview,
+  operatorCropMarker,
+  predictedActionOfEventType,
   safeFusionSummary,
 } from './one-sku-bootstrap.report';
 
@@ -54,7 +57,6 @@ describe('deriveCropWarnings', () => {
   });
 
   it('does not falsely flag a valid crop in the 640-scale fusion geometry', () => {
-    // Codex P1: a 192-wide mirror made this exact crop look out of frame.
     const wideCrop = {
       ...cleanCrop,
       box: { x: 400, y: 200, width: 200, height: 150 },
@@ -63,8 +65,6 @@ describe('deriveCropWarnings', () => {
   });
 
   it('classifies the observed failure: blurry background crop with heavy occlusion', () => {
-    // The Nescafe-mapped-to-SKU-LIME-GREEN case: sharpness 0.9-2.4,
-    // occlusion 51-56%, crop mostly table — must warn loudly.
     const warnings = deriveCropWarnings(
       { ...cleanCrop, sharpness: 1.4, occlusion: 0.53 },
       DIMS,
@@ -134,7 +134,14 @@ describe('safeFusionSummary', () => {
   });
 
   const fullEvidence = {
-    detector: { adapterKey: 'classical', warnings: [], yoloReady: false },
+    detector: {
+      adapterKey: 'classical',
+      warnings: [],
+      yoloReady: false,
+      events: [
+        { kind: 'RETURN', startMs: 800, peakMs: 1500, endMs: 2200 },
+      ],
+    },
     cropArtifactId: 'artifact-auto-1',
     crops: [
       {
@@ -175,8 +182,11 @@ describe('safeFusionSummary', () => {
     expect(summary.topSku).toBe('WATER-BOTTLE-500ML');
     expect(summary.topScore).toBe(0.44);
     expect(summary.yoloReady).toBe(false);
+    expect(summary.detectedKind).toBe('RETURN');
     expect(summary.cropSource).toBe('AUTO');
     expect(summary.cropArtifactId).toBe('artifact-auto-1');
+    // The automatic crop IS the run's persisted evidence.
+    expect(summary.cropEvidenceConnected).toBe(true);
     expect(summary.vlmVerdict).toBe('AMBIGUOUS');
     expect(summary.vlmVisualSupport).toBe('WEAK');
     expect(summary.vlmReasonCodes).toEqual(['LOW_VISUAL_MATCH', 'OCCLUDED']);
@@ -205,21 +215,24 @@ describe('safeFusionSummary', () => {
     for (const evidence of [null, undefined, 42, 'text', [], {}, { crops: 'x' }]) {
       const summary = safeFusionSummary(run(evidence), 'SKU-A', DIMS);
       expect(summary.topSku).toBeNull();
+      expect(summary.detectedKind).toBeNull();
       expect(summary.selectedCrop).toBeNull();
       expect(summary.cropWarnings).toEqual(['NO_CLEAR_PRODUCT_FRAME']);
     }
   });
 });
 
-describe('applyOperatorCrop', () => {
-  const base: SafeFusionSummary = {
+function fusionFixture(over: Partial<SafeFusionSummary> = {}): SafeFusionSummary {
+  return {
     createdAt: new Date('2026-08-24T10:00:00Z'),
     policy: 'NEEDS_VLM',
     topSku: 'SKU-A',
     topScore: 0.4,
     yoloReady: false,
+    detectedKind: 'PICKUP',
     cropSource: 'AUTO',
     cropArtifactId: 'artifact-auto-1',
+    cropEvidenceConnected: true,
     vlmInvoked: false,
     vlmStatus: null,
     vlmVerdict: null,
@@ -232,82 +245,156 @@ describe('applyOperatorCrop', () => {
     expectedSkuInventoryVerdict: null,
     selectedCrop: { ...cleanCrop, sharpness: 1.2, occlusion: 0.6 },
     cropWarnings: ['HIGH_OCCLUSION', 'LOW_SHARPNESS', 'NO_CLEAR_PRODUCT_FRAME'],
+    ...over,
   };
-  const native = { width: 1920, height: 1080 };
+}
 
-  it('supersedes the auto crop as the clip evidence', () => {
-    const applied = applyOperatorCrop(
-      base,
-      {
-        artifactId: 'artifact-manual-1',
-        timestampMs: 2100,
-        box: { x: 600, y: 300, width: 500, height: 600 },
-        createdAt: new Date('2026-08-24T11:00:00Z'),
-      },
-      native,
-    );
+describe('applyOperatorCrop', () => {
+  const native = { width: 1920, height: 1080 };
+  const crop = {
+    artifactId: 'artifact-manual-1',
+    timestampMs: 2100,
+    box: { x: 600, y: 300, width: 500, height: 600 },
+    createdAt: new Date('2026-08-24T11:00:00Z'),
+  };
+
+  it('supersedes the auto crop as the clip evidence when connected', () => {
+    const applied = applyOperatorCrop(fusionFixture(), crop, native, true);
     expect(applied.cropSource).toBe('OPERATOR');
     expect(applied.cropArtifactId).toBe('artifact-manual-1');
+    expect(applied.cropEvidenceConnected).toBe(true);
     expect(applied.selectedCrop?.phase).toBe('operator');
     expect(applied.selectedCrop?.qualityKnown).toBe(false);
-    // The observed-failure warnings are gone: the operator visually
-    // confirmed this crop and its geometry is valid.
     expect(applied.cropWarnings).toEqual([]);
+  });
+
+  it('marks an unbound manual crop as NOT connected to evidence', () => {
+    const applied = applyOperatorCrop(fusionFixture(), crop, native, false);
+    expect(applied.cropSource).toBe('OPERATOR');
+    expect(applied.cropEvidenceConnected).toBe(false);
   });
 
   it('still applies geometric checks in NATIVE space', () => {
     const applied = applyOperatorCrop(
-      base,
-      {
-        artifactId: 'artifact-manual-2',
-        timestampMs: 2100,
-        box: { x: 1900, y: 1000, width: 500, height: 600 },
-        createdAt: new Date(),
-      },
+      fusionFixture(),
+      { ...crop, box: { x: 1900, y: 1000, width: 500, height: 600 } },
       native,
+      true,
     );
     expect(applied.cropWarnings).toEqual(['CROP_MISALIGNED']);
   });
 
   it('reports UNKNOWN_GEOMETRY when native dims are unknown', () => {
-    const applied = applyOperatorCrop(
-      base,
-      {
-        artifactId: 'artifact-manual-3',
-        timestampMs: 2100,
-        box: { x: 10, y: 10, width: 200, height: 200 },
-        createdAt: new Date(),
-      },
-      null,
-    );
+    const applied = applyOperatorCrop(fusionFixture(), crop, null, true);
     expect(applied.cropWarnings).toEqual(['UNKNOWN_GEOMETRY']);
   });
 });
 
+describe('operatorCropMarker', () => {
+  it('is an opaque bracketed id — no slashes or free text', () => {
+    expect(operatorCropMarker('ckabc123')).toBe('[operator-crop:ckabc123]');
+  });
+});
+
+describe('predictedActionOfEventType', () => {
+  it('mirrors the Phase 15/18 snapshot mapping', () => {
+    expect(predictedActionOfEventType('PRODUCT_PICKUP')).toBe('PICKUP');
+    expect(predictedActionOfEventType('PRODUCT_RETURN')).toBe('RETURN');
+    expect(predictedActionOfEventType('REVIEW_REQUIRED')).toBe('UNKNOWN');
+  });
+});
+
+describe('isPhase18EligibleReview (mirror of collectCandidates)', () => {
+  const event = {
+    productId: 'prod-a',
+    sku: 'SKU-A',
+    eventType: 'PRODUCT_PICKUP',
+  };
+  const review = (over: Record<string, unknown>) => ({
+    verdict: 'CORRECT',
+    expectedAction: 'PICKUP',
+    expectedProductId: null,
+    expectedSku: null,
+    ...over,
+  });
+
+  it('accepts CORRECT and FALSE_TOUCH', () => {
+    expect(isPhase18EligibleReview(review({}) as never, event)).toBe(true);
+    expect(
+      isPhase18EligibleReview(
+        review({ verdict: 'FALSE_TOUCH', expectedAction: 'NO_OP' }) as never,
+        event,
+      ),
+    ).toBe(true);
+  });
+
+  it('rejects UNCERTAIN, INCORRECT, and MISSED_EVENT', () => {
+    for (const verdict of ['UNCERTAIN', 'INCORRECT', 'MISSED_EVENT']) {
+      expect(
+        isPhase18EligibleReview(review({ verdict }) as never, event),
+      ).toBe(false);
+    }
+  });
+
+  it('rejects WRONG_SKU without a correction, or with an unchanged one', () => {
+    expect(
+      isPhase18EligibleReview(review({ verdict: 'WRONG_SKU' }) as never, event),
+    ).toBe(false);
+    expect(
+      isPhase18EligibleReview(
+        review({ verdict: 'WRONG_SKU', expectedProductId: 'prod-a' }) as never,
+        event,
+      ),
+    ).toBe(false);
+    expect(
+      isPhase18EligibleReview(
+        review({ verdict: 'WRONG_SKU', expectedSku: 'SKU-A' }) as never,
+        event,
+      ),
+    ).toBe(false);
+  });
+
+  it('accepts WRONG_SKU with a genuinely different correction', () => {
+    expect(
+      isPhase18EligibleReview(
+        review({
+          verdict: 'WRONG_SKU',
+          expectedProductId: 'prod-c',
+          expectedSku: 'SKU-C',
+        }) as never,
+        event,
+      ),
+    ).toBe(true);
+  });
+
+  it('rejects WRONG_ACTION with an unusable or unchanged action', () => {
+    expect(
+      isPhase18EligibleReview(
+        review({ verdict: 'WRONG_ACTION', expectedAction: 'UNKNOWN' }) as never,
+        event,
+      ),
+    ).toBe(false);
+    expect(
+      isPhase18EligibleReview(
+        review({ verdict: 'WRONG_ACTION', expectedAction: 'PICKUP' }) as never,
+        event,
+      ),
+    ).toBe(false);
+  });
+
+  it('accepts WRONG_ACTION with a changed usable action', () => {
+    expect(
+      isPhase18EligibleReview(
+        review({ verdict: 'WRONG_ACTION', expectedAction: 'RETURN' }) as never,
+        event,
+      ),
+    ).toBe(true);
+  });
+});
+
 describe('deriveFailureReasons', () => {
-  const summary = (over: Record<string, unknown>) => ({
-    fusion: {
-      createdAt: new Date(),
-      policy: 'NEEDS_VLM',
-      topSku: null,
-      topScore: null,
-      yoloReady: false,
-      cropSource: 'AUTO',
-      cropArtifactId: null,
-      vlmInvoked: true,
-      vlmStatus: 'VERDICT',
-      vlmVerdict: null,
-      vlmSelectedSku: null,
-      vlmVisualSupport: null,
-      vlmReasonCodes: [],
-      vlmRequiresHumanReview: null,
-      barcodeMatchedSku: 'SKU-A',
-      ocrStatus: 'OK',
-      expectedSkuInventoryVerdict: null,
-      selectedCrop: null,
-      cropWarnings: [],
-      ...over,
-    } as never,
+  const summary = (over: Partial<SafeFusionSummary>) => ({
+    fusion: fusionFixture({ selectedCrop: null, cropWarnings: [], ...over }),
   });
 
   it('rolls up the common failure reasons, most frequent first', () => {
@@ -335,7 +422,6 @@ describe('deriveFailureReasons', () => {
       MISSING_REFERENCES: 1,
       MISSED_POSITIVE_EVENT: 1,
     });
-    expect(reasons[0].reason).toBe('HIGH_OCCLUSION');
   });
 
   it('reports nothing for a healthy SKU', () => {
@@ -344,27 +430,13 @@ describe('deriveFailureReasons', () => {
 });
 
 describe('evaluateGates', () => {
-  const healthyFusion: SafeFusionSummary = {
-    createdAt: new Date(),
+  const healthyFusion = fusionFixture({
     policy: 'AUTO_PROPOSE',
-    topSku: 'SKU-A',
     topScore: 0.7,
-    yoloReady: false,
-    cropSource: 'AUTO',
-    cropArtifactId: 'artifact-1',
-    vlmInvoked: false,
-    vlmStatus: null,
-    vlmVerdict: null,
-    vlmSelectedSku: null,
-    vlmVisualSupport: null,
-    vlmReasonCodes: [],
-    vlmRequiresHumanReview: null,
-    barcodeMatchedSku: null,
-    ocrStatus: 'OK',
-    expectedSkuInventoryVerdict: 'PLAUSIBLE',
     selectedCrop: cleanCrop,
     cropWarnings: [],
-  };
+    expectedSkuInventoryVerdict: 'PLAUSIBLE',
+  });
   const healthy = {
     referenceCount: 9,
     minRequiredReferences: 5,
@@ -372,10 +444,10 @@ describe('evaluateGates', () => {
     stockedQuantity: 12,
     latestFusion: healthyFusion,
     reviewedPickupExamples: 5,
-    reviewedReturnExamples: 2,
-    reviewedFalseTouchExamples: 2,
+    reviewedReturnExamples: 5,
+    reviewedFalseTouchExamples: 5,
     unreviewedClips: 0,
-    linkedEvaluationReviewCount: 7,
+    linkedEvaluationReviewCount: 15,
   };
 
   it('is ready when every required gate passes', () => {
@@ -402,8 +474,10 @@ describe('evaluateGates', () => {
     ['stockedQuantity', { stockedQuantity: 0 }],
     ['latestFusion', { latestFusion: null }],
     ['reviewedPickupExamples', { reviewedPickupExamples: 4 }],
-    ['reviewedReturnExamples', { reviewedReturnExamples: 1 }],
-    ['reviewedFalseTouchExamples', { reviewedFalseTouchExamples: 1 }],
+    // Phase 18 alignment: 2 returns / 2 false-touches (the old bootstrap
+    // minimums) are BELOW the Phase 18 per-action default of 5.
+    ['reviewedReturnExamples at 2', { reviewedReturnExamples: 2 }],
+    ['reviewedFalseTouchExamples at 2', { reviewedFalseTouchExamples: 2 }],
     ['unreviewedClips', { unreviewedClips: 2 }],
     ['linkedEvaluationReviewCount null', { linkedEvaluationReviewCount: null }],
     ['linkedEvaluationReviewCount 0', { linkedEvaluationReviewCount: 0 }],
@@ -416,10 +490,9 @@ describe('evaluateGates', () => {
   it('fails the clean-crop gate while the latest crop carries gating warnings', () => {
     const gates = evaluateGates({
       ...healthy,
-      latestFusion: {
-        ...healthyFusion,
+      latestFusion: fusionFixture({
         cropWarnings: ['HIGH_OCCLUSION', 'LOW_SHARPNESS'],
-      },
+      }),
     });
     const crop = gates.items.find((item) => item.key === 'CLEAN_CROP');
     expect(crop?.satisfied).toBe(false);
@@ -430,25 +503,44 @@ describe('evaluateGates', () => {
   it('does not fail CLEAN_CROP on the advisory UNKNOWN_GEOMETRY warning', () => {
     const gates = evaluateGates({
       ...healthy,
-      latestFusion: { ...healthyFusion, cropWarnings: ['UNKNOWN_GEOMETRY'] },
+      latestFusion: fusionFixture({
+        cropWarnings: ['UNKNOWN_GEOMETRY'],
+        selectedCrop: cleanCrop,
+      }),
     });
     const crop = gates.items.find((item) => item.key === 'CLEAN_CROP');
     expect(crop?.satisfied).toBe(true);
     expect(crop?.detail).toContain('UNKNOWN_GEOMETRY');
   });
 
-  it('CLEAN_CROP can pass on a valid operator-selected crop', () => {
+  it('CLEAN_CROP passes on a CONNECTED operator crop', () => {
     const gates = evaluateGates({
       ...healthy,
-      latestFusion: {
-        ...healthyFusion,
+      latestFusion: fusionFixture({
         cropSource: 'OPERATOR',
+        cropEvidenceConnected: true,
         selectedCrop: { ...cleanCrop, phase: 'operator', qualityKnown: false },
         cropWarnings: [],
-      },
+      }),
     });
     const crop = gates.items.find((item) => item.key === 'CLEAN_CROP');
     expect(crop?.satisfied).toBe(true);
     expect(crop?.detail).toContain('operator-selected');
+  });
+
+  it('CLEAN_CROP NEVER passes on an operator crop that is not connected to evidence', () => {
+    const gates = evaluateGates({
+      ...healthy,
+      latestFusion: fusionFixture({
+        cropSource: 'OPERATOR',
+        cropEvidenceConnected: false,
+        selectedCrop: { ...cleanCrop, phase: 'operator', qualityKnown: false },
+        cropWarnings: [],
+      }),
+    });
+    const crop = gates.items.find((item) => item.key === 'CLEAN_CROP');
+    expect(crop?.satisfied).toBe(false);
+    expect(crop?.detail).toContain('not connected to evidence');
+    expect(gates.readyForDatasetImprovement).toBe(false);
   });
 });

@@ -8,6 +8,7 @@ import {
   OneSkuVideoRow,
   Paginated,
   Product,
+  Store,
   VideoArtifact,
   VideoAsset,
   api,
@@ -18,6 +19,7 @@ import { Page, useDebounced, useLoad } from '../components';
 import { TEST_TYPE_LABEL } from '../cv-evaluation-utils';
 import {
   CROP_WARNING_LABELS,
+  EXCLUDED_REASON_LABELS,
   FAILURE_REASON_LABELS,
   MANUAL_CROP_REASONS,
   ManualCropDraft,
@@ -93,7 +95,9 @@ function WarningBadges({ warnings }: { warnings: string[] }) {
   );
 }
 
-/** Static first-SKU standard operating procedure. */
+/** Static first-SKU standard operating procedure — the counts MATCH the
+ *  Phase 18 per-action minimum (5) so bootstrap-ready means
+ *  dataset-ready, not a smoke test. */
 function SopPanel() {
   return (
     <aside style={{ ...stepCard, background: 'var(--panel, rgba(76,110,245,0.06))' }}>
@@ -101,11 +105,15 @@ function SopPanel() {
       <ol style={{ margin: '0.4rem 0 0 1.2rem', lineHeight: 1.7 }}>
         <li>Upload 8–12 reference images (all angles below)</li>
         <li>Record 5 pickup videos</li>
-        <li>Record 2 return videos</li>
-        <li>Record 2 false-touch videos (touch, no removal)</li>
-        <li>Review every result (correct / wrong SKU / false touch)</li>
+        <li>Record 5 return videos</li>
+        <li>Record 5 false-touch videos (touch, no removal)</li>
+        <li>Review every result (correct / wrong SKU / wrong action / false touch)</li>
         <li>Send reviewed examples to Dataset Improvement</li>
       </ol>
+      <p className="muted" style={{ margin: '0.4rem 0 0' }}>
+        Fewer clips make a smoke test only — the page will not claim
+        dataset-ready below these minimums.
+      </p>
     </aside>
   );
 }
@@ -185,6 +193,15 @@ function CropQualityCard({
             ? 'operator-selected crop'
             : 'automatic crop'}
         </p>
+        {fusion.cropSource === 'OPERATOR' && !fusion.cropEvidenceConnected ? (
+          <p style={{ margin: '0.25rem 0 0' }}>
+            <span className="badge warn">not connected to evidence</span>{' '}
+            <span className="muted">
+              record a correction below to bind this crop into the reviewed
+              evidence — until then it cannot satisfy the crop gate
+            </span>
+          </p>
+        ) : null}
       </div>
       <dl className="detail" style={{ flex: 1, minWidth: '16rem' }}>
         <dt>Quality</dt>
@@ -359,7 +376,12 @@ function BootstrapGroundTruthForm({
  * the one-sku-bootstrap API, which appends a Phase 15 pilot review on the
  * clip's imported shadow journey event. This page NEVER uses the
  * vision-event review endpoint (whose approve/override path can mutate
- * checkout basket lines), and session-bound clips are excluded.
+ * checkout basket lines), and excluded clips are refused server-side.
+ *
+ * The primary action is DERIVED from the prediction-vs-ground-truth
+ * comparison (Codex P1): CORRECT is offered only when SKU AND action
+ * both match; a right-SKU/wrong-action prediction records WRONG_ACTION
+ * with the corrected action — never a mislabeling CORRECT.
  */
 function CorrectionPanel({
   row,
@@ -376,19 +398,17 @@ function CorrectionPanel({
   const [correctedProductId, setCorrectedProductId] = useState(productId);
   const [actionErrorText, setActionErrorText] = useState<string | null>(null);
 
-  if (row.sessionBound) {
-    return (
-      <p>
-        <span className="badge down">session-bound</span>{' '}
-        <span className="muted">
-          This clip is attached to a checkout session and is read-only for
-          bootstrap corrections.
-        </span>
-      </p>
-    );
-  }
   const isNone = row.eventKind === 'NONE';
-  const expectedAction = row.eventKind === 'RETURN' ? 'RETURN' : 'PICKUP';
+  const gtAction = row.eventKind === 'RETURN' ? 'RETURN' : 'PICKUP';
+  const predictedAction = row.fusion?.detectedKind ?? null;
+  const skuMatches =
+    row.predictedSku !== null && row.predictedSku === row.expectedSku;
+  const actionMatches =
+    predictedAction !== null && predictedAction === row.eventKind;
+  const bothMatch = !isNone && skuMatches && actionMatches;
+  const wrongActionOnly = !isNone && skuMatches && !actionMatches;
+  const wrongSkuOnly = !isNone && !skuMatches && actionMatches;
+  const bothWrong = !isNone && !skuMatches && !actionMatches;
 
   async function record(body: Record<string, unknown>, message: string) {
     setBusy(true);
@@ -412,25 +432,52 @@ function CorrectionPanel({
       {actionErrorText ? <div className="error">{actionErrorText}</div> : null}
       {row.bootstrapReviewVerdict ? (
         <p className="muted">
-          Latest bootstrap review: <span className="badge ok">{row.bootstrapReviewVerdict}</span>{' '}
+          Latest bootstrap review:{' '}
+          <span className={row.bootstrapReviewEligible ? 'badge ok' : 'badge warn'}>
+            {row.bootstrapReviewVerdict}
+            {row.bootstrapReviewEligible ? '' : ' (not dataset-eligible)'}
+          </span>{' '}
           (a changed mind appends a newer review)
         </p>
       ) : null}
+      {!isNone ? (
+        <p className="muted">
+          Prediction: {row.predictedSku ?? 'UNKNOWN'}
+          {predictedAction ? ` · ${predictedAction}` : ''} — ground truth:{' '}
+          {row.expectedSku} · {gtAction}
+        </p>
+      ) : null}
       <div className="toolbar" style={{ flexWrap: 'wrap' }}>
-        {!isNone ? (
+        {bothMatch ? (
+          <button
+            className="primary"
+            disabled={busy}
+            onClick={() =>
+              void record(
+                { verdict: 'CORRECT', expectedAction: gtAction },
+                'Recorded: prediction confirmed correct (SKU and action match).',
+              )
+            }
+          >
+            Confirm correct
+          </button>
+        ) : null}
+        {wrongActionOnly ? (
+          <button
+            className="primary"
+            disabled={busy}
+            onClick={() =>
+              void record(
+                { verdict: 'WRONG_ACTION', expectedAction: gtAction },
+                `Recorded: wrong action — corrected to ${gtAction}.`,
+              )
+            }
+          >
+            Record wrong action (corrected: {gtAction})
+          </button>
+        ) : null}
+        {wrongSkuOnly || bothWrong ? (
           <>
-            <button
-              className="primary"
-              disabled={busy}
-              onClick={() =>
-                void record(
-                  { verdict: 'CORRECT', expectedAction },
-                  'Recorded: prediction confirmed correct.',
-                )
-              }
-            >
-              Correct
-            </button>
             <select
               value={correctedProductId}
               onChange={(e) => setCorrectedProductId(e.target.value)}
@@ -443,23 +490,25 @@ function CorrectionPanel({
               ))}
             </select>
             <button
+              className={wrongSkuOnly ? 'primary' : undefined}
               disabled={busy}
               onClick={() =>
                 void record(
                   {
                     verdict: 'WRONG_SKU',
-                    expectedAction,
+                    expectedAction: gtAction,
                     expectedProductId: correctedProductId,
                   },
                   'Recorded: wrong SKU, corrected label saved.',
                 )
               }
             >
-              Incorrect → corrected SKU
+              Record wrong SKU
             </button>
           </>
         ) : null}
         <button
+          className={isNone ? 'primary' : undefined}
           disabled={busy}
           onClick={() =>
             void record(
@@ -475,13 +524,21 @@ function CorrectionPanel({
           onClick={() =>
             void record(
               { verdict: 'UNCERTAIN', expectedAction: 'UNKNOWN' },
-              'Recorded: uncertain — excluded from the dataset.',
+              'Recorded: uncertain — excluded from the dataset (recapture recommended).',
             )
           }
         >
           Uncertain
         </button>
       </div>
+      {bothWrong ? (
+        <p className="muted">
+          Both SKU and action differ from ground truth — a single review
+          cannot correct both for the dataset. Recording wrong SKU fixes the
+          label; the action will follow the prediction, so recapturing the
+          clip is recommended.
+        </p>
+      ) : null}
       <p className="muted">
         Corrections append pilot-review records only (the Phase 18 dataset
         source) — no basket, order, payment, or inventory change ever
@@ -770,6 +827,11 @@ export function OneSkuBootstrapPage() {
     [selectedProductId, reload],
   );
 
+  // Store context is REQUIRED for bootstrap clips (Codex P1): without a
+  // location the shadow journey cannot open and the clip can never be
+  // corrected into the evaluation run.
+  const stores = useLoad<Paginated<Store>>(() => api('/stores?take=100'), []);
+
   const selectedAsset = useLoad<VideoAsset | null>(
     () =>
       selectedAssetId
@@ -838,11 +900,27 @@ export function OneSkuBootstrapPage() {
     });
   }
 
+  /** Attestations are declarations about ONE specific clip: whenever the
+   *  selected file changes (before submit, after a failed upload, any
+   *  time), every checkbox resets and must be re-confirmed (Codex P1). */
+  function onFileSelectionChange() {
+    setAttested({});
+    setActionErrorText(null);
+    setNotice(null);
+  }
+
   async function uploadTestVideo(event: FormEvent) {
     event.preventDefault();
     const file = videoInput.current?.files?.[0];
     if (!file) {
       setActionErrorText('Choose a test video file first.');
+      return;
+    }
+    if (!uploadLocationId) {
+      setActionErrorText(
+        'Select the store context first — a bootstrap clip without a store ' +
+          'cannot be corrected or linked to the evaluation run.',
+      );
       return;
     }
     if (!allAttested) {
@@ -860,9 +938,7 @@ export function OneSkuBootstrapPage() {
         formData.append(field, 'true');
         attestationHeaders[header] = 'true';
       }
-      if (uploadLocationId) {
-        formData.append('locationId', uploadLocationId);
-      }
+      formData.append('locationId', uploadLocationId);
       const asset = await apiUpload<VideoAsset>(
         '/video-assets',
         formData,
@@ -1091,16 +1167,26 @@ export function OneSkuBootstrapPage() {
               style={{ flexWrap: 'wrap' }}
               onSubmit={(e) => void uploadTestVideo(e)}
             >
-              <input ref={videoInput} type="file" accept={ACCEPTED_EXTENSIONS} />
+              <input
+                ref={videoInput}
+                type="file"
+                accept={ACCEPTED_EXTENSIONS}
+                onChange={onFileSelectionChange}
+              />
               <select
                 value={uploadLocationId}
                 onChange={(e) => setUploadLocationId(e.target.value)}
-                title="Store context so fusion can validate the SKU is stocked"
+                title="REQUIRED: the store this clip was staged in — without it the clip cannot be corrected or linked to the evaluation run"
               >
-                <option value="">— store context (recommended) —</option>
-                {data.inventory.levels.map((level) => (
-                  <option key={level.locationId} value={level.locationId}>
-                    {level.locationName} ({level.locationCode})
+                <option value="">— store context (required) —</option>
+                {(stores.data?.items ?? []).map((store) => (
+                  <option key={store.id} value={store.id}>
+                    {store.name} ({store.code})
+                    {data.inventory.levels.some(
+                      (level) => level.locationId === store.id,
+                    )
+                      ? ' · stocked'
+                      : ''}
                   </option>
                 ))}
               </select>
@@ -1123,17 +1209,24 @@ export function OneSkuBootstrapPage() {
                   {label}
                 </label>
               ))}
-              <button className="primary" type="submit" disabled={busy || !allAttested}>
+              <button
+                className="primary"
+                type="submit"
+                disabled={busy || !allAttested || !uploadLocationId}
+              >
                 {busy ? 'Working…' : 'Upload test video'}
               </button>
             </form>
             <p className="muted">
-              Attestations are per clip — they reset after every upload. Keep
-              the product clearly visible BEFORE the pickup and fill the frame
+              Attestations are per clip — they reset after every upload AND
+              whenever you pick a different file. Store context is required:
+              without it the clip cannot become dataset evidence. Keep the
+              product clearly visible BEFORE the pickup and fill the frame
               with the scene, not the table.
             </p>
 
-            {data.videos.length > 0 ? (
+            {data.videos.filter((row) => row.excludedReason === null).length >
+            0 ? (
               <div style={{ overflowX: 'auto' }}>
                 <table className="table">
                   <thead>
@@ -1149,84 +1242,131 @@ export function OneSkuBootstrapPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {data.videos.map((row) => (
-                      <tr key={row.videoAssetId}>
-                        <td>
-                          <Link to={`/video-assets/${row.videoAssetId}`}>
-                            {row.originalFilename}
-                          </Link>
-                          {row.sessionBound ? (
-                            <span className="badge down" style={{ marginLeft: '0.3rem' }}>
-                              session-bound
-                            </span>
-                          ) : null}
-                        </td>
-                        <td>
-                          {row.eventKind}
-                          {row.expectedSku ? ` · ${row.expectedSku}` : ''}
-                        </td>
-                        <td>{basketDeltaLabel(row.expectedBasketDelta)}</td>
-                        <td>{row.predictedSku ?? '—'}</td>
-                        <td>
-                          {row.missedPositiveEvent ? (
-                            <span className="badge down">missed event</span>
-                          ) : row.predictionMatchesExpected === null ? (
-                            <span className="muted">no run</span>
-                          ) : row.predictionMatchesExpected ? (
-                            <span className="badge ok">correct</span>
-                          ) : (
-                            <span className="badge down">incorrect</span>
-                          )}
-                        </td>
-                        <td>
-                          {row.fusion ? (
-                            row.fusion.cropWarnings.length === 0 ? (
-                              <span className="badge ok">clean</span>
+                    {data.videos
+                      .filter((row) => row.excludedReason === null)
+                      .map((row) => (
+                        <tr key={row.videoAssetId}>
+                          <td>
+                            <Link to={`/video-assets/${row.videoAssetId}`}>
+                              {row.originalFilename}
+                            </Link>
+                          </td>
+                          <td>
+                            {row.eventKind}
+                            {row.expectedSku ? ` · ${row.expectedSku}` : ''}
+                          </td>
+                          <td>{basketDeltaLabel(row.expectedBasketDelta)}</td>
+                          <td>{row.predictedSku ?? '—'}</td>
+                          <td>
+                            {row.missedPositiveEvent ? (
+                              <span className="badge down">missed event</span>
+                            ) : row.predictionMatchesExpected === null ? (
+                              <span className="muted">no run</span>
+                            ) : row.predictionMatchesExpected ? (
+                              <span className="badge ok">correct</span>
+                            ) : (
+                              <span className="badge down">incorrect</span>
+                            )}
+                          </td>
+                          <td>
+                            {row.fusion ? (
+                              row.fusion.cropSource === 'OPERATOR' &&
+                              !row.fusion.cropEvidenceConnected ? (
+                                <span className="badge warn">
+                                  manual crop not connected
+                                </span>
+                              ) : row.fusion.cropWarnings.length === 0 ? (
+                                <span className="badge ok">clean</span>
+                              ) : (
+                                <span className="badge warn">
+                                  {row.fusion.cropWarnings.length} warning(s)
+                                </span>
+                              )
+                            ) : (
+                              <span className="muted">—</span>
+                            )}
+                          </td>
+                          <td>
+                            {row.reviewed ? (
+                              <span className="badge ok">
+                                reviewed
+                                {row.bootstrapReviewVerdict
+                                  ? ` (${row.bootstrapReviewVerdict})`
+                                  : ''}
+                              </span>
+                            ) : row.staleReview ? (
+                              <span className="badge warn">
+                                needs fresh review
+                              </span>
+                            ) : row.bootstrapReviewVerdict &&
+                              !row.bootstrapReviewEligible ? (
+                              <span className="badge warn">
+                                {row.bootstrapReviewVerdict} · not dataset-eligible
+                              </span>
                             ) : (
                               <span className="badge warn">
-                                {row.fusion.cropWarnings.length} warning(s)
+                                {row.missedPositiveEvent
+                                  ? 'needs correction'
+                                  : 'needs review'}
                               </span>
-                            )
-                          ) : (
-                            <span className="muted">—</span>
-                          )}
-                        </td>
-                        <td>
-                          {row.reviewed ? (
-                            <span className="badge ok">
-                              reviewed
-                              {row.bootstrapReviewVerdict
-                                ? ` (${row.bootstrapReviewVerdict})`
-                                : ''}
-                            </span>
-                          ) : (
-                            <span className="badge warn">
-                              {row.missedPositiveEvent ? 'needs correction' : 'needs review'}
-                            </span>
-                          )}
-                        </td>
-                        <td>
-                          <button
-                            disabled={busy}
-                            onClick={() => {
-                              setSelectedAssetId(row.videoAssetId);
-                              setManualCropOpen(false);
-                            }}
-                          >
-                            Open
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                            )}
+                          </td>
+                          <td>
+                            <button
+                              disabled={busy}
+                              onClick={() => {
+                                setSelectedAssetId(row.videoAssetId);
+                                setManualCropOpen(false);
+                              }}
+                            >
+                              Open
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
                   </tbody>
                 </table>
               </div>
             ) : (
               <p className="muted">
-                No ground-truthed clips yet — upload one and set its ground
-                truth below.
+                No bootstrap-safe ground-truthed clips yet — upload one and
+                set its ground truth below.
               </p>
             )}
+            {data.counts.excludedClips > 0 ? (
+              <details style={{ marginTop: '0.5rem' }}>
+                <summary>
+                  Excluded from bootstrap ({data.counts.excludedClips}) — these
+                  never count toward or block readiness
+                </summary>
+                <table className="table">
+                  <tbody>
+                    {data.videos
+                      .filter((row) => row.excludedReason !== null)
+                      .map((row) => (
+                        <tr key={row.videoAssetId}>
+                          <td>
+                            <Link to={`/video-assets/${row.videoAssetId}`}>
+                              {row.originalFilename}
+                            </Link>
+                          </td>
+                          <td>
+                            <span className="badge down">
+                              {row.excludedReason === 'SESSION_BOUND'
+                                ? 'session-bound'
+                                : 'no store context'}
+                            </span>
+                          </td>
+                          <td className="muted">
+                            {EXCLUDED_REASON_LABELS[row.excludedReason ?? ''] ??
+                              ''}
+                          </td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </details>
+            ) : null}
           </section>
 
           {selectedAssetId ? (
@@ -1287,9 +1427,9 @@ export function OneSkuBootstrapPage() {
             </section>
           ) : null}
 
-          {selectedRow && !selectedRow.sessionBound ? (
+          {selectedRow && selectedRow.excludedReason === null ? (
             <section style={stepCard}>
-              <StepHeading n={6} title="Correct / approve evidence" />
+              <StepHeading n={6} title="Correct / approve eligible evidence" />
               <CorrectionPanel
                 row={selectedRow}
                 productId={selectedProductId}
@@ -1300,14 +1440,13 @@ export function OneSkuBootstrapPage() {
                 }}
               />
             </section>
-          ) : selectedRow?.sessionBound ? (
+          ) : selectedRow?.excludedReason ? (
             <section style={stepCard}>
-              <StepHeading n={6} title="Correct / approve evidence" />
+              <StepHeading n={6} title="Correct / approve eligible evidence" />
               <p>
-                <span className="badge down">session-bound</span>{' '}
+                <span className="badge down">excluded from bootstrap</span>{' '}
                 <span className="muted">
-                  This clip is attached to a checkout session — read-only here.
-                  Use a clip uploaded without a session for bootstrap evidence.
+                  {EXCLUDED_REASON_LABELS[selectedRow.excludedReason] ?? ''}
                 </span>
               </p>
             </section>

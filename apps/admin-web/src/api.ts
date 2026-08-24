@@ -1975,8 +1975,10 @@ export interface OneSkuFusionSummary {
   topSku: string | null;
   topScore: number | null;
   yoloReady: boolean | null;
+  detectedKind: string | null;
   cropSource: 'AUTO' | 'OPERATOR';
   cropArtifactId: string | null;
+  cropEvidenceConnected: boolean;
   vlmInvoked: boolean;
   vlmStatus: string | null;
   vlmVerdict: string | null;
@@ -2002,11 +2004,13 @@ export interface OneSkuVideoRow {
   quantity: number;
   actualTimestampMs: number | null;
   expectedBasketDelta: number;
-  sessionBound: boolean;
+  excludedReason: 'SESSION_BOUND' | 'MISSING_STORE_CONTEXT' | null;
   missedPositiveEvent: boolean;
   reviewed: boolean;
+  staleReview: boolean;
   reviewDecision: string | null;
   bootstrapReviewVerdict: string | null;
+  bootstrapReviewEligible: boolean;
   visionEventStatus: string | null;
   needsReview: boolean;
   predictedSku: string | null;
@@ -2047,6 +2051,7 @@ export interface OneSkuBootstrapReport {
   videos: OneSkuVideoRow[];
   counts: {
     totalClips: number;
+    excludedClips: number;
     reviewedPickupExamples: number;
     reviewedReturnExamples: number;
     reviewedFalseTouchExamples: number;
