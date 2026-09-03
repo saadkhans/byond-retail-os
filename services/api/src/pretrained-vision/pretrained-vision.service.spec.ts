@@ -4,6 +4,12 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import type {
+  LocalDetectorResult,
+  LocalDetectorRuntimePort,
+  LocalDetectorStatus,
+  LocalModelDescriptor,
+} from '../local-vision-runtime/local-vision-runtime.port';
 import { PlanogramService } from '../planogram/planogram.service';
 import { PlatformModulesService } from '../platform-modules/platform-modules.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -54,6 +60,8 @@ interface HarnessOptions {
   /** Locations that exist in TENANT (default ['store-1']). */
   tenantLocations?: string[];
   narrowed?: Row | null;
+  /** Fake LOCAL detector runtime port bound to the YOLO slot. */
+  detectorRuntime?: LocalDetectorRuntimePort;
 }
 
 function buildHarness(options: HarnessOptions = {}) {
@@ -156,14 +164,92 @@ function buildHarness(options: HarnessOptions = {}) {
     config as unknown as ConfigService,
     platformModules as unknown as PlatformModulesService,
     planograms as unknown as PlanogramService,
+    options.detectorRuntime,
   );
   return { service, prisma, planograms, platformModules, storedRuns };
 }
 
+// ------------------------------------------------ local runtime fakes
+
+const MODEL: LocalModelDescriptor = {
+  modelId: 'yolo-retail-lab-v1',
+  task: 'DETECT',
+  runtime: 'ULTRALYTICS',
+  format: 'PT',
+  version: '1',
+  inputSize: 640,
+  classCount: 3,
+  roleClassCounts: { PRODUCT: 1, HAND: 1, PERSON: 1, OBJECT: 0 },
+};
+
+function readyStatus(over: Partial<LocalDetectorStatus> = {}): LocalDetectorStatus {
+  return {
+    availability: 'READY',
+    reasonCode: null,
+    model: MODEL,
+    device: 'CUDA',
+    runtimeVersion: '8.3.40',
+    ...over,
+  };
+}
+
+/** Product visible in the first frames, a hand grabs it mid-clip, then
+ *  the product is gone — a pickup-shaped timeline over 6 sampled frames. */
+function pickupResult(over: Partial<LocalDetectorResult> = {}): LocalDetectorResult {
+  const product = {
+    role: 'PRODUCT' as const,
+    classIndex: 0,
+    confidence: 0.82,
+    box: { x: 0.4, y: 0.4, width: 0.2, height: 0.25 },
+  };
+  const hand = {
+    role: 'HAND' as const,
+    classIndex: 1,
+    confidence: 0.7,
+    box: { x: 0.45, y: 0.5, width: 0.12, height: 0.12 },
+  };
+  const person = {
+    role: 'PERSON' as const,
+    classIndex: 2,
+    confidence: 0.9,
+    box: { x: 0.1, y: 0.1, width: 0.5, height: 0.8 },
+  };
+  return {
+    status: 'OK',
+    reasonCode: null,
+    model: MODEL,
+    device: 'CUDA',
+    analysisDims: { width: 640, height: 360 },
+    sampledFps: 2,
+    frames: [
+      { frameIndex: 0, timestampMs: 0, detections: [product, person] },
+      { frameIndex: 1, timestampMs: 500, detections: [product, person] },
+      { frameIndex: 2, timestampMs: 1000, detections: [product, hand, person] },
+      { frameIndex: 3, timestampMs: 1500, detections: [product, hand, person] },
+      { frameIndex: 4, timestampMs: 2000, detections: [hand, person] },
+      { frameIndex: 5, timestampMs: 2500, detections: [person] },
+    ],
+    elapsedMs: 1234,
+    ...over,
+  };
+}
+
+function fakeRuntime(input: {
+  status?: LocalDetectorStatus | (() => Promise<LocalDetectorStatus>);
+  detect?: LocalDetectorResult | (() => Promise<LocalDetectorResult>);
+}): LocalDetectorRuntimePort & { detect: jest.Mock; status: jest.Mock } {
+  const status = input.status ?? readyStatus();
+  const detect = input.detect ?? pickupResult();
+  return {
+    status: jest.fn(typeof status === 'function' ? status : async () => status),
+    detect: jest.fn(typeof detect === 'function' ? detect : async () => detect),
+  };
+}
+
 describe('PretrainedVisionService — provider selection', () => {
-  it('classical config keeps ONLY the always-ready classical fallback', () => {
+  it('classical config keeps ONLY the always-ready classical fallback', async () => {
     const { service } = buildHarness({ provider: 'classical' });
-    const statuses = service.providerStatuses();
+    const statuses = await service.providerStatuses();
     expect(statuses.find((s) => s.provider === 'CLASSICAL')?.availability).toBe(
       'READY',
     );
@@ -174,18 +260,18 @@ describe('PretrainedVisionService — provider selection', () => {
     }
   });
 
-  it('enabled slots without local runtimes report UNAVAILABLE, never break', () => {
+  it('enabled slots without local runtimes report UNAVAILABLE, never break', async () => {
     const { service } = buildHarness({ provider: 'hybrid', stubMode: false });
-    const statuses = service.providerStatuses();
+    const statuses = await service.providerStatuses();
     expect(statuses.find((s) => s.provider === 'YOLO_LOCAL')).toMatchObject({
       availability: 'UNAVAILABLE',
       reasonCode: 'LOCAL_RUNTIME_NOT_INSTALLED',
     });
   });
 
-  it('an invalid provider value degrades safely to classical-only', () => {
+  it('an invalid provider value degrades safely to classical-only', async () => {
     const { service } = buildHarness({ provider: 'bogus-provider' });
-    const statuses = service.providerStatuses();
+    const statuses = await service.providerStatuses();
     expect(statuses.find((s) => s.provider === 'CLASSICAL')?.availability).toBe(
       'READY',
     );
@@ -194,11 +280,11 @@ describe('PretrainedVisionService — provider selection', () => {
     ).toHaveLength(3);
   });
 
-  it('stub mode marks enabled slots READY and labels them stubMode', () => {
+  it('stub mode marks enabled slots READY and labels them stubMode', async () => {
     const { service } = buildHarness({ provider: 'hybrid', stubMode: true });
-    const yolo = service
-      .providerStatuses()
-      .find((s) => s.provider === 'YOLO_LOCAL');
+    const yolo = (await service.providerStatuses()).find(
+      (s) => s.provider === 'YOLO_LOCAL',
+    );
     expect(yolo).toMatchObject({ availability: 'READY', stubMode: true });
   });
 });
@@ -648,5 +734,350 @@ describe('PretrainedVisionService — candidate scope (P1, no blind cap)', () =>
     const report = await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
     const skus = report.embeddingCandidates.map((row) => row.sku);
     expect(skus).toContain('SKU-A');
+  });
+});
+
+describe('PretrainedVisionService — real local detector runtime (Phase 20)', () => {
+  it('runtime UNAVAILABLE (runtime not installed) → YOLO row PROVIDER_UNAVAILABLE, classical still completes', async () => {
+    const runtime = fakeRuntime({
+      status: readyStatus({
+        availability: 'UNAVAILABLE',
+        reasonCode: 'LOCAL_RUNTIME_NOT_INSTALLED',
+        model: null,
+        device: null,
+      }),
+      detect: {
+        ...pickupResult(),
+        status: 'UNAVAILABLE',
+        reasonCode: 'LOCAL_RUNTIME_NOT_INSTALLED',
+        frames: [],
+        model: null,
+      },
+    });
+    const { service, storedRuns } = buildHarness({
+      provider: 'yolo_local',
+      detectorRuntime: runtime,
+    });
+    const statuses = await service.providerStatuses();
+    expect(statuses.find((s) => s.provider === 'YOLO_LOCAL')).toMatchObject({
+      availability: 'UNAVAILABLE',
+      reasonCode: 'LOCAL_RUNTIME_NOT_INSTALLED',
+      stubMode: false,
+      runtime: null,
+    });
+    const report = await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
+    expect(storedRuns.find((row) => row.provider === 'YOLO_LOCAL')).toMatchObject({
+      status: 'PROVIDER_UNAVAILABLE',
+    });
+    expect(storedRuns.find((row) => row.provider === 'CLASSICAL')).toMatchObject({
+      status: 'COMPLETED',
+    });
+    expect(report.classical?.topSku).toBe('SKU-A');
+    expect(
+      report.runs.find((run) => run.provider === 'YOLO_LOCAL')?.evidence.reasonCode,
+    ).toBe('LOCAL_RUNTIME_NOT_INSTALLED');
+  });
+
+  it('runtime reporting MODEL_NOT_FOUND surfaces the classified code only', async () => {
+    const runtime = fakeRuntime({
+      status: readyStatus({
+        availability: 'UNAVAILABLE',
+        reasonCode: 'MODEL_NOT_FOUND',
+        model: null,
+        device: null,
+      }),
+      detect: {
+        ...pickupResult(),
+        status: 'UNAVAILABLE',
+        reasonCode: 'MODEL_NOT_FOUND',
+        frames: [],
+        model: null,
+      },
+    });
+    const { service, storedRuns } = buildHarness({
+      provider: 'yolo_local',
+      detectorRuntime: runtime,
+    });
+    await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
+    const yolo = storedRuns.find((row) => row.provider === 'YOLO_LOCAL') as Row;
+    expect(yolo.status).toBe('PROVIDER_UNAVAILABLE');
+    expect((yolo.evidence as Row).reasonCode).toBe('MODEL_NOT_FOUND');
+  });
+
+  it('a rejecting runtime → FAILED + ADAPTER_ERROR, no message leaks, classical unaffected', async () => {
+    const runtime = fakeRuntime({
+      detect: async () => {
+        throw new Error(
+          'python C:/tools/python.exe exited: Traceback (most recent call last) C:/models/x.pt',
+        );
+      },
+    });
+    const { service, storedRuns } = buildHarness({
+      provider: 'yolo_local',
+      detectorRuntime: runtime,
+    });
+    const report = await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
+    const yolo = storedRuns.find((row) => row.provider === 'YOLO_LOCAL') as Row;
+    expect(yolo.status).toBe('FAILED');
+    expect((yolo.evidence as Row).reasonCode).toBe('ADAPTER_ERROR');
+    expect(
+      report.runs.find((run) => run.provider === 'CLASSICAL')?.status,
+    ).toBe('COMPLETED');
+    const serialized = JSON.stringify({ report, storedRuns });
+    for (const needle of ['Traceback', 'python', 'C:/', '.pt']) {
+      expect(serialized).not.toContain(needle);
+    }
+  });
+
+  it('a rejecting status probe → UNAVAILABLE / LOCAL_RUNTIME_PROBE_FAILED', async () => {
+    const runtime = fakeRuntime({
+      status: async () => {
+        throw new Error('spawn ENOENT /usr/bin/python3');
+      },
+    });
+    const { service } = buildHarness({
+      provider: 'yolo_local',
+      detectorRuntime: runtime,
+    });
+    const yolo = (await service.providerStatuses()).find(
+      (s) => s.provider === 'YOLO_LOCAL',
+    );
+    expect(yolo).toMatchObject({
+      availability: 'UNAVAILABLE',
+      reasonCode: 'LOCAL_RUNTIME_PROBE_FAILED',
+      runtime: null,
+    });
+    expect(JSON.stringify(yolo)).not.toContain('python');
+  });
+
+  it('runtime OK → COMPLETED real evidence: PRODUCT_IN_HAND, hand signal, forced review, improvement notes', async () => {
+    const runtime = fakeRuntime({});
+    const { service, storedRuns } = buildHarness({
+      provider: 'yolo_local',
+      detectorRuntime: runtime,
+    });
+    const report = await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
+    expect(runtime.detect).toHaveBeenCalledWith({
+      tenantId: TENANT,
+      videoAssetId: 'va-1',
+    });
+
+    const yoloRow = storedRuns.find((row) => row.provider === 'YOLO_LOCAL') as Row;
+    expect(yoloRow.status).toBe('COMPLETED');
+    const yolo = report.runs.find((run) => run.provider === 'YOLO_LOCAL');
+    expect(yolo?.synthetic).toBe(false);
+    expect(yolo?.evidence.availability).toBe('READY');
+    expect(yolo?.evidence.reasonCode).toBeNull();
+    const labels = yolo?.evidence.detections.map((row) => row.label) ?? [];
+    expect(labels).toContain('PRODUCT');
+    expect(labels).toContain('PRODUCT_IN_HAND');
+    expect(labels).toContain('HAND');
+    expect(yolo?.evidence.handSignal).toMatchObject({
+      handPresent: true,
+      contactStartMs: 1000,
+      contactEndMs: 1500,
+      contactDurationMs: 500,
+      enteredZoneAtMs: 1000,
+      leftZoneAtMs: 2000,
+    });
+    // Product present early, gone late → disappeared → PICKUP candidate.
+    expect(yolo?.evidence.features).toMatchObject({
+      objectDisappeared: true,
+      objectAppeared: false,
+      actionCandidate: 'PICKUP',
+    });
+    expect(yolo?.evidence.notes).toEqual(
+      expect.arrayContaining([
+        'LOCAL_DETECTOR_OUTPUT',
+        'PRODUCT_DETECTED',
+        'PRODUCT_IN_HAND_DETECTED',
+        'HAND_DETECTED_BY_DETECTOR',
+        'PERSON_DETECTED',
+      ]),
+    );
+    expect(yolo?.evidence.notes).not.toContain('STUB_SYNTHETIC_OUTPUT');
+
+    // Review gate: real pretrained output is advisory — always review.
+    expect(report.fusionSuggestion.reviewRequired).toBe(true);
+    expect(report.fusionSuggestion.notes).toContain('PRETRAINED_GATE_NOT_APPROVED');
+    expect(report.fusionSuggestion.notes).toContain('STILL_NEEDS_REVIEW');
+    expect(report.improvementNotes).toEqual(
+      expect.arrayContaining([
+        'PRODUCT_DETECTED',
+        'DETECTION_COVERAGE_IMPROVED',
+        'HAND_CONTACT_OBSERVED',
+        'STILL_NEEDS_REVIEW',
+      ]),
+    );
+    expect(report.improvementNotes).not.toContain('NO_IMPROVEMENT_OVER_CLASSICAL');
+
+    // The classical fallback is untouched and never replaced.
+    expect(report.classical).toMatchObject({ topSku: 'SKU-A', action: 'PICKUP' });
+    const classical = report.runs.find((run) => run.provider === 'CLASSICAL');
+    expect(classical?.status).toBe('COMPLETED');
+    expect(classical?.evidence.synthetic).toBe(false);
+    expect(report.embeddingCandidates).toEqual([]);
+  });
+
+  it('never leaks runtime internals even when the runtime result carries junk fields', async () => {
+    const junk = {
+      ...pickupResult(),
+      internalModelFile: 'C:\\models\\x.pt',
+      stderr: 'Traceback (most recent call last): python worker crashed',
+      argv: ['python', 'ml/models/worker.py'],
+      model: { ...MODEL, location: 'C:\\models\\yolo\\weights.pt' },
+    } as unknown as LocalDetectorResult;
+    const runtime = fakeRuntime({
+      status: {
+        ...readyStatus(),
+        interpreter: 'C:\\Python312\\python.exe',
+      } as unknown as LocalDetectorStatus,
+      detect: junk,
+    });
+    const { service, storedRuns } = buildHarness({
+      provider: 'yolo_local',
+      detectorRuntime: runtime,
+    });
+    const report = await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
+    const serialized = JSON.stringify({
+      report,
+      storedRuns,
+      statuses: await service.providerStatuses(),
+    });
+    for (const needle of [
+      'C:\\',
+      '.pt',
+      'Traceback',
+      'python',
+      'ml/models',
+      'weights',
+      'interpreter',
+      'argv',
+      'stderr',
+      'location',
+    ]) {
+      expect(serialized).not.toContain(needle);
+    }
+    const persistedEvidence = (
+      storedRuns.find((row) => row.provider === 'YOLO_LOCAL') as Row
+    ).evidence as Row;
+    expect(Object.keys(persistedEvidence).sort()).toEqual(
+      [
+        'availability',
+        'detections',
+        'embeddingCandidates',
+        'features',
+        'handSignal',
+        'notes',
+        'provider',
+        'reasonCode',
+        'synthetic',
+      ].sort(),
+    );
+  });
+
+  it('providers listing shows the opaque runtime model id when READY and null otherwise', async () => {
+    const ready = fakeRuntime({});
+    const { service } = buildHarness({
+      provider: 'yolo_local',
+      detectorRuntime: ready,
+    });
+    const statuses = await service.providerStatuses();
+    expect(statuses.find((s) => s.provider === 'YOLO_LOCAL')).toMatchObject({
+      availability: 'READY',
+      reasonCode: null,
+      stubMode: false,
+      runtime: {
+        modelId: 'yolo-retail-lab-v1',
+        runtimeKind: 'ULTRALYTICS',
+        format: 'PT',
+        version: '1',
+        device: 'CUDA',
+      },
+    });
+    expect(statuses.find((s) => s.provider === 'CLASSICAL')?.runtime).toBeNull();
+
+    const unavailable = fakeRuntime({
+      status: readyStatus({
+        availability: 'UNAVAILABLE',
+        reasonCode: 'MODEL_NOT_CONFIGURED',
+        model: null,
+        device: null,
+      }),
+    });
+    const { service: service2 } = buildHarness({
+      provider: 'yolo_local',
+      detectorRuntime: unavailable,
+    });
+    expect(
+      (await service2.providerStatuses()).find((s) => s.provider === 'YOLO_LOCAL')
+        ?.runtime,
+    ).toBeNull();
+  });
+
+  it('a runtime descriptor with a path-shaped field drops the whole runtime block', async () => {
+    const runtime = fakeRuntime({
+      status: readyStatus({ model: { ...MODEL, version: 'C:/models/v1' } }),
+    });
+    const { service } = buildHarness({
+      provider: 'yolo_local',
+      detectorRuntime: runtime,
+    });
+    const yolo = (await service.providerStatuses()).find(
+      (s) => s.provider === 'YOLO_LOCAL',
+    );
+    expect(yolo?.availability).toBe('READY');
+    expect(yolo?.runtime).toBeNull();
+  });
+
+  it('stub mode wins over a bound runtime (synthetic, runtime never called)', async () => {
+    const runtime = fakeRuntime({});
+    const { service } = buildHarness({
+      provider: 'yolo_local',
+      stubMode: true,
+      detectorRuntime: runtime,
+    });
+    const yolo = (await service.providerStatuses()).find(
+      (s) => s.provider === 'YOLO_LOCAL',
+    );
+    expect(yolo).toMatchObject({ availability: 'READY', stubMode: true, runtime: null });
+    const report = await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
+    const run = report.runs.find((row) => row.provider === 'YOLO_LOCAL');
+    expect(run?.synthetic).toBe(true);
+    expect(run?.evidence.notes).toContain('STUB_SYNTHETIC_OUTPUT');
+    expect(runtime.detect).not.toHaveBeenCalled();
+    expect(runtime.status).not.toHaveBeenCalled();
+    // Synthetic evidence does not trip the real-evidence review gate.
+    expect(report.fusionSuggestion.notes).not.toContain('PRETRAINED_GATE_NOT_APPROVED');
+  });
+
+  it('a disabled detector slot never touches the bound runtime', async () => {
+    const runtime = fakeRuntime({});
+    const { service, storedRuns } = buildHarness({
+      provider: 'classical',
+      detectorRuntime: runtime,
+    });
+    await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
+    expect(runtime.detect).not.toHaveBeenCalled();
+    expect(runtime.status).not.toHaveBeenCalled();
+    expect(storedRuns.map((row) => row.provider)).toEqual(['CLASSICAL']);
+  });
+
+  it('report() rebuilds real evidence from the stored row with the same review gate', async () => {
+    const runtime = fakeRuntime({});
+    const { service } = buildHarness({
+      provider: 'yolo_local',
+      detectorRuntime: runtime,
+    });
+    await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
+    const report = await service.report(TENANT, 'va-1', {}, VIEWER);
+    const yolo = report.runs.find((run) => run.provider === 'YOLO_LOCAL');
+    expect(yolo?.synthetic).toBe(false);
+    expect(
+      yolo?.evidence.detections.some((row) => row.label === 'PRODUCT_IN_HAND'),
+    ).toBe(true);
+    expect(report.fusionSuggestion.reviewRequired).toBe(true);
+    expect(report.fusionSuggestion.notes).toContain('PRETRAINED_GATE_NOT_APPROVED');
+    expect(runtime.detect).toHaveBeenCalledTimes(1);
   });
 });

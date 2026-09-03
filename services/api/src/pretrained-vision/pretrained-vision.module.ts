@@ -19,6 +19,7 @@ import {
   CurrentUser,
 } from '../auth/decorators/request-context.decorators';
 import { RequestContext } from '../auth/request-context';
+import { LocalVisionRuntimeModule } from '../local-vision-runtime/local-vision-runtime.module';
 import { PlanogramModule } from '../planogram/planogram.module';
 import { PlatformModulesModule } from '../platform-modules/platform-modules.module';
 import { PretrainedVisionService } from './pretrained-vision.service';
@@ -147,7 +148,10 @@ export class PretrainedVisionController {
 }
 
 @Module({
-  imports: [PlatformModulesModule, PlanogramModule],
+  // LocalVisionRuntimeModule binds the LOCAL_DETECTOR_RUNTIME port — the
+  // only place a model file or worker process is ever touched. This
+  // module consumes the port type alone.
+  imports: [PlatformModulesModule, PlanogramModule, LocalVisionRuntimeModule],
   controllers: [PretrainedVisionController],
   providers: [PretrainedVisionService],
 })

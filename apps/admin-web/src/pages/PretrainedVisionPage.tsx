@@ -39,6 +39,10 @@ const IMPROVEMENT_LABELS: Record<string, string> = {
   HAND_COVERED_PRODUCT: 'Hand covered product',
   CROP_IMPROVED: 'Crop improved',
   SKU_CANDIDATE_CHANGED: 'SKU candidate changed',
+  DETECTION_COVERAGE_IMPROVED: 'Detector covered more frames than classical',
+  HAND_CONTACT_OBSERVED: 'Hand contact observed by detector',
+  PRETRAINED_GATE_NOT_APPROVED:
+    'Pretrained output is advisory until gates are approved',
   STILL_NEEDS_REVIEW: 'Still needs review',
   NO_IMPROVEMENT_OVER_CLASSICAL: 'No improvement over classical fallback',
 };
@@ -67,6 +71,10 @@ function ProviderChips({ providers }: { providers: PretrainedProviderStatus[] })
         >
           {provider.provider} · {provider.availability}
           {provider.stubMode ? ' (lab stub)' : ''}
+          {provider.runtime
+            ? ` · model ${provider.runtime.modelId}` +
+              (provider.runtime.device ? ` (${provider.runtime.device})` : '')
+            : ''}
         </span>
       ))}
     </div>
@@ -360,7 +368,7 @@ export function PretrainedVisionPage() {
                               : run.evidence.handSignal?.handPresent
                                 ? 'hand near shelf zone'
                                 : 'no signal') +
-                          (run.synthetic ? ' · lab stub' : '')}
+                          (run.synthetic ? ' · lab stub' : ' · real local inference')}
                     </dd>
                   </div>
                 ))}

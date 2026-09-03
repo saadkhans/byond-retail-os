@@ -188,6 +188,21 @@ pnpm run ml:test
 
 See `ml/scripts/README.md` for per-script CLI details and exit codes.
 
+## Local inference runtime (Phase 20)
+
+`ml/runtime/yolo_detect_worker.py` is the first real local inference
+worker: the API's `local-vision-runtime` module spawns it (no shell, no
+network, stderr discarded) to run an Ultralytics-YOLO-class detector over
+frames of an uploaded test clip and feed the Phase 19 pretrained-vision
+adapter layer. It is stdlib-only at import time; `numpy` and `ultralytics`
+load lazily, so a machine without them reports `RUNTIME_MISSING` and the
+API keeps the provider UNAVAILABLE with the classical fallback intact.
+`ml/tests/test_yolo_detect_worker.py` pins the stdin/stdout protocol with
+fake modules, so `ml:test` still needs no heavy ML install. Weights live in
+the gitignored `ml/models/<modelId>/` registry and **never enter the
+repo**. Setup, manifest format, env keys, reason codes, and
+troubleshooting: [`docs/cv/local-yolo-provider.md`](../docs/cv/local-yolo-provider.md).
+
 ## Future training
 
 `ml/configs/training.example.yaml` documents the intended shape of a

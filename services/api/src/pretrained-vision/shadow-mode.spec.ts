@@ -80,6 +80,29 @@ describe('pretrained-vision module shadow mode', () => {
     }
   });
 
+  it('consumes the local runtime through its PORT and token only — never a runtime class', () => {
+    // Phase 20: the detector slot is backed by the local-vision-runtime
+    // module. This module may import its pure port types, its DI token,
+    // and (from the Nest module file only) the module class — never the
+    // registry, worker runner, or runtime implementation.
+    const runtimeImport = /from\s+'\.\.\/local-vision-runtime\/([a-z.-]+)'/g;
+    for (const file of sourceFiles(root)) {
+      const source = readFileSync(file, 'utf8');
+      const isModuleFile = file.endsWith('pretrained-vision.module.ts');
+      for (const match of source.matchAll(runtimeImport)) {
+        const allowed =
+          match[1] === 'local-vision-runtime.port' ||
+          match[1] === 'local-vision-runtime.tokens' ||
+          (isModuleFile && match[1] === 'local-vision-runtime.module');
+        expect(
+          allowed
+            ? null
+            : `${file} imports ${match[0]} — runtime implementation reached past the port`,
+        ).toBeNull();
+      }
+    }
+  });
+
   it('cross-module service imports stay on the read-only allowlist', () => {
     const serviceImport = /from\s+'\.\.\/([a-z-]+)\/[a-z-]+\.service'/g;
     const allowed = new Set([

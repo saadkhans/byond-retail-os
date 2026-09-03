@@ -394,6 +394,66 @@ class EnvironmentVariables {
   @IsOptional()
   @IsString()
   PICKUP_YOLO_MODEL_PATH?: string;
+
+  // ── Local vision runtime (Phase 20 — first REAL local YOLO provider) ──
+  // The pretrained-vision YOLO_LOCAL slot runs a LOCAL Ultralytics-class
+  // model through a confined Python worker (ml/runtime). Everything here
+  // is local-only: no external API, no cloud model call. The API selects
+  // a model by REGISTRY KEY, never by path, and no path is ever exposed.
+
+  // Root of the safe local model registry: <root>/<modelId>/manifest.json
+  // plus the weights file the manifest names. Absolute, or relative to
+  // the repo root. Default <repo>/ml/models (gitignored).
+  @IsOptional()
+  @IsString()
+  CV_LOCAL_MODEL_ROOT?: string;
+
+  // Registry key of the YOLO model to run (directory name under the root).
+  // Unset → the slot reports UNAVAILABLE (MODEL_NOT_CONFIGURED).
+  @IsOptional()
+  @Matches(/^[a-z0-9][a-z0-9._-]{0,63}$/, {
+    message:
+      'CV_LOCAL_YOLO_MODEL_ID must be a registry key: lowercase ' +
+      'alphanumerics, dot, underscore, or dash (max 64 chars)',
+  })
+  CV_LOCAL_YOLO_MODEL_ID?: string;
+
+  // Python interpreter running the worker: a bare executable name looked
+  // up on PATH (default "python") or an absolute path. Missing interpreter
+  // or missing ultralytics/numpy → LOCAL_RUNTIME_NOT_INSTALLED, never a
+  // boot failure.
+  @IsOptional()
+  @IsString()
+  CV_LOCAL_PYTHON_BIN?: string;
+
+  // Wall-clock kill timeout for one worker invocation (default 60000).
+  @IsOptional()
+  @IsInt()
+  @Min(5000)
+  @Max(300_000)
+  CV_LOCAL_YOLO_TIMEOUT_MS?: number;
+
+  // Detection confidence floor passed to the model (default 0.25).
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(1)
+  CV_LOCAL_YOLO_CONF_THRESHOLD?: number;
+
+  // Analysis sampling rate in frames per second of source time (default
+  // 2; at most 32 frames per clip are sent to the worker regardless).
+  @IsOptional()
+  @IsNumber()
+  @Min(0.5)
+  @Max(8)
+  CV_LOCAL_YOLO_FPS?: number;
+
+  // Inference device hint: auto (runtime picks), cpu, or cuda.
+  @IsOptional()
+  @Matches(/^(auto|cpu|cuda)$/i, {
+    message: 'CV_LOCAL_YOLO_DEVICE must be auto, cpu, or cuda',
+  })
+  CV_LOCAL_YOLO_DEVICE?: string;
 }
 
 // Placeholder markers — banned in EVERY environment (staging and preview
