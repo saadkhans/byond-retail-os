@@ -52,4 +52,21 @@ describe('One SKU Bootstrap page safety', () => {
       'Inventory details hidden — inventory permission required',
     );
   });
+
+  it('degrades gracefully when video details are redacted (no video-asset:read)', () => {
+    expect(pageSource).toContain('data.videoDetailsVisible');
+    expect(pageSource).toContain(
+      'Video details hidden — video asset permission required',
+    );
+  });
+
+  it('offers the false-touch action only on NONE ground-truth clips', () => {
+    // The server enforces this too — a false touch on a positive clip
+    // would mislabel a real pickup/return as NO_OP.
+    expect(pageSource).toMatch(/\{isNone \? \([\s\S]{0,800}FALSE_TOUCH/);
+  });
+
+  it('never renders the uncalibrated ranking score as a percentage', () => {
+    expect(pageSource).not.toMatch(/topScore \* 100/);
+  });
 });

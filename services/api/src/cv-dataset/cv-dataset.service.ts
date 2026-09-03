@@ -12,6 +12,7 @@ import {
   CvDatasetPurpose,
   CvDatasetSplit,
   CustomerJourneyEventType,
+  GroundTruthEventKind,
   PilotExpectedAction,
   PilotObservationVerdict,
   Prisma,
@@ -1095,9 +1096,71 @@ export class CvDatasetService {
         tenantId,
         run.sourceEvaluationRunId,
       );
+      // Ground-truth drift guard (Codex P1): video-bootstrap reviews bind
+      // labels at review time, but VideoGroundTruth is EDITABLE — a
+      // candidate whose effective labels contradict the clip's CURRENT
+      // truth would export mislabeled data. Live observations carry no
+      // video asset and are unaffected.
+      const truthAssetIds = [
+        ...new Set(
+          observations
+            .map((observation) => observation.videoAssetId)
+            .filter((id): id is string => typeof id === 'string'),
+        ),
+      ];
+      const truthRows = truthAssetIds.length
+        ? await this.prisma.videoGroundTruth.findMany({
+            where: { tenantId, videoAssetId: { in: truthAssetIds } },
+            select: {
+              videoAssetId: true,
+              eventKind: true,
+              productId: true,
+              product: { select: { sku: true } },
+            },
+          })
+        : [];
+      const truthByAsset = new Map(
+        truthRows.map((row) => [row.videoAssetId, row]),
+      );
       for (const observation of observations) {
         const predictedAction = predictedActionOf(observation.eventType);
         const review = observation.latestReview;
+        const truth = observation.videoAssetId
+          ? (truthByAsset.get(observation.videoAssetId) ?? null)
+          : null;
+        // Demote an otherwise-ELIGIBLE seed whose effective labels no
+        // longer match the clip's current ground truth. Never rewrites
+        // the review row — a fresh review restores eligibility.
+        const guardCurrentTruth = (seed: CandidateSeed): CandidateSeed => {
+          if (seed.eligibility !== CvDatasetEligibility.ELIGIBLE || !truth) {
+            return seed;
+          }
+          const effectiveAction = seed.correctedActionLabel ?? seed.actionLabel;
+          const truthAction =
+            truth.eventKind === GroundTruthEventKind.NONE
+              ? PilotExpectedAction.NO_OP
+              : truth.eventKind === GroundTruthEventKind.RETURN
+                ? PilotExpectedAction.RETURN
+                : PilotExpectedAction.PICKUP;
+          const actionMatches = effectiveAction === truthAction;
+          // Product-ID equality is canonical when both ids are known;
+          // the SKU snapshot is the fallback. Negatives carry no product.
+          const productMatches =
+            truthAction === PilotExpectedAction.NO_OP
+              ? true
+              : seed.skuId !== null && truth.productId !== null
+                ? seed.skuId === truth.productId
+                : seed.skuCodeSnapshot !== null &&
+                  (truth.product?.sku ?? null) !== null &&
+                  seed.skuCodeSnapshot === truth.product?.sku;
+          return actionMatches && productMatches
+            ? seed
+            : {
+                ...seed,
+                eligibility: CvDatasetEligibility.EXCLUDED,
+                exclusionReason: 'STALE_GROUND_TRUTH',
+              };
+        };
         const base = {
           sourceType: CvDatasetCandidateSourceType.LIVE_REVIEW,
           sourceId: observation.journeyEventId,
@@ -1132,28 +1195,32 @@ export class CvDatasetService {
           continue;
         }
         if (review.verdict === PilotObservationVerdict.CORRECT) {
-          seeds.push({
-            ...base,
-            skuId: observation.predictedProductId,
-            skuCodeSnapshot: observation.predictedSku,
-            correctedActionLabel: null,
-            reviewVerdict: review.verdict,
-            eligibility: CvDatasetEligibility.ELIGIBLE,
-            exclusionReason: null,
-          });
+          seeds.push(
+            guardCurrentTruth({
+              ...base,
+              skuId: observation.predictedProductId,
+              skuCodeSnapshot: observation.predictedSku,
+              correctedActionLabel: null,
+              reviewVerdict: review.verdict,
+              eligibility: CvDatasetEligibility.ELIGIBLE,
+              exclusionReason: null,
+            }),
+          );
           continue;
         }
         if (review.verdict === PilotObservationVerdict.FALSE_TOUCH) {
           // A confirmed false touch is a reviewed corrected NEGATIVE.
-          seeds.push({
-            ...base,
-            skuId: observation.predictedProductId,
-            skuCodeSnapshot: observation.predictedSku,
-            correctedActionLabel: PilotExpectedAction.NO_OP,
-            reviewVerdict: review.verdict,
-            eligibility: CvDatasetEligibility.ELIGIBLE,
-            exclusionReason: null,
-          });
+          seeds.push(
+            guardCurrentTruth({
+              ...base,
+              skuId: observation.predictedProductId,
+              skuCodeSnapshot: observation.predictedSku,
+              correctedActionLabel: PilotExpectedAction.NO_OP,
+              reviewVerdict: review.verdict,
+              eligibility: CvDatasetEligibility.ELIGIBLE,
+              exclusionReason: null,
+            }),
+          );
           continue;
         }
         if (review.verdict === PilotObservationVerdict.WRONG_SKU) {
@@ -1183,15 +1250,17 @@ export class CvDatasetService {
             seeds.push(excluded(review.verdict, 'CORRECTION_NOT_DIFFERENT'));
             continue;
           }
-          seeds.push({
-            ...base,
-            skuId: correctedProductId,
-            skuCodeSnapshot: correctedSku,
-            correctedActionLabel: null,
-            reviewVerdict: review.verdict,
-            eligibility: CvDatasetEligibility.ELIGIBLE,
-            exclusionReason: null,
-          });
+          seeds.push(
+            guardCurrentTruth({
+              ...base,
+              skuId: correctedProductId,
+              skuCodeSnapshot: correctedSku,
+              correctedActionLabel: null,
+              reviewVerdict: review.verdict,
+              eligibility: CvDatasetEligibility.ELIGIBLE,
+              exclusionReason: null,
+            }),
+          );
           continue;
         }
         if (review.verdict === PilotObservationVerdict.WRONG_ACTION) {
@@ -1206,15 +1275,17 @@ export class CvDatasetService {
             seeds.push(excluded(review.verdict, 'CORRECTION_NOT_DIFFERENT'));
             continue;
           }
-          seeds.push({
-            ...base,
-            skuId: review.expectedProductId ?? observation.predictedProductId,
-            skuCodeSnapshot: review.expectedSku ?? observation.predictedSku,
-            correctedActionLabel: corrected,
-            reviewVerdict: review.verdict,
-            eligibility: CvDatasetEligibility.ELIGIBLE,
-            exclusionReason: null,
-          });
+          seeds.push(
+            guardCurrentTruth({
+              ...base,
+              skuId: review.expectedProductId ?? observation.predictedProductId,
+              skuCodeSnapshot: review.expectedSku ?? observation.predictedSku,
+              correctedActionLabel: corrected,
+              reviewVerdict: review.verdict,
+              eligibility: CvDatasetEligibility.ELIGIBLE,
+              exclusionReason: null,
+            }),
+          );
           continue;
         }
         seeds.push(

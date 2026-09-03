@@ -226,7 +226,10 @@ function CropQualityCard({
         <dt>Top prediction</dt>
         <dd>
           {fusion.topSku ?? 'UNKNOWN'}
-          {fusion.topScore !== null ? ` (${Math.round(fusion.topScore * 100)}%)` : ''}{' '}
+          {/* Uncalibrated RANKING score — never a probability, so no % */}
+          {fusion.topScore !== null
+            ? ` (ranking score ${fusion.topScore.toFixed(2)})`
+            : ''}{' '}
           · {fusion.policy}
         </dd>
         <dt>VLM verdict</dt>
@@ -529,18 +532,24 @@ function CorrectionPanel({
             )}
           </>
         ) : null}
-        <button
-          className={isNone ? 'primary' : undefined}
-          disabled={busy}
-          onClick={() =>
-            void record(
-              { verdict: 'FALSE_TOUCH', expectedAction: 'NO_OP' },
-              'Recorded: false touch — nothing was removed.',
-            )
-          }
-        >
-          False touch / nothing removed
-        </button>
+        {isNone ? (
+          // NONE ground truth ONLY (the server also enforces this): a
+          // false touch on a PICKUP/RETURN clip would mislabel a real
+          // positive as NO_OP — if nothing was removed, the ground truth
+          // must be fixed first.
+          <button
+            className="primary"
+            disabled={busy}
+            onClick={() =>
+              void record(
+                { verdict: 'FALSE_TOUCH', expectedAction: 'NO_OP' },
+                'Recorded: false touch — nothing was removed.',
+              )
+            }
+          >
+            False touch / nothing removed
+          </button>
+        ) : null}
         <button
           disabled={busy}
           onClick={() =>
@@ -1254,8 +1263,14 @@ export function OneSkuBootstrapPage() {
               with the scene, not the table.
             </p>
 
-            {data.videos.filter((row) => row.excludedReason === null).length >
-            0 ? (
+            {!data.videoDetailsVisible ? (
+              <p className="muted">
+                Video details hidden — video asset permission required.
+                Aggregate readiness (counts and the gate checklist) still
+                computes server-side, so the bootstrap can continue.
+              </p>
+            ) : data.videos.filter((row) => row.excludedReason === null)
+                .length > 0 ? (
               <div style={{ overflowX: 'auto' }}>
                 <table className="table">
                   <thead>
@@ -1327,6 +1342,11 @@ export function OneSkuBootstrapPage() {
                               <span className="badge warn">
                                 needs fresh review
                               </span>
+                            ) : row.staleTruthReview ? (
+                              <span className="badge warn">
+                                Review stale after ground-truth change —
+                                re-review required
+                              </span>
                             ) : row.bootstrapReviewVerdict &&
                               !row.bootstrapReviewEligible ? (
                               <span className="badge warn">
@@ -1362,7 +1382,7 @@ export function OneSkuBootstrapPage() {
                 set its ground truth below.
               </p>
             )}
-            {data.counts.excludedClips > 0 ? (
+            {data.videoDetailsVisible && data.counts.excludedClips > 0 ? (
               <details style={{ marginTop: '0.5rem' }}>
                 <summary>
                   Excluded from bootstrap ({data.counts.excludedClips}) — these
@@ -1549,9 +1569,10 @@ export function OneSkuBootstrapPage() {
             <dl className="detail">
               <dt>Latest top prediction</dt>
               <dd>
+                {/* Uncalibrated RANKING score — never a probability */}
                 {data.latest
                   ? `${data.latest.predictedSku ?? 'UNKNOWN'} ` +
-                    `(${data.latest.topScore !== null ? Math.round(data.latest.topScore * 100) : '—'}% · ` +
+                    `(ranking score ${data.latest.topScore !== null ? data.latest.topScore.toFixed(2) : '—'} · ` +
                     `${data.latest.policy})`
                   : '— no fusion run yet'}
               </dd>

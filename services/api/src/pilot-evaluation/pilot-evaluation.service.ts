@@ -359,6 +359,10 @@ export class PilotEvaluationService {
         return {
           journeyEventId: event.id,
           liveSessionId: journeyToSession.get(event.journeyId) ?? null,
+          /** Set for FUSION_SHADOW (video bootstrap) observations — lets
+           *  Phase 18 check candidates against the clip's CURRENT
+           *  editable ground truth. Null for live observations. */
+          videoAssetId: event.videoAssetId,
           eventType: event.eventType,
           occurredAt: event.occurredAt,
           predictedProductId: event.productId,

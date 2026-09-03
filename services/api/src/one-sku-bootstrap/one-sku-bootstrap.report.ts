@@ -487,6 +487,88 @@ export function isPhase18EligibleReview(
   }
 }
 
+// ---------------------------------------- ground-truth drift guard (P1)
+
+/** The ACTION this review would hand Phase 18 as the candidate label —
+ *  mirror of collectCandidates' per-verdict label selection. */
+export function effectiveReviewedAction(
+  review: BootstrapReviewSnapshot,
+  event: ReviewedEventSnapshot,
+): string {
+  switch (review.verdict) {
+    case 'CORRECT':
+    case 'WRONG_SKU':
+      return predictedActionOfEventType(event.eventType);
+    case 'WRONG_ACTION':
+      return review.expectedAction;
+    case 'FALSE_TOUCH':
+      return 'NO_OP';
+    default:
+      return 'UNKNOWN';
+  }
+}
+
+/** The PRODUCT this review would hand Phase 18 as the candidate label —
+ *  mirror of collectCandidates' per-verdict label selection. */
+export function effectiveReviewedProduct(
+  review: BootstrapReviewSnapshot,
+  event: ReviewedEventSnapshot,
+): { productId: string | null; sku: string | null } {
+  switch (review.verdict) {
+    case 'CORRECT':
+      return { productId: event.productId, sku: event.sku };
+    case 'WRONG_SKU':
+      return { productId: review.expectedProductId, sku: review.expectedSku };
+    case 'WRONG_ACTION':
+      return {
+        productId: review.expectedProductId ?? event.productId,
+        sku: review.expectedSku ?? event.sku,
+      };
+    default:
+      // FALSE_TOUCH and everything else label a NEGATIVE — no product.
+      return { productId: null, sku: null };
+  }
+}
+
+export interface CurrentTruthSnapshot {
+  eventKind: string;
+  productId: string | null;
+  sku: string | null;
+}
+
+/**
+ * Ground-truth drift guard (Codex P1): ground truth is EDITABLE, and a
+ * review binds its labels at review time — when the truth is edited
+ * afterward (PICKUP→RETURN, product A→B), the review's EFFECTIVE labels
+ * (exactly what Phase 18 would export) no longer describe the clip.
+ * Such a review must read as STALE: not reviewed, not counted toward
+ * any minimum, re-review required. Old review rows are never rewritten —
+ * a fresh review after the truth edit restores eligibility.
+ */
+export function matchesCurrentGroundTruth(
+  review: BootstrapReviewSnapshot,
+  event: ReviewedEventSnapshot,
+  truth: CurrentTruthSnapshot,
+): boolean {
+  const action = effectiveReviewedAction(review, event);
+  const truthAction = truth.eventKind === 'NONE' ? 'NO_OP' : truth.eventKind;
+  if (action !== truthAction) {
+    return false;
+  }
+  if (truthAction === 'NO_OP') {
+    return true; // negatives carry no product by design
+  }
+  const product = effectiveReviewedProduct(review, event);
+  // Product-ID equality is canonical when both sides are known; the SKU
+  // snapshot is the fallback (same rule as isPhase18EligibleReview).
+  if (product.productId !== null && truth.productId !== null) {
+    return product.productId === truth.productId;
+  }
+  return (
+    product.sku !== null && truth.sku !== null && product.sku === truth.sku
+  );
+}
+
 // ------------------------------------------------------ failure rollup
 
 export function deriveFailureReasons(

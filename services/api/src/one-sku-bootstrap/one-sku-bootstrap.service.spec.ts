@@ -28,6 +28,9 @@ const LINKED_RUN = {
   bootstrapProductId: null,
   _count: { reviews: 1 },
 };
+/** Report viewer that clears the video-asset read boundary — most tests
+ *  inspect per-clip rows, which are redacted for the default viewer. */
+const CLIP_VIEWER = { hasVideoAssetReadPermission: true };
 
 type Row = Record<string, unknown>;
 
@@ -83,6 +86,7 @@ function truthRow(over: Row = {}): Row {
     videoAssetId: 'va-1',
     eventKind: 'PICKUP',
     testType: null,
+    productId: PRODUCT.id,
     quantity: 1,
     actualTimestampMs: 1500,
     product: { sku: PRODUCT.sku },
@@ -150,6 +154,8 @@ interface HarnessData {
   reviewOperatorCrop?: Row | null;
   /** Whether the tenant has the inventory module enabled (default true). */
   inventoryModuleEnabled?: boolean;
+  /** Whether the tenant has the video-ingest module enabled (default true). */
+  videoIngestModuleEnabled?: boolean;
   /** Full-aggregate on-hand total; defaults to the sum of `levels`. */
   totalOnHand?: number;
 }
@@ -243,8 +249,12 @@ function buildHarness(data: HarnessData) {
     appendFromFusionRun: jest.fn(async () => ({})),
   };
   const platformModules = {
-    isEnabledForTenant: jest.fn(
-      async () => data.inventoryModuleEnabled ?? true,
+    isEnabledForTenant: jest.fn(async (_tenant: string, moduleCode: string) =>
+      moduleCode === 'inventory'
+        ? (data.inventoryModuleEnabled ?? true)
+        : moduleCode === 'video-ingest'
+          ? (data.videoIngestModuleEnabled ?? true)
+          : true,
     ),
   };
   const service = new OneSkuBootstrapService(
@@ -272,7 +282,7 @@ describe('OneSkuBootstrapService.report', () => {
       importedEvents: [importedEvent()],
       pilotReviews: [pilotReview()],
     });
-    await service.report(TENANT, PRODUCT.id);
+    await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     for (const delegate of [
       prisma.productReferenceImage.count,
       prisma.productReferenceEmbedding.count,
@@ -313,7 +323,7 @@ describe('OneSkuBootstrapService.report', () => {
       // service must not even query them.
       pilotReviews: [pilotReview()],
     });
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     expect(prisma.pilotObservationReview.findMany).not.toHaveBeenCalled();
     expect(report.videos[0].reviewed).toBe(false);
     expect(report.counts.reviewedPickupExamples).toBe(0);
@@ -327,7 +337,7 @@ describe('OneSkuBootstrapService.report', () => {
       importedEvents: [importedEvent()],
       pilotReviews: [pilotReview()],
     });
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     expect(report.videos[0].reviewed).toBe(true);
     expect(report.videos[0].bootstrapReviewEligible).toBe(true);
     expect(report.counts.reviewedPickupExamples).toBe(1);
@@ -344,7 +354,7 @@ describe('OneSkuBootstrapService.report', () => {
       importedEvents: [importedEvent({ fusionRunId: 'fusion-old' })],
       pilotReviews: [pilotReview()],
     });
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     expect(report.videos[0].reviewed).toBe(false);
     expect(report.videos[0].staleReview).toBe(true);
     expect(report.videos[0].needsReview).toBe(true);
@@ -368,7 +378,7 @@ describe('OneSkuBootstrapService.report', () => {
         importedEvents: [importedEvent()],
         pilotReviews: [badReview],
       });
-      const report = await service.report(TENANT, PRODUCT.id);
+      const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
       expect(report.videos[0].reviewed).toBe(false);
       expect(report.videos[0].bootstrapReviewEligible).toBe(false);
       expect(report.counts.reviewedPickupExamples).toBe(0);
@@ -377,41 +387,67 @@ describe('OneSkuBootstrapService.report', () => {
   });
 
   it('counts valid WRONG_SKU / WRONG_ACTION / FALSE_TOUCH corrections', async () => {
-    const cases: [Row, 'pickup' | 'falseTouch'][] = [
+    // Every correction restores the clip's CURRENT ground truth (the
+    // only corrections the server accepts): WRONG_SKU over a
+    // mispredicted product, WRONG_ACTION over a mispredicted action,
+    // FALSE_TOUCH only on a NONE clip.
+    const cases: [HarnessData, 'pickup' | 'return' | 'falseTouch'][] = [
       [
-        pilotReview({
-          verdict: 'WRONG_SKU',
-          expectedProductId: 'prod-other',
-          expectedSku: 'SKU-OTHER',
-        }),
+        {
+          truths: [truthRow()],
+          importedEvents: [
+            importedEvent({ productId: 'prod-other', sku: 'SKU-OTHER' }),
+          ],
+          pilotReviews: [
+            pilotReview({
+              verdict: 'WRONG_SKU',
+              expectedProductId: PRODUCT.id,
+              expectedSku: PRODUCT.sku,
+            }),
+          ],
+        },
         'pickup',
       ],
       [
-        pilotReview({ verdict: 'WRONG_ACTION', expectedAction: 'RETURN' }),
-        'pickup',
+        {
+          truths: [truthRow({ eventKind: 'RETURN' })],
+          importedEvents: [importedEvent()],
+          pilotReviews: [
+            pilotReview({ verdict: 'WRONG_ACTION', expectedAction: 'RETURN' }),
+          ],
+        },
+        'return',
       ],
       [
-        pilotReview({ verdict: 'FALSE_TOUCH', expectedAction: 'NO_OP' }),
+        {
+          truths: [
+            truthRow({ eventKind: 'NONE', productId: null, product: null }),
+          ],
+          importedEvents: [importedEvent()],
+          pilotReviews: [
+            pilotReview({ verdict: 'FALSE_TOUCH', expectedAction: 'NO_OP' }),
+          ],
+        },
         'falseTouch',
       ],
     ];
-    for (const [review, bucket] of cases) {
+    for (const [fixtures, bucket] of cases) {
       const { service } = buildHarness({
         evaluationRun: LINKED_RUN,
-        truths: [truthRow()],
         runs: [fusionRun()],
-        importedEvents: [importedEvent()],
-        pilotReviews: [review],
+        ...fixtures,
       });
-      const report = await service.report(TENANT, PRODUCT.id);
+      const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
       expect(report.videos[0].reviewed).toBe(true);
-      if (bucket === 'pickup') {
-        expect(report.counts.reviewedPickupExamples).toBe(1);
-        expect(report.counts.reviewedFalseTouchExamples).toBe(0);
-      } else {
-        expect(report.counts.reviewedFalseTouchExamples).toBe(1);
-        expect(report.counts.reviewedPickupExamples).toBe(0);
-      }
+      expect(report.counts.reviewedPickupExamples).toBe(
+        bucket === 'pickup' ? 1 : 0,
+      );
+      expect(report.counts.reviewedReturnExamples).toBe(
+        bucket === 'return' ? 1 : 0,
+      );
+      expect(report.counts.reviewedFalseTouchExamples).toBe(
+        bucket === 'falseTouch' ? 1 : 0,
+      );
     }
   });
 
@@ -433,7 +469,7 @@ describe('OneSkuBootstrapService.report', () => {
       importedEvents: [importedEvent({ videoAssetId: 'va-good' })],
       pilotReviews: [pilotReview()],
     });
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     expect(
       report.videos.find((row) => row.videoAssetId === 'va-session')
         ?.excludedReason,
@@ -460,7 +496,7 @@ describe('OneSkuBootstrapService.report', () => {
         { sourceId: 'pickup:va-4', status: 'SUCCEEDED', visionEventId: null },
       ],
     });
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     expect(report.videos[0].reviewed).toBe(false);
     expect(report.videos[0].missedPositiveEvent).toBe(true);
     expect(report.videos[0].needsReview).toBe(true);
@@ -494,7 +530,7 @@ describe('OneSkuBootstrapService.report', () => {
         }),
       ],
     });
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     const clean = report.videos.find(
       (row) => row.videoAssetId === 'va-none-clean',
     );
@@ -532,7 +568,7 @@ describe('OneSkuBootstrapService.report', () => {
         }),
       ],
     });
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     expect(report.latest?.predictedSku).toBe('SKU-NEWEST');
     expect(report.latest?.policy).toBe('AUTO_PROPOSE');
   });
@@ -563,7 +599,7 @@ describe('OneSkuBootstrapService.report', () => {
       ],
       operatorCrops: [operatorCrop],
     });
-    const connectedReport = await connected.service.report(TENANT, PRODUCT.id);
+    const connectedReport = await connected.service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     const connectedFusion = connectedReport.videos[0].fusion;
     expect(connectedFusion?.cropSource).toBe('OPERATOR');
     expect(connectedFusion?.cropArtifactId).toBe('artifact-manual-1');
@@ -586,6 +622,7 @@ describe('OneSkuBootstrapService.report', () => {
     const unconnectedReport = await unconnected.service.report(
       TENANT,
       PRODUCT.id,
+      CLIP_VIEWER,
     );
     expect(unconnectedReport.videos[0].fusion?.cropEvidenceConnected).toBe(
       false,
@@ -615,7 +652,7 @@ describe('OneSkuBootstrapService.report', () => {
         },
       ],
     });
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     expect(report.videos[0].fusion?.cropSource).toBe('AUTO');
   });
 
@@ -641,7 +678,7 @@ describe('OneSkuBootstrapService.report', () => {
         }),
       ],
     });
-    const serialized = JSON.stringify(await service.report(TENANT, PRODUCT.id));
+    const serialized = JSON.stringify(await service.report(TENANT, PRODUCT.id, CLIP_VIEWER));
     expect(serialized).not.toContain('LEAKED-OCR-TEXT');
     expect(serialized).not.toContain('4111111111111111');
     expect(serialized).not.toContain('leaked-normalized');
@@ -652,7 +689,7 @@ describe('OneSkuBootstrapService.report', () => {
 
   it('reports an empty-but-honest baseline for a fresh SKU', async () => {
     const { service } = buildHarness({});
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     expect(report.counts.totalClips).toBe(0);
     expect(report.latest).toBeNull();
     expect(report.linkedEvaluationRun).toBeNull();
@@ -757,7 +794,7 @@ describe('OneSkuBootstrapService report — terminal runs are not the active lin
     const { service } = buildHarness({
       evaluationRuns: [{ ...LINKED_RUN, status: 'COMPLETED' }],
     });
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     expect(report.linkedEvaluationRun).toBeNull();
     expect(
       report.gates.items.find((item) => item.key === 'EVALUATION_RUN_LINKED')
@@ -781,7 +818,14 @@ describe('OneSkuBootstrapService.reviewClip', () => {
   const reviewClipBase: HarnessData = {
     videoAsset: { id: 'va-1', locationId: 'loc-1', unitId: 'unit-1', sessionId: null },
     groundTruth: { eventKind: 'PICKUP', productId: PRODUCT.id },
-    runs: [{ id: 'fusion-1', createdAt: new Date('2026-08-24T10:00:00Z') }],
+    runs: [
+      {
+        id: 'fusion-1',
+        createdAt: new Date('2026-08-24T10:00:00Z'),
+        policy: 'AUTO_PROPOSE',
+        fusedTopSku: PRODUCT.sku,
+      },
+    ],
     evaluationRun: { ...LINKED_RUN, _count: { reviews: 0 } },
   };
 
@@ -1297,6 +1341,103 @@ describe('OneSkuBootstrapService.reviewClip', () => {
     ).rejects.toThrow(/ground-truth product/);
     expect(evaluations.reviewObservation).not.toHaveBeenCalled();
   });
+
+  // FALSE_TOUCH requires NONE ground truth (Codex P1).
+  it.each([['PICKUP'], ['RETURN']] as const)(
+    'rejects FALSE_TOUCH on a %s clip with NO side effects',
+    async (eventKind) => {
+      const { service, evaluations, journeys, prisma } = buildHarness({
+        ...reviewClipBase,
+        groundTruth: { eventKind, productId: PRODUCT.id },
+      });
+      await expect(
+        service.reviewClip(TENANT, PRODUCT.id, 'va-1', {
+          verdict: 'FALSE_TOUCH' as never,
+          expectedAction: 'NO_OP' as never,
+          expectedProductId: null,
+          notes: null,
+        }),
+      ).rejects.toThrow(/only valid for a clip ground-truthed as NONE/);
+      expect(evaluations.createRun).not.toHaveBeenCalled();
+      expect(evaluations.reviewObservation).not.toHaveBeenCalled();
+      expect(journeys.create).not.toHaveBeenCalled();
+      expect(journeys.appendFromFusionRun).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    },
+  );
+
+  // Corrected-action lineage (Codex P1): the corrected action must BE
+  // the current ground-truth action.
+  it('rejects WRONG_ACTION whose corrected action is not the ground truth (e.g. NO_OP on a RETURN clip)', async () => {
+    // Predicted PICKUP, ground truth RETURN — NO_OP differs from the
+    // prediction but contradicts the truth: reject, with no side effects.
+    const { service, evaluations, journeys, prisma } = buildHarness({
+      ...reviewClipBase,
+      groundTruth: { eventKind: 'RETURN', productId: PRODUCT.id },
+    });
+    await expect(
+      service.reviewClip(TENANT, PRODUCT.id, 'va-1', {
+        verdict: 'WRONG_ACTION' as never,
+        expectedAction: 'NO_OP' as never,
+        expectedProductId: null,
+        notes: null,
+      }),
+    ).rejects.toThrow(/ground-truth action/);
+    expect(evaluations.createRun).not.toHaveBeenCalled();
+    expect(evaluations.reviewObservation).not.toHaveBeenCalled();
+    expect(journeys.create).not.toHaveBeenCalled();
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('accepts WRONG_ACTION restoring the truth action over a wrong prediction (both directions)', async () => {
+    // Predicted RETURN on a PICKUP-truth clip → corrected to PICKUP.
+    const { service, evaluations } = buildHarness({
+      ...reviewClipBase,
+      journeyEventLookups: [importedEvent({ eventType: 'PRODUCT_RETURN' })],
+    });
+    await service.reviewClip(TENANT, PRODUCT.id, 'va-1', {
+      verdict: 'WRONG_ACTION' as never,
+      expectedAction: 'PICKUP' as never,
+      expectedProductId: null,
+      notes: null,
+    });
+    expect(evaluations.reviewObservation).toHaveBeenCalledWith(
+      TENANT,
+      'eval-1',
+      expect.objectContaining({
+        verdict: 'WRONG_ACTION',
+        expectedAction: 'PICKUP',
+      }),
+      undefined,
+      { allowVideoShadowEvent: true },
+    );
+  });
+
+  // No-candidate runs never import (contained Codex P2): FAILED or
+  // top-less fusion runs would only yield REVIEW_REQUIRED events the
+  // product lookup can never find — every retry would open a NEW journey.
+  it.each([
+    ['a FAILED run', { policy: 'FAILED', fusedTopSku: PRODUCT.sku }],
+    ['a run with no fused top candidate', { policy: 'NEEDS_VLM', fusedTopSku: null }],
+  ])('refuses %s idempotently, before any journey exists', async (_label, runOver) => {
+    const { service, evaluations, journeys, prisma } = buildHarness({
+      ...reviewClipBase,
+      runs: [
+        {
+          id: 'fusion-1',
+          createdAt: new Date('2026-08-24T10:00:00Z'),
+          ...runOver,
+        },
+      ],
+    });
+    await expect(
+      service.reviewClip(TENANT, PRODUCT.id, 'va-1', reviewInput),
+    ).rejects.toThrow(/no candidate/);
+    expect(evaluations.createRun).not.toHaveBeenCalled();
+    expect(journeys.create).not.toHaveBeenCalled();
+    expect(journeys.appendFromFusionRun).not.toHaveBeenCalled();
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
 });
 
 describe('OneSkuBootstrapService.report — inventory redaction (Codex P1)', () => {
@@ -1311,13 +1452,17 @@ describe('OneSkuBootstrapService.report — inventory redaction (Codex P1)', () 
   it('redacts stock details for a caller without inventory:read', async () => {
     const { service, platformModules } = buildHarness({ levels: LEVELS });
     // Default viewer = no inventory permission (fail closed).
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     expect(report.inventory.stocked).toBe(true);
     expect(report.inventory.detailsVisible).toBe(false);
     expect(report.inventory.totalOnHand).toBeNull();
     expect(report.inventory.levels).toEqual([]);
-    // Without the permission the module lookup is not even consulted.
-    expect(platformModules.isEnabledForTenant).not.toHaveBeenCalled();
+    // Without the permission the INVENTORY module lookup is not even
+    // consulted (the viewer's video permission triggers its own check).
+    expect(platformModules.isEnabledForTenant).not.toHaveBeenCalledWith(
+      TENANT,
+      'inventory',
+    );
     // No location name/code or exact quantity anywhere in the response.
     const serialized = JSON.stringify(report);
     expect(serialized).not.toContain('Main Street Store');
@@ -1372,7 +1517,7 @@ describe('OneSkuBootstrapService.report — inventory redaction (Codex P1)', () 
 
   it('keeps the not-stocked classification honest for a redacted caller', async () => {
     const { service } = buildHarness({ levels: [] });
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     expect(report.inventory.stocked).toBe(false);
     expect(
       report.gates.items.find((item) => item.key === 'INVENTORY_STOCKED')
@@ -1461,7 +1606,7 @@ describe('OneSkuBootstrapService.ensureEvaluationRun — race and prefix safety 
       expect.not.objectContaining({ take: expect.anything() }),
     );
     // ...and the report resolves the SAME run through the same lookup.
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     expect(report.linkedEvaluationRun?.evaluationRunId).toBe('eval-real');
   });
 
@@ -1512,7 +1657,7 @@ describe('OneSkuBootstrapService.report — full-set aggregation (Codex P2)', ()
 
   it('keeps the full-aggregate total redacted for a caller without inventory access', async () => {
     const { service } = buildHarness({ levels: [], totalOnHand: 7 });
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     // Classification still true, exact number still hidden.
     expect(report.inventory.stocked).toBe(true);
     expect(report.inventory.totalOnHand).toBeNull();
@@ -1547,7 +1692,7 @@ describe('OneSkuBootstrapService.report — full-set aggregation (Codex P2)', ()
         pilotReview({ journeyEventId: `jevt-r${i}` }),
       ),
     });
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     // Display bounded, readiness complete.
     expect(report.videos).toHaveLength(100);
     expect(
@@ -1580,7 +1725,7 @@ describe('OneSkuBootstrapService.report — full-set aggregation (Codex P2)', ()
       importedEvents: [importedEvent({ videoAssetId: 'va-pos' })],
       pilotReviews: [pilotReview()],
     });
-    const report = await service.report(TENANT, PRODUCT.id);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     expect(report.videos).toHaveLength(100);
     expect(report.videos.some((row) => row.videoAssetId === 'va-pos')).toBe(
       false,
@@ -1592,9 +1737,176 @@ describe('OneSkuBootstrapService.report — full-set aggregation (Codex P2)', ()
 
   it('never limits the ground-truth readiness query', async () => {
     const { service, prisma } = buildHarness({ truths: [truthRow()] });
-    await service.report(TENANT, PRODUCT.id);
+    await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
     expect(prisma.videoGroundTruth.findMany).toHaveBeenCalledWith(
       expect.not.objectContaining({ take: expect.anything() }),
     );
+  });
+});
+
+describe('OneSkuBootstrapService.report — ground-truth drift (Codex P1)', () => {
+  it('marks a CORRECT review STALE when the truth ACTION was edited afterward', async () => {
+    // Reviewed as a correct PICKUP, truth later edited to RETURN: the
+    // review's effective labels no longer describe the clip.
+    const { service } = buildHarness({
+      evaluationRun: LINKED_RUN,
+      truths: [truthRow({ eventKind: 'RETURN' })],
+      runs: [fusionRun()],
+      importedEvents: [importedEvent()],
+      pilotReviews: [pilotReview()],
+    });
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
+    const row = report.videos[0];
+    expect(row.reviewed).toBe(false);
+    expect(row.staleTruthReview).toBe(true);
+    expect(row.bootstrapReviewEligible).toBe(false);
+    expect(row.needsReview).toBe(true);
+    expect(report.counts.reviewedPickupExamples).toBe(0);
+    expect(report.counts.reviewedReturnExamples).toBe(0);
+    expect(report.counts.unreviewedClips).toBe(1);
+    expect(
+      report.gates.items.find((item) => item.key === 'ALL_REVIEWED')
+        ?.satisfied,
+    ).toBe(false);
+    expect(report.gates.readyForDatasetImprovement).toBe(false);
+  });
+
+  it('marks a CORRECT review STALE when the truth PRODUCT was edited afterward', async () => {
+    const { service } = buildHarness({
+      evaluationRun: LINKED_RUN,
+      truths: [
+        truthRow({ productId: 'prod-b', product: { sku: 'SKU-B' } }),
+      ],
+      runs: [fusionRun()],
+      importedEvents: [importedEvent()],
+      pilotReviews: [pilotReview()],
+    });
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
+    expect(report.videos[0].staleTruthReview).toBe(true);
+    expect(report.videos[0].reviewed).toBe(false);
+    expect(report.counts.reviewedPickupExamples).toBe(0);
+  });
+
+  it('marks a FALSE_TOUCH review STALE when the truth became a positive action', async () => {
+    const { service } = buildHarness({
+      evaluationRun: LINKED_RUN,
+      truths: [truthRow()], // now PICKUP ground truth
+      runs: [fusionRun()],
+      importedEvents: [importedEvent()],
+      pilotReviews: [
+        pilotReview({ verdict: 'FALSE_TOUCH', expectedAction: 'NO_OP' }),
+      ],
+    });
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
+    expect(report.videos[0].staleTruthReview).toBe(true);
+    expect(report.counts.reviewedFalseTouchExamples).toBe(0);
+  });
+
+  it('a re-review matching the edited truth restores eligibility', async () => {
+    // Truth edited to RETURN; a NEWER WRONG_ACTION review corrects the
+    // predicted PICKUP to RETURN — eligible again.
+    const { service } = buildHarness({
+      evaluationRun: LINKED_RUN,
+      truths: [truthRow({ eventKind: 'RETURN' })],
+      runs: [fusionRun()],
+      importedEvents: [importedEvent()],
+      pilotReviews: [
+        pilotReview(), // old CORRECT (stale against RETURN truth)
+        pilotReview({
+          verdict: 'WRONG_ACTION',
+          expectedAction: 'RETURN',
+          createdAt: new Date('2026-08-24T12:00:00Z'),
+        }),
+      ],
+    });
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
+    expect(report.videos[0].reviewed).toBe(true);
+    expect(report.videos[0].staleTruthReview).toBe(false);
+    expect(report.counts.reviewedReturnExamples).toBe(1);
+  });
+
+  it('never auto-reviews a NONE clip whose only analysis FAILED', async () => {
+    const { service } = buildHarness({
+      evaluationRun: LINKED_RUN,
+      truths: [
+        truthRow({ eventKind: 'NONE', productId: null, product: null }),
+      ],
+      runs: [fusionRun({ policy: 'FAILED' })],
+    });
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
+    // A FAILED run is not completed analysis — the absence of a proposal
+    // proves nothing, so the clip still needs attention.
+    expect(report.videos[0].reviewed).toBe(false);
+    expect(report.counts.unreviewedClips).toBe(1);
+  });
+});
+
+describe('OneSkuBootstrapService.report — video-asset read boundary (Codex P1)', () => {
+  const clipFixtures: HarnessData = {
+    evaluationRun: LINKED_RUN,
+    truths: [truthRow()],
+    runs: [fusionRun()],
+    importedEvents: [importedEvent()],
+    pilotReviews: [pilotReview()],
+  };
+
+  it('redacts every video-derived detail for a caller without video-asset:read', async () => {
+    const { service } = buildHarness(clipFixtures);
+    const report = await service.report(TENANT, PRODUCT.id); // default viewer
+    expect(report.videoDetailsVisible).toBe(false);
+    expect(report.videos).toEqual([]);
+    // Aggregate readiness still works.
+    expect(report.counts.totalClips).toBe(1);
+    expect(report.counts.reviewedPickupExamples).toBe(1);
+    expect(report.gates.items.length).toBeGreaterThan(0);
+    // No filename, timestamp, crop geometry, or artifact id anywhere —
+    // including nested objects.
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain('clip.mp4');
+    expect(serialized).not.toContain('artifact-auto-1');
+    expect(serialized).not.toContain('durationMs');
+    expect(serialized).not.toContain('actualTimestampMs');
+    expect(serialized).not.toContain('cropWarnings');
+    expect(serialized).not.toContain('va-1');
+  });
+
+  it('redacts video details when the tenant lacks the video-ingest module', async () => {
+    const { service } = buildHarness({
+      ...clipFixtures,
+      videoIngestModuleEnabled: false,
+    });
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
+    expect(report.videoDetailsVisible).toBe(false);
+    expect(report.videos).toEqual([]);
+  });
+
+  it('returns full clip rows for video-asset:read + video-ingest module', async () => {
+    const { service, platformModules } = buildHarness(clipFixtures);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
+    expect(platformModules.isEnabledForTenant).toHaveBeenCalledWith(
+      TENANT,
+      'video-ingest',
+    );
+    expect(report.videoDetailsVisible).toBe(true);
+    expect(report.videos[0].originalFilename).toBe('clip.mp4');
+  });
+
+  it('keeps the inventory redaction independent of the video boundary', async () => {
+    const { service } = buildHarness({
+      ...clipFixtures,
+      levels: [
+        {
+          locationId: 'loc-1',
+          quantity: 4,
+          location: { name: 'Main Street Store', code: 'MAIN-01' },
+        },
+      ],
+    });
+    // Video visible, inventory NOT.
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
+    expect(report.videoDetailsVisible).toBe(true);
+    expect(report.inventory.detailsVisible).toBe(false);
+    expect(report.inventory.totalOnHand).toBeNull();
+    expect(JSON.stringify(report)).not.toContain('Main Street Store');
   });
 });

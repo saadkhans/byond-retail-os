@@ -58,6 +58,11 @@ export class OneSkuBootstrapController {
       // stock-level reads — the report never shows more than that
       // route would.
       hasInventoryReadPermission: actor.permissions.includes('inventory:read'),
+      // Same permission the video-asset read routes require (paired with
+      // the video-ingest module check in the service) — per-clip metadata
+      // never exceeds that boundary.
+      hasVideoAssetReadPermission:
+        actor.permissions.includes('video-asset:read'),
     });
   }
 

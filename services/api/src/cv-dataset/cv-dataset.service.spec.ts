@@ -11,6 +11,8 @@ const assemble = (...parts: string[]) => parts.join('');
 interface ObservationFixture {
   journeyEventId: string;
   liveSessionId: string | null;
+  /** Set for video-bootstrap (FUSION_SHADOW) observations. */
+  videoAssetId?: string | null;
   eventType: string;
   occurredAt: Date;
   predictedProductId: string | null;
@@ -83,6 +85,9 @@ function sessionsInBand(
 function buildHarness(
   options: {
     observations?: ObservationFixture[];
+    /** CURRENT VideoGroundTruth rows keyed by the observations'
+     *  videoAssetId — the ground-truth drift guard reads these. */
+    groundTruths?: Record<string, unknown>[];
     missedEvents?: Record<string, unknown>[];
     summary?: Record<string, unknown> | null;
     scenarios?: Record<string, unknown>[];
@@ -297,6 +302,9 @@ function buildHarness(
       update: jest.fn(),
       updateMany: jest.fn(),
       deleteMany: jest.fn(),
+    },
+    videoGroundTruth: {
+      findMany: jest.fn(async () => options.groundTruths ?? []),
     },
     $queryRaw: jest.fn(async () => []),
   };
@@ -2574,5 +2582,108 @@ describe('CvDatasetService — Codex P1 round 4 (calibration fingerprint + binar
         harness.service.exportManifest(TENANT, created.id),
       ).rejects.toThrow('INSUFFICIENT_STABLE_SPLIT_COVERAGE');
     }
+  });
+});
+
+describe('CvDatasetService — ground-truth drift guard (Codex P1)', () => {
+  const bootstrapObservation = (over: Partial<ObservationFixture> = {}) =>
+    observation({
+      journeyEventId: 'evt-video',
+      liveSessionId: null,
+      videoAssetId: 'va-1',
+      ...over,
+    });
+  const truthRow = (over: Record<string, unknown> = {}) => ({
+    videoAssetId: 'va-1',
+    eventKind: 'PICKUP',
+    productId: 'prod-a',
+    product: { sku: 'SKU-A' },
+    ...over,
+  });
+  const evalOnlyRun = (service: CvDatasetService) =>
+    service.createRun(TENANT, {
+      ...BASE_INPUT,
+      sourceEvaluationRunId: 'eval-1',
+    } as never);
+
+  it('excludes a CORRECT candidate whose clip truth was edited to another ACTION', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [
+        bootstrapObservation({ latestReview: review({ verdict: 'CORRECT' }) }),
+      ],
+      // Reviewed as a correct PICKUP; the truth NOW says RETURN.
+      groundTruths: [truthRow({ eventKind: 'RETURN' })],
+    });
+    const created = await evalOnlyRun(service);
+    await service.refreshCandidates(TENANT, created.id);
+    expect(candidates.find((row) => row.sourceId === 'evt-video')).toMatchObject({
+      eligibility: 'EXCLUDED',
+      exclusionReason: 'STALE_GROUND_TRUTH',
+    });
+  });
+
+  it('excludes a CORRECT candidate whose clip truth was edited to another PRODUCT', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [
+        bootstrapObservation({ latestReview: review({ verdict: 'CORRECT' }) }),
+      ],
+      groundTruths: [
+        truthRow({ productId: 'prod-b', product: { sku: 'SKU-B' } }),
+      ],
+    });
+    const created = await evalOnlyRun(service);
+    await service.refreshCandidates(TENANT, created.id);
+    expect(candidates.find((row) => row.sourceId === 'evt-video')).toMatchObject({
+      eligibility: 'EXCLUDED',
+      exclusionReason: 'STALE_GROUND_TRUTH',
+    });
+  });
+
+  it('keeps a candidate ELIGIBLE while its labels match the current truth', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [
+        bootstrapObservation({ latestReview: review({ verdict: 'CORRECT' }) }),
+        // A corrected WRONG_ACTION whose corrected action IS the truth.
+        bootstrapObservation({
+          journeyEventId: 'evt-video-wa',
+          videoAssetId: 'va-2',
+          latestReview: review({
+            reviewId: 'rev-wa2',
+            verdict: 'WRONG_ACTION',
+            expectedAction: 'RETURN',
+            expectedProductId: 'prod-a',
+            expectedSku: 'SKU-A',
+          }),
+        }),
+      ],
+      groundTruths: [
+        truthRow(),
+        truthRow({ videoAssetId: 'va-2', eventKind: 'RETURN' }),
+      ],
+    });
+    const created = await evalOnlyRun(service);
+    await service.refreshCandidates(TENANT, created.id);
+    expect(candidates.find((row) => row.sourceId === 'evt-video')).toMatchObject(
+      { eligibility: 'ELIGIBLE' },
+    );
+    expect(
+      candidates.find((row) => row.sourceId === 'evt-video-wa'),
+    ).toMatchObject({ eligibility: 'ELIGIBLE', correctedActionLabel: 'RETURN' });
+  });
+
+  it('leaves LIVE observations (no video asset) untouched by the guard', async () => {
+    const { service, candidates, prisma } = buildHarness({
+      observations: [
+        observation({ latestReview: review({ verdict: 'CORRECT' }) }),
+      ],
+      groundTruths: [],
+    });
+    const created = await evalOnlyRun(service);
+    await service.refreshCandidates(TENANT, created.id);
+    expect(candidates.find((row) => row.sourceId === 'evt-1')).toMatchObject({
+      eligibility: 'ELIGIBLE',
+    });
+    // No video asset anywhere → the truth table is never consulted.
+    expect(prisma.videoGroundTruth.findMany).not.toHaveBeenCalled();
   });
 });

@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import {
   CustomerJourneyEventType,
+  FusionPolicyResult,
   FusionRunScope,
   GroundTruthEventKind,
   InferenceJobStatus,
@@ -32,6 +33,7 @@ import {
   evaluateGates,
   fusionFrameDimsFor,
   isPhase18EligibleReview,
+  matchesCurrentGroundTruth,
   predictedActionOfEventType,
   safeFusionSummary,
 } from './one-sku-bootstrap.report';
@@ -133,6 +135,10 @@ export interface BootstrapVideoRow {
   /** A review exists only for an OLDER fusion run of this clip — the
    *  newest evidence needs a fresh review. */
   staleReview: boolean;
+  /** An eligible-shaped review exists on the LATEST evidence, but its
+   *  EFFECTIVE labels contradict the clip's CURRENT (edited) ground
+   *  truth — stale, re-review required (Codex P1). */
+  staleTruthReview: boolean;
   reviewDecision: string | null;
   /** Latest bootstrap pilot-review verdict bound to the clip's LATEST
    *  fusion run (the linked evaluation run only), if any. */
@@ -176,8 +182,15 @@ export interface OneSkuBootstrapReport {
       quantity: number;
     }[];
   };
+  /** true only when the caller clears the video-asset read boundary
+   *  (video-ingest module + video-asset:read): the per-clip rows below
+   *  carry filenames, states, durations, timestamps, crop geometry, and
+   *  artifact ids — the same metadata the video-asset routes protect.
+   *  When false, `videos` is empty and only aggregate readiness remains. */
+  videoDetailsVisible: boolean;
   /** Newest BOOTSTRAP_MAX_CLIPS rows for display — counts and gates are
-   *  computed over the COMPLETE ground-truth set, not this slice. */
+   *  computed over the COMPLETE ground-truth set, not this slice.
+   *  Empty whenever videoDetailsVisible is false. */
   videos: BootstrapVideoRow[];
   counts: {
     /** Bootstrap-safe clips only — excluded rows are not counted. */
@@ -481,6 +494,41 @@ export class OneSkuBootstrapService {
           'this as MISSING_CORRECTED_SKU',
       );
     }
+    // False-touch requires NONE ground truth (Codex P1): FALSE_TOUCH on
+    // a PICKUP/RETURN clip would hand Phase 18 an eligible NO_OP
+    // candidate that contradicts the clip's own ground truth — and count
+    // toward the false-touch minimum. Rejected BEFORE anything exists.
+    if (
+      input.verdict === PilotObservationVerdict.FALSE_TOUCH &&
+      truth.eventKind !== GroundTruthEventKind.NONE
+    ) {
+      throw new BadRequestException(
+        'FALSE_TOUCH is only valid for a clip ground-truthed as NONE — ' +
+          'if nothing was really removed in this clip, fix its ground ' +
+          'truth first',
+      );
+    }
+    // Corrected-action lineage (Codex P1): every dataset-bound verdict
+    // must carry the CURRENT ground truth's action. WRONG_ACTION restores
+    // the truth's action over a wrong prediction — it never invents a
+    // third label (predicted PICKUP on a RETURN clip corrects to RETURN,
+    // NOT to NO_OP). UNCERTAIN is exempt: Phase 18 excludes it anyway.
+    const truthAction =
+      truth.eventKind === GroundTruthEventKind.NONE
+        ? PilotExpectedAction.NO_OP
+        : truth.eventKind === GroundTruthEventKind.RETURN
+          ? PilotExpectedAction.RETURN
+          : PilotExpectedAction.PICKUP;
+    if (
+      input.verdict !== PilotObservationVerdict.UNCERTAIN &&
+      input.expectedAction !== truthAction
+    ) {
+      throw new BadRequestException(
+        'the corrected action must be the clip’s ground-truth action — ' +
+          'if the clip really shows a different action, fix its ground ' +
+          'truth first',
+      );
+    }
     const run = await this.prisma.pickupFusionRun.findFirst({
       where: {
         tenantId,
@@ -488,11 +536,23 @@ export class OneSkuBootstrapService {
         runScope: FusionRunScope.WHOLE_CLIP,
       },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      select: { id: true, createdAt: true },
+      select: { id: true, createdAt: true, policy: true, fusedTopSku: true },
     });
     if (!run) {
       throw new ConflictException(
         'run fusion on this clip first — the correction labels its fusion evidence',
+      );
+    }
+    // No-candidate runs never import (contained Codex P2): a FAILED run,
+    // or one with no fused top candidate, can only yield a
+    // REVIEW_REQUIRED shadow event — which the product-event lookup
+    // below would never find, so every retry would open ANOTHER journey
+    // and duplicate event. There is nothing to label either way: refuse
+    // up front, idempotently, before any run/journey/review exists.
+    if (run.policy === FusionPolicyResult.FAILED || !run.fusedTopSku) {
+      throw new ConflictException(
+        'fusion produced no candidate for this clip — there is nothing ' +
+          'to label; improve references or recapture the clip',
       );
     }
     const evaluation = await this.ensureEvaluationRun(
@@ -594,15 +654,8 @@ export class OneSkuBootstrapService {
       }
     }
     if (input.verdict === PilotObservationVerdict.WRONG_ACTION) {
-      if (
-        input.expectedAction !== PilotExpectedAction.PICKUP &&
-        input.expectedAction !== PilotExpectedAction.RETURN &&
-        input.expectedAction !== PilotExpectedAction.NO_OP
-      ) {
-        throw new BadRequestException(
-          'WRONG_ACTION needs a corrected PICKUP, RETURN, or NO_OP',
-        );
-      }
+      // expectedAction equals the ground-truth action (validated BEFORE
+      // the import above) — here only the prediction comparison remains.
       if (input.expectedAction === predictedAction) {
         throw new BadRequestException(
           'the corrected action equals the predicted action — Phase 18 ' +
@@ -694,12 +747,14 @@ export class OneSkuBootstrapService {
   async report(
     tenantId: string,
     productId: string,
-    // Fail-closed default (Codex P1): detailed stock/location data is
-    // shown only when the CALLER's inventory access is affirmatively
-    // established — omitting the viewer means redacted.
-    viewer: { hasInventoryReadPermission: boolean } = {
-      hasInventoryReadPermission: false,
-    },
+    // Fail-closed defaults (Codex P1): detailed stock/location data and
+    // video-derived clip metadata are shown only when the CALLER's
+    // access is affirmatively established — an omitted viewer or an
+    // omitted field means redacted.
+    viewer: {
+      hasInventoryReadPermission?: boolean;
+      hasVideoAssetReadPermission?: boolean;
+    } = {},
   ): Promise<OneSkuBootstrapReport> {
     const product = await this.requireProduct(tenantId, productId);
 
@@ -709,8 +764,17 @@ export class OneSkuBootstrapService {
     // still computed server-side for everyone — hiding details must not
     // block the bootstrap flow.
     const inventoryDetailsVisible =
-      viewer.hasInventoryReadPermission &&
+      viewer.hasInventoryReadPermission === true &&
       (await this.platformModules.isEnabledForTenant(tenantId, 'inventory'));
+    // Per-clip rows mirror the video-asset read boundary (Codex P1):
+    // filenames, asset states, durations, ground-truth timestamps, crop
+    // geometry, and artifact ids are exactly what the video-asset routes
+    // protect behind the video-ingest module + video-asset:read — this
+    // report must not become a side door. Counts and gates stay computed
+    // server-side for everyone (numbers and classified codes only).
+    const videoDetailsVisible =
+      viewer.hasVideoAssetReadPermission === true &&
+      (await this.platformModules.isEnabledForTenant(tenantId, 'video-ingest'));
 
     const [referenceCount, embeddingCount, levels, stockAggregate, runFamily] =
       await Promise.all([
@@ -995,22 +1059,42 @@ export class OneSkuBootstrapService {
 
       const pilotReview = latestRunReviewByAsset.get(truth.videoAssetId);
       const reviewedEvent = latestRunEventByAsset.get(truth.videoAssetId);
-      const reviewEligible =
-        pilotReview !== undefined &&
-        reviewedEvent !== undefined &&
-        isPhase18EligibleReview(
-          {
-            verdict: pilotReview.verdict,
-            expectedAction: pilotReview.expectedAction,
-            expectedProductId: pilotReview.expectedProductId,
-            expectedSku: pilotReview.expectedSku,
-          },
-          {
-            productId: reviewedEvent.productId,
-            sku: reviewedEvent.sku,
-            eventType: reviewedEvent.eventType,
-          },
-        );
+      const reviewSnapshot =
+        pilotReview !== undefined
+          ? {
+              verdict: pilotReview.verdict,
+              expectedAction: pilotReview.expectedAction,
+              expectedProductId: pilotReview.expectedProductId,
+              expectedSku: pilotReview.expectedSku,
+            }
+          : null;
+      const eventSnapshot =
+        reviewedEvent !== undefined
+          ? {
+              productId: reviewedEvent.productId,
+              sku: reviewedEvent.sku,
+              eventType: reviewedEvent.eventType,
+            }
+          : null;
+      const phase18Shaped =
+        reviewSnapshot !== null &&
+        eventSnapshot !== null &&
+        isPhase18EligibleReview(reviewSnapshot, eventSnapshot);
+      // Ground-truth drift (Codex P1): an eligible-shaped review whose
+      // EFFECTIVE labels no longer match the clip's CURRENT (editable)
+      // ground truth is STALE — the truth changed after the review, and
+      // exporting/counting it would mislabel the clip. Re-review required.
+      const truthConsistent =
+        phase18Shaped &&
+        reviewSnapshot !== null &&
+        eventSnapshot !== null &&
+        matchesCurrentGroundTruth(reviewSnapshot, eventSnapshot, {
+          eventKind: truth.eventKind,
+          productId: truth.productId ?? null,
+          sku: expectedSku,
+        });
+      const reviewEligible = phase18Shaped && truthConsistent;
+      const staleTruthReview = phase18Shaped && !truthConsistent;
       const staleReview =
         pilotReview === undefined &&
         hasOlderReviewByAsset.has(truth.videoAssetId);
@@ -1059,10 +1143,15 @@ export class OneSkuBootstrapService {
 
       // Reviewed rules (Codex P1): only Phase 18-ELIGIBLE bootstrap
       // reviews on the LATEST evidence count. The one event-less
-      // exception: a NONE clip whose analysis proposed nothing has no
-      // reviewable observation — the operator's NONE label is the record.
+      // exception: a NONE clip whose analysis COMPLETED and proposed
+      // nothing has no reviewable observation — the operator's NONE
+      // label is the record. A FAILED fusion run is NOT completed
+      // analysis (contained Codex P2): fusion persists failed runs
+      // precisely when it could not finish, so their absence of a
+      // proposal proves nothing.
       const hasAnalysis =
-        run !== undefined || job?.status === InferenceJobStatus.SUCCEEDED;
+        (run !== undefined && run.policy !== FusionPolicyResult.FAILED) ||
+        job?.status === InferenceJobStatus.SUCCEEDED;
       const missedPositiveEvent =
         !isNone &&
         job?.status === InferenceJobStatus.SUCCEEDED &&
@@ -1103,6 +1192,7 @@ export class OneSkuBootstrapService {
         missedPositiveEvent,
         reviewed,
         staleReview,
+        staleTruthReview,
         reviewDecision: event?.review?.decision ?? null,
         bootstrapReviewVerdict: pilotReview?.verdict ?? null,
         bootstrapReviewEligible: reviewEligible,
@@ -1112,7 +1202,8 @@ export class OneSkuBootstrapService {
           (event?.status === 'PENDING_REVIEW' ||
             fusion?.vlmRequiresHumanReview === true ||
             missedPositiveEvent ||
-            staleReview),
+            staleReview ||
+            staleTruthReview),
         predictedSku: fusion?.topSku ?? null,
         predictionMatchesExpected,
         fusion,
@@ -1141,6 +1232,9 @@ export class OneSkuBootstrapService {
     ).length;
     const reviewedFalseTouchExamples = includedRows.filter(
       (row) =>
+        // NONE ground truth ONLY (Codex P1): a false-touch example must
+        // BE a false touch — a mislabeled positive clip never counts.
+        row.eventKind === GroundTruthEventKind.NONE &&
         row.bootstrapReviewEligible &&
         row.bootstrapReviewVerdict === PilotObservationVerdict.FALSE_TOUCH,
     ).length;
@@ -1198,9 +1292,14 @@ export class OneSkuBootstrapService {
             }))
           : [],
       },
+      videoDetailsVisible,
       // Display-bounded (newest first) — every count/gate above was
       // computed over the FULL set, so the cap only limits what renders.
-      videos: videos.slice(0, BOOTSTRAP_MAX_CLIPS),
+      // Redacted to EMPTY (Codex P1) unless the caller clears the
+      // video-asset read boundary: the rows carry protected clip
+      // metadata, and nothing video-derived may ride out in nested
+      // objects either.
+      videos: videoDetailsVisible ? videos.slice(0, BOOTSTRAP_MAX_CLIPS) : [],
       counts: {
         totalClips: includedRows.length,
         excludedClips,

@@ -2008,6 +2008,9 @@ export interface OneSkuVideoRow {
   missedPositiveEvent: boolean;
   reviewed: boolean;
   staleReview: boolean;
+  /** Review contradicts the clip's CURRENT (edited) ground truth —
+   *  re-review required. */
+  staleTruthReview: boolean;
   reviewDecision: string | null;
   bootstrapReviewVerdict: string | null;
   bootstrapReviewEligible: boolean;
@@ -2052,6 +2055,10 @@ export interface OneSkuBootstrapReport {
       quantity: number;
     }[];
   };
+  /** false when the caller lacks video-ingest module + video-asset:read —
+   *  videos is empty and per-clip metadata is hidden; aggregate counts
+   *  and gates still work. */
+  videoDetailsVisible: boolean;
   videos: OneSkuVideoRow[];
   counts: {
     totalClips: number;
