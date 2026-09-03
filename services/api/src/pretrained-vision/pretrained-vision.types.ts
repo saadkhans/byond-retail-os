@@ -26,6 +26,18 @@ export type ProviderKind = 'CLASSICAL' | 'DETECTOR' | 'HAND' | 'EMBEDDING';
 
 export type ProviderAvailability = 'READY' | 'DISABLED' | 'UNAVAILABLE';
 
+/** Path-free description of the LOCAL runtime behind a READY provider:
+ *  an opaque registry model id, the runtime family, the weight format,
+ *  the operator's version label, and the compute device class. Never a
+ *  file name, directory, interpreter, or argv. */
+export interface ProviderRuntimeInfo {
+  modelId: string;
+  runtimeKind: string;
+  format: string;
+  version: string;
+  device: string | null;
+}
+
 export interface ProviderStatus {
   provider: PretrainedProviderCode;
   kind: ProviderKind;
@@ -36,6 +48,9 @@ export interface ProviderStatus {
   /** True when the adapter runs in the lab-only deterministic stub mode
    *  — its output is SYNTHETIC and labeled as such end to end. */
   stubMode: boolean;
+  /** Present only for a provider backed by a real local runtime;
+   *  classical and stub statuses carry null. */
+  runtime: ProviderRuntimeInfo | null;
 }
 
 // ---------------------------------------------------------- evidence
@@ -145,6 +160,46 @@ function boolOrNull(value: unknown): boolean | null {
 
 function code(value: unknown): string | null {
   return typeof value === 'string' && CODE_PATTERN.test(value) ? value : null;
+}
+
+const MODEL_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const RUNTIME_LABEL_PATTERN = /^[A-Za-z0-9._-]{1,32}$/;
+
+/**
+ * Allowlist rebuild of a runtime descriptor. ANY field failing its
+ * pattern drops the WHOLE descriptor to null — a runtime can never
+ * smuggle a path or log line into the providers listing through a
+ * "version" or "device" string.
+ */
+export function sanitizeProviderRuntime(value: unknown): ProviderRuntimeInfo | null {
+  const raw = value as Partial<ProviderRuntimeInfo> | null | undefined;
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const label = (input: unknown): string | null =>
+    typeof input === 'string' && RUNTIME_LABEL_PATTERN.test(input)
+      ? input
+      : null;
+  const modelId =
+    typeof raw.modelId === 'string' && MODEL_ID_PATTERN.test(raw.modelId)
+      ? raw.modelId
+      : null;
+  const runtimeKind = label(raw.runtimeKind);
+  const format = label(raw.format);
+  const version = label(raw.version);
+  if (modelId === null || runtimeKind === null || format === null || version === null) {
+    return null;
+  }
+  if (raw.device !== null && raw.device !== undefined && label(raw.device) === null) {
+    return null;
+  }
+  return {
+    modelId,
+    runtimeKind,
+    format,
+    version,
+    device: raw.device === null || raw.device === undefined ? null : (label(raw.device) as string),
+  };
 }
 
 function sanitizeBox(value: unknown): NormalizedBox | null {

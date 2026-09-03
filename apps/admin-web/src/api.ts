@@ -2089,12 +2089,24 @@ export interface OneSkuBootstrapReport {
 
 // ------------------------------------------------------------ Phase 19
 
+/** Path-free description of the LOCAL runtime behind a READY provider:
+ *  an opaque registry model id, runtime family, weight format, version
+ *  label, and compute device class — never a file or directory. */
+export interface PretrainedProviderRuntime {
+  modelId: string;
+  runtimeKind: string;
+  format: string;
+  version: string;
+  device: string | null;
+}
+
 export interface PretrainedProviderStatus {
   provider: string;
   kind: string;
   availability: 'READY' | 'DISABLED' | 'UNAVAILABLE';
   reasonCode: string | null;
   stubMode: boolean;
+  runtime: PretrainedProviderRuntime | null;
 }
 
 export interface PretrainedEmbeddingCandidate {

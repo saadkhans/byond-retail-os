@@ -50,6 +50,23 @@ describe('Pretrained Vision page safety', () => {
     }
   });
 
+  it('labels real local-runtime evidence as advisory and shows only an opaque model id', () => {
+    for (const label of [
+      'Detector covered more frames than classical',
+      'Hand contact observed by detector',
+      'Pretrained output is advisory until gates are approved',
+      'real local inference',
+    ]) {
+      expect(pageSource.includes(label)).toBe(true);
+    }
+    // The chip shows the registry model id — never a file, directory,
+    // interpreter, or worker location.
+    expect(pageSource).toContain('provider.runtime.modelId');
+    for (const needle of ['modelFile', 'modelRoot', 'python', '.pt', '.onnx']) {
+      expect(pageSource.includes(needle)).toBe(false);
+    }
+  });
+
   it('never renders similarity/ranking numbers as percentages', () => {
     expect(pageSource).not.toMatch(/topScore \* 100|similarity \* 100/);
   });

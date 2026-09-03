@@ -2,11 +2,15 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  Inject,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { FusionRunScope, PretrainedVisionRunStatus } from '@prisma/client';
+import type { LocalDetectorRuntimePort } from '../local-vision-runtime/local-vision-runtime.port';
+import { LOCAL_DETECTOR_RUNTIME } from '../local-vision-runtime/local-vision-runtime.tokens';
 import {
   SafeFusionSummary,
   fusionFrameDimsFor,
@@ -130,6 +134,12 @@ export class PretrainedVisionService {
     private readonly config: ConfigService,
     private readonly platformModules: PlatformModulesService,
     private readonly planograms: PlanogramService,
+    // The LOCAL detector runtime PORT (bound by local-vision-runtime).
+    // Optional: without a binding the detector slot reports
+    // UNAVAILABLE / LOCAL_RUNTIME_NOT_INSTALLED exactly as before.
+    @Optional()
+    @Inject(LOCAL_DETECTOR_RUNTIME)
+    detectorRuntime?: LocalDetectorRuntimePort,
   ) {
     const providerConfig = (
       this.config.get<string>('CV_PRETRAINED_PROVIDER') ?? 'classical'
@@ -144,14 +154,18 @@ export class PretrainedVisionService {
     // configured away.
     this.adapters = [
       new ClassicalVisionAdapter(),
-      new YoloVisionAdapter(yoloEnabled, stubMode),
+      new YoloVisionAdapter(yoloEnabled, stubMode, detectorRuntime ?? null),
       new HandSignalAdapter(handEnabled, stubMode),
       new EmbeddingRetrievalAdapter(embeddingEnabled, stubMode),
     ];
   }
 
-  providerStatuses(): ProviderStatus[] {
-    return this.adapters.map((adapter) => adapter.status());
+  async providerStatuses(): Promise<ProviderStatus[]> {
+    const statuses: ProviderStatus[] = [];
+    for (const adapter of this.adapters) {
+      statuses.push(await adapter.status());
+    }
+    return statuses;
   }
 
   /** Same boundary as the video-asset read routes (Codex precedent from
@@ -444,7 +458,7 @@ export class PretrainedVisionService {
     };
   }
 
-  private assembleReport(input: {
+  private async assembleReport(input: {
     videoAssetId: string;
     classical: SafeFusionSummary | null;
     runs: {
@@ -460,7 +474,7 @@ export class PretrainedVisionService {
       expectedAction: string;
       expectedSku: string | null;
     } | null;
-  }): PretrainedComparisonReport {
+  }): Promise<PretrainedComparisonReport> {
     const classicalAction: ActionCandidate =
       input.classical?.detectedKind === 'PICKUP'
         ? 'PICKUP'
@@ -504,6 +518,20 @@ export class PretrainedVisionService {
       reviewRequired = true;
       suggestionNotes.push('DETECTOR_CLASSICAL_ACTION_DISAGREEMENT');
     }
+    // HARD GATE (Phase 20): real (non-synthetic) pretrained evidence is
+    // advisory until confidence thresholds and gates are explicitly
+    // approved in a later phase — every such suggestion stays
+    // review-required regardless of agreement or planogram match.
+    const realPretrainedContributed = [detectorRun, handRun, embeddingRun].some(
+      (run) =>
+        run !== undefined &&
+        run.evidence.availability === 'READY' &&
+        run.evidence.synthetic === false,
+    );
+    if (realPretrainedContributed) {
+      reviewRequired = true;
+      suggestionNotes.push('PRETRAINED_GATE_NOT_APPROVED');
+    }
     if (reviewRequired) {
       suggestionNotes.push('STILL_NEEDS_REVIEW');
     }
@@ -515,6 +543,30 @@ export class PretrainedVisionService {
     );
     if (detectorRun?.evidence.detections.length) {
       improvementNotes.push('PRODUCT_DETECTED');
+    }
+    // Detection coverage: the classical baseline yields at most one
+    // selected crop frame; a detector that saw the product in at least
+    // two more sampled frames improved the evidence timeline.
+    const classicalProductFrames = input.classical?.selectedCrop ? 1 : 0;
+    const detectorProductFrames = new Set(
+      (detectorRun?.evidence.detections ?? [])
+        .filter((row) => row.label === 'PRODUCT' || row.label === 'PRODUCT_IN_HAND')
+        .map((row) => row.timestampMs),
+    ).size;
+    if (
+      detectorRun?.evidence.availability === 'READY' &&
+      detectorProductFrames >= classicalProductFrames + 2
+    ) {
+      improvementNotes.push('DETECTION_COVERAGE_IMPROVED');
+    }
+    // Hand contact is a signal the classical pipeline never produces.
+    const detectorContactMs = detectorRun?.evidence.handSignal?.contactDurationMs ?? null;
+    if (
+      detectorRun?.evidence.availability === 'READY' &&
+      detectorContactMs !== null &&
+      detectorContactMs > 0
+    ) {
+      improvementNotes.push('HAND_CONTACT_OBSERVED');
     }
     if (
       handSignal?.handPresent &&
@@ -548,7 +600,7 @@ export class PretrainedVisionService {
 
     return {
       videoAssetId: input.videoAssetId,
-      providers: this.providerStatuses(),
+      providers: await this.providerStatuses(),
       classical: input.classical
         ? {
             topSku: input.classical.topSku,
@@ -640,25 +692,31 @@ export class PretrainedVisionService {
       ctx.classical?.topSku ?? null,
     );
     const adapterContext: AdapterAnalysisContext = {
+      tenantId,
       videoAssetId,
       classical: ctx.classical,
       analysisDims: ctx.analysisDims,
       referenceSkus,
     };
-    const evidences: ProviderEvidence[] = this.adapters.map((adapter) => {
+    // Sequential on purpose: a local runtime owns the GPU/CPU for the
+    // duration of a clip, and a throwing OR rejecting adapter degrades
+    // to a classified envelope — never a raw error message.
+    const evidences: ProviderEvidence[] = [];
+    for (const adapter of this.adapters) {
       try {
-        return adapter.analyze(adapterContext);
+        evidences.push(await adapter.analyze(adapterContext));
       } catch {
-        // Never a raw error message — a classified envelope only.
-        return sanitizeProviderEvidence({
-          provider: adapter.provider,
-          availability: 'UNAVAILABLE',
-          reasonCode: 'ADAPTER_ERROR',
-          synthetic: false,
-          notes: ['ADAPTER_ERROR'],
-        });
+        evidences.push(
+          sanitizeProviderEvidence({
+            provider: adapter.provider,
+            availability: 'UNAVAILABLE',
+            reasonCode: 'ADAPTER_ERROR',
+            synthetic: false,
+            notes: ['ADAPTER_ERROR'],
+          }),
+        );
       }
-    });
+    }
 
     const visual = this.visualCandidates(
       ctx.classical,
