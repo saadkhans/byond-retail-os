@@ -14,6 +14,7 @@ import {
 } from '@prisma/client';
 import { JourneyService } from '../journey/journey.service';
 import { PilotEvaluationService } from '../pilot-evaluation/pilot-evaluation.service';
+import { PlatformModulesService } from '../platform-modules/platform-modules.service';
 import { pickupSourceId } from '../pickup-detection/pickup-detection.service';
 import { PICKUP_MIN_REFERENCE_IMAGES } from '../pickup-detection/reference-images.service';
 import { EMBEDDING_MODEL_KEY, EMBEDDING_MODEL_VERSION } from '../pickup-fusion/primitives';
@@ -61,7 +62,15 @@ import {
  * or provider error text (see safeFusionSummary's allowlist).
  */
 
-/** Deterministic per-SKU evaluation-run name — the find-or-create key.
+function prismaErrorCode(error: unknown): string | undefined {
+  return typeof error === 'object' && error !== null
+    ? String((error as { code?: unknown }).code ?? '')
+    : undefined;
+}
+
+/** Deterministic per-SKU evaluation-run name (display). The find-or-create
+ *  IDENTITY is the structured PilotEvaluationRun.bootstrapProductId field;
+ *  names only classify legacy runs created before that field existed.
  *  Successor runs (created when the previous one went terminal) carry a
  *  " (n)" suffix. */
 export function bootstrapRunName(sku: string): string {
@@ -150,8 +159,15 @@ export interface OneSkuBootstrapReport {
     embeddingsBuilt: boolean;
   };
   inventory: {
+    /** Non-sensitive readiness classification — safe for vision-only
+     *  callers. */
     stocked: boolean;
-    totalOnHand: number;
+    /** true only when the caller holds inventory:read AND the tenant has
+     *  the inventory module enabled (Codex P1): exact quantities and
+     *  location details below mirror the inventory API's own access
+     *  boundary and are redacted (null / empty) otherwise. */
+    detailsVisible: boolean;
+    totalOnHand: number | null;
     levels: {
       locationId: string;
       locationName: string;
@@ -197,6 +213,9 @@ export class OneSkuBootstrapService {
     private readonly prisma: PrismaService,
     private readonly evaluations: PilotEvaluationService,
     private readonly journeys: JourneyService,
+    // READ-ONLY: module-enablement lookup for the inventory redaction
+    // (isEnabledForTenant only — never enable/disable).
+    private readonly platformModules: PlatformModulesService,
   ) {}
 
   private async requireProduct(tenantId: string, productId: string) {
@@ -210,22 +229,45 @@ export class OneSkuBootstrapService {
     return product;
   }
 
-  /** This SKU's bootstrap-run family, newest first: the base-named run
-   *  plus any " (n)" successors (exact-SKU filtered — see
-   *  isBootstrapRunNameFor). */
-  private async bootstrapRunFamily(tenantId: string, sku: string) {
+  /** This product's bootstrap-run family, newest first: runs stamped
+   *  with the STRUCTURED bootstrapProductId identity, plus legacy rows
+   *  (created before that field existed) matched by exact run-name
+   *  family. Deliberately UN-limited (Codex P2): a `take` on a broad
+   *  prefix scan could truncate away the real open run behind other
+   *  SKUs' prefix-colliding names — the exact filters below run over
+   *  EVERY fetched row, and both ensureEvaluationRun and report resolve
+   *  the active run through this one method. */
+  private async bootstrapRunFamily(
+    tenantId: string,
+    productId: string,
+    sku: string,
+  ) {
     const rows = await this.prisma.pilotEvaluationRun.findMany({
-      where: { tenantId, name: { startsWith: bootstrapRunName(sku) } },
+      where: {
+        tenantId,
+        OR: [
+          { bootstrapProductId: productId },
+          {
+            bootstrapProductId: null,
+            name: { startsWith: bootstrapRunName(sku) },
+          },
+        ],
+      },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      take: 50,
       select: {
         id: true,
         name: true,
         status: true,
+        bootstrapProductId: true,
         _count: { select: { reviews: true } },
       },
     });
-    return rows.filter((row) => isBootstrapRunNameFor(row.name, sku));
+    return rows.filter(
+      (row) =>
+        row.bootstrapProductId === productId ||
+        (row.bootstrapProductId === null &&
+          isBootstrapRunNameFor(row.name, sku)),
+    );
   }
 
   /**
@@ -234,6 +276,13 @@ export class OneSkuBootstrapService {
    * Only an OPEN run is ever reused (Codex P2): reviews are append-only
    * on OPEN runs, so a COMPLETED/CANCELLED run is terminal history and
    * a new suffixed successor is opened instead of writing to it.
+   *
+   * Concurrency (Codex P2): creation stamps the STRUCTURED
+   * bootstrapProductId identity, and a partial unique index allows at
+   * most one OPEN bootstrap run per tenant/product — when two first
+   * corrections race, the loser's create hits the index (P2002) and
+   * re-reads the winner's run, so reviews can never split across
+   * duplicate open runs.
    */
   async ensureEvaluationRun(
     tenantId: string,
@@ -246,7 +295,11 @@ export class OneSkuBootstrapService {
     created: boolean;
   }> {
     const product = await this.requireProduct(tenantId, productId);
-    const family = await this.bootstrapRunFamily(tenantId, product.sku);
+    const family = await this.bootstrapRunFamily(
+      tenantId,
+      product.id,
+      product.sku,
+    );
     const open = family.find((run) => run.status === 'OPEN');
     if (open) {
       return {
@@ -259,23 +312,47 @@ export class OneSkuBootstrapService {
     const base = bootstrapRunName(product.sku);
     const name =
       family.length === 0 ? base : `${base} (${family.length + 1})`;
-    const created = await this.evaluations.createRun(
-      tenantId,
-      {
-        name,
-        description:
-          `Auto-created by the one-SKU bootstrap workflow for ${product.sku}. ` +
-          'Holds reviewed/corrected bootstrap clip evidence for Phase 18 ' +
-          'dataset improvement.',
-      },
-      actorId,
-    );
-    return {
-      evaluationRunId: created.evaluationRunId,
-      name: created.name,
-      status: created.status,
-      created: true,
-    };
+    try {
+      const created = await this.evaluations.createRun(
+        tenantId,
+        {
+          name,
+          description:
+            `Auto-created by the one-SKU bootstrap workflow for ${product.sku}. ` +
+            'Holds reviewed/corrected bootstrap clip evidence for Phase 18 ' +
+            'dataset improvement.',
+          bootstrapProductId: product.id,
+        },
+        actorId,
+      );
+      return {
+        evaluationRunId: created.evaluationRunId,
+        name: created.name,
+        status: created.status,
+        created: true,
+      };
+    } catch (error) {
+      if (prismaErrorCode(error) !== 'P2002') {
+        throw error;
+      }
+      // Lost the create race: another request opened this product's
+      // bootstrap run between our lookup and create — reuse it.
+      const retried = await this.bootstrapRunFamily(
+        tenantId,
+        product.id,
+        product.sku,
+      );
+      const winner = retried.find((run) => run.status === 'OPEN');
+      if (!winner) {
+        throw error;
+      }
+      return {
+        evaluationRunId: winner.id,
+        name: winner.name,
+        status: winner.status,
+        created: false,
+      };
+    }
   }
 
   /**
@@ -349,6 +426,23 @@ export class OneSkuBootstrapService {
       throw new ConflictException(
         'set the clip’s ground truth first — corrections label the ' +
           'prediction against it',
+      );
+    }
+    // Bind the clip to the ROUTE product (Codex P1): a positive
+    // (PICKUP/RETURN) clip ground-truthed for a DIFFERENT product must
+    // never enter this product's bootstrap run — Phase 18 would collect
+    // it as this product's evidence while this product's report never
+    // displays it. Rejected BEFORE any run/journey/review is created or
+    // reused. NONE (false-touch) clips carry no product by design and
+    // stay tenant-wide.
+    if (
+      truth.eventKind !== GroundTruthEventKind.NONE &&
+      truth.productId !== productId
+    ) {
+      throw new ConflictException(
+        'this clip’s ground truth belongs to a different product — ' +
+          'record the correction from THAT product’s bootstrap page so ' +
+          'the evidence lands in the right evaluation run',
       );
     }
     const run = await this.prisma.pickupFusionRun.findFirst({
@@ -545,8 +639,23 @@ export class OneSkuBootstrapService {
   async report(
     tenantId: string,
     productId: string,
+    // Fail-closed default (Codex P1): detailed stock/location data is
+    // shown only when the CALLER's inventory access is affirmatively
+    // established — omitting the viewer means redacted.
+    viewer: { hasInventoryReadPermission: boolean } = {
+      hasInventoryReadPermission: false,
+    },
   ): Promise<OneSkuBootstrapReport> {
     const product = await this.requireProduct(tenantId, productId);
+
+    // Detailed stock rows mirror the inventory API's own boundary:
+    // inventory module enabled for the tenant AND inventory:read on the
+    // caller. Readiness (stocked yes/no, the INVENTORY_STOCKED gate) is
+    // still computed server-side for everyone — hiding details must not
+    // block the bootstrap flow.
+    const inventoryDetailsVisible =
+      viewer.hasInventoryReadPermission &&
+      (await this.platformModules.isEnabledForTenant(tenantId, 'inventory'));
 
     const [referenceCount, embeddingCount, levels, runFamily] =
       await Promise.all([
@@ -565,7 +674,7 @@ export class OneSkuBootstrapService {
           },
           take: 50,
         }),
-        this.bootstrapRunFamily(tenantId, product.sku),
+        this.bootstrapRunFamily(tenantId, product.id, product.sku),
       ]);
     // Only an OPEN run is the ACTIVE linked run (Codex P2): a
     // COMPLETED/CANCELLED run is terminal history — new corrections go
@@ -1006,13 +1115,19 @@ export class OneSkuBootstrapService {
       },
       inventory: {
         stocked: totalOnHand > 0,
-        totalOnHand,
-        levels: levels.map((level) => ({
-          locationId: level.locationId,
-          locationName: level.location.name,
-          locationCode: level.location.code,
-          quantity: level.quantity,
-        })),
+        detailsVisible: inventoryDetailsVisible,
+        // Redacted (Codex P1) unless the caller clears the inventory
+        // API's own bar: no exact quantities, no location names/codes,
+        // no tenant-wide total for vision-only access.
+        totalOnHand: inventoryDetailsVisible ? totalOnHand : null,
+        levels: inventoryDetailsVisible
+          ? levels.map((level) => ({
+              locationId: level.locationId,
+              locationName: level.location.name,
+              locationCode: level.location.code,
+              quantity: level.quantity,
+            }))
+          : [],
       },
       videos,
       counts: {
@@ -1047,6 +1162,7 @@ export class OneSkuBootstrapService {
         minRequiredReferences: PICKUP_MIN_REFERENCE_IMAGES,
         embeddingCount,
         stockedQuantity: totalOnHand,
+        inventoryDetailsVisible,
         latestFusion,
         reviewedPickupExamples,
         reviewedReturnExamples,

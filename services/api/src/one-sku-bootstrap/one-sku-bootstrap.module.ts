@@ -40,17 +40,25 @@ export class OneSkuBootstrapController {
   @ApiOperation({
     summary:
       'One-SKU readiness report: reference/embedding counts, inventory ' +
-      'on hand, ground-truthed test clips with latest shadow predictions ' +
-      'and crop-quality warnings, reviewed-example counts, the linked ' +
-      'bootstrap evaluation run (the Phase 18 candidate source), common ' +
-      'failure reasons, and the dataset-improvement gate checklist ' +
-      '(guidance only — never blocks any workflow)',
+      'readiness (exact stock/location details only for callers who also ' +
+      'clear the inventory API boundary — inventory module + ' +
+      'inventory:read), ground-truthed test clips with latest shadow ' +
+      'predictions and crop-quality warnings, reviewed-example counts, ' +
+      'the linked bootstrap evaluation run (the Phase 18 candidate ' +
+      'source), common failure reasons, and the dataset-improvement gate ' +
+      'checklist (guidance only — never blocks any workflow)',
   })
   report(
     @CurrentTenantId() tenantId: string,
     @Param('productId') productId: string,
+    @CurrentUser() actor: RequestContext,
   ): Promise<OneSkuBootstrapReport> {
-    return this.bootstrap.report(tenantId, productId);
+    return this.bootstrap.report(tenantId, productId, {
+      // Same permission code the inventory controller requires for
+      // stock-level reads — the report never shows more than that
+      // route would.
+      hasInventoryReadPermission: actor.permissions.includes('inventory:read'),
+    });
   }
 
   @Post(':productId/evaluation-run')

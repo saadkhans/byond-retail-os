@@ -1165,9 +1165,17 @@ export function OneSkuBootstrapPage() {
             {data.inventory.stocked ? (
               <p>
                 <span className="badge ok">stocked</span>{' '}
-                {data.inventory.levels
-                  .map((level) => `${level.locationName} (${level.locationCode}): ${level.quantity}`)
-                  .join(' · ')}
+                {data.inventory.detailsVisible ? (
+                  data.inventory.levels
+                    .map((level) => `${level.locationName} (${level.locationCode}): ${level.quantity}`)
+                    .join(' · ')
+                ) : (
+                  <span className="muted">
+                    Inventory details hidden — inventory permission required.
+                    The readiness check above still runs server-side, so the
+                    bootstrap can continue.
+                  </span>
+                )}
               </p>
             ) : (
               <p>

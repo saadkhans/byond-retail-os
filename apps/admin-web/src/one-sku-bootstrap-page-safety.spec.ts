@@ -43,4 +43,13 @@ describe('One SKU Bootstrap page safety', () => {
   it('resets upload attestations after every successful upload', () => {
     expect(pageSource).toContain('setAttested({})');
   });
+
+  it('degrades gracefully when inventory details are redacted (no inventory:read)', () => {
+    // Stock rows render only behind the server's detailsVisible flag,
+    // and the hidden state explains itself instead of failing the page.
+    expect(pageSource).toContain('data.inventory.detailsVisible');
+    expect(pageSource).toContain(
+      'Inventory details hidden — inventory permission required',
+    );
+  });
 });

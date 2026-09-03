@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { JourneyService } from '../journey/journey.service';
 import { PilotEvaluationService } from '../pilot-evaluation/pilot-evaluation.service';
+import { PlatformModulesService } from '../platform-modules/platform-modules.service';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   OneSkuBootstrapService,
@@ -24,6 +25,7 @@ const LINKED_RUN = {
   id: 'eval-1',
   name: bootstrapRunName(PRODUCT.sku),
   status: 'OPEN',
+  bootstrapProductId: null,
   _count: { reviews: 1 },
 };
 
@@ -146,6 +148,8 @@ interface HarnessData {
   journeyEventLookups?: (Row | null)[];
   /** reviewClip's operator-crop findFirst result. */
   reviewOperatorCrop?: Row | null;
+  /** Whether the tenant has the inventory module enabled (default true). */
+  inventoryModuleEnabled?: boolean;
 }
 
 function buildHarness(data: HarnessData) {
@@ -216,12 +220,18 @@ function buildHarness(data: HarnessData) {
     create: jest.fn(async () => ({ id: 'journey-1' })),
     appendFromFusionRun: jest.fn(async () => ({})),
   };
+  const platformModules = {
+    isEnabledForTenant: jest.fn(
+      async () => data.inventoryModuleEnabled ?? true,
+    ),
+  };
   const service = new OneSkuBootstrapService(
     prisma as unknown as PrismaService,
     evaluations as unknown as PilotEvaluationService,
     journeys as unknown as JourneyService,
+    platformModules as unknown as PlatformModulesService,
   );
-  return { prisma, evaluations, journeys, service };
+  return { prisma, evaluations, journeys, platformModules, service };
 }
 
 describe('OneSkuBootstrapService.report', () => {
@@ -683,6 +693,7 @@ describe('OneSkuBootstrapService.ensureEvaluationRun', () => {
           id: 'eval-2',
           name: `${bootstrapRunName(PRODUCT.sku)} (2)`,
           status: 'OPEN',
+          bootstrapProductId: null,
           _count: { reviews: 3 },
         },
         { ...LINKED_RUN, status: 'COMPLETED' },
@@ -1065,5 +1076,246 @@ describe('OneSkuBootstrapService.reviewClip', () => {
     expect(journeys.create).not.toHaveBeenCalled();
     expect(journeys.appendFromFusionRun).not.toHaveBeenCalled();
     expect(result.journeyEventId).toBe('event-existing');
+  });
+
+  // Route-product binding (Codex P1): a positive clip ground-truthed for
+  // ANOTHER product must never become this product's bootstrap evidence.
+  it.each([['PICKUP'], ['RETURN']] as const)(
+    'rejects a %s clip whose ground truth belongs to a different product',
+    async (eventKind) => {
+      const { service, evaluations, journeys } = buildHarness({
+        ...reviewClipBase,
+        groundTruth: { eventKind, productId: 'prod-other' },
+      });
+      await expect(
+        service.reviewClip(TENANT, PRODUCT.id, 'va-1', reviewInput),
+      ).rejects.toThrow(/different product/);
+      // Nothing was created or attached: no evaluation run, no shadow
+      // journey event, no pilot review — Phase 18 can collect nothing.
+      expect(evaluations.createRun).not.toHaveBeenCalled();
+      expect(evaluations.reviewObservation).not.toHaveBeenCalled();
+      expect(journeys.create).not.toHaveBeenCalled();
+      expect(journeys.appendFromFusionRun).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects a positive clip whose ground truth carries NO product', async () => {
+    const { service, evaluations } = buildHarness({
+      ...reviewClipBase,
+      groundTruth: { eventKind: 'PICKUP', productId: null },
+    });
+    await expect(
+      service.reviewClip(TENANT, PRODUCT.id, 'va-1', reviewInput),
+    ).rejects.toThrow(ConflictException);
+    expect(evaluations.reviewObservation).not.toHaveBeenCalled();
+  });
+
+  it('still accepts a NONE (false-touch) clip with a null ground-truth product', async () => {
+    // NONE ground truth force-nulls productId — negatives stay
+    // tenant-wide by design and must not be blocked by the binding.
+    const { service, evaluations } = buildHarness({
+      ...reviewClipBase,
+      groundTruth: { eventKind: 'NONE', productId: null },
+      journeyEventLookups: [importedEvent()],
+    });
+    await service.reviewClip(TENANT, PRODUCT.id, 'va-1', {
+      verdict: 'FALSE_TOUCH' as never,
+      expectedAction: 'NO_OP' as never,
+      expectedProductId: null,
+      notes: null,
+    });
+    expect(evaluations.reviewObservation).toHaveBeenCalledWith(
+      TENANT,
+      'eval-1',
+      expect.objectContaining({ verdict: 'FALSE_TOUCH' }),
+      undefined,
+      { allowVideoShadowEvent: true },
+    );
+  });
+});
+
+describe('OneSkuBootstrapService.report — inventory redaction (Codex P1)', () => {
+  const LEVELS = [
+    {
+      locationId: 'loc-1',
+      quantity: 4,
+      location: { name: 'Main Street Store', code: 'MAIN-01' },
+    },
+  ];
+
+  it('redacts stock details for a caller without inventory:read', async () => {
+    const { service, platformModules } = buildHarness({ levels: LEVELS });
+    // Default viewer = no inventory permission (fail closed).
+    const report = await service.report(TENANT, PRODUCT.id);
+    expect(report.inventory.stocked).toBe(true);
+    expect(report.inventory.detailsVisible).toBe(false);
+    expect(report.inventory.totalOnHand).toBeNull();
+    expect(report.inventory.levels).toEqual([]);
+    // Without the permission the module lookup is not even consulted.
+    expect(platformModules.isEnabledForTenant).not.toHaveBeenCalled();
+    // No location name/code or exact quantity anywhere in the response.
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain('Main Street Store');
+    expect(serialized).not.toContain('MAIN-01');
+    // The readiness gate still works — classification only, no number.
+    const gate = report.gates.items.find(
+      (item) => item.key === 'INVENTORY_STOCKED',
+    );
+    expect(gate?.satisfied).toBe(true);
+    expect(gate?.detail).toBe(
+      'stocked (details hidden — inventory permission required)',
+    );
+  });
+
+  it('shows stock details when the caller has inventory:read AND the module', async () => {
+    const { service, platformModules } = buildHarness({ levels: LEVELS });
+    const report = await service.report(TENANT, PRODUCT.id, {
+      hasInventoryReadPermission: true,
+    });
+    expect(platformModules.isEnabledForTenant).toHaveBeenCalledWith(
+      TENANT,
+      'inventory',
+    );
+    expect(report.inventory.detailsVisible).toBe(true);
+    expect(report.inventory.totalOnHand).toBe(4);
+    expect(report.inventory.levels).toEqual([
+      {
+        locationId: 'loc-1',
+        locationName: 'Main Street Store',
+        locationCode: 'MAIN-01',
+        quantity: 4,
+      },
+    ]);
+    expect(
+      report.gates.items.find((item) => item.key === 'INVENTORY_STOCKED')
+        ?.detail,
+    ).toBe('4 on hand across stores');
+  });
+
+  it('redacts when the tenant does NOT have the inventory module enabled', async () => {
+    const { service } = buildHarness({
+      levels: LEVELS,
+      inventoryModuleEnabled: false,
+    });
+    const report = await service.report(TENANT, PRODUCT.id, {
+      hasInventoryReadPermission: true,
+    });
+    expect(report.inventory.detailsVisible).toBe(false);
+    expect(report.inventory.totalOnHand).toBeNull();
+    expect(report.inventory.levels).toEqual([]);
+  });
+
+  it('keeps the not-stocked classification honest for a redacted caller', async () => {
+    const { service } = buildHarness({ levels: [] });
+    const report = await service.report(TENANT, PRODUCT.id);
+    expect(report.inventory.stocked).toBe(false);
+    expect(
+      report.gates.items.find((item) => item.key === 'INVENTORY_STOCKED')
+        ?.detail,
+    ).toBe('not stocked');
+  });
+});
+
+describe('OneSkuBootstrapService.ensureEvaluationRun — race and prefix safety (Codex P2)', () => {
+  it('stamps the structured bootstrap identity on creation', async () => {
+    const { service, evaluations } = buildHarness({});
+    await service.ensureEvaluationRun(TENANT, PRODUCT.id, 'user-1');
+    expect(evaluations.createRun).toHaveBeenCalledWith(
+      TENANT,
+      expect.objectContaining({
+        name: bootstrapRunName(PRODUCT.sku),
+        bootstrapProductId: PRODUCT.id,
+      }),
+      'user-1',
+    );
+  });
+
+  it('resolves a concurrent-create loss (P2002) to the winner run', async () => {
+    const { service, evaluations, prisma } = buildHarness({});
+    // First family lookup: empty. The create then loses the race on the
+    // one-open-bootstrap-run-per-product partial unique index; the
+    // re-read sees the winner.
+    (evaluations.createRun as jest.Mock).mockRejectedValueOnce({
+      code: 'P2002',
+    });
+    (prisma.pilotEvaluationRun.findMany as jest.Mock)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        {
+          id: 'eval-winner',
+          name: bootstrapRunName(PRODUCT.sku),
+          status: 'OPEN',
+          bootstrapProductId: PRODUCT.id,
+          _count: { reviews: 1 },
+        },
+      ]);
+    const result = await service.ensureEvaluationRun(TENANT, PRODUCT.id);
+    expect(result).toEqual({
+      evaluationRunId: 'eval-winner',
+      name: bootstrapRunName(PRODUCT.sku),
+      status: 'OPEN',
+      created: false,
+    });
+  });
+
+  it('rethrows non-unique-violation createRun errors unchanged', async () => {
+    const { service, evaluations } = buildHarness({});
+    (evaluations.createRun as jest.Mock).mockRejectedValueOnce(
+      new Error('db down'),
+    );
+    await expect(
+      service.ensureEvaluationRun(TENANT, PRODUCT.id),
+    ).rejects.toThrow('db down');
+  });
+
+  it('finds the exact-family open run among 60+ prefix-colliding runs (no pre-limit)', async () => {
+    // 60 OPEN runs for LONGER SKUs sharing this SKU's prefix would have
+    // overflowed the old take-50 window and hidden the real run.
+    const noise = Array.from({ length: 60 }, (_, i) => ({
+      id: `noise-${i}`,
+      name: bootstrapRunName(`${PRODUCT.sku}-${i}`),
+      status: 'OPEN',
+      bootstrapProductId: null,
+      _count: { reviews: 0 },
+    }));
+    const real = {
+      id: 'eval-real',
+      name: bootstrapRunName(PRODUCT.sku),
+      status: 'OPEN',
+      bootstrapProductId: null,
+      _count: { reviews: 2 },
+    };
+    const { service, evaluations, prisma } = buildHarness({
+      evaluationRuns: [...noise, real],
+    });
+    const ensured = await service.ensureEvaluationRun(TENANT, PRODUCT.id);
+    expect(ensured.evaluationRunId).toBe('eval-real');
+    expect(evaluations.createRun).not.toHaveBeenCalled();
+    // The family query must not truncate before the exact filter runs.
+    expect(prisma.pilotEvaluationRun.findMany).toHaveBeenCalledWith(
+      expect.not.objectContaining({ take: expect.anything() }),
+    );
+    // ...and the report resolves the SAME run through the same lookup.
+    const report = await service.report(TENANT, PRODUCT.id);
+    expect(report.linkedEvaluationRun?.evaluationRunId).toBe('eval-real');
+  });
+
+  it('never adopts another product\'s structured-identity run, even with a matching name', async () => {
+    const { service, evaluations } = buildHarness({
+      evaluationRuns: [
+        {
+          id: 'eval-foreign',
+          // Name collides (e.g. the SKU was renamed) but the structured
+          // identity says this run bootstraps a DIFFERENT product.
+          name: bootstrapRunName(PRODUCT.sku),
+          status: 'OPEN',
+          bootstrapProductId: 'prod-other',
+          _count: { reviews: 5 },
+        },
+      ],
+    });
+    const ensured = await service.ensureEvaluationRun(TENANT, PRODUCT.id);
+    expect(ensured.evaluationRunId).not.toBe('eval-foreign');
+    expect(evaluations.createRun).toHaveBeenCalled();
   });
 });

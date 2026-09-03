@@ -2040,7 +2040,11 @@ export interface OneSkuBootstrapReport {
   };
   inventory: {
     stocked: boolean;
-    totalOnHand: number;
+    /** false when the caller lacks inventory module + inventory:read —
+     *  totalOnHand is null and levels is empty; the page shows the
+     *  readiness classification only. */
+    detailsVisible: boolean;
+    totalOnHand: number | null;
     levels: {
       locationId: string;
       locationName: string;

@@ -85,7 +85,16 @@ export class PilotEvaluationService {
 
   async createRun(
     tenantId: string,
-    input: { name: string; description?: string | null; locationId?: string | null },
+    input: {
+      name: string;
+      description?: string | null;
+      locationId?: string | null;
+      /** One-SKU bootstrap identity — set ONLY by the bootstrap
+       *  workflow's find-or-create; a partial unique index allows at
+       *  most one OPEN bootstrap run per tenant/product. Not exposed on
+       *  the HTTP create route. */
+      bootstrapProductId?: string | null;
+    },
     actorId?: string,
   ) {
     if (input.locationId) {
@@ -97,12 +106,22 @@ export class PilotEvaluationService {
         throw new NotFoundException('Store not found');
       }
     }
+    if (input.bootstrapProductId) {
+      const product = await this.prisma.product.findFirst({
+        where: { tenantId, id: input.bootstrapProductId },
+        select: { id: true },
+      });
+      if (!product) {
+        throw new NotFoundException('Product not found');
+      }
+    }
     const run = await this.prisma.pilotEvaluationRun.create({
       data: {
         tenantId,
         name: input.name,
         description: input.description ?? null,
         locationId: input.locationId ?? null,
+        bootstrapProductId: input.bootstrapProductId ?? null,
         createdById: actorId ?? null,
       },
     });

@@ -112,6 +112,7 @@ describe('one-sku-bootstrap module shadow mode', () => {
       'journey',
       'prisma',
       'pickup-detection', // pickupSourceId + PICKUP_MIN_REFERENCE_IMAGES (read-only helpers)
+      'platform-modules', // isEnabledForTenant only — read-only gate for inventory redaction
     ]);
     for (const file of sourceFiles(root)) {
       const source = readFileSync(file, 'utf8');

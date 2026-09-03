@@ -435,6 +435,7 @@ describe('evaluateGates', () => {
     minRequiredReferences: 5,
     embeddingCount: 9,
     stockedQuantity: 12,
+    inventoryDetailsVisible: true,
     latestFusion: healthyFusion,
     reviewedPickupExamples: 5,
     reviewedReturnExamples: 5,
@@ -449,6 +450,32 @@ describe('evaluateGates', () => {
     expect(gates.items.every((item) => !item.required || item.satisfied)).toBe(
       true,
     );
+  });
+
+  it('INVENTORY_STOCKED still evaluates for a redacted caller — without the exact number', () => {
+    const redacted = evaluateGates({
+      ...healthy,
+      inventoryDetailsVisible: false,
+    });
+    const gate = redacted.items.find(
+      (item) => item.key === 'INVENTORY_STOCKED',
+    );
+    expect(gate?.satisfied).toBe(true);
+    expect(gate?.detail).toBe(
+      'stocked (details hidden — inventory permission required)',
+    );
+    expect(gate?.detail).not.toContain('12');
+    // Hiding details never blocks the bootstrap flow.
+    expect(redacted.readyForDatasetImprovement).toBe(true);
+    const notStocked = evaluateGates({
+      ...healthy,
+      inventoryDetailsVisible: false,
+      stockedQuantity: 0,
+    });
+    expect(
+      notStocked.items.find((item) => item.key === 'INVENTORY_STOCKED')
+        ?.detail,
+    ).toBe('not stocked');
   });
 
   it('treats the 8-image recommendation as advisory only', () => {

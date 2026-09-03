@@ -540,6 +540,10 @@ export interface GateInput {
   minRequiredReferences: number;
   embeddingCount: number;
   stockedQuantity: number;
+  /** Whether the CALLER may see exact stock numbers (inventory module +
+   *  inventory:read). The gate still evaluates on the real quantity —
+   *  only the human-readable detail is redacted when false. */
+  inventoryDetailsVisible: boolean;
   latestFusion: SafeFusionSummary | null;
   reviewedPickupExamples: number;
   reviewedReturnExamples: number;
@@ -586,7 +590,13 @@ export function evaluateGates(input: GateInput): {
       label: 'SKU stocked in at least one store (quantity > 0)',
       satisfied: input.stockedQuantity > 0,
       required: true,
-      detail: `${input.stockedQuantity} on hand across stores`,
+      // Exact on-hand numbers follow the inventory API's access
+      // boundary — a vision-only caller sees only the classification.
+      detail: input.inventoryDetailsVisible
+        ? `${input.stockedQuantity} on hand across stores`
+        : input.stockedQuantity > 0
+          ? 'stocked (details hidden — inventory permission required)'
+          : 'not stocked',
     },
     {
       key: 'CLEAN_CROP',
