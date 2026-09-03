@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   NotFoundException,
 } from '@nestjs/common';
 import { JourneyService } from '../journey/journey.service';
@@ -1624,6 +1625,7 @@ describe('OneSkuBootstrapService.report — inventory redaction (Codex P1)', () 
     const { service, platformModules } = buildHarness({ levels: LEVELS });
     const report = await service.report(TENANT, PRODUCT.id, {
       hasInventoryReadPermission: true,
+      hasVideoAssetReadPermission: true,
     });
     expect(platformModules.isEnabledForTenant).toHaveBeenCalledWith(
       TENANT,
@@ -1652,6 +1654,7 @@ describe('OneSkuBootstrapService.report — inventory redaction (Codex P1)', () 
     });
     const report = await service.report(TENANT, PRODUCT.id, {
       hasInventoryReadPermission: true,
+      hasVideoAssetReadPermission: true,
     });
     expect(report.inventory.detailsVisible).toBe(false);
     expect(report.inventory.totalOnHand).toBeNull();
@@ -1780,6 +1783,7 @@ describe('OneSkuBootstrapService.report — full-set aggregation (Codex P2)', ()
     const { service, prisma } = buildHarness({ levels: [], totalOnHand: 7 });
     const report = await service.report(TENANT, PRODUCT.id, {
       hasInventoryReadPermission: true,
+      hasVideoAssetReadPermission: true,
     });
     expect(report.inventory.stocked).toBe(true);
     expect(report.inventory.totalOnHand).toBe(7);
@@ -1993,34 +1997,24 @@ describe('OneSkuBootstrapService.report — video-asset read boundary (Codex P1)
     pilotReviews: [pilotReview()],
   };
 
-  it('redacts every video-derived detail for a caller without video-asset:read', async () => {
+  it('refuses the report outright for a caller without video-asset:read', async () => {
+    // The report is video-derived END TO END (clip rows, fusion
+    // summaries, crop gates, even the clip counts) — the whole route
+    // sits behind the video boundary; no partial disclosure exists.
     const { service } = buildHarness(clipFixtures);
-    const report = await service.report(TENANT, PRODUCT.id); // default viewer
-    expect(report.videoDetailsVisible).toBe(false);
-    expect(report.videos).toEqual([]);
-    // Aggregate readiness still works.
-    expect(report.counts.totalClips).toBe(1);
-    expect(report.counts.reviewedPickupExamples).toBe(1);
-    expect(report.gates.items.length).toBeGreaterThan(0);
-    // No filename, timestamp, crop geometry, or artifact id anywhere —
-    // including nested objects.
-    const serialized = JSON.stringify(report);
-    expect(serialized).not.toContain('clip.mp4');
-    expect(serialized).not.toContain('artifact-auto-1');
-    expect(serialized).not.toContain('durationMs');
-    expect(serialized).not.toContain('actualTimestampMs');
-    expect(serialized).not.toContain('cropWarnings');
-    expect(serialized).not.toContain('va-1');
+    await expect(service.report(TENANT, PRODUCT.id)).rejects.toThrow(
+      ForbiddenException,
+    );
   });
 
-  it('redacts video details when the tenant lacks the video-ingest module', async () => {
+  it('refuses the report when the tenant lacks the video-ingest module', async () => {
     const { service } = buildHarness({
       ...clipFixtures,
       videoIngestModuleEnabled: false,
     });
-    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
-    expect(report.videoDetailsVisible).toBe(false);
-    expect(report.videos).toEqual([]);
+    await expect(
+      service.report(TENANT, PRODUCT.id, CLIP_VIEWER),
+    ).rejects.toThrow(ForbiddenException);
   });
 
   it('returns full clip rows for video-asset:read + video-ingest module', async () => {
@@ -2117,6 +2111,57 @@ describe('OneSkuBootstrapService.report — no-proposal NO_OP evidence (Codex P1
     ).toBe(true);
   });
 
+  it('a no-proposal negative never displaces the CLEAN_CROP evidence (latest fusion)', async () => {
+    // Newest run is a no-proposal true negative; an OLDER positive clip
+    // carries the real product crop — the gate must score the positive.
+    const negative = noProposalClip(1);
+    negative.run.createdAt = new Date('2026-08-24T14:00:00Z');
+    const { service } = buildHarness({
+      evaluationRun: LINKED_RUN,
+      truths: [negative.truth, truthRow()],
+      runs: [
+        negative.run,
+        fusionRun({ createdAt: new Date('2026-08-24T10:00:00Z') }),
+      ],
+      importedEvents: [negative.event, importedEvent()],
+      pilotReviews: [negative.review, pilotReview()],
+    });
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
+    // The latest summary reflects the POSITIVE evidence...
+    expect(report.latest?.predictedSku).toBe(PRODUCT.sku);
+    // ...and CLEAN_CROP passes on the positive clip's clean crop instead
+    // of failing on the negative's (correctly) absent product frame.
+    expect(
+      report.gates.items.find((item) => item.key === 'CLEAN_CROP')?.satisfied,
+    ).toBe(true);
+  });
+
+  it('never auto-reviews a NONE clip on a v1 detection job alone (no completed fusion)', async () => {
+    const { service } = buildHarness({
+      evaluationRun: LINKED_RUN,
+      truths: [
+        truthRow({
+          videoAssetId: 'va-none-job',
+          eventKind: 'NONE',
+          productId: null,
+          product: null,
+        }),
+      ],
+      // Detection succeeded, but no fusion run exists — fusion never
+      // completed, so the absence of an event proves nothing.
+      jobs: [
+        {
+          sourceId: 'pickup:va-none-job',
+          status: 'SUCCEEDED',
+          visionEventId: null,
+        },
+      ],
+    });
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
+    expect(report.videos[0].reviewed).toBe(false);
+    expect(report.counts.unreviewedClips).toBe(1);
+  });
+
   it('an UNREVIEWED no-proposal NONE clip is auto-reviewed but never counts as an example', async () => {
     const clip = noProposalClip(1);
     const { service } = buildHarness({
@@ -2142,30 +2187,15 @@ describe('OneSkuBootstrapService.report — full video-boundary redaction (Codex
     pilotReviews: [pilotReview()],
   };
 
-  it('redacts the latest fusion summary, failure reasons, and crop gate detail', async () => {
-    const { service } = buildHarness(fixtures);
-    const report = await service.report(TENANT, PRODUCT.id); // no video access
-    expect(report.videoDetailsVisible).toBe(false);
-    // Fusion-derived fields leave through ONE central gate: all hidden.
-    expect(report.latest).toBeNull();
-    expect(report.failureReasons).toEqual([]);
-    const cropGate = report.gates.items.find(
-      (item) => item.key === 'CLEAN_CROP',
+  it('never serves ANY response body without video access (no partial redaction to leak from)', async () => {
+    const { service, prisma } = buildHarness(fixtures);
+    await expect(service.report(TENANT, PRODUCT.id)).rejects.toThrow(
+      /video-ingest module and video-asset:read/,
     );
-    expect(cropGate?.detail).toBe(
-      'details hidden — video asset permission required',
-    );
-    // Aggregate readiness still present (booleans and counts only).
-    expect(typeof cropGate?.satisfied).toBe('boolean');
-    expect(report.counts.reviewedPickupExamples).toBe(1);
-    // Nothing fusion-derived anywhere in the serialized response.
-    const serialized = JSON.stringify(report);
-    expect(serialized).not.toContain('AUTO_PROPOSE');
-    expect(serialized).not.toContain('artifact-auto-1');
-    expect(serialized).not.toContain('fusion-1');
-    expect(serialized).not.toContain('2026-08-24T10:00:00');
-    expect(serialized).not.toContain('topScore');
-    expect(serialized).not.toContain('clip.mp4');
+    // The gate fires BEFORE any evidence is even read — nothing
+    // video-derived is fetched for an unauthorized caller.
+    expect(prisma.videoGroundTruth.findMany).not.toHaveBeenCalled();
+    expect(prisma.pickupFusionRun.findMany).not.toHaveBeenCalled();
   });
 
   it('returns latest summary and failure reasons to an authorized viewer', async () => {

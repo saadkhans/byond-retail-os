@@ -88,6 +88,9 @@ function buildHarness(
     /** CURRENT VideoGroundTruth rows keyed by the observations'
      *  videoAssetId — the ground-truth drift guard reads these. */
     groundTruths?: Record<string, unknown>[];
+    /** Video assets that were soft-deleted (everything else referenced
+     *  by observations counts as live). */
+    deletedVideoAssetIds?: string[];
     missedEvents?: Record<string, unknown>[];
     summary?: Record<string, unknown> | null;
     scenarios?: Record<string, unknown>[];
@@ -305,6 +308,15 @@ function buildHarness(
     },
     videoGroundTruth: {
       findMany: jest.fn(async () => options.groundTruths ?? []),
+    },
+    videoAsset: {
+      // Live (non-deleted) assets among the requested ids.
+      findMany: jest.fn(
+        async (args: { where: { id: { in: string[] } } }) =>
+          args.where.id.in
+            .filter((id) => !(options.deletedVideoAssetIds ?? []).includes(id))
+            .map((id) => ({ id })),
+      ),
     },
     $queryRaw: jest.fn(async () => []),
   };
@@ -2764,5 +2776,55 @@ describe('CvDatasetService — no-proposal (REVIEW_REQUIRED) NO_OP candidates', 
       eligibility: 'EXCLUDED',
       exclusionReason: 'STALE_GROUND_TRUTH',
     });
+  });
+});
+
+describe('CvDatasetService — deleted source media (Codex P1)', () => {
+  const videoObservation = () =>
+    observation({
+      journeyEventId: 'evt-video-del',
+      liveSessionId: null,
+      videoAssetId: 'va-gone',
+      latestReview: review({ reviewId: 'rev-del', verdict: 'CORRECT' }),
+    });
+  const liveTruth = {
+    videoAssetId: 'va-gone',
+    eventKind: 'PICKUP',
+    productId: 'prod-a',
+    product: { sku: 'SKU-A' },
+  };
+
+  it('excludes a reviewed candidate whose source clip was deleted', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [videoObservation()],
+      groundTruths: [liveTruth],
+      deletedVideoAssetIds: ['va-gone'],
+    });
+    const created = await service.createRun(TENANT, {
+      ...BASE_INPUT,
+      sourceEvaluationRunId: 'eval-1',
+    } as never);
+    await service.refreshCandidates(TENANT, created.id);
+    expect(
+      candidates.find((row) => row.sourceId === 'evt-video-del'),
+    ).toMatchObject({
+      eligibility: 'EXCLUDED',
+      exclusionReason: 'SOURCE_MEDIA_DELETED',
+    });
+  });
+
+  it('keeps the candidate ELIGIBLE while the source clip is live', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [videoObservation()],
+      groundTruths: [liveTruth],
+    });
+    const created = await service.createRun(TENANT, {
+      ...BASE_INPUT,
+      sourceEvaluationRunId: 'eval-1',
+    } as never);
+    await service.refreshCandidates(TENANT, created.id);
+    expect(
+      candidates.find((row) => row.sourceId === 'evt-video-del'),
+    ).toMatchObject({ eligibility: 'ELIGIBLE' });
   });
 });

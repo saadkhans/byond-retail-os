@@ -29,6 +29,8 @@ function buildHarness(
     journeyEvents?: Record<string, unknown>[];
     products?: { id: string; tenantId: string; sku: string }[];
     videoArtifacts?: Record<string, unknown>[];
+    /** Whether the tenant has the video-ingest module (default true). */
+    videoIngestModuleEnabled?: boolean;
   } = {},
 ) {
   let seq = 0;
@@ -255,8 +257,18 @@ function buildHarness(
   };
   /* eslint-enable @typescript-eslint/no-explicit-any */
 
-  const service = new PilotEvaluationService(prisma as never);
-  return { service, prisma, runs, sessions, reviews };
+  const platformModules = {
+    isEnabledForTenant: jest.fn(async (_tenant: string, moduleCode: string) =>
+      moduleCode === 'video-ingest'
+        ? (options.videoIngestModuleEnabled ?? true)
+        : true,
+    ),
+  };
+  const service = new PilotEvaluationService(
+    prisma as never,
+    platformModules as never,
+  );
+  return { service, prisma, runs, sessions, reviews, platformModules };
 }
 
 const LIVE_SESSIONS = [
@@ -1083,5 +1095,85 @@ describe('PilotEvaluationService — no-proposal (REVIEW_REQUIRED) true negative
     // as action-wrong would misstate the pilot.
     expect(summary.totals.falseTouch).toBe(0);
     expect(summary.totals.reviewed).toBe(0);
+  });
+});
+
+describe('PilotEvaluationService — observations video-asset boundary (Codex P1)', () => {
+  const VIDEO_EVENT = {
+    id: 'event-video-1',
+    tenantId: TENANT,
+    journeyId: 'journey-video',
+    eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+    occurredAt: new Date('2026-08-20T10:00:00.000Z'),
+    productId: 'prod-a',
+    sku: 'SKU-A',
+    productName: 'Product A',
+    matchScore: 0.35,
+    sourceType: 'FUSION_SHADOW',
+    videoAssetId: 'va-1',
+  };
+
+  async function reviewedVideoRun(harness: ReturnType<typeof buildHarness>) {
+    const run = await harness.service.createRun(
+      TENANT,
+      { name: 'One SKU bootstrap — SKU-A' },
+      'user-1',
+    );
+    await harness.service.reviewObservation(
+      TENANT,
+      run.evaluationRunId,
+      {
+        verdict: PilotObservationVerdict.CORRECT,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: 'event-video-1',
+      },
+      'user-1',
+      { allowVideoShadowEvent: true },
+    );
+    return run.evaluationRunId;
+  }
+
+  it('hides video-backed observations from a viewer without video-asset:read', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+    });
+    const runId = await reviewedVideoRun(harness);
+    const denied = await harness.service.observations(TENANT, runId, {
+      hasVideoAssetReadPermission: false,
+    });
+    // No asset ids, timestamps, scores, or crop artifact ids leak
+    // through the generic observations route.
+    expect(denied.observations).toHaveLength(0);
+    expect(JSON.stringify(denied)).not.toContain('va-1');
+  });
+
+  it('hides video-backed observations when the tenant lacks video-ingest', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+      videoIngestModuleEnabled: false,
+    });
+    const runId = await reviewedVideoRun(harness);
+    const denied = await harness.service.observations(TENANT, runId, {
+      hasVideoAssetReadPermission: true,
+    });
+    expect(denied.observations).toHaveLength(0);
+  });
+
+  it('returns video-backed observations to an authorized viewer and to INTERNAL callers', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+    });
+    const runId = await reviewedVideoRun(harness);
+    const authorized = await harness.service.observations(TENANT, runId, {
+      hasVideoAssetReadPermission: true,
+    });
+    expect(authorized.observations).toHaveLength(1);
+    // Internal callers (summary / dataset export / Phase 18 candidate
+    // refresh) omit the viewer and keep the full evidence set.
+    const internal = await harness.service.observations(TENANT, runId);
+    expect(internal.observations).toHaveLength(1);
   });
 });

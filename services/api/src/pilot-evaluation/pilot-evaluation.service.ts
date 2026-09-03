@@ -11,6 +11,7 @@ import {
   PilotObservationVerdict,
   Prisma,
 } from '@prisma/client';
+import { PlatformModulesService } from '../platform-modules/platform-modules.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { containsSensitiveFreeText } from '../video-ingest/media-safety';
 
@@ -81,7 +82,12 @@ export interface SessionLatency {
 
 @Injectable()
 export class PilotEvaluationService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // READ-ONLY module-enablement lookup for the video-observation
+    // boundary on the HTTP observations route (isEnabledForTenant only).
+    private readonly platformModules: PlatformModulesService,
+  ) {}
 
   async createRun(
     tenantId: string,
@@ -293,8 +299,29 @@ export class PilotEvaluationService {
    * Live CV observations of the run's attached sessions, each with its
    * LATEST pilot review (older reviews remain as audit history).
    */
-  async observations(tenantId: string, evaluationRunId: string) {
+  async observations(
+    tenantId: string,
+    evaluationRunId: string,
+    // HTTP callers pass their video-boundary context; INTERNAL callers
+    // (summary, dataset export, Phase 18 candidate refresh — service
+    // code that never echoes raw observation rows to a client) omit it
+    // and receive the full set.
+    viewer?: { hasVideoAssetReadPermission: boolean },
+  ) {
     await this.requireRun(tenantId, evaluationRunId);
+    // Video-backed (FUSION_SHADOW bootstrap) observations expose video
+    // asset ids, timestamps, scores, and crop artifact ids — the same
+    // metadata the video-asset routes guard behind the video-ingest
+    // module + video-asset:read (Codex P1: this generic route must not
+    // be a side door around the bootstrap report's boundary). A viewer
+    // without that access sees LIVE observations only.
+    const includeVideoObservations =
+      viewer === undefined ||
+      (viewer.hasVideoAssetReadPermission === true &&
+        (await this.platformModules.isEnabledForTenant(
+          tenantId,
+          'video-ingest',
+        )));
     const sessions = await this.attachedSessions(tenantId, evaluationRunId);
     const journeyIds = sessions
       .map((row) => row.journeyId)
@@ -330,7 +357,7 @@ export class PilotEvaluationService {
             },
           ]
         : []),
-      ...(reviewedEventIds.length
+      ...(reviewedEventIds.length && includeVideoObservations
         ? [
             {
               id: { in: reviewedEventIds },

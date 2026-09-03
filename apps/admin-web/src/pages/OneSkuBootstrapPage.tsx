@@ -275,6 +275,13 @@ function BootstrapGroundTruthForm({
     [assetId, reload],
   );
   useEffect(() => {
+    // A FAILED load is NOT "no truth saved" (Codex P1): leave the form
+    // alone and keep saving disabled below — resetting to defaults here
+    // would let an operator overwrite a real annotation with PICKUP
+    // defaults after a transient API error.
+    if (existing.error) {
+      return;
+    }
     const truth = existing.data;
     if (truth) {
       setKind(truth.eventKind);
@@ -295,7 +302,12 @@ function BootstrapGroundTruthForm({
     }
     setFieldErrors({});
     setApiErrorText(null);
-  }, [existing.data?.videoAssetId, existing.data?.updatedAt, existing.data]);
+  }, [
+    existing.data?.videoAssetId,
+    existing.data?.updatedAt,
+    existing.data,
+    existing.error,
+  ]);
 
   async function save(event: FormEvent) {
     event.preventDefault();
@@ -333,8 +345,14 @@ function BootstrapGroundTruthForm({
     <div>
       <h3 style={{ margin: '0 0 0.25rem' }}>Ground truth (what really happens)</h3>
       {apiErrorText ? <div className="error">{apiErrorText}</div> : null}
+      {existing.error ? (
+        <div className="error">
+          Could not load this clip’s ground truth — saving is disabled so a
+          real annotation cannot be overwritten. ({existing.error})
+        </div>
+      ) : null}
       {notice ? <p className="muted">✓ {notice}</p> : null}
-      {!existing.loading && !existing.data ? (
+      {!existing.loading && !existing.error && !existing.data ? (
         <p className="muted">No ground truth saved for this clip yet.</p>
       ) : null}
       <form className="toolbar" style={{ flexWrap: 'wrap', alignItems: 'flex-start' }} onSubmit={(e) => void save(e)}>
@@ -383,9 +401,10 @@ function BootstrapGroundTruthForm({
         <button
           className="primary"
           type="submit"
-          // Disabled while THIS clip's truth is still loading — a submit
-          // mid-transition must never persist another clip's values.
-          disabled={saving || existing.loading}
+          // Disabled while THIS clip's truth is loading OR failed to
+          // load — a submit mid-transition or over an unknown existing
+          // annotation must never persist wrong values.
+          disabled={saving || existing.loading || existing.error !== null}
         >
           {saving
             ? 'Saving…'

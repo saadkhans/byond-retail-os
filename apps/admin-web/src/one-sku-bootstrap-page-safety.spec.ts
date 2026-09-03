@@ -78,8 +78,12 @@ describe('One SKU Bootstrap page safety', () => {
       /<BootstrapGroundTruthForm\s+key=\{selectedAssetId\}/,
     );
     expect(pageSource).toContain('No ground truth saved for this clip yet');
-    // Submit is held while THIS clip's truth is still loading.
-    expect(pageSource).toContain('disabled={saving || existing.loading}');
+    // Submit is held while THIS clip's truth is loading or failed to
+    // load — never persisting values over an unknown annotation.
+    expect(pageSource).toContain(
+      'disabled={saving || existing.loading || existing.error !== null}',
+    );
+    expect(pageSource).toContain('Could not load this clip’s ground truth');
   });
 
   it('hides the fusion summary lines when video details are redacted', () => {

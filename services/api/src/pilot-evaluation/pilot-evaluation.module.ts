@@ -104,10 +104,21 @@ export class PilotEvaluationController {
   @ApiOperation({
     summary:
       'Live CV observations of the attached sessions, each with its ' +
-      'latest pilot review (older reviews remain as audit history)',
+      'latest pilot review (older reviews remain as audit history). ' +
+      'Video-backed bootstrap observations appear only for callers with ' +
+      'the video-ingest module and video-asset:read.',
   })
-  observations(@CurrentTenantId() tenantId: string, @Param('id') id: string) {
-    return this.evaluations.observations(tenantId, id);
+  observations(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @CurrentUser() actor: RequestContext,
+  ) {
+    return this.evaluations.observations(tenantId, id, {
+      // Same boundary the video-asset read routes enforce — video-backed
+      // observations carry asset ids/timestamps/crop artifact ids.
+      hasVideoAssetReadPermission:
+        actor.permissions.includes('video-asset:read'),
+    });
   }
 
   @Post(':id/reviews')

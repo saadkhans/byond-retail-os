@@ -1122,6 +1122,26 @@ export class CvDatasetService {
       const truthByAsset = new Map(
         truthRows.map((row) => [row.videoAssetId, row]),
       );
+      // Deleted source media (Codex P1): the asset delete flow removes
+      // the footage and soft-deletes the row while keeping ground-truth
+      // and shadow-event rows for audit — a candidate whose clip no
+      // longer exists must never stay ELIGIBLE or export a manifest
+      // reference to footage that is gone. Export freshness recomputes
+      // these seeds, so a post-refresh deletion also blocks the export.
+      const liveVideoAssetIds = new Set(
+        truthAssetIds.length
+          ? (
+              await this.prisma.videoAsset.findMany({
+                where: {
+                  tenantId,
+                  id: { in: truthAssetIds },
+                  deletedAt: null,
+                },
+                select: { id: true },
+              })
+            ).map((row) => row.id)
+          : [],
+      );
       for (const observation of observations) {
         const predictedAction = predictedActionOf(observation.eventType);
         const review = observation.latestReview;
@@ -1190,6 +1210,18 @@ export class CvDatasetService {
           eligibility: CvDatasetEligibility.EXCLUDED,
           exclusionReason,
         });
+        // A video-backed observation whose source clip was deleted has
+        // no footage an offline trainer could resolve — EXCLUDED, and a
+        // stored ELIGIBLE row goes stale against this recomputed seed.
+        if (
+          observation.videoAssetId &&
+          !liveVideoAssetIds.has(observation.videoAssetId)
+        ) {
+          seeds.push(
+            excluded(review?.verdict ?? 'UNREVIEWED', 'SOURCE_MEDIA_DELETED'),
+          );
+          continue;
+        }
         if (!review) {
           seeds.push(excluded('UNREVIEWED', 'NOT_REVIEWED'));
           continue;

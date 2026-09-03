@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -801,6 +802,20 @@ export class OneSkuBootstrapService {
     const videoDetailsVisible =
       viewer.hasVideoAssetReadPermission === true &&
       (await this.platformModules.isEnabledForTenant(tenantId, 'video-ingest'));
+    // The bootstrap report is video-derived END TO END — clip rows,
+    // fusion summaries, crop gates, failure rollups, and even the clip
+    // COUNTS all describe video evidence. Field-level redaction kept
+    // regrowing leak surface (Codex P1, three rounds), so the whole
+    // route now requires the video-asset read boundary — the documented
+    // fallback ("require video-ingest + video-asset:read for the entire
+    // report route"). The per-field redaction below stays as defense in
+    // depth should this gate ever soften.
+    if (!videoDetailsVisible) {
+      throw new ForbiddenException(
+        'the one-SKU bootstrap report requires the video-ingest module ' +
+          'and video-asset:read — its readiness evidence is video-derived',
+      );
+    }
 
     const [referenceCount, embeddingCount, levels, stockAggregate, runFamily] =
       await Promise.all([
@@ -1169,15 +1184,14 @@ export class OneSkuBootstrapService {
 
       // Reviewed rules (Codex P1): only Phase 18-ELIGIBLE bootstrap
       // reviews on the LATEST evidence count. The one event-less
-      // exception: a NONE clip whose analysis COMPLETED and proposed
-      // nothing has no reviewable observation — the operator's NONE
-      // label is the record. A FAILED fusion run is NOT completed
-      // analysis (contained Codex P2): fusion persists failed runs
-      // precisely when it could not finish, so their absence of a
-      // proposal proves nothing.
+      // exception: a NONE clip whose FUSION analysis COMPLETED and
+      // proposed nothing has no reviewable observation — the operator's
+      // NONE label is the record. STRICTLY a non-FAILED fusion run
+      // (Codex P2): a FAILED run proves nothing, and a v1 detection job
+      // alone is NOT completed fusion analysis either — the fallback
+      // must not sneak a half-analyzed clip past ALL_REVIEWED.
       const hasAnalysis =
-        (run !== undefined && run.policy !== FusionPolicyResult.FAILED) ||
-        job?.status === InferenceJobStatus.SUCCEEDED;
+        run !== undefined && run.policy !== FusionPolicyResult.FAILED;
       const missedPositiveEvent =
         !isNone &&
         job?.status === InferenceJobStatus.SUCCEEDED &&
@@ -1273,6 +1287,12 @@ export class OneSkuBootstrapService {
     for (const row of includedRows) {
       if (
         row.fusion !== null &&
+        // No-proposal TRUE NEGATIVES carry no product crop by design —
+        // a correct rejection must not displace the positive product
+        // evidence the CLEAN_CROP gate scores (Codex P1: recording the
+        // documented false-touch clips would otherwise flip the gate to
+        // NO_CLEAR_PRODUCT_FRAME and lock readiness out).
+        row.fusion.topSku !== null &&
         (latestFusion === null || row.fusion.createdAt > latestFusion.createdAt)
       ) {
         latestFusion = row.fusion;
