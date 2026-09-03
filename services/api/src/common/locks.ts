@@ -276,6 +276,25 @@ export function cameraCalibrationAdvisoryLockKey(
 }
 
 /**
+ * Serializes the one-SKU bootstrap's per-clip FUSION_SHADOW import: the
+ * first correction for a clip decides from a read-then-write ("has this
+ * clip's latest fusion run been imported as a shadow journey event?")
+ * before opening a journey and appending the event. Each bootstrap
+ * import opens its OWN journey, so the journey-scoped dedup inside
+ * appendEvent cannot see a concurrent import — without this lock two
+ * operators' first reviews would both import, and Phase 18 would
+ * collect the same footage twice under different source events.
+ * OneSkuBootstrapService.reviewClip MUST hold this lock across its
+ * check-then-import critical section.
+ */
+export function oneSkuBootstrapImportAdvisoryLockKey(
+  tenantId: string,
+  videoAssetId: string,
+): string {
+  return `one-sku-bootstrap-import:${tenantId}:${videoAssetId}`;
+}
+
+/**
  * Serializes Phase 18 dataset-improvement-run mutations — candidate
  * refresh (delete+rebuild), split planning, status transitions, and the
  * export stamp — for the SAME run. Without it, a refresh racing a

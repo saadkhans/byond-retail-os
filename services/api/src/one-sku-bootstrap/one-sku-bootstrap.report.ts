@@ -32,7 +32,9 @@ export const MIN_REVIEWED_PICKUPS = 5;
 export const MIN_REVIEWED_RETURNS = 5;
 export const MIN_REVIEWED_FALSE_TOUCHES = 5;
 
-/** Newest-first cap on ground-truthed clips considered by the report. */
+/** Newest-first cap on clip rows RETURNED for display. Counts and gates
+ *  always read the COMPLETE ground-truth set (Codex P2) — this bounds
+ *  only the response's video list. */
 export const BOOTSTRAP_MAX_CLIPS = 100;
 
 /**

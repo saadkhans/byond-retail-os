@@ -12,6 +12,7 @@ import {
   PilotExpectedAction,
   PilotObservationVerdict,
 } from '@prisma/client';
+import { oneSkuBootstrapImportAdvisoryLockKey } from '../common/locks';
 import { JourneyService } from '../journey/journey.service';
 import { PilotEvaluationService } from '../pilot-evaluation/pilot-evaluation.service';
 import { PlatformModulesService } from '../platform-modules/platform-modules.service';
@@ -175,6 +176,8 @@ export interface OneSkuBootstrapReport {
       quantity: number;
     }[];
   };
+  /** Newest BOOTSTRAP_MAX_CLIPS rows for display — counts and gates are
+   *  computed over the COMPLETE ground-truth set, not this slice. */
   videos: BootstrapVideoRow[];
   counts: {
     /** Bootstrap-safe clips only — excluded rows are not counted. */
@@ -418,6 +421,9 @@ export class OneSkuBootstrapService {
           'shadow journey can be opened in the same store',
       );
     }
+    // Captured after the guard: the narrowing does not survive into the
+    // import transaction's closure below.
+    const storeContext = { locationId: asset.locationId, unitId: asset.unitId };
     const truth = await this.prisma.videoGroundTruth.findFirst({
       where: { tenantId, videoAssetId },
       select: { eventKind: true, productId: true },
@@ -443,6 +449,36 @@ export class OneSkuBootstrapService {
         'this clip’s ground truth belongs to a different product — ' +
           'record the correction from THAT product’s bootstrap page so ' +
           'the evidence lands in the right evaluation run',
+      );
+    }
+    // Correction product lineage (Codex P1): a corrected product must be
+    // the clip's OWN ground-truth product. The route check above pins
+    // truth.productId === productId for positive clips, so ANY other
+    // corrected product — a third SKU, or any product on a NONE clip
+    // (which carries none) — would flow into Phase 18 as the corrected
+    // label while the report counts the clip toward THIS product's
+    // readiness from its ground truth: dataset-ready on mislabeled data.
+    // Rejected BEFORE any run/journey/review is created or reused.
+    if (
+      input.expectedProductId &&
+      input.expectedProductId !== truth.productId
+    ) {
+      throw new BadRequestException(
+        'the corrected product must be the clip’s ground-truth product — ' +
+          'if the clip really shows a different product, fix its ground ' +
+          'truth first',
+      );
+    }
+    // WRONG_SKU without the correction would only fail AFTER the run and
+    // event exist — reject it up front so nothing is created (Phase 18
+    // would exclude it as MISSING_CORRECTED_SKU anyway).
+    if (
+      input.verdict === PilotObservationVerdict.WRONG_SKU &&
+      !input.expectedProductId
+    ) {
+      throw new BadRequestException(
+        'WRONG_SKU needs the corrected product — Phase 18 would exclude ' +
+          'this as MISSING_CORRECTED_SKU',
       );
     }
     const run = await this.prisma.pickupFusionRun.findFirst({
@@ -485,22 +521,45 @@ export class OneSkuBootstrapService {
 
     let event = await findImportedEvent();
     if (!event) {
-      const journey = await this.journeys.create(
-        tenantId,
-        { locationId: asset.locationId, unitId: asset.unitId },
-        actorId,
-      );
-      await this.journeys.appendFromFusionRun(
-        tenantId,
-        journey.id,
-        videoAssetId,
-        actorId,
-        // Bootstrap imports label the pipeline's TOP candidate even when
-        // the policy demoted the run to review — correcting exactly those
-        // low-confidence clips is the point of the bootstrap.
-        { fusionRunId: run.id, proposeBelowThreshold: true },
-      );
-      event = await findImportedEvent();
+      // Serialize the per-clip import (Codex P2): two operators
+      // submitting the FIRST review for the same clip concurrently would
+      // both see no imported event and each open a journey + append a
+      // FUSION_SHADOW event for the same fusion run — Phase 18 would
+      // collect the footage twice under different source events (each
+      // bootstrap import opens its OWN journey, so appendEvent's
+      // journey-scoped dedup cannot see the race). The advisory xact
+      // lock makes check-then-import a critical section: the loser
+      // blocks here, re-reads, and reuses the winner's event. The
+      // delegated journey writes commit in their own transactions before
+      // the lock releases, so the loser's re-read always sees them.
+      event = await this.prisma.$transaction(async (tx) => {
+        // ::text cast is load-bearing (see common/locks.ts).
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${oneSkuBootstrapImportAdvisoryLockKey(
+          tenantId,
+          videoAssetId,
+        )}))::text`;
+        const imported = await findImportedEvent();
+        if (imported) {
+          return imported;
+        }
+        const journey = await this.journeys.create(
+          tenantId,
+          storeContext,
+          actorId,
+        );
+        await this.journeys.appendFromFusionRun(
+          tenantId,
+          journey.id,
+          videoAssetId,
+          actorId,
+          // Bootstrap imports label the pipeline's TOP candidate even
+          // when the policy demoted the run to review — correcting
+          // exactly those low-confidence clips is the point of the
+          // bootstrap.
+          { fusionRunId: run.id, proposeBelowThreshold: true },
+        );
+        return findImportedEvent();
+      });
       if (!event) {
         throw new ConflictException(
           'fusion produced no candidate for this clip — there is nothing ' +
@@ -566,12 +625,8 @@ export class OneSkuBootstrapService {
       }
     }
     if (input.verdict === PilotObservationVerdict.WRONG_SKU) {
-      if (!input.expectedProductId) {
-        throw new BadRequestException(
-          'WRONG_SKU needs the corrected product — Phase 18 would exclude ' +
-            'this as MISSING_CORRECTED_SKU',
-        );
-      }
+      // expectedProductId presence + ground-truth lineage were both
+      // validated BEFORE the import above.
       if (input.expectedProductId === event.productId) {
         throw new BadRequestException(
           'the corrected product equals the predicted product — Phase 18 ' +
@@ -657,7 +712,7 @@ export class OneSkuBootstrapService {
       viewer.hasInventoryReadPermission &&
       (await this.platformModules.isEnabledForTenant(tenantId, 'inventory'));
 
-    const [referenceCount, embeddingCount, levels, runFamily] =
+    const [referenceCount, embeddingCount, levels, stockAggregate, runFamily] =
       await Promise.all([
         this.prisma.productReferenceImage.count({
           where: { tenantId, productId },
@@ -665,6 +720,10 @@ export class OneSkuBootstrapService {
         this.prisma.productReferenceEmbedding.count({
           where: { tenantId, productId, modelKey: EMBEDDING_MODEL_KEY },
         }),
+        // DISPLAY rows only — bounded for response size. Readiness and
+        // the tenant-wide total come from the un-limited aggregate below
+        // (Codex P2): stock parked beyond the 50th location must still
+        // count, or "not stocked" would be reported over real inventory.
         this.prisma.inventoryLevel.findMany({
           where: { tenantId, productId },
           select: {
@@ -673,6 +732,10 @@ export class OneSkuBootstrapService {
             location: { select: { name: true, code: true } },
           },
           take: 50,
+        }),
+        this.prisma.inventoryLevel.aggregate({
+          where: { tenantId, productId },
+          _sum: { quantity: true },
         }),
         this.bootstrapRunFamily(tenantId, product.id, product.sku),
       ]);
@@ -684,6 +747,11 @@ export class OneSkuBootstrapService {
 
     // This SKU's PICKUP/RETURN clips plus every NONE (false-touch) clip:
     // NONE ground truth force-nulls productId, so negatives are shared.
+    // Deliberately UN-limited (Codex P2): counts and gates must read the
+    // COMPLETE set — a display cap here would let ALL_REVIEWED pass over
+    // omitted older unreviewed clips, and recent tenant-wide negatives
+    // would displace this SKU's positive examples. Only the RESPONSE's
+    // video list is bounded (newest BOOTSTRAP_MAX_CLIPS rows, below).
     const truths = await this.prisma.videoGroundTruth.findMany({
       where: {
         tenantId,
@@ -706,7 +774,6 @@ export class OneSkuBootstrapService {
         },
       },
       orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
-      take: BOOTSTRAP_MAX_CLIPS,
     });
     const liveTruths = truths.filter(
       (truth) => truth.videoAsset.deletedAt === null,
@@ -1093,7 +1160,9 @@ export class OneSkuBootstrapService {
     }
 
     const inferenceReady = referenceCount >= PICKUP_MIN_REFERENCE_IMAGES;
-    const totalOnHand = levels.reduce((sum, level) => sum + level.quantity, 0);
+    // Full-aggregate total (Codex P2) — never derived from the bounded
+    // display rows.
+    const totalOnHand = stockAggregate._sum.quantity ?? 0;
 
     return {
       product: {
@@ -1129,7 +1198,9 @@ export class OneSkuBootstrapService {
             }))
           : [],
       },
-      videos,
+      // Display-bounded (newest first) — every count/gate above was
+      // computed over the FULL set, so the cap only limits what renders.
+      videos: videos.slice(0, BOOTSTRAP_MAX_CLIPS),
       counts: {
         totalClips: includedRows.length,
         excludedClips,

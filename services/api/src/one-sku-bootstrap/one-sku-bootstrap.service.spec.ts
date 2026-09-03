@@ -150,11 +150,20 @@ interface HarnessData {
   reviewOperatorCrop?: Row | null;
   /** Whether the tenant has the inventory module enabled (default true). */
   inventoryModuleEnabled?: boolean;
+  /** Full-aggregate on-hand total; defaults to the sum of `levels`. */
+  totalOnHand?: number;
 }
 
 function buildHarness(data: HarnessData) {
   const journeyEventQueue = [...(data.journeyEventLookups ?? [])];
+  // Advisory-lock transaction wrapper for the per-clip import: the
+  // callback receives a tx whose only job here is the lock query.
+  const txQueryRaw = jest.fn(async () => []);
   const prisma = {
+    $transaction: jest.fn(
+      async (fn: (tx: { $queryRaw: jest.Mock }) => Promise<unknown>) =>
+        fn({ $queryRaw: txQueryRaw }),
+    ),
     product: {
       findFirst: jest.fn(async (args: { where: { tenantId: string } }) =>
         args.where.tenantId === TENANT ? (data.product ?? PRODUCT) : null,
@@ -168,6 +177,19 @@ function buildHarness(data: HarnessData) {
     },
     inventoryLevel: {
       findMany: jest.fn(async () => data.levels ?? []),
+      // Readiness reads the FULL aggregate, never the display rows.
+      aggregate: jest.fn(async () => ({
+        _sum: {
+          quantity:
+            data.totalOnHand ??
+            ((data.levels ?? []).length === 0
+              ? null
+              : (data.levels ?? []).reduce(
+                  (sum, level) => sum + ((level as Row).quantity as number),
+                  0,
+                )),
+        },
+      })),
     },
     pilotEvaluationRun: {
       // The run FAMILY lookup (base name + " (n)" successors), newest
@@ -231,7 +253,7 @@ function buildHarness(data: HarnessData) {
     journeys as unknown as JourneyService,
     platformModules as unknown as PlatformModulesService,
   );
-  return { prisma, evaluations, journeys, platformModules, service };
+  return { prisma, evaluations, journeys, platformModules, service, txQueryRaw };
 }
 
 describe('OneSkuBootstrapService.report', () => {
@@ -255,6 +277,7 @@ describe('OneSkuBootstrapService.report', () => {
       prisma.productReferenceImage.count,
       prisma.productReferenceEmbedding.count,
       prisma.inventoryLevel.findMany,
+      prisma.inventoryLevel.aggregate,
       prisma.pilotEvaluationRun.findMany,
       prisma.videoGroundTruth.findMany,
       prisma.pickupFusionRun.findMany,
@@ -744,12 +767,17 @@ describe('OneSkuBootstrapService report — terminal runs are not the active lin
 });
 
 describe('OneSkuBootstrapService.reviewClip', () => {
+  // A valid WRONG_SKU correction: the prediction named some OTHER
+  // product, and the correction restores the clip's ground-truth product
+  // (Codex P1: the corrected product may ONLY be the ground truth's).
   const reviewInput = {
     verdict: 'WRONG_SKU' as never,
     expectedAction: 'PICKUP' as never,
-    expectedProductId: 'prod-other',
+    expectedProductId: PRODUCT.id,
     notes: null,
   };
+  const mispredictedEvent = (over: Row = {}) =>
+    importedEvent({ productId: 'prod-other', sku: 'SKU-OTHER', ...over });
   const reviewClipBase: HarnessData = {
     videoAsset: { id: 'va-1', locationId: 'loc-1', unitId: 'unit-1', sessionId: null },
     groundTruth: { eventKind: 'PICKUP', productId: PRODUCT.id },
@@ -916,12 +944,15 @@ describe('OneSkuBootstrapService.reviewClip', () => {
   });
 
   it('imports the fusion run as a shadow journey event and appends a pilot review', async () => {
-    const { service, evaluations, journeys, prisma } = buildHarness({
+    const { service, evaluations, journeys, prisma, txQueryRaw } = buildHarness({
       ...reviewClipBase,
     });
+    // Lookup order: outside the lock (miss), inside the lock (still a
+    // miss — this request wins the import), after the append (hit).
     prisma.customerJourneyEvent.findFirst
       .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce(importedEvent() as never);
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(mispredictedEvent() as never);
 
     const result = await service.reviewClip(
       TENANT,
@@ -930,6 +961,9 @@ describe('OneSkuBootstrapService.reviewClip', () => {
       reviewInput,
       'user-1',
     );
+    // The import ran INSIDE the advisory-lock transaction (Codex P2).
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(txQueryRaw).toHaveBeenCalledTimes(1);
     expect(journeys.create).toHaveBeenCalledWith(
       TENANT,
       { locationId: 'loc-1', unitId: 'unit-1' },
@@ -948,7 +982,7 @@ describe('OneSkuBootstrapService.reviewClip', () => {
       expect.objectContaining({
         verdict: 'WRONG_SKU',
         journeyEventId: 'jevt-1',
-        expectedProductId: 'prod-other',
+        expectedProductId: PRODUCT.id,
       }),
       'user-1',
       { allowVideoShadowEvent: true },
@@ -959,7 +993,7 @@ describe('OneSkuBootstrapService.reviewClip', () => {
   it('binds a newer operator crop STRUCTURALLY — never via notes', async () => {
     const { service, evaluations } = buildHarness({
       ...reviewClipBase,
-      journeyEventLookups: [importedEvent()],
+      journeyEventLookups: [mispredictedEvent()],
       reviewOperatorCrop: { id: 'artifact-manual-1' },
     });
     await service.reviewClip(TENANT, PRODUCT.id, 'va-1', {
@@ -983,7 +1017,7 @@ describe('OneSkuBootstrapService.reviewClip', () => {
   it('passes operatorCropArtifactId null when no newer manual crop exists', async () => {
     const { service, evaluations } = buildHarness({
       ...reviewClipBase,
-      journeyEventLookups: [importedEvent()],
+      journeyEventLookups: [mispredictedEvent()],
       reviewOperatorCrop: null,
     });
     await service.reviewClip(TENANT, PRODUCT.id, 'va-1', reviewInput);
@@ -1063,9 +1097,9 @@ describe('OneSkuBootstrapService.reviewClip', () => {
   });
 
   it('reuses an already-imported journey event without opening a new journey', async () => {
-    const { service, journeys } = buildHarness({
+    const { service, journeys, prisma } = buildHarness({
       ...reviewClipBase,
-      journeyEventLookups: [importedEvent({ id: 'event-existing' })],
+      journeyEventLookups: [mispredictedEvent({ id: 'event-existing' })],
     });
     const result = await service.reviewClip(
       TENANT,
@@ -1075,6 +1109,8 @@ describe('OneSkuBootstrapService.reviewClip', () => {
     );
     expect(journeys.create).not.toHaveBeenCalled();
     expect(journeys.appendFromFusionRun).not.toHaveBeenCalled();
+    // No import needed → no lock transaction either.
+    expect(prisma.$transaction).not.toHaveBeenCalled();
     expect(result.journeyEventId).toBe('event-existing');
   });
 
@@ -1131,6 +1167,135 @@ describe('OneSkuBootstrapService.reviewClip', () => {
       undefined,
       { allowVideoShadowEvent: true },
     );
+  });
+
+  it('serializes the per-clip import and reuses a concurrently imported event', async () => {
+    // The outside-lock lookup misses, but the in-lock re-check finds the
+    // event a concurrent first review imported — no second journey, no
+    // second FUSION_SHADOW event, no duplicate Phase 18 footage.
+    const { service, journeys, evaluations, prisma, txQueryRaw } =
+      buildHarness({
+        ...reviewClipBase,
+        journeyEventLookups: [
+          null,
+          mispredictedEvent({ id: 'event-winner' }),
+        ],
+      });
+    const result = await service.reviewClip(
+      TENANT,
+      PRODUCT.id,
+      'va-1',
+      reviewInput,
+    );
+    expect(txQueryRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(journeys.create).not.toHaveBeenCalled();
+    expect(journeys.appendFromFusionRun).not.toHaveBeenCalled();
+    expect(result.journeyEventId).toBe('event-winner');
+    // The review binds to the winner's event — both concurrent reviews
+    // resolve to the SAME Phase 18 source evidence.
+    expect(evaluations.reviewObservation).toHaveBeenCalledWith(
+      TENANT,
+      'eval-1',
+      expect.objectContaining({ journeyEventId: 'event-winner' }),
+      undefined,
+      { allowVideoShadowEvent: true },
+    );
+  });
+
+  // Correction product lineage (Codex P1): the corrected product may
+  // ONLY be the clip's ground-truth product.
+  it('rejects a corrected product that is neither the prediction nor the ground truth', async () => {
+    // Ground truth A (route product), predicted B — correcting to C
+    // would hand Phase 18 a third SKU while the report counts the clip
+    // toward A.
+    const { service, evaluations, journeys, prisma } = buildHarness({
+      ...reviewClipBase,
+      journeyEventLookups: [mispredictedEvent()],
+    });
+    await expect(
+      service.reviewClip(TENANT, PRODUCT.id, 'va-1', {
+        verdict: 'WRONG_SKU' as never,
+        expectedAction: 'PICKUP' as never,
+        expectedProductId: 'prod-third',
+        notes: null,
+      }),
+    ).rejects.toThrow(/ground-truth product/);
+    // Nothing was created or attached — rejected before run/import/review.
+    expect(evaluations.createRun).not.toHaveBeenCalled();
+    expect(evaluations.reviewObservation).not.toHaveBeenCalled();
+    expect(journeys.create).not.toHaveBeenCalled();
+    expect(journeys.appendFromFusionRun).not.toHaveBeenCalled();
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('rejects WRONG_SKU with a MISSING corrected product BEFORE anything is created', async () => {
+    const { service, evaluations, journeys, prisma } = buildHarness({
+      ...reviewClipBase,
+    });
+    await expect(
+      service.reviewClip(TENANT, PRODUCT.id, 'va-1', {
+        verdict: 'WRONG_SKU' as never,
+        expectedAction: 'PICKUP' as never,
+        expectedProductId: null,
+        notes: null,
+      }),
+    ).rejects.toThrow(/MISSING_CORRECTED_SKU/);
+    expect(evaluations.createRun).not.toHaveBeenCalled();
+    expect(evaluations.reviewObservation).not.toHaveBeenCalled();
+    expect(journeys.create).not.toHaveBeenCalled();
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('accepts WRONG_SKU when the correction restores the ground-truth product', async () => {
+    const { service, evaluations } = buildHarness({
+      ...reviewClipBase,
+      journeyEventLookups: [mispredictedEvent()],
+    });
+    await service.reviewClip(TENANT, PRODUCT.id, 'va-1', reviewInput);
+    expect(evaluations.reviewObservation).toHaveBeenCalledWith(
+      TENANT,
+      'eval-1',
+      expect.objectContaining({
+        verdict: 'WRONG_SKU',
+        expectedProductId: PRODUCT.id,
+      }),
+      undefined,
+      { allowVideoShadowEvent: true },
+    );
+  });
+
+  it('rejects a both-wrong WRONG_ACTION whose corrected product is not the ground truth', async () => {
+    const { service, evaluations } = buildHarness({
+      ...reviewClipBase,
+      groundTruth: { eventKind: 'RETURN', productId: PRODUCT.id },
+      journeyEventLookups: [mispredictedEvent()],
+    });
+    await expect(
+      service.reviewClip(TENANT, PRODUCT.id, 'va-1', {
+        verdict: 'WRONG_ACTION' as never,
+        expectedAction: 'RETURN' as never,
+        expectedProductId: 'prod-third',
+        notes: null,
+      }),
+    ).rejects.toThrow(/ground-truth product/);
+    expect(evaluations.reviewObservation).not.toHaveBeenCalled();
+  });
+
+  it('rejects any corrected product on a NONE clip (no ground-truth product exists)', async () => {
+    const { service, evaluations } = buildHarness({
+      ...reviewClipBase,
+      groundTruth: { eventKind: 'NONE', productId: null },
+    });
+    await expect(
+      service.reviewClip(TENANT, PRODUCT.id, 'va-1', {
+        verdict: 'WRONG_SKU' as never,
+        expectedAction: 'PICKUP' as never,
+        expectedProductId: 'prod-other',
+        notes: null,
+      }),
+    ).rejects.toThrow(/ground-truth product/);
+    expect(evaluations.reviewObservation).not.toHaveBeenCalled();
   });
 });
 
@@ -1317,5 +1482,119 @@ describe('OneSkuBootstrapService.ensureEvaluationRun — race and prefix safety 
     const ensured = await service.ensureEvaluationRun(TENANT, PRODUCT.id);
     expect(ensured.evaluationRunId).not.toBe('eval-foreign');
     expect(evaluations.createRun).toHaveBeenCalled();
+  });
+});
+
+describe('OneSkuBootstrapService.report — full-set aggregation (Codex P2)', () => {
+  it('derives stocked/totalOnHand from the FULL inventory aggregate, not the 50 displayed rows', async () => {
+    // Display rows are empty (stock parked beyond the display window),
+    // but the aggregate says 7 units exist somewhere.
+    const { service, prisma } = buildHarness({ levels: [], totalOnHand: 7 });
+    const report = await service.report(TENANT, PRODUCT.id, {
+      hasInventoryReadPermission: true,
+    });
+    expect(report.inventory.stocked).toBe(true);
+    expect(report.inventory.totalOnHand).toBe(7);
+    const gate = report.gates.items.find(
+      (item) => item.key === 'INVENTORY_STOCKED',
+    );
+    expect(gate?.satisfied).toBe(true);
+    expect(gate?.detail).toBe('7 on hand across stores');
+    // The display query stays bounded — only the aggregate is unlimited.
+    expect(prisma.inventoryLevel.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ take: 50 }),
+    );
+    expect(prisma.inventoryLevel.aggregate).toHaveBeenCalledWith({
+      where: { tenantId: TENANT, productId: PRODUCT.id },
+      _sum: { quantity: true },
+    });
+  });
+
+  it('keeps the full-aggregate total redacted for a caller without inventory access', async () => {
+    const { service } = buildHarness({ levels: [], totalOnHand: 7 });
+    const report = await service.report(TENANT, PRODUCT.id);
+    // Classification still true, exact number still hidden.
+    expect(report.inventory.stocked).toBe(true);
+    expect(report.inventory.totalOnHand).toBeNull();
+    expect(report.inventory.levels).toEqual([]);
+  });
+
+  it('computes counts and gates across ALL clips while displaying only the newest 100', async () => {
+    // 100 newest reviewed pickups + 1 OLDER unreviewed clip that falls
+    // outside the display window: ALL_REVIEWED must still fail, and the
+    // reviewed count must cover the full set.
+    const reviewedTruths = Array.from({ length: 100 }, (_, i) =>
+      truthRow({ videoAssetId: `va-r${i}` }),
+    );
+    const oldUnreviewed = truthRow({ videoAssetId: 'va-old-unreviewed' });
+    const { service } = buildHarness({
+      evaluationRun: LINKED_RUN,
+      truths: [...reviewedTruths, oldUnreviewed],
+      runs: [
+        ...reviewedTruths.map((_, i) =>
+          fusionRun({ id: `fusion-r${i}`, videoAssetId: `va-r${i}` }),
+        ),
+        fusionRun({ id: 'fusion-old', videoAssetId: 'va-old-unreviewed' }),
+      ],
+      importedEvents: reviewedTruths.map((_, i) =>
+        importedEvent({
+          id: `jevt-r${i}`,
+          videoAssetId: `va-r${i}`,
+          fusionRunId: `fusion-r${i}`,
+        }),
+      ),
+      pilotReviews: reviewedTruths.map((_, i) =>
+        pilotReview({ journeyEventId: `jevt-r${i}` }),
+      ),
+    });
+    const report = await service.report(TENANT, PRODUCT.id);
+    // Display bounded, readiness complete.
+    expect(report.videos).toHaveLength(100);
+    expect(
+      report.videos.some((row) => row.videoAssetId === 'va-old-unreviewed'),
+    ).toBe(false);
+    expect(report.counts.totalClips).toBe(101);
+    expect(report.counts.reviewedPickupExamples).toBe(100);
+    expect(report.counts.unreviewedClips).toBe(1);
+    const allReviewed = report.gates.items.find(
+      (item) => item.key === 'ALL_REVIEWED',
+    );
+    expect(allReviewed?.satisfied).toBe(false);
+    expect(allReviewed?.detail).toBe('1 awaiting review');
+  });
+
+  it('does not let recent tenant-wide negatives displace this SKU\'s positive examples', async () => {
+    // 100 newest NONE clips push the SKU's only reviewed pickup past the
+    // display window — the pickup must still count toward readiness.
+    const negatives = Array.from({ length: 100 }, (_, i) =>
+      truthRow({
+        videoAssetId: `va-none${i}`,
+        eventKind: 'NONE',
+        product: null,
+      }),
+    );
+    const { service } = buildHarness({
+      evaluationRun: LINKED_RUN,
+      truths: [...negatives, truthRow({ videoAssetId: 'va-pos' })],
+      runs: [fusionRun({ videoAssetId: 'va-pos' })],
+      importedEvents: [importedEvent({ videoAssetId: 'va-pos' })],
+      pilotReviews: [pilotReview()],
+    });
+    const report = await service.report(TENANT, PRODUCT.id);
+    expect(report.videos).toHaveLength(100);
+    expect(report.videos.some((row) => row.videoAssetId === 'va-pos')).toBe(
+      false,
+    );
+    // The displaced positive still counts for readiness.
+    expect(report.counts.reviewedPickupExamples).toBe(1);
+    expect(report.counts.totalClips).toBe(101);
+  });
+
+  it('never limits the ground-truth readiness query', async () => {
+    const { service, prisma } = buildHarness({ truths: [truthRow()] });
+    await service.report(TENANT, PRODUCT.id);
+    expect(prisma.videoGroundTruth.findMany).toHaveBeenCalledWith(
+      expect.not.objectContaining({ take: expect.anything() }),
+    );
   });
 });
