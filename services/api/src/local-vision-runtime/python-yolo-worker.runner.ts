@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { isAbsolute, resolve } from 'node:path';
+import { posix, resolve, win32 } from 'node:path';
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { LocalRuntimeReasonCode } from './local-vision-runtime.port';
@@ -246,8 +246,11 @@ export function normalizePythonBinary(value: string | undefined): string | null 
   if (BARE_BINARY_PATTERN.test(candidate)) {
     return candidate;
   }
+  // Accept both path styles regardless of host platform: the setting is
+  // operator-authored per machine, and the runner's own tests must pass on
+  // Linux CI with a Windows-style value (and vice versa).
   if (
-    isAbsolute(candidate) &&
+    (win32.isAbsolute(candidate) || posix.isAbsolute(candidate)) &&
     ABSOLUTE_BINARY_PATTERN.test(candidate) &&
     !candidate.includes('..')
   ) {
