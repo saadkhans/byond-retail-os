@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
@@ -52,6 +53,11 @@ import {
  */
 
 export interface PlanogramSection {
+  /** WHERE this section came from — never mixed:
+   *  SCORED_AT_EVALUATION = the immutable snapshot stored with the run;
+   *  CURRENT_ACTIVE = live lookup (no stored snapshot exists);
+   *  NOT_CONFIGURED = no planogram context at all. */
+  source: 'SCORED_AT_EVALUATION' | 'CURRENT_ACTIVE' | 'NOT_CONFIGURED';
   configured: boolean;
   rackId: string | null;
   rackCode: string | null;
@@ -188,12 +194,6 @@ export class PretrainedVisionService {
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       select: { verdict: true, expectedAction: true, expectedSku: true },
     });
-    const referenceSkus = await this.prisma.product.findMany({
-      where: { tenantId, referenceImages: { some: {} } },
-      select: { id: true, sku: true },
-      orderBy: [{ sku: 'asc' }],
-      take: 50,
-    });
     const native =
       asset.width && asset.height
         ? { width: asset.width, height: asset.height }
@@ -208,62 +208,239 @@ export class PretrainedVisionService {
       correction,
       classical,
       analysisDims: fusionFrameDimsFor(native),
-      referenceSkus: referenceSkus.map((row) => ({
-        productId: row.id,
-        sku: row.sku,
-      })),
     };
   }
 
-  private async planogramSection(
+  /**
+   * The store a clip's planogram context is allowed to come from
+   * (Codex-class P1: wrong-store contamination). A clip captured in a
+   * store can ONLY be scored against that store's planograms — an
+   * explicit locationId must match it. Only a store-less clip may take
+   * an explicit (tenant-validated) location.
+   */
+  private async resolvePlanogramLocation(
     tenantId: string,
-    assetLocationId: string | null,
+    asset: { locationId: string | null },
     input: PlanogramContextInput,
-    visualCandidates: { sku: string; score: number }[],
-  ): Promise<{ section: PlanogramSection; prior: PlanogramPriorResult }> {
-    const locationId = input.locationId ?? assetLocationId;
-    let narrowed:
+  ): Promise<string | null> {
+    if (asset.locationId) {
+      if (input.locationId && input.locationId !== asset.locationId) {
+        throw new BadRequestException(
+          'this clip was captured in a different store — planogram ' +
+            'context must use the clip’s own store',
+        );
+      }
+      return asset.locationId;
+    }
+    if (input.locationId) {
+      const location = await this.prisma.location.findFirst({
+        where: { tenantId, id: input.locationId },
+        select: { id: true },
+      });
+      if (!location) {
+        throw new NotFoundException('Store not found in this tenant');
+      }
+      return input.locationId;
+    }
+    return null;
+  }
+
+  private async resolveNarrowing(
+    tenantId: string,
+    asset: { locationId: string | null },
+    input: PlanogramContextInput,
+  ) {
+    const locationId = await this.resolvePlanogramLocation(
+      tenantId,
+      asset,
+      input,
+    );
+    if (!locationId || !input.rackCode) {
+      return null;
+    }
+    return this.planograms.narrowCandidates(tenantId, {
+      locationId,
+      rackCode: input.rackCode,
+      normalizedRackX: input.normalizedRackX ?? null,
+      normalizedRackY: input.normalizedRackY ?? null,
+    });
+  }
+
+  /**
+   * The embedding candidate scope (Codex-class P1: no blind cap). Built
+   * in priority order — planogram cell → adjacent → rack → classical top
+   * — then the FULL tenant reference library (reference-ready products,
+   * id/sku only, no alphabetical truncation: the correct SKU can never
+   * fall outside the search space by ordering). Output candidate lists
+   * stay bounded by the sanitizer AFTER ranking.
+   */
+  private async resolveReferenceScope(
+    tenantId: string,
+    narrowed: NarrowedCandidates | null,
+    classicalTopSku: string | null,
+  ): Promise<{ productId: string; sku: string }[]> {
+    const referenceReady = await this.prisma.product.findMany({
+      where: { tenantId, referenceImages: { some: {} } },
+      select: { id: true, sku: true },
+      orderBy: [{ sku: 'asc' }],
+    });
+    const bySku = new Map(referenceReady.map((row) => [row.sku, row]));
+    // Classical top SKU joins the scope even without reference images —
+    // the comparison must be able to rank the classical hypothesis.
+    if (classicalTopSku && !bySku.has(classicalTopSku)) {
+      const product = await this.prisma.product.findFirst({
+        where: { tenantId, sku: classicalTopSku },
+        select: { id: true, sku: true },
+      });
+      if (product) {
+        bySku.set(product.sku, product);
+      }
+    }
+    const prioritized: { productId: string; sku: string }[] = [];
+    const seen = new Set<string>();
+    const push = (sku: string) => {
+      const row = bySku.get(sku);
+      if (row && !seen.has(row.sku)) {
+        seen.add(row.sku);
+        prioritized.push({ productId: row.id, sku: row.sku });
+      }
+    };
+    for (const sku of narrowed?.cellSkus ?? []) {
+      push(sku);
+    }
+    for (const sku of narrowed?.adjacentSkus ?? []) {
+      push(sku);
+    }
+    for (const sku of narrowed?.rackSkus ?? []) {
+      push(sku);
+    }
+    if (classicalTopSku) {
+      push(classicalTopSku);
+    }
+    for (const row of bySku.values()) {
+      if (!seen.has(row.sku)) {
+        seen.add(row.sku);
+        prioritized.push({ productId: row.id, sku: row.sku });
+      }
+    }
+    return prioritized;
+  }
+
+  private buildPlanogramSection(
+    narrowed:
       | (NarrowedCandidates & {
           rackId: string;
           rackCode: string;
           version: number;
         })
-      | null = null;
-    if (locationId && input.rackCode) {
-      narrowed = await this.planograms.narrowCandidates(tenantId, {
-        locationId,
-        rackCode: input.rackCode,
-        normalizedRackX: input.normalizedRackX ?? null,
-        normalizedRackY: input.normalizedRackY ?? null,
-      });
-    }
-    const prior = applyPlanogramPrior(visualCandidates, narrowed);
+      | null,
+    input: PlanogramContextInput,
+    visualCandidates: { sku: string; score: number }[],
+    source: PlanogramSection['source'],
+  ): PlanogramSection {
+    const prior: PlanogramPriorResult = applyPlanogramPrior(
+      visualCandidates,
+      narrowed,
+    );
     return {
-      prior,
-      section: {
-        configured: narrowed !== null,
-        rackId: narrowed?.rackId ?? null,
-        rackCode: narrowed?.rackCode ?? null,
-        version: narrowed?.version ?? null,
-        cell: narrowed?.cell
+      source: narrowed === null && source !== 'SCORED_AT_EVALUATION'
+        ? 'NOT_CONFIGURED'
+        : source,
+      configured: narrowed !== null,
+      rackId: narrowed?.rackId ?? null,
+      rackCode: narrowed?.rackCode ?? null,
+      version: narrowed?.version ?? null,
+      cell: narrowed?.cell
+        ? {
+            cellCode: narrowed.cell.cellCode,
+            rowIndex: narrowed.cell.rowIndex,
+            columnIndex: narrowed.cell.columnIndex,
+            confidence: narrowed.cell.confidence,
+          }
+        : null,
+      normalizedRackX: input.normalizedRackX ?? null,
+      normalizedRackY: input.normalizedRackY ?? null,
+      cellAssignmentConfidence: narrowed?.cell?.confidence ?? null,
+      planogramCandidateSkus: narrowed?.cellSkus ?? [],
+      adjacentCellCandidateSkus: narrowed?.adjacentSkus ?? [],
+      rackCandidateSkus: narrowed?.rackSkus ?? [],
+      planogramMatchStatus: prior.matchStatus,
+      flags: prior.flags,
+      reviewRequired: prior.reviewRequired,
+      candidates: prior.candidates.slice(0, 10),
+    };
+  }
+
+  /** Allowlist rebuild of a STORED scored-planogram snapshot on its way
+   *  OUT — even a hand-edited row cannot leak or change shape. */
+  private sanitizeStoredPlanogramSection(raw: unknown): PlanogramSection | null {
+    const section = raw as Partial<PlanogramSection> | null | undefined;
+    if (!section || typeof section !== 'object') {
+      return null;
+    }
+    const skuList = (value: unknown) =>
+      (Array.isArray(value) ? value : [])
+        .filter((sku): sku is string => typeof sku === 'string')
+        .slice(0, 64);
+    const codeList = (value: unknown) =>
+      (Array.isArray(value) ? value : [])
+        .filter(
+          (code): code is string =>
+            typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code),
+        )
+        .slice(0, 16);
+    const num01 = (value: unknown) =>
+      typeof value === 'number' && Number.isFinite(value)
+        ? Math.min(1, Math.max(0, value))
+        : null;
+    return {
+      // A stored snapshot is BY DEFINITION the scored evidence.
+      source: 'SCORED_AT_EVALUATION',
+      configured: section.configured === true,
+      rackId: typeof section.rackId === 'string' ? section.rackId : null,
+      rackCode: typeof section.rackCode === 'string' ? section.rackCode : null,
+      version:
+        typeof section.version === 'number' && Number.isInteger(section.version)
+          ? section.version
+          : null,
+      cell:
+        section.cell &&
+        typeof section.cell === 'object' &&
+        typeof section.cell.cellCode === 'string'
           ? {
-              cellCode: narrowed.cell.cellCode,
-              rowIndex: narrowed.cell.rowIndex,
-              columnIndex: narrowed.cell.columnIndex,
-              confidence: narrowed.cell.confidence,
+              cellCode: section.cell.cellCode,
+              rowIndex: Number(section.cell.rowIndex) || 0,
+              columnIndex: Number(section.cell.columnIndex) || 0,
+              confidence: num01(section.cell.confidence) ?? 0,
             }
           : null,
-        normalizedRackX: input.normalizedRackX ?? null,
-        normalizedRackY: input.normalizedRackY ?? null,
-        cellAssignmentConfidence: narrowed?.cell?.confidence ?? null,
-        planogramCandidateSkus: narrowed?.cellSkus ?? [],
-        adjacentCellCandidateSkus: narrowed?.adjacentSkus ?? [],
-        rackCandidateSkus: narrowed?.rackSkus ?? [],
-        planogramMatchStatus: prior.matchStatus,
-        flags: prior.flags,
-        reviewRequired: prior.reviewRequired,
-        candidates: prior.candidates.slice(0, 10),
-      },
+      normalizedRackX: num01(section.normalizedRackX),
+      normalizedRackY: num01(section.normalizedRackY),
+      cellAssignmentConfidence: num01(section.cellAssignmentConfidence),
+      planogramCandidateSkus: skuList(section.planogramCandidateSkus),
+      adjacentCellCandidateSkus: skuList(section.adjacentCellCandidateSkus),
+      rackCandidateSkus: skuList(section.rackCandidateSkus),
+      planogramMatchStatus:
+        typeof section.planogramMatchStatus === 'string' &&
+        /^[A-Z_]{1,40}$/.test(section.planogramMatchStatus)
+          ? section.planogramMatchStatus
+          : 'UNKNOWN_CELL',
+      flags: codeList(section.flags),
+      reviewRequired: section.reviewRequired === true,
+      candidates: (Array.isArray(section.candidates) ? section.candidates : [])
+        .filter(
+          (row): row is { sku: string; score: number; planogramBoost: number } =>
+            !!row &&
+            typeof (row as { sku?: unknown }).sku === 'string' &&
+            typeof (row as { score?: unknown }).score === 'number',
+        )
+        .map((row) => ({
+          sku: row.sku,
+          score: row.score,
+          planogramBoost:
+            typeof row.planogramBoost === 'number' ? row.planogramBoost : 0,
+        }))
+        .slice(0, 10),
     };
   }
 
@@ -277,7 +454,6 @@ export class PretrainedVisionService {
       evidence: ProviderEvidence;
     }[];
     planogram: PlanogramSection;
-    prior: PlanogramPriorResult;
     truth: { eventKind: string; product: { sku: string } | null } | null;
     correction: {
       verdict: string;
@@ -304,8 +480,8 @@ export class PretrainedVisionService {
     // Final fusion SUGGESTION (advisory only — never applied anywhere):
     // planogram-boosted top candidate + the strongest available action
     // signal. UNKNOWN or any disagreement stays review-required.
-    const suggestedSku = input.prior.candidates.length
-      ? input.prior.candidates[0].sku
+    const suggestedSku = input.planogram.candidates.length
+      ? input.planogram.candidates[0].sku
       : null;
     const detectorAction =
       detectorRun?.evidence.features?.actionCandidate ?? null;
@@ -314,7 +490,7 @@ export class PretrainedVisionService {
         ? detectorAction
         : classicalAction;
     const suggestionNotes: string[] = [];
-    let reviewRequired = input.prior.reviewRequired;
+    let reviewRequired = input.planogram.reviewRequired;
     if (suggestedAction === 'UNKNOWN') {
       reviewRequired = true;
       suggestionNotes.push('ACTION_UNRESOLVED');
@@ -454,11 +630,20 @@ export class PretrainedVisionService {
           'against the classical baseline',
       );
     }
+    // Planogram narrowing FIRST: it validates the store binding (a
+    // mismatched location rejects BEFORE anything runs or persists) and
+    // its tiers seed the embedding candidate scope.
+    const narrowed = await this.resolveNarrowing(tenantId, ctx.asset, input);
+    const referenceSkus = await this.resolveReferenceScope(
+      tenantId,
+      narrowed,
+      ctx.classical?.topSku ?? null,
+    );
     const adapterContext: AdapterAnalysisContext = {
       videoAssetId,
       classical: ctx.classical,
       analysisDims: ctx.analysisDims,
-      referenceSkus: ctx.referenceSkus,
+      referenceSkus,
     };
     const evidences: ProviderEvidence[] = this.adapters.map((adapter) => {
       try {
@@ -482,11 +667,11 @@ export class PretrainedVisionService {
         evidence,
       })),
     );
-    const { section, prior } = await this.planogramSection(
-      tenantId,
-      ctx.asset.locationId,
+    const section = this.buildPlanogramSection(
+      narrowed,
       input,
       visual,
+      'SCORED_AT_EVALUATION',
     );
 
     const persisted: {
@@ -514,6 +699,9 @@ export class PretrainedVisionService {
                 : PretrainedVisionRunStatus.PROVIDER_UNAVAILABLE,
           planogramRackId: section.rackId,
           planogramVersion: section.version,
+          // The EXACT scored planogram snapshot — immutable evidence a
+          // later planogram publish can never rewrite.
+          planogramEvidence: section as unknown as object,
           evidence: evidence as object,
           createdById: actorId ?? null,
         },
@@ -531,7 +719,6 @@ export class PretrainedVisionService {
       classical: ctx.classical,
       runs: persisted,
       planogram: section,
-      prior,
       truth: ctx.truth,
       correction: ctx.correction,
     });
@@ -575,18 +762,30 @@ export class PretrainedVisionService {
       ctx.classical,
       runs.map((run) => ({ provider: run.provider, evidence: run.evidence })),
     );
-    const { section, prior } = await this.planogramSection(
-      tenantId,
-      ctx.asset.locationId,
-      input,
-      visual,
+    // VERSION SAFETY: when a stored scored-planogram snapshot exists,
+    // the report shows EXACTLY it — publishing a new planogram version
+    // never rewrites what an old run was scored against. Only when no
+    // snapshot exists does the report compute a (clearly labeled)
+    // CURRENT_ACTIVE section from live data.
+    const storedSnapshotRow = rows.find(
+      (row) => row.planogramEvidence !== null,
     );
+    const storedSection = storedSnapshotRow
+      ? this.sanitizeStoredPlanogramSection(storedSnapshotRow.planogramEvidence)
+      : null;
+    const section =
+      storedSection ??
+      this.buildPlanogramSection(
+        await this.resolveNarrowing(tenantId, ctx.asset, input),
+        input,
+        visual,
+        'CURRENT_ACTIVE',
+      );
     return this.assembleReport({
       videoAssetId,
       classical: ctx.classical,
       runs,
       planogram: section,
-      prior,
       truth: ctx.truth,
       correction: ctx.correction,
     });

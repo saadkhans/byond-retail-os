@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
@@ -108,15 +109,24 @@ export class PlanogramController {
     @Query('y') y?: string,
     @Query('visualTopSku') visualTopSku?: string,
   ) {
-    const parsed = (value?: string) => {
-      const num = value === undefined || value === '' ? NaN : Number(value);
-      return Number.isFinite(num) ? num : null;
+    // Missing coordinate = unknown cell (rack fallback). A PRESENT
+    // coordinate must be a real normalized value — silently clamping an
+    // out-of-range point would map garbage onto an edge cell.
+    const parsed = (name: string, value?: string) => {
+      if (value === undefined || value === '') {
+        return null;
+      }
+      const num = Number(value);
+      if (!Number.isFinite(num) || num < 0 || num > 1) {
+        throw new BadRequestException(`${name} must be between 0 and 1`);
+      }
+      return num;
     };
     const narrowed = await this.planograms.narrowCandidates(tenantId, {
       locationId,
       rackCode,
-      normalizedRackX: parsed(x),
-      normalizedRackY: parsed(y),
+      normalizedRackX: parsed('x', x),
+      normalizedRackY: parsed('y', y),
     });
     return {
       narrowed,

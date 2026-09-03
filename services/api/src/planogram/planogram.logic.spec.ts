@@ -142,6 +142,22 @@ describe('planogram match status + soft prior', () => {
     expect(result.candidates[0].sku).toBe('SKU-B3');
   });
 
+  it('injects an expected-cell SKU the visual ranker missed, at prior-only weight', () => {
+    const narrowed = narrowedAt(1, 2); // B3 expects SKU-B3
+    const result = applyPlanogramPrior(
+      [{ sku: 'SKU-OTHER', score: 0.9 }],
+      narrowed,
+    );
+    const injected = result.candidates.find((row) => row.sku === 'SKU-B3');
+    // Present, but at boost-only weight — visual evidence still wins.
+    expect(injected).toEqual({
+      sku: 'SKU-B3',
+      score: CELL_PRIOR_BOOST,
+      planogramBoost: CELL_PRIOR_BOOST,
+    });
+    expect(result.candidates[0].sku).toBe('SKU-OTHER');
+  });
+
   it('flags REVIEW_REQUIRED (not rejection) when visual evidence leaves the planogram', () => {
     const narrowed = narrowedAt(1, 2); // B3 expects SKU-B3
     const result = applyPlanogramPrior(

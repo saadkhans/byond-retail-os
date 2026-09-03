@@ -269,6 +269,19 @@ export function applyPlanogramPrior(
       planogramBoost: Math.round(boost * 1000) / 1000,
     };
   });
+  // Expected-cell SKUs always PARTICIPATE, at prior-only weight: a SKU
+  // the planogram expects but the visual ranker did not surface enters
+  // with score == its boost (small by design — real visual evidence
+  // dominates). Without this, a truncated visual top-N could hide the
+  // expected SKU from the comparison entirely.
+  if (narrowed && narrowed.matchableCell) {
+    for (const sku of narrowed.cellSkus) {
+      if (!boosted.some((row) => row.sku === sku)) {
+        const boost = Math.round(CELL_PRIOR_BOOST * confidence * 1000) / 1000;
+        boosted.push({ sku, score: boost, planogramBoost: boost });
+      }
+    }
+  }
   boosted.sort((a, b) => b.score - a.score);
 
   let reviewRequired = false;

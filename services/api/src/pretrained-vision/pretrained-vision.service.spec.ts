@@ -49,6 +49,10 @@ interface HarnessOptions {
   truth?: Row | null;
   correction?: Row | null;
   referenceProducts?: { id: string; sku: string }[];
+  /** Catalog products WITHOUT reference images (classical-top lookup). */
+  catalogProducts?: { id: string; sku: string }[];
+  /** Locations that exist in TENANT (default ['store-1']). */
+  tenantLocations?: string[];
   narrowed?: Row | null;
 }
 
@@ -91,12 +95,25 @@ function buildHarness(options: HarnessOptions = {}) {
     pilotObservationReview: {
       findFirst: jest.fn(async () => options.correction ?? null),
     },
+    location: {
+      findFirst: jest.fn(async (args: { where: { tenantId: string; id: string } }) =>
+        args.where.tenantId === TENANT &&
+        (options.tenantLocations ?? ['store-1']).includes(args.where.id)
+          ? { id: args.where.id }
+          : null,
+      ),
+    },
     product: {
       findMany: jest.fn(async () =>
         (options.referenceProducts ?? [
           { id: 'prod-a', sku: 'SKU-A' },
           { id: 'prod-b', sku: 'SKU-B' },
         ]).map((row) => ({ id: row.id, sku: row.sku })),
+      ),
+      findFirst: jest.fn(async (args: { where: { sku?: string } }) =>
+        (options.catalogProducts ?? []).find(
+          (row) => row.sku === args.where.sku,
+        ) ?? null,
       ),
     },
     pretrainedVisionRun: {
@@ -407,5 +424,229 @@ describe('PretrainedVisionService.report', () => {
     await expect(
       service.report(OTHER_TENANT, 'va-1', {}, VIEWER),
     ).rejects.toThrow(NotFoundException);
+  });
+});
+
+describe('PretrainedVisionService — planogram store binding (P1)', () => {
+  it('rejects a planogram location that differs from the clip store, with NO side effects', async () => {
+    const { service, storedRuns, planograms } = buildHarness();
+    await expect(
+      service.evaluate(
+        TENANT,
+        'va-1',
+        { locationId: 'store-2', rackCode: 'R1' },
+        'user-1',
+        VIEWER,
+      ),
+    ).rejects.toThrow(/own store/);
+    expect(storedRuns).toHaveLength(0);
+    expect(planograms.narrowCandidates).not.toHaveBeenCalled();
+  });
+
+  it('uses the clip store when locationId is omitted', async () => {
+    const { service, planograms } = buildHarness({
+      narrowed: {
+        rackId: 'rack-1',
+        rackCode: 'R1',
+        version: 1,
+        cell: null,
+        matchableCell: false,
+        cellSkus: [],
+        adjacentSkus: [],
+        rackSkus: [],
+        usedRackFallback: true,
+      },
+    });
+    await service.evaluate(TENANT, 'va-1', { rackCode: 'R1' }, 'user-1', VIEWER);
+    expect(planograms.narrowCandidates).toHaveBeenCalledWith(
+      TENANT,
+      expect.objectContaining({ locationId: 'store-1' }),
+    );
+  });
+
+  it('accepts an explicit locationId that MATCHES the clip store', async () => {
+    const { service } = buildHarness();
+    const report = await service.evaluate(
+      TENANT,
+      'va-1',
+      { locationId: 'store-1', rackCode: 'R1' },
+      'user-1',
+      VIEWER,
+    );
+    expect(report.classical?.topSku).toBe('SKU-A');
+  });
+
+  it('a store-less clip may use an explicit TENANT-validated location only', async () => {
+    const storelessAsset = {
+      id: 'va-1',
+      width: 1920,
+      height: 1080,
+      locationId: null,
+    };
+    const ok = buildHarness({
+      asset: storelessAsset,
+      tenantLocations: ['store-9'],
+    });
+    await ok.service.evaluate(
+      TENANT,
+      'va-1',
+      { locationId: 'store-9', rackCode: 'R1' },
+      'user-1',
+      VIEWER,
+    );
+    expect(ok.prisma.location.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ tenantId: TENANT, id: 'store-9' }),
+      }),
+    );
+
+    const foreign = buildHarness({
+      asset: storelessAsset,
+      tenantLocations: [],
+    });
+    await expect(
+      foreign.service.evaluate(
+        TENANT,
+        'va-1',
+        { locationId: 'store-of-tenant-b', rackCode: 'R1' },
+        'user-1',
+        VIEWER,
+      ),
+    ).rejects.toThrow(NotFoundException);
+    expect(foreign.storedRuns).toHaveLength(0);
+  });
+});
+
+describe('PretrainedVisionService — scored planogram immutability (P1)', () => {
+  const narrowedV1 = {
+    rackId: 'rack-1',
+    rackCode: 'R1',
+    version: 1,
+    cell: { rowIndex: 1, columnIndex: 2, cellCode: 'B3', confidence: 1 },
+    matchableCell: true,
+    cellSkus: ['SKU-B'],
+    adjacentSkus: [],
+    rackSkus: ['SKU-B'],
+    usedRackFallback: false,
+  };
+
+  it('report shows the STORED scored snapshot even after the planogram changes', async () => {
+    const { service, planograms } = buildHarness({ narrowed: narrowedV1 });
+    const evaluated = await service.evaluate(
+      TENANT,
+      'va-1',
+      {
+        locationId: 'store-1',
+        rackCode: 'R1',
+        normalizedRackX: 0.62,
+        normalizedRackY: 0.38,
+      },
+      'user-1',
+      VIEWER,
+    );
+    expect(evaluated.planogram.version).toBe(1);
+    expect(evaluated.planogram.source).toBe('SCORED_AT_EVALUATION');
+
+    // The planogram is re-published as version 2 with DIFFERENT cells.
+    (planograms.narrowCandidates as jest.Mock).mockResolvedValue({
+      ...narrowedV1,
+      version: 2,
+      cellSkus: ['SKU-TOTALLY-DIFFERENT'],
+    });
+    (planograms.narrowCandidates as jest.Mock).mockClear();
+
+    const report = await service.report(TENANT, 'va-1', {}, VIEWER);
+    // The OLD run's scored evidence is immutable: version 1, original
+    // candidates/status, and the live planogram was never consulted.
+    expect(report.planogram.source).toBe('SCORED_AT_EVALUATION');
+    expect(report.planogram.version).toBe(1);
+    expect(report.planogram.planogramCandidateSkus).toEqual(['SKU-B']);
+    expect(report.planogram.planogramMatchStatus).toBe(
+      evaluated.planogram.planogramMatchStatus,
+    );
+    expect(planograms.narrowCandidates).not.toHaveBeenCalled();
+  });
+
+  it('labels a live section CURRENT_ACTIVE only when NO stored snapshot exists', async () => {
+    const { service } = buildHarness({ narrowed: narrowedV1 });
+    // No evaluate ran — report computes live and says so.
+    const report = await service.report(
+      TENANT,
+      'va-1',
+      { locationId: 'store-1', rackCode: 'R1' },
+      VIEWER,
+    );
+    expect(report.planogram.source).toBe('CURRENT_ACTIVE');
+  });
+});
+
+describe('PretrainedVisionService — candidate scope (P1, no blind cap)', () => {
+  it('queries the reference library WITHOUT a take limit', async () => {
+    const { service, prisma } = buildHarness({
+      provider: 'hybrid',
+      stubMode: true,
+    });
+    await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
+    expect(prisma.product.findMany).toHaveBeenCalledWith(
+      expect.not.objectContaining({ take: expect.anything() }),
+    );
+  });
+
+  it('ranks a late-alphabet planogram SKU that a 50-cap would have dropped', async () => {
+    // 60 reference products; the planogram cell expects the LAST one.
+    const referenceProducts = Array.from({ length: 60 }, (_, i) => ({
+      id: `prod-${String(i).padStart(2, '0')}`,
+      sku: `SKU-${String(i).padStart(2, '0')}`,
+    }));
+    const { service } = buildHarness({
+      provider: 'embeddings_local',
+      stubMode: true,
+      referenceProducts,
+      narrowed: {
+        rackId: 'rack-1',
+        rackCode: 'R1',
+        version: 1,
+        cell: { rowIndex: 0, columnIndex: 0, cellCode: 'A1', confidence: 1 },
+        matchableCell: true,
+        cellSkus: ['SKU-59'],
+        adjacentSkus: [],
+        rackSkus: ['SKU-59'],
+        usedRackFallback: false,
+      },
+    });
+    const report = await service.evaluate(
+      TENANT,
+      'va-1',
+      {
+        locationId: 'store-1',
+        rackCode: 'R1',
+        normalizedRackX: 0.1,
+        normalizedRackY: 0.1,
+      },
+      'user-1',
+      VIEWER,
+    );
+    // SKU-59 (beyond any first-50 alphabetical window) is scoreable and
+    // the planogram prior surfaces it among the boosted candidates.
+    expect(
+      report.planogram.candidates.some((row) => row.sku === 'SKU-59'),
+    ).toBe(true);
+    // Output stays bounded after ranking.
+    expect(report.embeddingCandidates.length).toBeLessThanOrEqual(10);
+    expect(report.planogram.candidates.length).toBeLessThanOrEqual(10);
+  });
+
+  it('includes the classical top SKU even when it has no reference images', async () => {
+    const { service } = buildHarness({
+      provider: 'embeddings_local',
+      stubMode: true,
+      // Reference library does NOT contain SKU-A (the classical top)...
+      referenceProducts: [{ id: 'prod-z', sku: 'SKU-Z' }],
+      // ...but the tenant catalog does.
+      catalogProducts: [{ id: 'prod-a', sku: 'SKU-A' }],
+    });
+    const report = await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
+    const skus = report.embeddingCandidates.map((row) => row.sku);
+    expect(skus).toContain('SKU-A');
   });
 });

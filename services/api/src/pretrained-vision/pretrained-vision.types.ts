@@ -116,6 +116,10 @@ export interface ProviderEvidence {
 const CODE_PATTERN = /^[A-Z0-9_]{1,64}$/;
 /** SKU/product codes as the catalog stores them — safe identifiers. */
 const SKU_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 _.\-()]{0,63}$/;
+/** Product IDs are cuid-like opaque identifiers: strictly alphanumeric
+ *  plus - and _. No slash, backslash, colon, dot, or space — a provider
+ *  bug can never smuggle a path, URL, or token through this field. */
+const PRODUCT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
 function num01(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value)
@@ -187,7 +191,7 @@ function sanitizeEmbeddingCandidate(value: unknown): EmbeddingCandidate | null {
     return null;
   }
   const productId =
-    typeof raw.productId === 'string' && raw.productId.length <= 64
+    typeof raw.productId === 'string' && PRODUCT_ID_PATTERN.test(raw.productId)
       ? raw.productId
       : null;
   return { sku: raw.sku, productId, similarity };

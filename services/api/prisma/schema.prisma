@@ -3005,6 +3005,10 @@ model PretrainedVisionRun {
   status           PretrainedVisionRunStatus
   planogramRackId  String?
   planogramVersion Int?
+  /** The EXACT sanitized planogram section the run was scored against —
+   *  immutable evidence: publishing a new planogram version can never
+   *  rewrite what an old run's candidates/match status looked like. */
+  planogramEvidence Json?
   evidence         Json
   createdById      String?
   createdAt        DateTime                  @default(now())

@@ -2142,6 +2142,9 @@ export interface PretrainedProviderEvidence {
 }
 
 export interface PlanogramReportSection {
+  /** SCORED_AT_EVALUATION = immutable stored snapshot; CURRENT_ACTIVE =
+   *  live lookup (no stored snapshot); NOT_CONFIGURED = no planogram. */
+  source: 'SCORED_AT_EVALUATION' | 'CURRENT_ACTIVE' | 'NOT_CONFIGURED';
   configured: boolean;
   rackId: string | null;
   rackCode: string | null;
