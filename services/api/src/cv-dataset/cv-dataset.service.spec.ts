@@ -11,6 +11,8 @@ const assemble = (...parts: string[]) => parts.join('');
 interface ObservationFixture {
   journeyEventId: string;
   liveSessionId: string | null;
+  /** Set for video-bootstrap (FUSION_SHADOW) observations. */
+  videoAssetId?: string | null;
   eventType: string;
   occurredAt: Date;
   predictedProductId: string | null;
@@ -83,6 +85,12 @@ function sessionsInBand(
 function buildHarness(
   options: {
     observations?: ObservationFixture[];
+    /** CURRENT VideoGroundTruth rows keyed by the observations'
+     *  videoAssetId — the ground-truth drift guard reads these. */
+    groundTruths?: Record<string, unknown>[];
+    /** Video assets that were soft-deleted (everything else referenced
+     *  by observations counts as live). */
+    deletedVideoAssetIds?: string[];
     missedEvents?: Record<string, unknown>[];
     summary?: Record<string, unknown> | null;
     scenarios?: Record<string, unknown>[];
@@ -297,6 +305,18 @@ function buildHarness(
       update: jest.fn(),
       updateMany: jest.fn(),
       deleteMany: jest.fn(),
+    },
+    videoGroundTruth: {
+      findMany: jest.fn(async () => options.groundTruths ?? []),
+    },
+    videoAsset: {
+      // Live (non-deleted) assets among the requested ids.
+      findMany: jest.fn(
+        async (args: { where: { id: { in: string[] } } }) =>
+          args.where.id.in
+            .filter((id) => !(options.deletedVideoAssetIds ?? []).includes(id))
+            .map((id) => ({ id })),
+      ),
     },
     $queryRaw: jest.fn(async () => []),
   };
@@ -662,6 +682,67 @@ describe('CvDatasetService — candidate collection (reviewed/corrected only)', 
       expect(row.occlusionBucket).toBeNull();
       expect(row.calibrationZoneLabel).toBeNull();
     }
+  });
+
+  it('a video-bootstrap observation (no live session) yields an ELIGIBLE candidate', async () => {
+    // One-SKU bootstrap reviews reference FUSION_SHADOW video events —
+    // no LiveCameraSession exists, so liveSessionId is null and the
+    // group key falls back to the event itself (groupKeyOf).
+    const { service, candidates } = buildHarness({
+      observations: [
+        observation({
+          journeyEventId: 'evt-video',
+          liveSessionId: null,
+          matchScore: 0.35,
+          latestReview: review({
+            verdict: 'WRONG_SKU',
+            expectedProductId: 'prod-c',
+            expectedSku: 'SKU-C',
+          }) as never,
+        }),
+      ],
+    });
+    const created = await createLinkedRun(service, {
+      sourceTestProtocolId: null,
+      sourceCalibrationProfileId: null,
+    });
+    const result = await service.refreshCandidates(TENANT, created.id);
+    expect(result.eligible).toBe(1);
+    const row = candidates.find((c) => c.sourceId === 'evt-video')!;
+    expect(row.eligibility).toBe('ELIGIBLE');
+    expect(row.liveSessionId).toBeNull();
+    expect(row.skuCodeSnapshot).toBe('SKU-C');
+    expect(row.reviewSource).toBe('PILOT_EVALUATION');
+    // No operator crop on the review → the candidate resolves to the
+    // event's own automatic fusion crop.
+    expect(row.evidenceCropArtifactId).toBeNull();
+  });
+
+  it('carries the review’s STRUCTURED operator-crop reference into the candidate', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [
+        observation({
+          journeyEventId: 'evt-video-crop',
+          liveSessionId: null,
+          matchScore: 0.35,
+          latestReview: review({
+            verdict: 'CORRECT',
+            operatorCropArtifactId: 'artifact-manual-1',
+          }) as never,
+        }),
+      ],
+    });
+    const created = await createLinkedRun(service, {
+      sourceTestProtocolId: null,
+      sourceCalibrationProfileId: null,
+    });
+    await service.refreshCandidates(TENANT, created.id);
+    const row = candidates.find((c) => c.sourceId === 'evt-video-crop')!;
+    expect(row.eligibility).toBe('ELIGIBLE');
+    // The Phase 18 candidate references the crop the operator ACTUALLY
+    // approved — an opaque artifact id, never the rejected automatic
+    // crop and never a path/URL.
+    expect(row.evidenceCropArtifactId).toBe('artifact-manual-1');
   });
 
   it('never mutates the reviewed/corrected source records it reads', async () => {
@@ -1169,6 +1250,62 @@ describe('CvDatasetService — Codex P1 hardening', () => {
     await harness.service.planSplits(TENANT, created.id);
     const result = await harness.service.exportManifest(TENANT, created.id);
     expect(result.rowCount).toBe(5);
+  });
+
+  it('export rejects stale crop evidence: null→crop, crop→crop, crop→null (Codex P1)', async () => {
+    const opts = mixedFixtureOptions();
+    const harness = buildHarness(opts);
+    const created = await createLinkedRun(harness.service, FULL_TRAIN);
+    const reviewRow = opts.observations[0].latestReview as Record<
+      string,
+      unknown
+    >;
+    const refreshAndReady = async () => {
+      await harness.service.refreshCandidates(TENANT, created.id);
+      await harness.service.planSplits(TENANT, created.id);
+    };
+    await refreshAndReady();
+    await harness.service.setStatus(TENANT, created.id, 'READY' as never);
+
+    // null → crop A: an operator crop appears AFTER the refresh.
+    reviewRow.operatorCropArtifactId = 'artifact-crop-a';
+    const nullToCrop = await harness.service
+      .exportManifest(TENANT, created.id)
+      .then(
+        () => null,
+        (thrown: Error) => thrown,
+      );
+    expect(nullToCrop).toBeInstanceOf(BadRequestException);
+    expect(nullToCrop!.message).toContain('CV_DATASET_STALE_CANDIDATES');
+    expect(nullToCrop!.message).toContain('refresh candidates');
+    // Controlled message: never echoes the artifact id or any path.
+    expect(nullToCrop!.message).not.toContain('artifact-crop-a');
+
+    // crop A → crop B: refresh picked up A, then a replacement crop
+    // was reviewed — stale again.
+    await refreshAndReady();
+    reviewRow.operatorCropArtifactId = 'artifact-crop-b';
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('CV_DATASET_STALE_CANDIDATES');
+
+    // crop B → null: refresh picked up B, then the crop reference was
+    // lost — losing the crop is stale too.
+    await refreshAndReady();
+    reviewRow.operatorCropArtifactId = null;
+    await expect(
+      harness.service.exportManifest(TENANT, created.id),
+    ).rejects.toThrow('CV_DATASET_STALE_CANDIDATES');
+
+    // Finally: settle on crop A, refresh + replan, and the export
+    // succeeds naming the CURRENT crop (opaque id, references-only).
+    reviewRow.operatorCropArtifactId = 'artifact-crop-a';
+    await refreshAndReady();
+    const withCrop = await harness.service.exportManifest(TENANT, created.id);
+    const exported = (
+      withCrop.manifest.candidates as { evidenceCropArtifactId: string | null }[]
+    ).find((row) => row.evidenceCropArtifactId !== null);
+    expect(exported?.evidenceCropArtifactId).toBe('artifact-crop-a');
   });
 
   it('export validation runs on the LOCKED candidate snapshot (refresh/plan races)', async () => {
@@ -2457,5 +2594,237 @@ describe('CvDatasetService — Codex P1 round 4 (calibration fingerprint + binar
         harness.service.exportManifest(TENANT, created.id),
       ).rejects.toThrow('INSUFFICIENT_STABLE_SPLIT_COVERAGE');
     }
+  });
+});
+
+describe('CvDatasetService — ground-truth drift guard (Codex P1)', () => {
+  const bootstrapObservation = (over: Partial<ObservationFixture> = {}) =>
+    observation({
+      journeyEventId: 'evt-video',
+      liveSessionId: null,
+      videoAssetId: 'va-1',
+      ...over,
+    });
+  const truthRow = (over: Record<string, unknown> = {}) => ({
+    videoAssetId: 'va-1',
+    eventKind: 'PICKUP',
+    productId: 'prod-a',
+    product: { sku: 'SKU-A' },
+    ...over,
+  });
+  const evalOnlyRun = (service: CvDatasetService) =>
+    service.createRun(TENANT, {
+      ...BASE_INPUT,
+      sourceEvaluationRunId: 'eval-1',
+    } as never);
+
+  it('excludes a CORRECT candidate whose clip truth was edited to another ACTION', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [
+        bootstrapObservation({ latestReview: review({ verdict: 'CORRECT' }) }),
+      ],
+      // Reviewed as a correct PICKUP; the truth NOW says RETURN.
+      groundTruths: [truthRow({ eventKind: 'RETURN' })],
+    });
+    const created = await evalOnlyRun(service);
+    await service.refreshCandidates(TENANT, created.id);
+    expect(candidates.find((row) => row.sourceId === 'evt-video')).toMatchObject({
+      eligibility: 'EXCLUDED',
+      exclusionReason: 'STALE_GROUND_TRUTH',
+    });
+  });
+
+  it('excludes a CORRECT candidate whose clip truth was edited to another PRODUCT', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [
+        bootstrapObservation({ latestReview: review({ verdict: 'CORRECT' }) }),
+      ],
+      groundTruths: [
+        truthRow({ productId: 'prod-b', product: { sku: 'SKU-B' } }),
+      ],
+    });
+    const created = await evalOnlyRun(service);
+    await service.refreshCandidates(TENANT, created.id);
+    expect(candidates.find((row) => row.sourceId === 'evt-video')).toMatchObject({
+      eligibility: 'EXCLUDED',
+      exclusionReason: 'STALE_GROUND_TRUTH',
+    });
+  });
+
+  it('keeps a candidate ELIGIBLE while its labels match the current truth', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [
+        bootstrapObservation({ latestReview: review({ verdict: 'CORRECT' }) }),
+        // A corrected WRONG_ACTION whose corrected action IS the truth.
+        bootstrapObservation({
+          journeyEventId: 'evt-video-wa',
+          videoAssetId: 'va-2',
+          latestReview: review({
+            reviewId: 'rev-wa2',
+            verdict: 'WRONG_ACTION',
+            expectedAction: 'RETURN',
+            expectedProductId: 'prod-a',
+            expectedSku: 'SKU-A',
+          }),
+        }),
+      ],
+      groundTruths: [
+        truthRow(),
+        truthRow({ videoAssetId: 'va-2', eventKind: 'RETURN' }),
+      ],
+    });
+    const created = await evalOnlyRun(service);
+    await service.refreshCandidates(TENANT, created.id);
+    expect(candidates.find((row) => row.sourceId === 'evt-video')).toMatchObject(
+      { eligibility: 'ELIGIBLE' },
+    );
+    expect(
+      candidates.find((row) => row.sourceId === 'evt-video-wa'),
+    ).toMatchObject({ eligibility: 'ELIGIBLE', correctedActionLabel: 'RETURN' });
+  });
+
+  it('leaves LIVE observations (no video asset) untouched by the guard', async () => {
+    const { service, candidates, prisma } = buildHarness({
+      observations: [
+        observation({ latestReview: review({ verdict: 'CORRECT' }) }),
+      ],
+      groundTruths: [],
+    });
+    const created = await evalOnlyRun(service);
+    await service.refreshCandidates(TENANT, created.id);
+    expect(candidates.find((row) => row.sourceId === 'evt-1')).toMatchObject({
+      eligibility: 'ELIGIBLE',
+    });
+    // No video asset anywhere → the truth table is never consulted.
+    expect(prisma.videoGroundTruth.findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('CvDatasetService — no-proposal (REVIEW_REQUIRED) NO_OP candidates', () => {
+  it('collects a bootstrap FALSE_TOUCH true negative as an ELIGIBLE NO_OP candidate', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [
+        observation({
+          journeyEventId: 'evt-video-rr',
+          liveSessionId: null,
+          videoAssetId: 'va-neg',
+          eventType: 'REVIEW_REQUIRED',
+          predictedProductId: null,
+          predictedSku: null,
+          predictedProductName: null,
+          matchScore: null,
+          latestReview: review({ reviewId: 'rev-tn', verdict: 'FALSE_TOUCH' }),
+        }),
+      ],
+      groundTruths: [
+        {
+          videoAssetId: 'va-neg',
+          eventKind: 'NONE',
+          productId: null,
+          product: null,
+        },
+      ],
+    });
+    const created = await service.createRun(TENANT, {
+      ...BASE_INPUT,
+      sourceEvaluationRunId: 'eval-1',
+    } as never);
+    await service.refreshCandidates(TENANT, created.id);
+    const candidate = candidates.find((row) => row.sourceId === 'evt-video-rr');
+    // An evidence-bearing NO_OP example: the clip itself is the negative
+    // evidence — no fabricated SKU, no fake correction.
+    expect(candidate).toMatchObject({
+      eligibility: 'ELIGIBLE',
+      correctedActionLabel: 'NO_OP',
+      skuId: null,
+      skuCodeSnapshot: null,
+      reviewVerdict: 'FALSE_TOUCH',
+    });
+  });
+
+  it('excludes the true negative when the clip truth later becomes a positive', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [
+        observation({
+          journeyEventId: 'evt-video-rr',
+          liveSessionId: null,
+          videoAssetId: 'va-neg',
+          eventType: 'REVIEW_REQUIRED',
+          predictedProductId: null,
+          predictedSku: null,
+          matchScore: null,
+          latestReview: review({ reviewId: 'rev-tn', verdict: 'FALSE_TOUCH' }),
+        }),
+      ],
+      groundTruths: [
+        {
+          videoAssetId: 'va-neg',
+          eventKind: 'PICKUP',
+          productId: 'prod-a',
+          product: { sku: 'SKU-A' },
+        },
+      ],
+    });
+    const created = await service.createRun(TENANT, {
+      ...BASE_INPUT,
+      sourceEvaluationRunId: 'eval-1',
+    } as never);
+    await service.refreshCandidates(TENANT, created.id);
+    expect(
+      candidates.find((row) => row.sourceId === 'evt-video-rr'),
+    ).toMatchObject({
+      eligibility: 'EXCLUDED',
+      exclusionReason: 'STALE_GROUND_TRUTH',
+    });
+  });
+});
+
+describe('CvDatasetService — deleted source media (Codex P1)', () => {
+  const videoObservation = () =>
+    observation({
+      journeyEventId: 'evt-video-del',
+      liveSessionId: null,
+      videoAssetId: 'va-gone',
+      latestReview: review({ reviewId: 'rev-del', verdict: 'CORRECT' }),
+    });
+  const liveTruth = {
+    videoAssetId: 'va-gone',
+    eventKind: 'PICKUP',
+    productId: 'prod-a',
+    product: { sku: 'SKU-A' },
+  };
+
+  it('excludes a reviewed candidate whose source clip was deleted', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [videoObservation()],
+      groundTruths: [liveTruth],
+      deletedVideoAssetIds: ['va-gone'],
+    });
+    const created = await service.createRun(TENANT, {
+      ...BASE_INPUT,
+      sourceEvaluationRunId: 'eval-1',
+    } as never);
+    await service.refreshCandidates(TENANT, created.id);
+    expect(
+      candidates.find((row) => row.sourceId === 'evt-video-del'),
+    ).toMatchObject({
+      eligibility: 'EXCLUDED',
+      exclusionReason: 'SOURCE_MEDIA_DELETED',
+    });
+  });
+
+  it('keeps the candidate ELIGIBLE while the source clip is live', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [videoObservation()],
+      groundTruths: [liveTruth],
+    });
+    const created = await service.createRun(TENANT, {
+      ...BASE_INPUT,
+      sourceEvaluationRunId: 'eval-1',
+    } as never);
+    await service.refreshCandidates(TENANT, created.id);
+    expect(
+      candidates.find((row) => row.sourceId === 'evt-video-del'),
+    ).toMatchObject({ eligibility: 'ELIGIBLE' });
   });
 });

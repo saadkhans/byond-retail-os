@@ -44,6 +44,7 @@ import {
 import { InventoryPage } from './pages/InventoryPage';
 import { JourneyDetailPage, JourneysPage } from './pages/JourneysPage';
 import { LoginPage } from './pages/LoginPage';
+import { OneSkuBootstrapPage } from './pages/OneSkuBootstrapPage';
 import { OrderDetailPage, OrdersPage } from './pages/OrdersPage';
 import { PaymentEventsPage } from './pages/PaymentEventsPage';
 import {
@@ -107,6 +108,7 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/inference">Inference jobs</NavLink>
         <NavLink to="/video-assets">Test videos</NavLink>
         <NavLink to="/reference-library">Reference library</NavLink>
+        <NavLink to="/one-sku-bootstrap">One SKU bootstrap</NavLink>
         <NavLink to="/pickup-validation">Pickup validation</NavLink>
         <NavLink to="/cv-evaluation">CV Evaluation</NavLink>
         <NavLink to="/journeys">Journeys</NavLink>
@@ -193,6 +195,10 @@ export function App() {
                     <Route
                       path="reference-library"
                       element={<ReferenceLibraryPage />}
+                    />
+                    <Route
+                      path="one-sku-bootstrap"
+                      element={<OneSkuBootstrapPage />}
                     />
                     <Route
                       path="pickup-validation"

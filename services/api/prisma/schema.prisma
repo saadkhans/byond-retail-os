@@ -554,6 +554,7 @@ model Product {
   journeyEvents           CustomerJourneyEvent[]
   journeyEventReviews     CustomerJourneyEventReview[] @relation("JourneyReviewCorrectedProduct")
   pilotReviewExpectations PilotObservationReview[]     @relation("PilotReviewExpectedProduct")
+  bootstrapEvaluationRuns PilotEvaluationRun[]         @relation("PilotRunBootstrapProduct")
   cvScenarioExpectations  CvTestProtocolScenario[]     @relation("CvScenarioExpectedProduct")
   calibrationZoneExpectations CameraCalibrationZoneProduct[] @relation("CameraCalibrationZoneExpectedProduct")
 
@@ -2464,12 +2465,20 @@ model PilotEvaluationRun {
   name        String
   description String?
   status      PilotEvaluationRunStatus @default(OPEN)
+  // One-SKU bootstrap identity: the product this run bootstraps, set ONLY
+  // by the bootstrap workflow's find-or-create (NULL for every other
+  // pilot run). A partial unique index (raw SQL in the
+  // one_sku_bootstrap_run_identity migration — Prisma cannot express the
+  // WHERE clause) allows at most ONE OPEN run per tenant/product, so
+  // concurrent first corrections cannot split reviews across duplicates.
+  bootstrapProductId String?
   createdById String?
   createdAt   DateTime                 @default(now())
   completedAt DateTime?
 
   tenant                 Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   location               Location?                 @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  bootstrapProduct       Product?                  @relation("PilotRunBootstrapProduct", fields: [bootstrapProductId], references: [id], onDelete: Restrict)
   sessions               PilotEvaluationSession[]
   reviews                PilotObservationReview[]
   testProtocols          CvTestProtocol[]
@@ -2477,6 +2486,7 @@ model PilotEvaluationRun {
 
   @@unique([id, tenantId])
   @@index([tenantId, createdAt(sort: Desc)])
+  @@index([tenantId, bootstrapProductId])
 }
 
 model PilotEvaluationSession {
@@ -2513,6 +2523,12 @@ model PilotObservationReview {
   predictedProductId String?
   predictedSku       String?
   predictedAction    PilotExpectedAction?
+  // One-SKU bootstrap: OPAQUE id of the operator-approved manual CROP
+  // VideoArtifact that supersedes the fusion run's automatic crop as
+  // this observation's evidence. STRUCTURED (never parsed from notes),
+  // validated tenant-scoped + same-video at write time, and carried into
+  // Phase 18 candidates as evidenceCropArtifactId. Never a path or URL.
+  operatorCropArtifactId String?
   notes              String?
   reviewedById       String?
   createdAt          DateTime                @default(now())
@@ -2878,6 +2894,11 @@ model CvDatasetCandidate {
   occlusionBucket      String?
   calibrationZoneLabel String?
   scenarioTypeSnapshot String?
+  // OPAQUE id of the operator-approved crop artifact this candidate's
+  // evidence resolves to (copied from the source review's structured
+  // operatorCropArtifactId at refresh). Null = the source event's own
+  // automatic fusion crop. Reference marker only — never a path/URL.
+  evidenceCropArtifactId String?
   split                CvDatasetSplit?
   eligibility          CvDatasetEligibility
   exclusionReason      String?

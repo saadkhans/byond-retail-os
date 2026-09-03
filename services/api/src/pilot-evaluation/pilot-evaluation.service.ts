@@ -11,6 +11,7 @@ import {
   PilotObservationVerdict,
   Prisma,
 } from '@prisma/client';
+import { PlatformModulesService } from '../platform-modules/platform-modules.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { containsSensitiveFreeText } from '../video-ingest/media-safety';
 
@@ -81,11 +82,25 @@ export interface SessionLatency {
 
 @Injectable()
 export class PilotEvaluationService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // READ-ONLY module-enablement lookup for the video-observation
+    // boundary on the HTTP observations route (isEnabledForTenant only).
+    private readonly platformModules: PlatformModulesService,
+  ) {}
 
   async createRun(
     tenantId: string,
-    input: { name: string; description?: string | null; locationId?: string | null },
+    input: {
+      name: string;
+      description?: string | null;
+      locationId?: string | null;
+      /** One-SKU bootstrap identity — set ONLY by the bootstrap
+       *  workflow's find-or-create; a partial unique index allows at
+       *  most one OPEN bootstrap run per tenant/product. Not exposed on
+       *  the HTTP create route. */
+      bootstrapProductId?: string | null;
+    },
     actorId?: string,
   ) {
     if (input.locationId) {
@@ -97,12 +112,22 @@ export class PilotEvaluationService {
         throw new NotFoundException('Store not found');
       }
     }
+    if (input.bootstrapProductId) {
+      const product = await this.prisma.product.findFirst({
+        where: { tenantId, id: input.bootstrapProductId },
+        select: { id: true },
+      });
+      if (!product) {
+        throw new NotFoundException('Product not found');
+      }
+    }
     const run = await this.prisma.pilotEvaluationRun.create({
       data: {
         tenantId,
         name: input.name,
         description: input.description ?? null,
         locationId: input.locationId ?? null,
+        bootstrapProductId: input.bootstrapProductId ?? null,
         createdById: actorId ?? null,
       },
     });
@@ -274,8 +299,29 @@ export class PilotEvaluationService {
    * Live CV observations of the run's attached sessions, each with its
    * LATEST pilot review (older reviews remain as audit history).
    */
-  async observations(tenantId: string, evaluationRunId: string) {
+  async observations(
+    tenantId: string,
+    evaluationRunId: string,
+    // HTTP callers pass their video-boundary context; INTERNAL callers
+    // (summary, dataset export, Phase 18 candidate refresh — service
+    // code that never echoes raw observation rows to a client) omit it
+    // and receive the full set.
+    viewer?: { hasVideoAssetReadPermission: boolean },
+  ) {
     await this.requireRun(tenantId, evaluationRunId);
+    // Video-backed (FUSION_SHADOW bootstrap) observations expose video
+    // asset ids, timestamps, scores, and crop artifact ids — the same
+    // metadata the video-asset routes guard behind the video-ingest
+    // module + video-asset:read (Codex P1: this generic route must not
+    // be a side door around the bootstrap report's boundary). A viewer
+    // without that access sees LIVE observations only.
+    const includeVideoObservations =
+      viewer === undefined ||
+      (viewer.hasVideoAssetReadPermission === true &&
+        (await this.platformModules.isEnabledForTenant(
+          tenantId,
+          'video-ingest',
+        )));
     const sessions = await this.attachedSessions(tenantId, evaluationRunId);
     const journeyIds = sessions
       .map((row) => row.journeyId)
@@ -285,21 +331,61 @@ export class PilotEvaluationService {
         .filter((row) => row.journeyId !== null)
         .map((row) => [row.journeyId as string, row.liveSessionId]),
     );
-    const events = journeyIds.length
-      ? await this.prisma.customerJourneyEvent.findMany({
-          where: {
-            tenantId,
-            journeyId: { in: journeyIds },
-            sourceType: 'LIVE_SHADOW',
-            eventType: { in: LIVE_OBSERVATION_EVENT_TYPES },
-          },
-          orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
-        })
-      : [];
     const reviews = await this.prisma.pilotObservationReview.findMany({
       where: { tenantId, evaluationRunId },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     });
+    // Observations come from two provenances:
+    // - LIVE_SHADOW events on journeys of the run's attached sessions.
+    // - FUSION_SHADOW events (video bootstrap) that this run's own
+    //   reviews reference — video journeys have no live session, so the
+    //   review row is the only linkage that can surface them here.
+    const reviewedEventIds = [
+      ...new Set(
+        reviews
+          .map((review) => review.journeyEventId)
+          .filter((id): id is string => id !== null),
+      ),
+    ];
+    const eventScopes = [
+      ...(journeyIds.length
+        ? [
+            {
+              journeyId: { in: journeyIds },
+              sourceType: 'LIVE_SHADOW' as const,
+              eventType: { in: LIVE_OBSERVATION_EVENT_TYPES },
+            },
+          ]
+        : []),
+      ...(reviewedEventIds.length && includeVideoObservations
+        ? [
+            {
+              id: { in: reviewedEventIds },
+              sourceType: 'FUSION_SHADOW' as const,
+              // Video-bootstrap observations include REVIEW_REQUIRED:
+              // a completed NO-PROPOSAL run's import, reviewable ONLY as
+              // a FALSE_TOUCH true negative (see reviewObservation).
+              // Scoped to ids this run's own reviews reference, so
+              // unreviewed shadow noise never surfaces here.
+              eventType: {
+                in: [
+                  ...LIVE_OBSERVATION_EVENT_TYPES,
+                  CustomerJourneyEventType.REVIEW_REQUIRED,
+                ],
+              },
+            },
+          ]
+        : []),
+    ];
+    const events = eventScopes.length
+      ? await this.prisma.customerJourneyEvent.findMany({
+          where: {
+            tenantId,
+            OR: eventScopes,
+          },
+          orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
+        })
+      : [];
     const latestByEvent = new Map<string, (typeof reviews)[number]>();
     const missed: (typeof reviews)[number][] = [];
     for (const review of reviews) {
@@ -316,6 +402,10 @@ export class PilotEvaluationService {
         return {
           journeyEventId: event.id,
           liveSessionId: journeyToSession.get(event.journeyId) ?? null,
+          /** Set for FUSION_SHADOW (video bootstrap) observations — lets
+           *  Phase 18 check candidates against the clip's CURRENT
+           *  editable ground truth. Null for live observations. */
+          videoAssetId: event.videoAssetId,
           eventType: event.eventType,
           occurredAt: event.occurredAt,
           predictedProductId: event.productId,
@@ -329,6 +419,7 @@ export class PilotEvaluationService {
                 expectedAction: review.expectedAction,
                 expectedProductId: review.expectedProductId,
                 expectedSku: review.expectedSku,
+                operatorCropArtifactId: review.operatorCropArtifactId,
                 notes: review.notes,
                 reviewedById: review.reviewedById,
                 reviewedAt: review.createdAt,
@@ -364,8 +455,24 @@ export class PilotEvaluationService {
       liveSessionId?: string | null;
       expectedProductId?: string | null;
       notes?: string | null;
+      /** One-SKU bootstrap (service-internal — not on the HTTP DTO):
+       *  OPAQUE id of the operator-approved manual CROP artifact that
+       *  supersedes the automatic crop as this observation's evidence.
+       *  Validated below: tenant-scoped, a CROP, operator-created, and
+       *  belonging to the SAME video as the reviewed event. */
+      operatorCropArtifactId?: string | null;
     },
     actorId?: string,
+    options?: {
+      /** SERVICE-INTERNAL capability (never reachable from the HTTP
+       *  endpoint, whose controller passes only DTO fields): accept a
+       *  FUSION_SHADOW (video bootstrap) event. Only the one-SKU
+       *  bootstrap flow sets this, AFTER validating the SKU, the linked
+       *  bootstrap run, the asset, and its LATEST fusion run — without
+       *  it, a public review request could attach any tenant-local
+       *  video event to any open run and forge Phase 18 linkage. */
+      allowVideoShadowEvent?: boolean;
+    },
   ) {
     const run = await this.requireRun(tenantId, evaluationRunId);
     if (run.status !== PilotEvaluationRunStatus.OPEN) {
@@ -405,6 +512,11 @@ export class PilotEvaluationService {
           'MISSED_EVENT reviews must not reference a journey event',
         );
       }
+      if (input.operatorCropArtifactId) {
+        throw new BadRequestException(
+          'a missed event has no crop evidence to attach',
+        );
+      }
       const liveSessionId = input.liveSessionId ?? null;
       if (
         !liveSessionId ||
@@ -438,8 +550,15 @@ export class PilotEvaluationService {
       return { reviewId: review.id, verdict: review.verdict };
     }
 
-    // Every other verdict labels ONE concrete live observation belonging
-    // to a journey of an attached session (tenant-scoped end to end).
+    // Every other verdict labels ONE concrete shadow observation.
+    // Two provenances are accepted (tenant-scoped end to end):
+    // - LIVE_SHADOW: must belong to a journey of a live session attached
+    //   to this run (unchanged Phase 15 rule).
+    // - FUSION_SHADOW: a shadow event imported from a CONTROLLED TEST
+    //   VIDEO's fusion run (one-SKU bootstrap). No live session exists
+    //   for a video clip, so the review row itself is the run linkage
+    //   and liveSessionId stays null; the event's videoAssetId is the
+    //   evidence locator provenance.
     if (!input.journeyEventId) {
       throw new BadRequestException('journeyEventId is required');
     }
@@ -447,24 +566,101 @@ export class PilotEvaluationService {
       where: {
         tenantId,
         id: input.journeyEventId,
-        sourceType: 'LIVE_SHADOW',
-        eventType: { in: LIVE_OBSERVATION_EVENT_TYPES },
+        sourceType: { in: ['LIVE_SHADOW', 'FUSION_SHADOW'] },
+        eventType: {
+          in: [
+            ...LIVE_OBSERVATION_EVENT_TYPES,
+            CustomerJourneyEventType.REVIEW_REQUIRED,
+          ],
+        },
       },
     });
     if (!event) {
       throw new NotFoundException('Live observation not found');
     }
-    const owning = sessions.find((row) => row.journeyId === event.journeyId);
-    if (!owning) {
-      throw new ConflictException(
-        'observation does not belong to a session attached to this run',
+    // A REVIEW_REQUIRED observation is a completed NO-PROPOSAL analysis:
+    // there is no candidate to confirm or correct, so the ONLY label it
+    // accepts is a video-bootstrap FALSE_TOUCH true negative — the
+    // evidence-bearing NO_OP example the one-SKU workflow records for a
+    // NONE-truth clip whose pipeline correctly proposed nothing.
+    if (
+      event.eventType === CustomerJourneyEventType.REVIEW_REQUIRED &&
+      (event.sourceType !== 'FUSION_SHADOW' ||
+        input.verdict !== PilotObservationVerdict.FALSE_TOUCH)
+    ) {
+      throw new BadRequestException(
+        'a no-candidate observation can only be labeled FALSE_TOUCH ' +
+          'through the one-SKU bootstrap workflow',
       );
+    }
+    let liveSessionId: string | null = null;
+    if (event.sourceType === 'LIVE_SHADOW') {
+      const owning = sessions.find((row) => row.journeyId === event.journeyId);
+      if (!owning) {
+        throw new ConflictException(
+          'observation does not belong to a session attached to this run',
+        );
+      }
+      liveSessionId = owning.liveSessionId;
+    } else {
+      // FUSION_SHADOW (video bootstrap) events have no attached-session
+      // linkage to prove they belong to this run — only the bootstrap
+      // workflow, which validates the SKU/run/asset/latest-fusion chain
+      // itself, may label them (Codex P2). The PUBLIC review endpoint
+      // never sets this capability, so an arbitrary caller cannot
+      // attach an unrelated clip to an open run and have Phase 18
+      // collect it as forged linkage.
+      if (options?.allowVideoShadowEvent !== true) {
+        throw new ConflictException(
+          'video-shadow observations can only be reviewed through the ' +
+            'one-SKU bootstrap workflow',
+        );
+      }
+      if (!event.videoAssetId) {
+        // FUSION_SHADOW without video provenance has no evidence locator
+        // an offline trainer could map to footage — refuse to label it.
+        throw new BadRequestException(
+          'a video-shadow observation needs video provenance',
+        );
+      }
+    }
+    // Operator crop evidence (one-SKU bootstrap): STRUCTURED, validated
+    // reference — tenant-scoped, a CROP artifact, operator-created, and
+    // on the SAME video the reviewed event came from. A cross-tenant or
+    // cross-video id can never be attached.
+    let operatorCropArtifactId: string | null = null;
+    if (input.operatorCropArtifactId) {
+      const artifact = await this.prisma.videoArtifact.findFirst({
+        where: {
+          tenantId,
+          id: input.operatorCropArtifactId,
+          artifactType: 'CROP',
+        },
+        select: { id: true, videoAssetId: true, createdById: true },
+      });
+      if (!artifact) {
+        throw new NotFoundException('Crop artifact not found');
+      }
+      if (artifact.createdById === null) {
+        throw new BadRequestException(
+          'only an operator-created manual crop can be attached as evidence',
+        );
+      }
+      if (
+        event.videoAssetId === null ||
+        artifact.videoAssetId !== event.videoAssetId
+      ) {
+        throw new BadRequestException(
+          'the crop artifact does not belong to the reviewed observation’s video',
+        );
+      }
+      operatorCropArtifactId = artifact.id;
     }
     const review = await this.prisma.pilotObservationReview.create({
       data: {
         tenantId,
         evaluationRunId,
-        liveSessionId: owning.liveSessionId,
+        liveSessionId,
         journeyEventId: event.id,
         verdict: input.verdict,
         expectedAction: input.expectedAction,
@@ -474,6 +670,7 @@ export class PilotEvaluationService {
         predictedProductId: event.productId,
         predictedSku: event.sku,
         predictedAction: predictedActionOf(event.eventType),
+        operatorCropArtifactId,
         notes: notes || null,
         reviewedById: actorId ?? null,
       },
@@ -501,7 +698,15 @@ export class PilotEvaluationService {
       tenantId,
       evaluationRunId,
     );
-    const latest = observations
+    // TRUE-NEGATIVE (REVIEW_REQUIRED no-candidate) bootstrap observations
+    // carry NO prediction to score — their FALSE_TOUCH label is dataset
+    // evidence, not an accuracy judgment, so they stay OUT of the
+    // accuracy/confusion math (counting a correct rejection as
+    // "action-wrong" would misstate the pilot).
+    const scored = observations.filter(
+      (row) => row.eventType !== CustomerJourneyEventType.REVIEW_REQUIRED,
+    );
+    const latest = scored
       .map((row) => row.latestReview)
       .filter(
         (review): review is NonNullable<typeof review> => review !== null,
@@ -524,7 +729,7 @@ export class PilotEvaluationService {
     // Confusion over LABELED observations (predicted vs expected). For
     // CORRECT the expectation IS the prediction.
     const observationByReview = new Map(
-      observations
+      scored
         .filter((row) => row.latestReview !== null)
         .map((row) => [row.latestReview!.reviewId, row]),
     );

@@ -28,6 +28,9 @@ function buildHarness(
     liveSessions?: Record<string, unknown>[];
     journeyEvents?: Record<string, unknown>[];
     products?: { id: string; tenantId: string; sku: string }[];
+    videoArtifacts?: Record<string, unknown>[];
+    /** Whether the tenant has the video-ingest module (default true). */
+    videoIngestModuleEnabled?: boolean;
   } = {},
 ) {
   let seq = 0;
@@ -180,29 +183,73 @@ function buildHarness(
         return row ? { id: row.id } : null;
       }),
     },
-    customerJourneyEvent: {
-      findMany: jest.fn(async (args: { where: Record<string, unknown> }) =>
-        journeyEvents.filter((e) =>
-          whereMatch(e, {
-            tenantId: args.where.tenantId,
-            sourceType: args.where.sourceType,
-          }) &&
-          ((args.where.journeyId as { in: string[] }).in ?? []).includes(
-            e.journeyId as string,
-          ) &&
-          ((args.where.eventType as { in: string[] }).in ?? []).includes(
-            e.eventType as string,
-          ),
-        ),
-      ),
+    videoArtifact: {
       findFirst: jest.fn(async (args: { where: Record<string, unknown> }) => {
-        const { eventType, ...rest } = args.where;
+        const row = (options.videoArtifacts ?? []).find((a) =>
+          whereMatch(a, args.where),
+        );
+        return row ?? null;
+      }),
+    },
+    customerJourneyEvent: {
+      // observations() now queries with an OR of provenance scopes
+      // (session journeys → LIVE_SHADOW; review-referenced ids →
+      // FUSION_SHADOW); honor both that shape and the legacy flat one.
+      findMany: jest.fn(async (args: { where: Record<string, unknown> }) => {
+        const scopes =
+          (args.where.OR as Record<string, unknown>[] | undefined) ?? [
+            args.where,
+          ];
+        return journeyEvents.filter(
+          (e) =>
+            whereMatch(e, { tenantId: args.where.tenantId }) &&
+            scopes.some((scope) => {
+              // eventType lives per SCOPE now (REVIEW_REQUIRED is a
+              // FUSION_SHADOW-only observation kind); honor a top-level
+              // filter too for any legacy shape.
+              const eventTypeIn = (
+                (scope.eventType ?? args.where.eventType) as
+                  | { in: string[] }
+                  | undefined
+              )?.in;
+              if (
+                eventTypeIn &&
+                !eventTypeIn.includes(e.eventType as string)
+              ) {
+                return false;
+              }
+              const journeyIn = (
+                scope.journeyId as { in: string[] } | undefined
+              )?.in;
+              const idIn = (scope.id as { in: string[] } | undefined)?.in;
+              if (
+                scope.sourceType !== undefined &&
+                e.sourceType !== scope.sourceType
+              ) {
+                return false;
+              }
+              if (journeyIn && !journeyIn.includes(e.journeyId as string)) {
+                return false;
+              }
+              if (idIn && !idIn.includes(e.id as string)) {
+                return false;
+              }
+              return true;
+            }),
+        );
+      }),
+      findFirst: jest.fn(async (args: { where: Record<string, unknown> }) => {
+        const { eventType, sourceType, ...rest } = args.where;
+        const sourceIn = (sourceType as { in: string[] } | undefined)?.in;
         const row = journeyEvents.find(
           (e) =>
             whereMatch(e, rest) &&
             ((eventType as { in: string[] }).in ?? []).includes(
               e.eventType as string,
-            ),
+            ) &&
+            (sourceIn
+              ? sourceIn.includes(e.sourceType as string)
+              : sourceType === undefined || e.sourceType === sourceType),
         );
         return row ?? null;
       }),
@@ -210,8 +257,18 @@ function buildHarness(
   };
   /* eslint-enable @typescript-eslint/no-explicit-any */
 
-  const service = new PilotEvaluationService(prisma as never);
-  return { service, prisma, runs, sessions, reviews };
+  const platformModules = {
+    isEnabledForTenant: jest.fn(async (_tenant: string, moduleCode: string) =>
+      moduleCode === 'video-ingest'
+        ? (options.videoIngestModuleEnabled ?? true)
+        : true,
+    ),
+  };
+  const service = new PilotEvaluationService(
+    prisma as never,
+    platformModules as never,
+  );
+  return { service, prisma, runs, sessions, reviews, platformModules };
 }
 
 const LIVE_SESSIONS = [
@@ -647,5 +704,476 @@ describe('PilotEvaluationService — dataset export', () => {
     expect(populated.manifest).not.toContain('://');
     expect(populated.manifest).not.toContain('CAMERA_');
     expect(populated.manifest).not.toContain('credential');
+  });
+});
+
+describe('PilotEvaluationService — video-bootstrap (FUSION_SHADOW) observations', () => {
+  const VIDEO_EVENT = {
+    id: 'event-video-1',
+    tenantId: TENANT,
+    journeyId: 'journey-video',
+    eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+    occurredAt: new Date('2026-08-20T10:00:00.000Z'),
+    productId: 'prod-a',
+    sku: 'SKU-A',
+    productName: 'Product A',
+    matchScore: 0.35,
+    sourceType: 'FUSION_SHADOW',
+    videoAssetId: 'va-1',
+  };
+
+  it('records a review on a video-shadow event with NO attached session and surfaces it as an observation', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+    });
+    const run = await harness.service.createRun(
+      TENANT,
+      { name: 'One SKU bootstrap — SKU-A' },
+      'user-1',
+    );
+    const review = await harness.service.reviewObservation(
+      TENANT,
+      run.evaluationRunId,
+      {
+        verdict: PilotObservationVerdict.WRONG_SKU,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: 'event-video-1',
+        expectedProductId: 'prod-c',
+      },
+      'user-1',
+      { allowVideoShadowEvent: true },
+    );
+    const stored = harness.reviews.find(
+      (row) => row.id === review.reviewId,
+    ) as Record<string, unknown>;
+    // No live session exists for a video clip — the review row itself is
+    // the run linkage, and the prediction snapshots are server-side.
+    expect(stored.liveSessionId).toBeNull();
+    expect(stored.predictedSku).toBe('SKU-A');
+    expect(stored.expectedSku).toBe('SKU-C');
+
+    // The reviewed video event is now an observation of the run — the
+    // exact rows Phase 18 candidate refresh consumes.
+    const result = await harness.service.observations(
+      TENANT,
+      run.evaluationRunId,
+    );
+    expect(result.observations).toHaveLength(1);
+    expect(result.observations[0].journeyEventId).toBe('event-video-1');
+    expect(result.observations[0].liveSessionId).toBeNull();
+    expect(result.observations[0].latestReview?.verdict).toBe(
+      PilotObservationVerdict.WRONG_SKU,
+    );
+  });
+
+  it('refuses a video-shadow event that lacks video provenance', async () => {
+    const harness = buildHarness({
+      journeyEvents: [
+        { ...VIDEO_EVENT, id: 'event-video-2', videoAssetId: null },
+      ],
+      products: PRODUCTS,
+    });
+    const run = await harness.service.createRun(
+      TENANT,
+      { name: 'One SKU bootstrap — SKU-A' },
+      'user-1',
+    );
+    await expect(
+      harness.service.reviewObservation(
+        TENANT,
+        run.evaluationRunId,
+        {
+          verdict: PilotObservationVerdict.CORRECT,
+          expectedAction: PilotExpectedAction.PICKUP,
+          journeyEventId: 'event-video-2',
+        },
+        undefined,
+        { allowVideoShadowEvent: true },
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('REJECTS a video-shadow event on the public path (no bootstrap capability)', async () => {
+    // The HTTP review endpoint calls reviewObservation WITHOUT the
+    // service-internal capability — an arbitrary caller can never
+    // attach a tenant-local video event to an open run and have
+    // Phase 18 collect it as forged linkage (Codex P2).
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+    });
+    const run = await harness.service.createRun(
+      TENANT,
+      { name: 'One SKU bootstrap — SKU-A' },
+      'user-1',
+    );
+    await expect(
+      harness.service.reviewObservation(TENANT, run.evaluationRunId, {
+        verdict: PilotObservationVerdict.CORRECT,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: 'event-video-1',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(harness.reviews).toHaveLength(0);
+  });
+
+  it('still refuses a LIVE_SHADOW event whose session is not attached to the run', async () => {
+    const harness = buildHarness({
+      liveSessions: LIVE_SESSIONS,
+      journeyEvents: EVENTS,
+      products: PRODUCTS,
+    });
+    const run = await harness.service.createRun(
+      TENANT,
+      { name: 'Unattached' },
+      'user-1',
+    );
+    await expect(
+      harness.service.reviewObservation(TENANT, run.evaluationRunId, {
+        verdict: PilotObservationVerdict.CORRECT,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: 'event-1',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+});
+
+describe('PilotEvaluationService — structured operator-crop evidence', () => {
+  const VIDEO_EVENT = {
+    id: 'event-video-crop',
+    tenantId: TENANT,
+    journeyId: 'journey-video',
+    eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+    occurredAt: new Date('2026-08-20T10:00:00.000Z'),
+    productId: 'prod-a',
+    sku: 'SKU-A',
+    productName: 'Product A',
+    matchScore: 0.35,
+    sourceType: 'FUSION_SHADOW',
+    videoAssetId: 'va-1',
+  };
+  const CROP = {
+    id: 'artifact-manual-1',
+    tenantId: TENANT,
+    videoAssetId: 'va-1',
+    artifactType: 'CROP',
+    createdById: 'user-1',
+  };
+
+  async function makeRun(harness: ReturnType<typeof buildHarness>) {
+    const run = await harness.service.createRun(
+      TENANT,
+      { name: 'One SKU bootstrap — SKU-A' },
+      'user-1',
+    );
+    return run.evaluationRunId;
+  }
+
+  it('stores the crop reference STRUCTURALLY and surfaces it in observations()', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+      videoArtifacts: [CROP],
+    });
+    const runId = await makeRun(harness);
+    const review = await harness.service.reviewObservation(
+      TENANT,
+      runId,
+      {
+        verdict: PilotObservationVerdict.CORRECT,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: VIDEO_EVENT.id,
+        operatorCropArtifactId: CROP.id,
+        notes: 'clean view',
+      },
+      'user-1',
+      { allowVideoShadowEvent: true },
+    );
+    const stored = harness.reviews.find(
+      (row) => row.id === review.reviewId,
+    ) as Record<string, unknown>;
+    expect(stored.operatorCropArtifactId).toBe(CROP.id);
+    // Notes stay free text — the association is NEVER parsed from them.
+    expect(stored.notes).toBe('clean view');
+
+    const result = await harness.service.observations(TENANT, runId);
+    expect(result.observations[0].latestReview?.operatorCropArtifactId).toBe(
+      CROP.id,
+    );
+  });
+
+  it('rejects a crop from another tenant (tenant isolation)', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+      videoArtifacts: [{ ...CROP, tenantId: 'tenant-2' }],
+    });
+    const runId = await makeRun(harness);
+    await expect(
+      harness.service.reviewObservation(TENANT, runId, {
+        verdict: PilotObservationVerdict.CORRECT,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: VIDEO_EVENT.id,
+        operatorCropArtifactId: CROP.id,
+      }, undefined, { allowVideoShadowEvent: true }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('rejects a crop that belongs to a DIFFERENT video than the observation', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+      videoArtifacts: [{ ...CROP, videoAssetId: 'va-other' }],
+    });
+    const runId = await makeRun(harness);
+    await expect(
+      harness.service.reviewObservation(TENANT, runId, {
+        verdict: PilotObservationVerdict.CORRECT,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: VIDEO_EVENT.id,
+        operatorCropArtifactId: CROP.id,
+      }, undefined, { allowVideoShadowEvent: true }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('rejects a pipeline-created crop (only operator crops are evidence overrides)', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+      videoArtifacts: [{ ...CROP, createdById: null }],
+    });
+    const runId = await makeRun(harness);
+    await expect(
+      harness.service.reviewObservation(TENANT, runId, {
+        verdict: PilotObservationVerdict.CORRECT,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: VIDEO_EVENT.id,
+        operatorCropArtifactId: CROP.id,
+      }, undefined, { allowVideoShadowEvent: true }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+});
+
+describe('PilotEvaluationService — no-proposal (REVIEW_REQUIRED) true negatives', () => {
+  const NO_PROPOSAL_EVENT = {
+    id: 'event-video-rr',
+    tenantId: TENANT,
+    journeyId: 'journey-video',
+    eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+    occurredAt: new Date('2026-08-20T10:00:00.000Z'),
+    productId: null,
+    sku: null,
+    productName: null,
+    matchScore: null,
+    sourceType: 'FUSION_SHADOW',
+    videoAssetId: 'va-1',
+  };
+
+  async function makeRun(harness: ReturnType<typeof buildHarness>) {
+    const run = await harness.service.createRun(
+      TENANT,
+      { name: 'One SKU bootstrap — SKU-A' },
+      'user-1',
+    );
+    return run.evaluationRunId;
+  }
+
+  it('accepts a bootstrap FALSE_TOUCH on a no-proposal record and surfaces it as an observation', async () => {
+    const harness = buildHarness({
+      journeyEvents: [NO_PROPOSAL_EVENT],
+      products: PRODUCTS,
+    });
+    const runId = await makeRun(harness);
+    const review = await harness.service.reviewObservation(
+      TENANT,
+      runId,
+      {
+        verdict: PilotObservationVerdict.FALSE_TOUCH,
+        expectedAction: PilotExpectedAction.NO_OP,
+        journeyEventId: 'event-video-rr',
+      },
+      'user-1',
+      { allowVideoShadowEvent: true },
+    );
+    const stored = harness.reviews.find(
+      (row) => row.id === review.reviewId,
+    ) as Record<string, unknown>;
+    // Server-side snapshots of a NO-candidate record: no product, no
+    // predicted action to misstate.
+    expect(stored.predictedProductId).toBeNull();
+    expect(stored.predictedSku).toBeNull();
+    expect(stored.predictedAction).toBe(PilotExpectedAction.UNKNOWN);
+
+    const { observations } = await harness.service.observations(
+      TENANT,
+      runId,
+    );
+    expect(observations).toHaveLength(1);
+    expect(observations[0].journeyEventId).toBe('event-video-rr');
+    expect(observations[0].videoAssetId).toBe('va-1');
+    expect(observations[0].latestReview?.verdict).toBe(
+      PilotObservationVerdict.FALSE_TOUCH,
+    );
+  });
+
+  it('refuses every verdict except FALSE_TOUCH on a no-proposal record', async () => {
+    const harness = buildHarness({
+      journeyEvents: [NO_PROPOSAL_EVENT],
+      products: PRODUCTS,
+    });
+    const runId = await makeRun(harness);
+    for (const verdict of [
+      PilotObservationVerdict.CORRECT,
+      PilotObservationVerdict.WRONG_SKU,
+      PilotObservationVerdict.WRONG_ACTION,
+      PilotObservationVerdict.UNCERTAIN,
+    ]) {
+      await expect(
+        harness.service.reviewObservation(
+          TENANT,
+          runId,
+          {
+            verdict,
+            expectedAction: PilotExpectedAction.NO_OP,
+            journeyEventId: 'event-video-rr',
+            expectedProductId:
+              verdict === PilotObservationVerdict.WRONG_SKU ? 'prod-c' : undefined,
+          },
+          'user-1',
+          { allowVideoShadowEvent: true },
+        ),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
+    expect(harness.reviews).toHaveLength(0);
+  });
+
+  it('refuses FALSE_TOUCH on a LIVE_SHADOW REVIEW_REQUIRED event', async () => {
+    const harness = buildHarness({
+      liveSessions: LIVE_SESSIONS,
+      journeyEvents: [
+        {
+          ...NO_PROPOSAL_EVENT,
+          id: 'event-live-rr',
+          journeyId: 'journey-1',
+          sourceType: 'LIVE_SHADOW',
+          videoAssetId: null,
+        },
+      ],
+      products: PRODUCTS,
+    });
+    const runId = await makeRun(harness);
+    await harness.service.attachSession(TENANT, runId, 'live-1');
+    await expect(
+      harness.service.reviewObservation(TENANT, runId, {
+        verdict: PilotObservationVerdict.FALSE_TOUCH,
+        expectedAction: PilotExpectedAction.NO_OP,
+        journeyEventId: 'event-live-rr',
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('keeps no-proposal true negatives OUT of accuracy/confusion math', async () => {
+    const harness = buildHarness({
+      journeyEvents: [NO_PROPOSAL_EVENT],
+      products: PRODUCTS,
+    });
+    const runId = await makeRun(harness);
+    await harness.service.reviewObservation(
+      TENANT,
+      runId,
+      {
+        verdict: PilotObservationVerdict.FALSE_TOUCH,
+        expectedAction: PilotExpectedAction.NO_OP,
+        journeyEventId: 'event-video-rr',
+      },
+      'user-1',
+      { allowVideoShadowEvent: true },
+    );
+    const summary = await harness.service.summary(TENANT, runId);
+    // A correct rejection carries NO prediction to score — counting it
+    // as action-wrong would misstate the pilot.
+    expect(summary.totals.falseTouch).toBe(0);
+    expect(summary.totals.reviewed).toBe(0);
+  });
+});
+
+describe('PilotEvaluationService — observations video-asset boundary (Codex P1)', () => {
+  const VIDEO_EVENT = {
+    id: 'event-video-1',
+    tenantId: TENANT,
+    journeyId: 'journey-video',
+    eventType: CustomerJourneyEventType.PRODUCT_PICKUP,
+    occurredAt: new Date('2026-08-20T10:00:00.000Z'),
+    productId: 'prod-a',
+    sku: 'SKU-A',
+    productName: 'Product A',
+    matchScore: 0.35,
+    sourceType: 'FUSION_SHADOW',
+    videoAssetId: 'va-1',
+  };
+
+  async function reviewedVideoRun(harness: ReturnType<typeof buildHarness>) {
+    const run = await harness.service.createRun(
+      TENANT,
+      { name: 'One SKU bootstrap — SKU-A' },
+      'user-1',
+    );
+    await harness.service.reviewObservation(
+      TENANT,
+      run.evaluationRunId,
+      {
+        verdict: PilotObservationVerdict.CORRECT,
+        expectedAction: PilotExpectedAction.PICKUP,
+        journeyEventId: 'event-video-1',
+      },
+      'user-1',
+      { allowVideoShadowEvent: true },
+    );
+    return run.evaluationRunId;
+  }
+
+  it('hides video-backed observations from a viewer without video-asset:read', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+    });
+    const runId = await reviewedVideoRun(harness);
+    const denied = await harness.service.observations(TENANT, runId, {
+      hasVideoAssetReadPermission: false,
+    });
+    // No asset ids, timestamps, scores, or crop artifact ids leak
+    // through the generic observations route.
+    expect(denied.observations).toHaveLength(0);
+    expect(JSON.stringify(denied)).not.toContain('va-1');
+  });
+
+  it('hides video-backed observations when the tenant lacks video-ingest', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+      videoIngestModuleEnabled: false,
+    });
+    const runId = await reviewedVideoRun(harness);
+    const denied = await harness.service.observations(TENANT, runId, {
+      hasVideoAssetReadPermission: true,
+    });
+    expect(denied.observations).toHaveLength(0);
+  });
+
+  it('returns video-backed observations to an authorized viewer and to INTERNAL callers', async () => {
+    const harness = buildHarness({
+      journeyEvents: [VIDEO_EVENT],
+      products: PRODUCTS,
+    });
+    const runId = await reviewedVideoRun(harness);
+    const authorized = await harness.service.observations(TENANT, runId, {
+      hasVideoAssetReadPermission: true,
+    });
+    expect(authorized.observations).toHaveLength(1);
+    // Internal callers (summary / dataset export / Phase 18 candidate
+    // refresh) omit the viewer and keep the full evidence set.
+    const internal = await harness.service.observations(TENANT, runId);
+    expect(internal.observations).toHaveLength(1);
   });
 });

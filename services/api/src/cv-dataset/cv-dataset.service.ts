@@ -12,6 +12,7 @@ import {
   CvDatasetPurpose,
   CvDatasetSplit,
   CustomerJourneyEventType,
+  GroundTruthEventKind,
   PilotExpectedAction,
   PilotObservationVerdict,
   Prisma,
@@ -162,6 +163,10 @@ interface CandidateSeed {
   reviewSource: string;
   confidenceBucket: string | null;
   scenarioTypeSnapshot: string | null;
+  /** OPAQUE id of the operator-approved crop artifact the source
+   *  review named as this candidate's evidence (null = the event's own
+   *  automatic fusion crop). Reference marker only — never a path. */
+  evidenceCropArtifactId: string | null;
   eligibility: CvDatasetEligibility;
   exclusionReason: string | null;
 }
@@ -205,6 +210,9 @@ export interface DatasetCandidateView {
   occlusionBucket: string | null;
   calibrationZoneLabel: string | null;
   scenarioTypeSnapshot: string | null;
+  /** Operator-approved crop reference (OPAQUE artifact id) — null when
+   *  the candidate's evidence is the event's automatic fusion crop. */
+  evidenceCropArtifactId: string | null;
   split: CvDatasetSplit | null;
   eligibility: CvDatasetEligibility;
   exclusionReason: string | null;
@@ -253,6 +261,7 @@ function toCandidateView(row: CvDatasetCandidate): DatasetCandidateView {
     occlusionBucket: row.occlusionBucket,
     calibrationZoneLabel: row.calibrationZoneLabel,
     scenarioTypeSnapshot: row.scenarioTypeSnapshot,
+    evidenceCropArtifactId: row.evidenceCropArtifactId,
     split: row.split,
     eligibility: row.eligibility,
     exclusionReason: row.exclusionReason,
@@ -1087,9 +1096,91 @@ export class CvDatasetService {
         tenantId,
         run.sourceEvaluationRunId,
       );
+      // Ground-truth drift guard (Codex P1): video-bootstrap reviews bind
+      // labels at review time, but VideoGroundTruth is EDITABLE — a
+      // candidate whose effective labels contradict the clip's CURRENT
+      // truth would export mislabeled data. Live observations carry no
+      // video asset and are unaffected.
+      const truthAssetIds = [
+        ...new Set(
+          observations
+            .map((observation) => observation.videoAssetId)
+            .filter((id): id is string => typeof id === 'string'),
+        ),
+      ];
+      const truthRows = truthAssetIds.length
+        ? await this.prisma.videoGroundTruth.findMany({
+            where: { tenantId, videoAssetId: { in: truthAssetIds } },
+            select: {
+              videoAssetId: true,
+              eventKind: true,
+              productId: true,
+              product: { select: { sku: true } },
+            },
+          })
+        : [];
+      const truthByAsset = new Map(
+        truthRows.map((row) => [row.videoAssetId, row]),
+      );
+      // Deleted source media (Codex P1): the asset delete flow removes
+      // the footage and soft-deletes the row while keeping ground-truth
+      // and shadow-event rows for audit — a candidate whose clip no
+      // longer exists must never stay ELIGIBLE or export a manifest
+      // reference to footage that is gone. Export freshness recomputes
+      // these seeds, so a post-refresh deletion also blocks the export.
+      const liveVideoAssetIds = new Set(
+        truthAssetIds.length
+          ? (
+              await this.prisma.videoAsset.findMany({
+                where: {
+                  tenantId,
+                  id: { in: truthAssetIds },
+                  deletedAt: null,
+                },
+                select: { id: true },
+              })
+            ).map((row) => row.id)
+          : [],
+      );
       for (const observation of observations) {
         const predictedAction = predictedActionOf(observation.eventType);
         const review = observation.latestReview;
+        const truth = observation.videoAssetId
+          ? (truthByAsset.get(observation.videoAssetId) ?? null)
+          : null;
+        // Demote an otherwise-ELIGIBLE seed whose effective labels no
+        // longer match the clip's current ground truth. Never rewrites
+        // the review row — a fresh review restores eligibility.
+        const guardCurrentTruth = (seed: CandidateSeed): CandidateSeed => {
+          if (seed.eligibility !== CvDatasetEligibility.ELIGIBLE || !truth) {
+            return seed;
+          }
+          const effectiveAction = seed.correctedActionLabel ?? seed.actionLabel;
+          const truthAction =
+            truth.eventKind === GroundTruthEventKind.NONE
+              ? PilotExpectedAction.NO_OP
+              : truth.eventKind === GroundTruthEventKind.RETURN
+                ? PilotExpectedAction.RETURN
+                : PilotExpectedAction.PICKUP;
+          const actionMatches = effectiveAction === truthAction;
+          // Product-ID equality is canonical when both ids are known;
+          // the SKU snapshot is the fallback. Negatives carry no product.
+          const productMatches =
+            truthAction === PilotExpectedAction.NO_OP
+              ? true
+              : seed.skuId !== null && truth.productId !== null
+                ? seed.skuId === truth.productId
+                : seed.skuCodeSnapshot !== null &&
+                  (truth.product?.sku ?? null) !== null &&
+                  seed.skuCodeSnapshot === truth.product?.sku;
+          return actionMatches && productMatches
+            ? seed
+            : {
+                ...seed,
+                eligibility: CvDatasetEligibility.EXCLUDED,
+                exclusionReason: 'STALE_GROUND_TRUTH',
+              };
+        };
         const base = {
           sourceType: CvDatasetCandidateSourceType.LIVE_REVIEW,
           sourceId: observation.journeyEventId,
@@ -1101,6 +1192,11 @@ export class CvDatasetService {
           reviewSource: 'PILOT_EVALUATION',
           confidenceBucket: confidenceBucketOf(observation.matchScore),
           scenarioTypeSnapshot: null,
+          // STRUCTURED operator-crop evidence override from the review
+          // (one-SKU bootstrap) — the candidate resolves to the crop the
+          // operator approved, not the rejected automatic one. Never
+          // parsed from notes.
+          evidenceCropArtifactId: review?.operatorCropArtifactId ?? null,
         };
         const excluded = (
           verdict: string,
@@ -1114,33 +1210,49 @@ export class CvDatasetService {
           eligibility: CvDatasetEligibility.EXCLUDED,
           exclusionReason,
         });
+        // A video-backed observation whose source clip was deleted has
+        // no footage an offline trainer could resolve — EXCLUDED, and a
+        // stored ELIGIBLE row goes stale against this recomputed seed.
+        if (
+          observation.videoAssetId &&
+          !liveVideoAssetIds.has(observation.videoAssetId)
+        ) {
+          seeds.push(
+            excluded(review?.verdict ?? 'UNREVIEWED', 'SOURCE_MEDIA_DELETED'),
+          );
+          continue;
+        }
         if (!review) {
           seeds.push(excluded('UNREVIEWED', 'NOT_REVIEWED'));
           continue;
         }
         if (review.verdict === PilotObservationVerdict.CORRECT) {
-          seeds.push({
-            ...base,
-            skuId: observation.predictedProductId,
-            skuCodeSnapshot: observation.predictedSku,
-            correctedActionLabel: null,
-            reviewVerdict: review.verdict,
-            eligibility: CvDatasetEligibility.ELIGIBLE,
-            exclusionReason: null,
-          });
+          seeds.push(
+            guardCurrentTruth({
+              ...base,
+              skuId: observation.predictedProductId,
+              skuCodeSnapshot: observation.predictedSku,
+              correctedActionLabel: null,
+              reviewVerdict: review.verdict,
+              eligibility: CvDatasetEligibility.ELIGIBLE,
+              exclusionReason: null,
+            }),
+          );
           continue;
         }
         if (review.verdict === PilotObservationVerdict.FALSE_TOUCH) {
           // A confirmed false touch is a reviewed corrected NEGATIVE.
-          seeds.push({
-            ...base,
-            skuId: observation.predictedProductId,
-            skuCodeSnapshot: observation.predictedSku,
-            correctedActionLabel: PilotExpectedAction.NO_OP,
-            reviewVerdict: review.verdict,
-            eligibility: CvDatasetEligibility.ELIGIBLE,
-            exclusionReason: null,
-          });
+          seeds.push(
+            guardCurrentTruth({
+              ...base,
+              skuId: observation.predictedProductId,
+              skuCodeSnapshot: observation.predictedSku,
+              correctedActionLabel: PilotExpectedAction.NO_OP,
+              reviewVerdict: review.verdict,
+              eligibility: CvDatasetEligibility.ELIGIBLE,
+              exclusionReason: null,
+            }),
+          );
           continue;
         }
         if (review.verdict === PilotObservationVerdict.WRONG_SKU) {
@@ -1170,15 +1282,17 @@ export class CvDatasetService {
             seeds.push(excluded(review.verdict, 'CORRECTION_NOT_DIFFERENT'));
             continue;
           }
-          seeds.push({
-            ...base,
-            skuId: correctedProductId,
-            skuCodeSnapshot: correctedSku,
-            correctedActionLabel: null,
-            reviewVerdict: review.verdict,
-            eligibility: CvDatasetEligibility.ELIGIBLE,
-            exclusionReason: null,
-          });
+          seeds.push(
+            guardCurrentTruth({
+              ...base,
+              skuId: correctedProductId,
+              skuCodeSnapshot: correctedSku,
+              correctedActionLabel: null,
+              reviewVerdict: review.verdict,
+              eligibility: CvDatasetEligibility.ELIGIBLE,
+              exclusionReason: null,
+            }),
+          );
           continue;
         }
         if (review.verdict === PilotObservationVerdict.WRONG_ACTION) {
@@ -1193,15 +1307,17 @@ export class CvDatasetService {
             seeds.push(excluded(review.verdict, 'CORRECTION_NOT_DIFFERENT'));
             continue;
           }
-          seeds.push({
-            ...base,
-            skuId: review.expectedProductId ?? observation.predictedProductId,
-            skuCodeSnapshot: review.expectedSku ?? observation.predictedSku,
-            correctedActionLabel: corrected,
-            reviewVerdict: review.verdict,
-            eligibility: CvDatasetEligibility.ELIGIBLE,
-            exclusionReason: null,
-          });
+          seeds.push(
+            guardCurrentTruth({
+              ...base,
+              skuId: review.expectedProductId ?? observation.predictedProductId,
+              skuCodeSnapshot: review.expectedSku ?? observation.predictedSku,
+              correctedActionLabel: corrected,
+              reviewVerdict: review.verdict,
+              eligibility: CvDatasetEligibility.ELIGIBLE,
+              exclusionReason: null,
+            }),
+          );
           continue;
         }
         seeds.push(
@@ -1234,6 +1350,7 @@ export class CvDatasetService {
           reviewSource: 'PILOT_EVALUATION',
           confidenceBucket: null,
           scenarioTypeSnapshot: null,
+          evidenceCropArtifactId: null,
           eligibility: CvDatasetEligibility.EXCLUDED,
           exclusionReason: 'MISSING_EVIDENCE_LOCATOR',
         });
@@ -1280,6 +1397,7 @@ export class CvDatasetService {
           reviewSource: 'CV_TEST_PROTOCOL',
           confidenceBucket: null,
           scenarioTypeSnapshot: scenario.scenarioType,
+          evidenceCropArtifactId: null,
           eligibility: decided
             ? CvDatasetEligibility.ELIGIBLE
             : CvDatasetEligibility.EXCLUDED,
@@ -2098,7 +2216,12 @@ export class CvDatasetService {
       // same verdict against a different session, or a changed
       // evaluation/protocol/calibration stamp, is just as stale as a
       // flipped verdict — the manifest would point at the wrong
-      // footage or assert setup metadata that was never used.
+      // footage or assert setup metadata that was never used. The
+      // operator-crop reference is part of that lineage (Codex P1): a
+      // replacement crop reviewed after the refresh — including
+      // null→crop, crop→different crop, and crop→null — must force a
+      // refresh, or the export would name a crop the operator no
+      // longer stands behind.
       if (
         !seed ||
         seed.eligibility !== CvDatasetEligibility.ELIGIBLE ||
@@ -2110,7 +2233,8 @@ export class CvDatasetService {
         seed.liveSessionId !== row.liveSessionId ||
         seed.evaluationRunId !== row.evaluationRunId ||
         seed.protocolId !== row.protocolId ||
-        seed.calibrationProfileId !== row.calibrationProfileId
+        seed.calibrationProfileId !== row.calibrationProfileId ||
+        seed.evidenceCropArtifactId !== row.evidenceCropArtifactId
       ) {
         stale = true;
         break;
@@ -2129,7 +2253,7 @@ export class CvDatasetService {
     }
     if (stale) {
       throw new BadRequestException(
-        `${DATASET_STALE_CANDIDATES}: source reviews or scenario results changed after the last refresh — refresh candidates and re-plan splits before exporting`,
+        `${DATASET_STALE_CANDIDATES}: source reviews, scenario results, or crop evidence changed after the last refresh — refresh candidates and re-plan splits before exporting`,
       );
     }
   }

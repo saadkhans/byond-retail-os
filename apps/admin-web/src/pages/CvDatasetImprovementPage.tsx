@@ -57,7 +57,14 @@ export function CvDatasetImprovementPage() {
   const [testPercent, setTestPercent] = useState('10');
   const [minPerSku, setMinPerSku] = useState('5');
   const [minPerAction, setMinPerAction] = useState('5');
-  const [sourceEvaluationRunId, setSourceEvaluationRunId] = useState('');
+  // One-SKU bootstrap hands its linked evaluation run over via query
+  // param so the create form arrives preselected (an OPAQUE id only).
+  const [sourceEvaluationRunId, setSourceEvaluationRunId] = useState(
+    () =>
+      new URLSearchParams(window.location.search).get(
+        'sourceEvaluationRunId',
+      ) ?? '',
+  );
   const [sourceTestProtocolId, setSourceTestProtocolId] = useState('');
   const [sourceCalibrationProfileId, setSourceCalibrationProfileId] =
     useState('');

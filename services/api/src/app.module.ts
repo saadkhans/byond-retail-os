@@ -15,6 +15,7 @@ import { InferenceModule } from './inference/inference.module';
 import { InventoryModule } from './inventory/inventory.module';
 import { JourneyModule } from './journey/journey.module';
 import { LocationsModule } from './locations/locations.module';
+import { OneSkuBootstrapModule } from './one-sku-bootstrap/one-sku-bootstrap.module';
 import { OrdersModule } from './orders/orders.module';
 import { PaymentsModule } from './payments/payments.module';
 import { PilotEvaluationModule } from './pilot-evaluation/pilot-evaluation.module';
@@ -56,6 +57,7 @@ import { VisionModule } from './vision/vision.module';
     CameraModule,
     PilotEvaluationModule,
     CvDatasetModule,
+    OneSkuBootstrapModule,
   ],
 })
 export class AppModule implements NestModule {

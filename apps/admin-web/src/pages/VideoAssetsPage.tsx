@@ -36,7 +36,7 @@ const CROP_REASONS = [
   'VLM_REVIEW',
 ];
 
-const ACCEPTED_EXTENSIONS = '.mp4,.m4v,.mov,.webm,.mkv,.avi,.mpg,.mpeg';
+export const ACCEPTED_EXTENSIONS = '.mp4,.m4v,.mov,.webm,.mkv,.avi,.mpg,.mpeg';
 
 /**
  * The FOUR attestations the upload API requires. They are the operator's
@@ -48,7 +48,7 @@ const ACCEPTED_EXTENSIONS = '.mp4,.m4v,.mov,.webm,.mkv,.avi,.mpg,.mpeg';
  * stylized or low-quality digits defeat recognition), so the honest
  * control is that these clips are ones YOU staged and control.
  */
-const UPLOAD_ATTESTATIONS = [
+export const UPLOAD_ATTESTATIONS = [
   {
     field: 'controlledTestMedia',
     header: 'x-controlled-test-media',
