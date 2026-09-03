@@ -2086,3 +2086,143 @@ export interface OneSkuBootstrapReport {
   gates: { items: OneSkuGateItem[]; readyForDatasetImprovement: boolean };
   scoreNote: string;
 }
+
+// ------------------------------------------------------------ Phase 19
+
+export interface PretrainedProviderStatus {
+  provider: string;
+  kind: string;
+  availability: 'READY' | 'DISABLED' | 'UNAVAILABLE';
+  reasonCode: string | null;
+  stubMode: boolean;
+}
+
+export interface PretrainedEmbeddingCandidate {
+  sku: string;
+  productId: string | null;
+  similarity: number;
+}
+
+export interface PretrainedHandSignal {
+  handPresent: boolean;
+  nearShelfZone: boolean;
+  enteredZoneAtMs: number | null;
+  contactStartMs: number | null;
+  contactEndMs: number | null;
+  leftZoneAtMs: number | null;
+  contactDurationMs: number | null;
+}
+
+export interface PretrainedProviderEvidence {
+  provider: string;
+  availability: string;
+  reasonCode: string | null;
+  synthetic: boolean;
+  detections: {
+    label: string;
+    timestampMs: number;
+    box: { x: number; y: number; width: number; height: number };
+    confidence: number;
+    quality: {
+      sharpness: number | null;
+      occlusion: number | null;
+      brightness: number | null;
+    } | null;
+  }[];
+  handSignal: PretrainedHandSignal | null;
+  embeddingCandidates: PretrainedEmbeddingCandidate[];
+  features: {
+    handProximity: number | null;
+    occlusionScore: number | null;
+    sharpnessScore: number | null;
+    actionCandidate: string;
+    topSkuCandidates: PretrainedEmbeddingCandidate[];
+  } | null;
+  notes: string[];
+}
+
+export interface PlanogramReportSection {
+  /** SCORED_AT_EVALUATION = immutable stored snapshot; CURRENT_ACTIVE =
+   *  live lookup (no stored snapshot); NOT_CONFIGURED = no planogram. */
+  source: 'SCORED_AT_EVALUATION' | 'CURRENT_ACTIVE' | 'NOT_CONFIGURED';
+  configured: boolean;
+  rackId: string | null;
+  rackCode: string | null;
+  version: number | null;
+  cell: {
+    cellCode: string;
+    rowIndex: number;
+    columnIndex: number;
+    confidence: number;
+  } | null;
+  cellAssignmentConfidence: number | null;
+  planogramCandidateSkus: string[];
+  adjacentCellCandidateSkus: string[];
+  rackCandidateSkus: string[];
+  planogramMatchStatus: string;
+  flags: string[];
+  reviewRequired: boolean;
+  candidates: { sku: string; score: number; planogramBoost: number }[];
+}
+
+export interface PretrainedComparisonReport {
+  videoAssetId: string;
+  providers: PretrainedProviderStatus[];
+  classical: {
+    topSku: string | null;
+    topScore: number | null;
+    policy: string;
+    action: string;
+  } | null;
+  runs: {
+    provider: string;
+    status: string;
+    synthetic: boolean;
+    createdAt: string;
+    evidence: PretrainedProviderEvidence;
+  }[];
+  embeddingCandidates: PretrainedEmbeddingCandidate[];
+  handSignal: PretrainedHandSignal | null;
+  planogram: PlanogramReportSection;
+  fusionSuggestion: {
+    sku: string | null;
+    action: string;
+    reviewRequired: boolean;
+    notes: string[];
+  };
+  groundTruth: { eventKind: string; sku: string | null } | null;
+  operatorCorrection: {
+    verdict: string;
+    expectedAction: string;
+    expectedSku: string | null;
+  } | null;
+  improvementNotes: string[];
+}
+
+export interface PlanogramRackView {
+  rackId: string;
+  locationId: string;
+  rackCode: string;
+  name: string | null;
+  rows: number;
+  columns: number;
+  version: number;
+  status: string;
+  cells: {
+    cellCode: string;
+    rowIndex: number;
+    columnIndex: number;
+    productId: string;
+    sku: string;
+    isPrimary: boolean;
+    facingCount: number;
+  }[];
+}
+
+export function pretrainedEvaluatePath(videoAssetId: string): string {
+  return `/pretrained-vision/videos/${encodeURIComponent(videoAssetId)}/evaluate`;
+}
+
+export function pretrainedReportPath(videoAssetId: string): string {
+  return `/pretrained-vision/videos/${encodeURIComponent(videoAssetId)}/report`;
+}

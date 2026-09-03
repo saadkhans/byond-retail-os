@@ -45,6 +45,7 @@ import { InventoryPage } from './pages/InventoryPage';
 import { JourneyDetailPage, JourneysPage } from './pages/JourneysPage';
 import { LoginPage } from './pages/LoginPage';
 import { OneSkuBootstrapPage } from './pages/OneSkuBootstrapPage';
+import { PretrainedVisionPage } from './pages/PretrainedVisionPage';
 import { OrderDetailPage, OrdersPage } from './pages/OrdersPage';
 import { PaymentEventsPage } from './pages/PaymentEventsPage';
 import {
@@ -119,6 +120,7 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/pilot-evaluations">Pilot evaluations</NavLink>
         <NavLink to="/cv-test-protocols">Test protocols</NavLink>
         <NavLink to="/cv-dataset-improvement">Dataset improvement</NavLink>
+        <NavLink to="/pretrained-vision">Pretrained vision</NavLink>
         <NavLink to="/review-queue">Review queue</NavLink>
         <div className="spacer" />
         <div className="who">{user?.email}</div>
@@ -199,6 +201,10 @@ export function App() {
                     <Route
                       path="one-sku-bootstrap"
                       element={<OneSkuBootstrapPage />}
+                    />
+                    <Route
+                      path="pretrained-vision"
+                      element={<PretrainedVisionPage />}
                     />
                     <Route
                       path="pickup-validation"

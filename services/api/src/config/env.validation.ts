@@ -331,6 +331,29 @@ class EnvironmentVariables {
   @IsString()
   PICKUP_VLM_MODEL?: string;
 
+  // Phase 19 — which LOCAL pretrained vision provider set the adapter
+  // registry enables. classical (default) keeps only the always-ready
+  // classical fallback; yolo_local / embeddings_local / hybrid enable
+  // the corresponding optional local adapter slots. NEVER a paid or
+  // external API — every provider in the registry is local-only.
+  @IsOptional()
+  @Matches(/^(classical|yolo_local|embeddings_local|hybrid)$/, {
+    message:
+      'CV_PRETRAINED_PROVIDER must be classical, yolo_local, ' +
+      'embeddings_local, or hybrid',
+  })
+  CV_PRETRAINED_PROVIDER?: string;
+
+  // Phase 19 — lab-only DETERMINISTIC stub inference for the optional
+  // local adapters, so the evaluation flow can be exercised before the
+  // heavy local runtimes (Ultralytics/MediaPipe/DINOv2-class) are
+  // installed. Stub evidence is explicitly labeled synthetic.
+  @IsOptional()
+  @Matches(/^(true|false)$/, {
+    message: 'CV_PRETRAINED_STUB_MODE must be true or false',
+  })
+  CV_PRETRAINED_STUB_MODE?: string;
+
   // Secret — value is never echoed (validation errors report property
   // names only).
   @IsOptional()

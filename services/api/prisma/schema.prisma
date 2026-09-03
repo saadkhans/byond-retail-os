@@ -260,6 +260,9 @@ model Tenant {
   cameraCalibrationZoneProducts  CameraCalibrationZoneProduct[]
   cvDatasetImprovementRuns       CvDatasetImprovementRun[]
   cvDatasetCandidates            CvDatasetCandidate[]
+  planogramRacks                 PlanogramRack[]
+  planogramCellAssignments       PlanogramCellAssignment[]
+  pretrainedVisionRuns           PretrainedVisionRun[]
 }
 
 model User {
@@ -399,6 +402,7 @@ model Location {
   pilotEvaluationRuns PilotEvaluationRun[]
   cvTestProtocols     CvTestProtocol[]
   cameraCalibrationProfiles CameraCalibrationProfile[]
+  planogramRacks      PlanogramRack[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -555,6 +559,7 @@ model Product {
   journeyEventReviews     CustomerJourneyEventReview[] @relation("JourneyReviewCorrectedProduct")
   pilotReviewExpectations PilotObservationReview[]     @relation("PilotReviewExpectedProduct")
   bootstrapEvaluationRuns PilotEvaluationRun[]         @relation("PilotRunBootstrapProduct")
+  planogramCellAssignments PlanogramCellAssignment[]
   cvScenarioExpectations  CvTestProtocolScenario[]     @relation("CvScenarioExpectedProduct")
   calibrationZoneExpectations CameraCalibrationZoneProduct[] @relation("CameraCalibrationZoneExpectedProduct")
 
@@ -2345,6 +2350,7 @@ model VideoAsset {
   fusionRuns          PickupFusionRun[]
   replayCameraSources CameraSource[]           @relation("CameraReplayAsset")
   cameraPilotRuns     CameraPilotRun[]
+  pretrainedVisionRuns PretrainedVisionRun[]
 
   @@unique([id, tenantId])
   @@index([tenantId, createdAt(sort: Desc), id(sort: Desc)])
@@ -2911,4 +2917,105 @@ model CvDatasetCandidate {
   @@unique([id, tenantId])
   @@unique([tenantId, runId, sourceType, sourceId])
   @@index([tenantId, runId, eligibility])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 19 — pretrained retail vision adapters + planogram-aware SKU
+// narrowing. EVERYTHING here is shadow evidence: planograms are a SOFT
+// scoring prior for SKU candidate narrowing, and pretrained provider
+// runs are local-only normalized evidence for side-by-side evaluation
+// against the classical fallback. Nothing in this phase touches
+// checkout, order, payment, settlement, or inventory tables.
+
+enum PlanogramRackStatus {
+  ACTIVE
+  INACTIVE
+}
+
+// One VERSION of a store rack's planned layout (rows × columns grid).
+// Publishing a new layout for the same rackCode deactivates the current
+// ACTIVE version and creates version+1 — old evidence keeps pointing at
+// the version it was scored against, so a planogram edit can never
+// silently rewrite previously reviewed candidate labels.
+model PlanogramRack {
+  id          String              @id @default(cuid())
+  tenantId    String
+  locationId  String
+  rackCode    String
+  name        String?
+  rows        Int
+  columns     Int
+  version     Int                 @default(1)
+  status      PlanogramRackStatus @default(ACTIVE)
+  activeFrom  DateTime            @default(now())
+  activeTo    DateTime?
+  createdById String?
+  createdAt   DateTime            @default(now())
+
+  tenant   Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location Location                  @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  cells    PlanogramCellAssignment[]
+
+  @@unique([id, tenantId])
+  @@index([tenantId, locationId, rackCode, status])
+}
+
+// One SKU expected in one cell of a rack version. isPrimary marks the
+// facing owner; additional rows are secondary placements. Snapshot SKU
+// survives catalog renames for evidence traceability.
+model PlanogramCellAssignment {
+  id              String   @id @default(cuid())
+  tenantId        String
+  rackId          String
+  cellCode        String
+  rowIndex        Int
+  columnIndex     Int
+  productId       String
+  skuCodeSnapshot String
+  isPrimary       Boolean  @default(true)
+  facingCount     Int      @default(1)
+  createdAt       DateTime @default(now())
+
+  tenant  Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  rack    PlanogramRack @relation(fields: [rackId], references: [id], onDelete: Cascade)
+  product Product       @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@unique([rackId, cellCode, productId])
+  @@index([tenantId, rackId])
+  @@index([tenantId, productId])
+}
+
+enum PretrainedVisionRunStatus {
+  COMPLETED
+  PROVIDER_UNAVAILABLE
+  FAILED
+}
+
+// One LOCAL pretrained-provider evaluation over one uploaded clip.
+// evidence is ALLOWLIST-normalized before persistence (classified codes,
+// numbers, normalized boxes, SKU snapshots) — never file paths, model
+// paths, raw tensors, raw media, or provider logs. Records the planogram
+// version the run was scored against (version safety).
+model PretrainedVisionRun {
+  id               String                    @id @default(cuid())
+  tenantId         String
+  videoAssetId     String
+  provider         String
+  status           PretrainedVisionRunStatus
+  planogramRackId  String?
+  planogramVersion Int?
+  /** The EXACT sanitized planogram section the run was scored against —
+   *  immutable evidence: publishing a new planogram version can never
+   *  rewrite what an old run's candidates/match status looked like. */
+  planogramEvidence Json?
+  evidence         Json
+  createdById      String?
+  createdAt        DateTime                  @default(now())
+
+  tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  videoAsset VideoAsset @relation(fields: [videoAssetId], references: [id], onDelete: Cascade)
+
+  @@unique([id, tenantId])
+  @@index([tenantId, videoAssetId, createdAt(sort: Desc)])
 }

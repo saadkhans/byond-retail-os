@@ -295,6 +295,22 @@ export function oneSkuBootstrapImportAdvisoryLockKey(
 }
 
 /**
+ * Serializes Phase 19 planogram publication per (tenant, store, rack
+ * code): publishing is a read-then-write (deactivate the current ACTIVE
+ * version, create version+1), so two concurrent publishes of the same
+ * rack must not both read the same predecessor and mint duplicate ACTIVE
+ * versions. PlanogramService.publishRack MUST take this lock inside its
+ * transaction before the active-version read.
+ */
+export function planogramRackAdvisoryLockKey(
+  tenantId: string,
+  locationId: string,
+  rackCode: string,
+): string {
+  return `planogram-rack:${tenantId}:${locationId}:${rackCode}`;
+}
+
+/**
  * Serializes Phase 18 dataset-improvement-run mutations — candidate
  * refresh (delete+rebuild), split planning, status transitions, and the
  * export stamp — for the SAME run. Without it, a refresh racing a
