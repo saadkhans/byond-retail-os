@@ -210,6 +210,8 @@ export interface OneSkuBootstrapReport {
     status: string;
     reviewCount: number;
   } | null;
+  /** Latest FUSION evidence summary — video-derived, so null whenever
+   *  videoDetailsVisible is false. */
   latest: {
     predictedSku: string | null;
     topScore: number | null;
@@ -218,6 +220,8 @@ export interface OneSkuBootstrapReport {
     vlmStatus: string | null;
     runCreatedAt: Date;
   } | null;
+  /** Derived from fusion/crop/VLM evidence — empty whenever
+   *  videoDetailsVisible is false. */
   failureReasons: { reason: BootstrapFailureReason; count: number }[];
   gates: { items: GateItem[]; readyForDatasetImprovement: boolean };
   scoreNote: string;
@@ -543,13 +547,27 @@ export class OneSkuBootstrapService {
         'run fusion on this clip first — the correction labels its fusion evidence',
       );
     }
-    // No-candidate runs never import (contained Codex P2): a FAILED run,
-    // or one with no fused top candidate, can only yield a
-    // REVIEW_REQUIRED shadow event — which the product-event lookup
-    // below would never find, so every retry would open ANOTHER journey
-    // and duplicate event. There is nothing to label either way: refuse
-    // up front, idempotently, before any run/journey/review exists.
-    if (run.policy === FusionPolicyResult.FAILED || !run.fusedTopSku) {
+    // A FAILED run is NOT completed analysis — nothing can be labeled
+    // from it (importing it would only mint unreviewable shadow noise,
+    // and every retry would open another journey). Refuse up front,
+    // idempotently, before any run/journey/review exists.
+    if (run.policy === FusionPolicyResult.FAILED) {
+      throw new ConflictException(
+        'the latest fusion run FAILED — re-run fusion on this clip ' +
+          'before reviewing it',
+      );
+    }
+    // Completed with NO fused candidate: the one reviewable statement is
+    // a NONE clip's FALSE_TOUCH — a TRUE NEGATIVE where the pipeline
+    // correctly proposed nothing (Codex P1: five such clips must be able
+    // to satisfy the NO_OP gate without waiting for false positives).
+    // The FALSE_TOUCH↔NONE pairing was already validated above; every
+    // other verdict has no candidate to label.
+    const runProposes = run.fusedTopSku !== null;
+    if (
+      !runProposes &&
+      input.verdict !== PilotObservationVerdict.FALSE_TOUCH
+    ) {
       throw new ConflictException(
         'fusion produced no candidate for this clip — there is nothing ' +
           'to label; improve references or recapture the clip',
@@ -561,6 +579,19 @@ export class OneSkuBootstrapService {
       actorId,
     );
 
+    // A PROPOSING run's import is a product event; a completed
+    // NO-PROPOSAL run's import is the REVIEW_REQUIRED event — the
+    // structured no-candidate record a FALSE_TOUCH true-negative review
+    // binds to. The type sets are kept DISJOINT per case so an
+    // elsewhere-created REVIEW_REQUIRED can never shadow a proposing
+    // run's product event, and retries of a no-proposal import find the
+    // existing REVIEW_REQUIRED row instead of opening another journey.
+    const importedEventTypes = runProposes
+      ? [
+          CustomerJourneyEventType.PRODUCT_PICKUP,
+          CustomerJourneyEventType.PRODUCT_RETURN,
+        ]
+      : [CustomerJourneyEventType.REVIEW_REQUIRED];
     const findImportedEvent = () =>
       this.prisma.customerJourneyEvent.findFirst({
         where: {
@@ -568,12 +599,7 @@ export class OneSkuBootstrapService {
           videoAssetId,
           fusionRunId: run.id,
           sourceType: 'FUSION_SHADOW',
-          eventType: {
-            in: [
-              CustomerJourneyEventType.PRODUCT_PICKUP,
-              CustomerJourneyEventType.PRODUCT_RETURN,
-            ],
-          },
+          eventType: { in: importedEventTypes },
         },
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         select: { id: true, productId: true, sku: true, eventType: true },
@@ -1293,12 +1319,15 @@ export class OneSkuBootstrapService {
           : [],
       },
       videoDetailsVisible,
+      // CENTRAL video-boundary redaction (Codex P1): EVERY video-,
+      // fusion-, and crop-derived field leaves through this one gate —
+      // per-clip rows, the latest fusion summary (predicted SKU, score,
+      // policy, VLM result, run timestamp), and the fusion-derived
+      // failure rollup. Gate DETAILS are redacted inside evaluateGates
+      // via the same flag; what remains for a redacted caller is
+      // aggregate readiness only (booleans and counts).
       // Display-bounded (newest first) — every count/gate above was
       // computed over the FULL set, so the cap only limits what renders.
-      // Redacted to EMPTY (Codex P1) unless the caller clears the
-      // video-asset read boundary: the rows carry protected clip
-      // metadata, and nothing video-derived may ride out in nested
-      // objects either.
       videos: videoDetailsVisible ? videos.slice(0, BOOTSTRAP_MAX_CLIPS) : [],
       counts: {
         totalClips: includedRows.length,
@@ -1316,23 +1345,27 @@ export class OneSkuBootstrapService {
             reviewCount: linkedRun._count.reviews,
           }
         : null,
-      latest: latestFusion
-        ? {
-            predictedSku: latestFusion.topSku,
-            topScore: latestFusion.topScore,
-            policy: latestFusion.policy,
-            vlmVerdict: latestFusion.vlmVerdict,
-            vlmStatus: latestFusion.vlmStatus,
-            runCreatedAt: latestFusion.createdAt,
-          }
-        : null,
-      failureReasons: deriveFailureReasons(includedRows, { inferenceReady }),
+      latest:
+        videoDetailsVisible && latestFusion
+          ? {
+              predictedSku: latestFusion.topSku,
+              topScore: latestFusion.topScore,
+              policy: latestFusion.policy,
+              vlmVerdict: latestFusion.vlmVerdict,
+              vlmStatus: latestFusion.vlmStatus,
+              runCreatedAt: latestFusion.createdAt,
+            }
+          : null,
+      failureReasons: videoDetailsVisible
+        ? deriveFailureReasons(includedRows, { inferenceReady })
+        : [],
       gates: evaluateGates({
         referenceCount,
         minRequiredReferences: PICKUP_MIN_REFERENCE_IMAGES,
         embeddingCount,
         stockedQuantity: totalOnHand,
         inventoryDetailsVisible,
+        videoDetailsVisible,
         latestFusion,
         reviewedPickupExamples,
         reviewedReturnExamples,

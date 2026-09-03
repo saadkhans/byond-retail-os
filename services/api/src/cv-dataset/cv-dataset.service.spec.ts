@@ -2687,3 +2687,82 @@ describe('CvDatasetService — ground-truth drift guard (Codex P1)', () => {
     expect(prisma.videoGroundTruth.findMany).not.toHaveBeenCalled();
   });
 });
+
+describe('CvDatasetService — no-proposal (REVIEW_REQUIRED) NO_OP candidates', () => {
+  it('collects a bootstrap FALSE_TOUCH true negative as an ELIGIBLE NO_OP candidate', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [
+        observation({
+          journeyEventId: 'evt-video-rr',
+          liveSessionId: null,
+          videoAssetId: 'va-neg',
+          eventType: 'REVIEW_REQUIRED',
+          predictedProductId: null,
+          predictedSku: null,
+          predictedProductName: null,
+          matchScore: null,
+          latestReview: review({ reviewId: 'rev-tn', verdict: 'FALSE_TOUCH' }),
+        }),
+      ],
+      groundTruths: [
+        {
+          videoAssetId: 'va-neg',
+          eventKind: 'NONE',
+          productId: null,
+          product: null,
+        },
+      ],
+    });
+    const created = await service.createRun(TENANT, {
+      ...BASE_INPUT,
+      sourceEvaluationRunId: 'eval-1',
+    } as never);
+    await service.refreshCandidates(TENANT, created.id);
+    const candidate = candidates.find((row) => row.sourceId === 'evt-video-rr');
+    // An evidence-bearing NO_OP example: the clip itself is the negative
+    // evidence — no fabricated SKU, no fake correction.
+    expect(candidate).toMatchObject({
+      eligibility: 'ELIGIBLE',
+      correctedActionLabel: 'NO_OP',
+      skuId: null,
+      skuCodeSnapshot: null,
+      reviewVerdict: 'FALSE_TOUCH',
+    });
+  });
+
+  it('excludes the true negative when the clip truth later becomes a positive', async () => {
+    const { service, candidates } = buildHarness({
+      observations: [
+        observation({
+          journeyEventId: 'evt-video-rr',
+          liveSessionId: null,
+          videoAssetId: 'va-neg',
+          eventType: 'REVIEW_REQUIRED',
+          predictedProductId: null,
+          predictedSku: null,
+          matchScore: null,
+          latestReview: review({ reviewId: 'rev-tn', verdict: 'FALSE_TOUCH' }),
+        }),
+      ],
+      groundTruths: [
+        {
+          videoAssetId: 'va-neg',
+          eventKind: 'PICKUP',
+          productId: 'prod-a',
+          product: { sku: 'SKU-A' },
+        },
+      ],
+    });
+    const created = await service.createRun(TENANT, {
+      ...BASE_INPUT,
+      sourceEvaluationRunId: 'eval-1',
+    } as never);
+    await service.refreshCandidates(TENANT, created.id);
+    expect(
+      candidates.find((row) => row.sourceId === 'evt-video-rr'),
+    ).toMatchObject({
+      eligibility: 'EXCLUDED',
+      exclusionReason: 'STALE_GROUND_TRUTH',
+    });
+  });
+});

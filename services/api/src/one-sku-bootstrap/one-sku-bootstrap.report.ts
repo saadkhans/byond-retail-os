@@ -628,6 +628,11 @@ export interface GateInput {
    *  inventory:read). The gate still evaluates on the real quantity —
    *  only the human-readable detail is redacted when false. */
   inventoryDetailsVisible: boolean;
+  /** Whether the CALLER may see video/fusion/crop-derived evidence
+   *  (video-ingest module + video-asset:read). Gates still evaluate on
+   *  the real evidence — only details that would reveal it are redacted
+   *  when false. */
+  videoDetailsVisible: boolean;
   latestFusion: SafeFusionSummary | null;
   reviewedPickupExamples: number;
   reviewedReturnExamples: number;
@@ -692,17 +697,21 @@ export function evaluateGates(input: GateInput): {
         gatingCropWarnings(input.latestFusion.cropWarnings).length === 0 &&
         input.latestFusion.cropEvidenceConnected,
       required: true,
-      detail: input.latestFusion
-        ? input.latestFusion.cropSource === 'OPERATOR' &&
-          !input.latestFusion.cropEvidenceConnected
-          ? 'manual crop not connected to evidence — record a correction to bind it'
-          : (input.latestFusion.cropSource === 'OPERATOR'
-              ? 'operator-selected crop · '
-              : '') +
-            (input.latestFusion.cropWarnings.length === 0
-              ? 'clean'
-              : input.latestFusion.cropWarnings.join(', '))
-        : 'no fusion run yet',
+      // Crop warnings/sources are FUSION-derived evidence — behind the
+      // video-asset read boundary. Redacted callers get the boolean only.
+      detail: !input.videoDetailsVisible
+        ? 'details hidden — video asset permission required'
+        : input.latestFusion
+          ? input.latestFusion.cropSource === 'OPERATOR' &&
+            !input.latestFusion.cropEvidenceConnected
+            ? 'manual crop not connected to evidence — record a correction to bind it'
+            : (input.latestFusion.cropSource === 'OPERATOR'
+                ? 'operator-selected crop · '
+                : '') +
+              (input.latestFusion.cropWarnings.length === 0
+                ? 'clean'
+                : input.latestFusion.cropWarnings.join(', '))
+          : 'no fusion run yet',
     },
     {
       key: 'PICKUP_EXAMPLES',

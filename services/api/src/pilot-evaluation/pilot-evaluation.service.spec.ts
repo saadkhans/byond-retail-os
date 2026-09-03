@@ -194,8 +194,6 @@ function buildHarness(
       // (session journeys → LIVE_SHADOW; review-referenced ids →
       // FUSION_SHADOW); honor both that shape and the legacy flat one.
       findMany: jest.fn(async (args: { where: Record<string, unknown> }) => {
-        const eventTypeIn =
-          (args.where.eventType as { in: string[] }).in ?? [];
         const scopes =
           (args.where.OR as Record<string, unknown>[] | undefined) ?? [
             args.where,
@@ -203,8 +201,21 @@ function buildHarness(
         return journeyEvents.filter(
           (e) =>
             whereMatch(e, { tenantId: args.where.tenantId }) &&
-            eventTypeIn.includes(e.eventType as string) &&
             scopes.some((scope) => {
+              // eventType lives per SCOPE now (REVIEW_REQUIRED is a
+              // FUSION_SHADOW-only observation kind); honor a top-level
+              // filter too for any legacy shape.
+              const eventTypeIn = (
+                (scope.eventType ?? args.where.eventType) as
+                  | { in: string[] }
+                  | undefined
+              )?.in;
+              if (
+                eventTypeIn &&
+                !eventTypeIn.includes(e.eventType as string)
+              ) {
+                return false;
+              }
               const journeyIn = (
                 scope.journeyId as { in: string[] } | undefined
               )?.in;
@@ -929,5 +940,148 @@ describe('PilotEvaluationService — structured operator-crop evidence', () => {
         operatorCropArtifactId: CROP.id,
       }, undefined, { allowVideoShadowEvent: true }),
     ).rejects.toBeInstanceOf(BadRequestException);
+  });
+});
+
+describe('PilotEvaluationService — no-proposal (REVIEW_REQUIRED) true negatives', () => {
+  const NO_PROPOSAL_EVENT = {
+    id: 'event-video-rr',
+    tenantId: TENANT,
+    journeyId: 'journey-video',
+    eventType: CustomerJourneyEventType.REVIEW_REQUIRED,
+    occurredAt: new Date('2026-08-20T10:00:00.000Z'),
+    productId: null,
+    sku: null,
+    productName: null,
+    matchScore: null,
+    sourceType: 'FUSION_SHADOW',
+    videoAssetId: 'va-1',
+  };
+
+  async function makeRun(harness: ReturnType<typeof buildHarness>) {
+    const run = await harness.service.createRun(
+      TENANT,
+      { name: 'One SKU bootstrap — SKU-A' },
+      'user-1',
+    );
+    return run.evaluationRunId;
+  }
+
+  it('accepts a bootstrap FALSE_TOUCH on a no-proposal record and surfaces it as an observation', async () => {
+    const harness = buildHarness({
+      journeyEvents: [NO_PROPOSAL_EVENT],
+      products: PRODUCTS,
+    });
+    const runId = await makeRun(harness);
+    const review = await harness.service.reviewObservation(
+      TENANT,
+      runId,
+      {
+        verdict: PilotObservationVerdict.FALSE_TOUCH,
+        expectedAction: PilotExpectedAction.NO_OP,
+        journeyEventId: 'event-video-rr',
+      },
+      'user-1',
+      { allowVideoShadowEvent: true },
+    );
+    const stored = harness.reviews.find(
+      (row) => row.id === review.reviewId,
+    ) as Record<string, unknown>;
+    // Server-side snapshots of a NO-candidate record: no product, no
+    // predicted action to misstate.
+    expect(stored.predictedProductId).toBeNull();
+    expect(stored.predictedSku).toBeNull();
+    expect(stored.predictedAction).toBe(PilotExpectedAction.UNKNOWN);
+
+    const { observations } = await harness.service.observations(
+      TENANT,
+      runId,
+    );
+    expect(observations).toHaveLength(1);
+    expect(observations[0].journeyEventId).toBe('event-video-rr');
+    expect(observations[0].videoAssetId).toBe('va-1');
+    expect(observations[0].latestReview?.verdict).toBe(
+      PilotObservationVerdict.FALSE_TOUCH,
+    );
+  });
+
+  it('refuses every verdict except FALSE_TOUCH on a no-proposal record', async () => {
+    const harness = buildHarness({
+      journeyEvents: [NO_PROPOSAL_EVENT],
+      products: PRODUCTS,
+    });
+    const runId = await makeRun(harness);
+    for (const verdict of [
+      PilotObservationVerdict.CORRECT,
+      PilotObservationVerdict.WRONG_SKU,
+      PilotObservationVerdict.WRONG_ACTION,
+      PilotObservationVerdict.UNCERTAIN,
+    ]) {
+      await expect(
+        harness.service.reviewObservation(
+          TENANT,
+          runId,
+          {
+            verdict,
+            expectedAction: PilotExpectedAction.NO_OP,
+            journeyEventId: 'event-video-rr',
+            expectedProductId:
+              verdict === PilotObservationVerdict.WRONG_SKU ? 'prod-c' : undefined,
+          },
+          'user-1',
+          { allowVideoShadowEvent: true },
+        ),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    }
+    expect(harness.reviews).toHaveLength(0);
+  });
+
+  it('refuses FALSE_TOUCH on a LIVE_SHADOW REVIEW_REQUIRED event', async () => {
+    const harness = buildHarness({
+      liveSessions: LIVE_SESSIONS,
+      journeyEvents: [
+        {
+          ...NO_PROPOSAL_EVENT,
+          id: 'event-live-rr',
+          journeyId: 'journey-1',
+          sourceType: 'LIVE_SHADOW',
+          videoAssetId: null,
+        },
+      ],
+      products: PRODUCTS,
+    });
+    const runId = await makeRun(harness);
+    await harness.service.attachSession(TENANT, runId, 'live-1');
+    await expect(
+      harness.service.reviewObservation(TENANT, runId, {
+        verdict: PilotObservationVerdict.FALSE_TOUCH,
+        expectedAction: PilotExpectedAction.NO_OP,
+        journeyEventId: 'event-live-rr',
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('keeps no-proposal true negatives OUT of accuracy/confusion math', async () => {
+    const harness = buildHarness({
+      journeyEvents: [NO_PROPOSAL_EVENT],
+      products: PRODUCTS,
+    });
+    const runId = await makeRun(harness);
+    await harness.service.reviewObservation(
+      TENANT,
+      runId,
+      {
+        verdict: PilotObservationVerdict.FALSE_TOUCH,
+        expectedAction: PilotExpectedAction.NO_OP,
+        journeyEventId: 'event-video-rr',
+      },
+      'user-1',
+      { allowVideoShadowEvent: true },
+    );
+    const summary = await harness.service.summary(TENANT, runId);
+    // A correct rejection carries NO prediction to score — counting it
+    // as action-wrong would misstate the pilot.
+    expect(summary.totals.falseTouch).toBe(0);
+    expect(summary.totals.reviewed).toBe(0);
   });
 });

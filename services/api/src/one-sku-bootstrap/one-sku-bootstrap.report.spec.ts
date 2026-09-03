@@ -436,6 +436,7 @@ describe('evaluateGates', () => {
     embeddingCount: 9,
     stockedQuantity: 12,
     inventoryDetailsVisible: true,
+    videoDetailsVisible: true,
     latestFusion: healthyFusion,
     reviewedPickupExamples: 5,
     reviewedReturnExamples: 5,
@@ -476,6 +477,24 @@ describe('evaluateGates', () => {
       notStocked.items.find((item) => item.key === 'INVENTORY_STOCKED')
         ?.detail,
     ).toBe('not stocked');
+  });
+
+  it('CLEAN_CROP still evaluates for a video-redacted caller — without evidence details', () => {
+    const redacted = evaluateGates({
+      ...healthy,
+      videoDetailsVisible: false,
+      latestFusion: fusionFixture({
+        cropWarnings: ['HIGH_OCCLUSION', 'LOW_SHARPNESS'],
+      }),
+    });
+    const crop = redacted.items.find((item) => item.key === 'CLEAN_CROP');
+    // The boolean still reflects the real evidence...
+    expect(crop?.satisfied).toBe(false);
+    // ...but the warning codes (fusion-derived evidence) never leave.
+    expect(crop?.detail).toBe(
+      'details hidden — video asset permission required',
+    );
+    expect(crop?.detail).not.toContain('HIGH_OCCLUSION');
   });
 
   it('treats the 8-image recommendation as advisory only', () => {

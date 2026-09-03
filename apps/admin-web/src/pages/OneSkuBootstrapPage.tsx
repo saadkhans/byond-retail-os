@@ -283,8 +283,19 @@ function BootstrapGroundTruthForm({
       );
       setQuantity(String(truth.quantity));
       setTestType(truth.testType ?? '');
+    } else {
+      // NULL truth = blank defaults (Codex P1). The form is also
+      // remounted per asset via key={assetId}, so a clip without saved
+      // truth can never inherit the previous clip's values — this branch
+      // additionally covers a same-asset reload that comes back empty.
+      setKind('PICKUP');
+      setTimestampMs('');
+      setQuantity('1');
+      setTestType('');
     }
-  }, [existing.data?.videoAssetId, existing.data?.updatedAt]);
+    setFieldErrors({});
+    setApiErrorText(null);
+  }, [existing.data?.videoAssetId, existing.data?.updatedAt, existing.data]);
 
   async function save(event: FormEvent) {
     event.preventDefault();
@@ -323,6 +334,9 @@ function BootstrapGroundTruthForm({
       <h3 style={{ margin: '0 0 0.25rem' }}>Ground truth (what really happens)</h3>
       {apiErrorText ? <div className="error">{apiErrorText}</div> : null}
       {notice ? <p className="muted">✓ {notice}</p> : null}
+      {!existing.loading && !existing.data ? (
+        <p className="muted">No ground truth saved for this clip yet.</p>
+      ) : null}
       <form className="toolbar" style={{ flexWrap: 'wrap', alignItems: 'flex-start' }} onSubmit={(e) => void save(e)}>
         <select value={kind} onChange={(e) => setKind(e.target.value as typeof kind)}>
           <option value="PICKUP">Pickup</option>
@@ -366,8 +380,18 @@ function BootstrapGroundTruthForm({
             </option>
           ))}
         </select>
-        <button className="primary" type="submit" disabled={saving}>
-          {saving ? 'Saving…' : 'Save ground truth'}
+        <button
+          className="primary"
+          type="submit"
+          // Disabled while THIS clip's truth is still loading — a submit
+          // mid-transition must never persist another clip's values.
+          disabled={saving || existing.loading}
+        >
+          {saving
+            ? 'Saving…'
+            : existing.loading
+              ? 'Loading…'
+              : 'Save ground truth'}
         </button>
       </form>
     </div>
@@ -1448,7 +1472,12 @@ export function OneSkuBootstrapPage() {
                 </div>
               ) : null}
               {analysisReady ? (
+                // key remounts the form per asset (Codex P1): switching
+                // clips must NEVER carry the previous clip's action/
+                // timestamp/quantity/scenario into a submit that targets
+                // the new asset's URL.
                 <BootstrapGroundTruthForm
+                  key={selectedAssetId}
                   assetId={selectedAssetId}
                   product={selectedProduct}
                   durationMs={selectedAsset.data?.durationMs ?? null}
@@ -1570,27 +1599,35 @@ export function OneSkuBootstrapPage() {
               <dt>Latest top prediction</dt>
               <dd>
                 {/* Uncalibrated RANKING score — never a probability */}
-                {data.latest
-                  ? `${data.latest.predictedSku ?? 'UNKNOWN'} ` +
-                    `(ranking score ${data.latest.topScore !== null ? data.latest.topScore.toFixed(2) : '—'} · ` +
-                    `${data.latest.policy})`
-                  : '— no fusion run yet'}
+                {!data.videoDetailsVisible
+                  ? '— hidden (video asset permission required)'
+                  : data.latest
+                    ? `${data.latest.predictedSku ?? 'UNKNOWN'} ` +
+                      `(ranking score ${data.latest.topScore !== null ? data.latest.topScore.toFixed(2) : '—'} · ` +
+                      `${data.latest.policy})`
+                    : '— no fusion run yet'}
               </dd>
               <dt>Latest VLM verdict</dt>
               <dd>
-                {data.latest?.vlmVerdict ??
-                  (data.latest?.vlmStatus ? data.latest.vlmStatus : '— not invoked')}
+                {!data.videoDetailsVisible
+                  ? '— hidden (video asset permission required)'
+                  : (data.latest?.vlmVerdict ??
+                    (data.latest?.vlmStatus
+                      ? data.latest.vlmStatus
+                      : '— not invoked'))}
               </dd>
               <dt>Common failure reasons</dt>
               <dd>
-                {data.failureReasons.length === 0
-                  ? '— none observed'
-                  : data.failureReasons
-                      .map(
-                        (entry) =>
-                          `${FAILURE_REASON_LABELS[entry.reason] ?? entry.reason} ×${entry.count}`,
-                      )
-                      .join(' · ')}
+                {!data.videoDetailsVisible
+                  ? '— hidden (video asset permission required)'
+                  : data.failureReasons.length === 0
+                    ? '— none observed'
+                    : data.failureReasons
+                        .map(
+                          (entry) =>
+                            `${FAILURE_REASON_LABELS[entry.reason] ?? entry.reason} ×${entry.count}`,
+                        )
+                        .join(' · ')}
               </dd>
             </dl>
             <p className="muted">{data.scoreNote}</p>

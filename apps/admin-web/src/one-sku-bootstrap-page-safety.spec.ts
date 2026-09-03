@@ -69,4 +69,22 @@ describe('One SKU Bootstrap page safety', () => {
   it('never renders the uncalibrated ranking score as a percentage', () => {
     expect(pageSource).not.toMatch(/topScore \* 100/);
   });
+
+  it('remounts the ground-truth form per asset so stale values cannot cross clips', () => {
+    // key={selectedAssetId} resets every form field on asset switch, and
+    // a null-truth load leaves blank defaults instead of the previous
+    // clip's values.
+    expect(pageSource).toMatch(
+      /<BootstrapGroundTruthForm\s+key=\{selectedAssetId\}/,
+    );
+    expect(pageSource).toContain('No ground truth saved for this clip yet');
+    // Submit is held while THIS clip's truth is still loading.
+    expect(pageSource).toContain('disabled={saving || existing.loading}');
+  });
+
+  it('hides the fusion summary lines when video details are redacted', () => {
+    expect(pageSource).toContain(
+      '— hidden (video asset permission required)',
+    );
+  });
 });

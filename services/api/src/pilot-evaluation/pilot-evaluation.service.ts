@@ -322,13 +322,30 @@ export class PilotEvaluationService {
     ];
     const eventScopes = [
       ...(journeyIds.length
-        ? [{ journeyId: { in: journeyIds }, sourceType: 'LIVE_SHADOW' as const }]
+        ? [
+            {
+              journeyId: { in: journeyIds },
+              sourceType: 'LIVE_SHADOW' as const,
+              eventType: { in: LIVE_OBSERVATION_EVENT_TYPES },
+            },
+          ]
         : []),
       ...(reviewedEventIds.length
         ? [
             {
               id: { in: reviewedEventIds },
               sourceType: 'FUSION_SHADOW' as const,
+              // Video-bootstrap observations include REVIEW_REQUIRED:
+              // a completed NO-PROPOSAL run's import, reviewable ONLY as
+              // a FALSE_TOUCH true negative (see reviewObservation).
+              // Scoped to ids this run's own reviews reference, so
+              // unreviewed shadow noise never surfaces here.
+              eventType: {
+                in: [
+                  ...LIVE_OBSERVATION_EVENT_TYPES,
+                  CustomerJourneyEventType.REVIEW_REQUIRED,
+                ],
+              },
             },
           ]
         : []),
@@ -337,7 +354,6 @@ export class PilotEvaluationService {
       ? await this.prisma.customerJourneyEvent.findMany({
           where: {
             tenantId,
-            eventType: { in: LIVE_OBSERVATION_EVENT_TYPES },
             OR: eventScopes,
           },
           orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
@@ -524,11 +540,31 @@ export class PilotEvaluationService {
         tenantId,
         id: input.journeyEventId,
         sourceType: { in: ['LIVE_SHADOW', 'FUSION_SHADOW'] },
-        eventType: { in: LIVE_OBSERVATION_EVENT_TYPES },
+        eventType: {
+          in: [
+            ...LIVE_OBSERVATION_EVENT_TYPES,
+            CustomerJourneyEventType.REVIEW_REQUIRED,
+          ],
+        },
       },
     });
     if (!event) {
       throw new NotFoundException('Live observation not found');
+    }
+    // A REVIEW_REQUIRED observation is a completed NO-PROPOSAL analysis:
+    // there is no candidate to confirm or correct, so the ONLY label it
+    // accepts is a video-bootstrap FALSE_TOUCH true negative — the
+    // evidence-bearing NO_OP example the one-SKU workflow records for a
+    // NONE-truth clip whose pipeline correctly proposed nothing.
+    if (
+      event.eventType === CustomerJourneyEventType.REVIEW_REQUIRED &&
+      (event.sourceType !== 'FUSION_SHADOW' ||
+        input.verdict !== PilotObservationVerdict.FALSE_TOUCH)
+    ) {
+      throw new BadRequestException(
+        'a no-candidate observation can only be labeled FALSE_TOUCH ' +
+          'through the one-SKU bootstrap workflow',
+      );
     }
     let liveSessionId: string | null = null;
     if (event.sourceType === 'LIVE_SHADOW') {
@@ -635,7 +671,15 @@ export class PilotEvaluationService {
       tenantId,
       evaluationRunId,
     );
-    const latest = observations
+    // TRUE-NEGATIVE (REVIEW_REQUIRED no-candidate) bootstrap observations
+    // carry NO prediction to score — their FALSE_TOUCH label is dataset
+    // evidence, not an accuracy judgment, so they stay OUT of the
+    // accuracy/confusion math (counting a correct rejection as
+    // "action-wrong" would misstate the pilot).
+    const scored = observations.filter(
+      (row) => row.eventType !== CustomerJourneyEventType.REVIEW_REQUIRED,
+    );
+    const latest = scored
       .map((row) => row.latestReview)
       .filter(
         (review): review is NonNullable<typeof review> => review !== null,
@@ -658,7 +702,7 @@ export class PilotEvaluationService {
     // Confusion over LABELED observations (predicted vs expected). For
     // CORRECT the expectation IS the prediction.
     const observationByReview = new Map(
-      observations
+      scored
         .filter((row) => row.latestReview !== null)
         .map((row) => [row.latestReview!.reviewId, row]),
     );

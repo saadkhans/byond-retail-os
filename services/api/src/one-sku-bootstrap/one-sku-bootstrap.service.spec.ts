@@ -1413,30 +1413,173 @@ describe('OneSkuBootstrapService.reviewClip', () => {
     );
   });
 
-  // No-candidate runs never import (contained Codex P2): FAILED or
-  // top-less fusion runs would only yield REVIEW_REQUIRED events the
-  // product lookup can never find — every retry would open a NEW journey.
+  // Failed / no-candidate runs (contained Codex P2 + P1 NO_OP path).
   it.each([
-    ['a FAILED run', { policy: 'FAILED', fusedTopSku: PRODUCT.sku }],
-    ['a run with no fused top candidate', { policy: 'NEEDS_VLM', fusedTopSku: null }],
-  ])('refuses %s idempotently, before any journey exists', async (_label, runOver) => {
-    const { service, evaluations, journeys, prisma } = buildHarness({
-      ...reviewClipBase,
+    ['a FAILED run', { policy: 'FAILED', fusedTopSku: PRODUCT.sku }, /FAILED/],
+    [
+      'a run with no fused top candidate (non-FALSE_TOUCH verdict)',
+      { policy: 'NEEDS_VLM', fusedTopSku: null },
+      /no candidate/,
+    ],
+  ])(
+    'refuses %s idempotently, before any journey exists',
+    async (_label, runOver, message) => {
+      const { service, evaluations, journeys, prisma } = buildHarness({
+        ...reviewClipBase,
+        runs: [
+          {
+            id: 'fusion-1',
+            createdAt: new Date('2026-08-24T10:00:00Z'),
+            ...runOver,
+          },
+        ],
+      });
+      await expect(
+        service.reviewClip(TENANT, PRODUCT.id, 'va-1', reviewInput),
+      ).rejects.toThrow(message);
+      expect(evaluations.createRun).not.toHaveBeenCalled();
+      expect(journeys.create).not.toHaveBeenCalled();
+      expect(journeys.appendFromFusionRun).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    },
+  );
+
+  // Evidence-bearing NO_OP path (Codex P1): a NONE clip whose COMPLETED
+  // analysis proposed nothing is a TRUE NEGATIVE — FALSE_TOUCH imports
+  // the run's REVIEW_REQUIRED record and reviews it.
+  const noProposalBase: HarnessData = {
+    ...reviewClipBase,
+    groundTruth: { eventKind: 'NONE', productId: null },
+    runs: [
+      {
+        id: 'fusion-1',
+        createdAt: new Date('2026-08-24T10:00:00Z'),
+        policy: 'NEEDS_VLM',
+        fusedTopSku: null,
+      },
+    ],
+  };
+  const reviewRequiredEvent = (over: Row = {}): Row => ({
+    id: 'jevt-rr',
+    videoAssetId: 'va-1',
+    fusionRunId: 'fusion-1',
+    productId: null,
+    sku: null,
+    eventType: 'REVIEW_REQUIRED',
+    ...over,
+  });
+  const falseTouchInput = {
+    verdict: 'FALSE_TOUCH' as never,
+    expectedAction: 'NO_OP' as never,
+    expectedProductId: null,
+    notes: null,
+  };
+
+  it('records FALSE_TOUCH on a completed no-proposal NONE clip (imports REVIEW_REQUIRED)', async () => {
+    const { service, evaluations, journeys, prisma } = buildHarness(
+      noProposalBase,
+    );
+    // outside lock (miss) → in lock (miss, we import) → after append (hit)
+    prisma.customerJourneyEvent.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(reviewRequiredEvent() as never);
+    const result = await service.reviewClip(
+      TENANT,
+      PRODUCT.id,
+      'va-1',
+      falseTouchInput,
+    );
+    // Import went through the SAME serialized journey path.
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(journeys.appendFromFusionRun).toHaveBeenCalledWith(
+      TENANT,
+      'journey-1',
+      'va-1',
+      undefined,
+      { fusionRunId: 'fusion-1', proposeBelowThreshold: true },
+    );
+    expect(evaluations.reviewObservation).toHaveBeenCalledWith(
+      TENANT,
+      'eval-1',
+      expect.objectContaining({
+        verdict: 'FALSE_TOUCH',
+        expectedAction: 'NO_OP',
+        journeyEventId: 'jevt-rr',
+      }),
+      undefined,
+      { allowVideoShadowEvent: true },
+    );
+    expect(result.journeyEventId).toBe('jevt-rr');
+    // The lookup targeted REVIEW_REQUIRED — a no-proposal retry finds
+    // the existing record instead of opening another journey.
+    expect(prisma.customerJourneyEvent.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          eventType: { in: ['REVIEW_REQUIRED'] },
+        }),
+      }),
+    );
+  });
+
+  it('reuses an already-imported REVIEW_REQUIRED record idempotently', async () => {
+    const { service, journeys, prisma } = buildHarness({
+      ...noProposalBase,
+      journeyEventLookups: [reviewRequiredEvent()],
+    });
+    const result = await service.reviewClip(
+      TENANT,
+      PRODUCT.id,
+      'va-1',
+      falseTouchInput,
+    );
+    expect(journeys.create).not.toHaveBeenCalled();
+    expect(journeys.appendFromFusionRun).not.toHaveBeenCalled();
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(result.journeyEventId).toBe('jevt-rr');
+  });
+
+  it('still refuses FALSE_TOUCH on a FAILED no-proposal run', async () => {
+    const { service, journeys } = buildHarness({
+      ...noProposalBase,
       runs: [
         {
           id: 'fusion-1',
           createdAt: new Date('2026-08-24T10:00:00Z'),
-          ...runOver,
+          policy: 'FAILED',
+          fusedTopSku: null,
         },
       ],
     });
     await expect(
-      service.reviewClip(TENANT, PRODUCT.id, 'va-1', reviewInput),
-    ).rejects.toThrow(/no candidate/);
-    expect(evaluations.createRun).not.toHaveBeenCalled();
+      service.reviewClip(TENANT, PRODUCT.id, 'va-1', falseTouchInput),
+    ).rejects.toThrow(/FAILED/);
     expect(journeys.create).not.toHaveBeenCalled();
-    expect(journeys.appendFromFusionRun).not.toHaveBeenCalled();
-    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('never routes a PROPOSING run through the REVIEW_REQUIRED lookup', async () => {
+    // FALSE_TOUCH on a NONE clip whose run DID propose (a false
+    // positive) labels the PRODUCT event, exactly as before.
+    const { service, evaluations, prisma } = buildHarness({
+      ...reviewClipBase,
+      groundTruth: { eventKind: 'NONE', productId: null },
+      journeyEventLookups: [importedEvent()],
+    });
+    await service.reviewClip(TENANT, PRODUCT.id, 'va-1', falseTouchInput);
+    expect(prisma.customerJourneyEvent.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          eventType: { in: ['PRODUCT_PICKUP', 'PRODUCT_RETURN'] },
+        }),
+      }),
+    );
+    expect(evaluations.reviewObservation).toHaveBeenCalledWith(
+      TENANT,
+      'eval-1',
+      expect.objectContaining({ journeyEventId: 'jevt-1' }),
+      undefined,
+      { allowVideoShadowEvent: true },
+    );
   });
 });
 
@@ -1908,5 +2051,129 @@ describe('OneSkuBootstrapService.report — video-asset read boundary (Codex P1)
     expect(report.inventory.detailsVisible).toBe(false);
     expect(report.inventory.totalOnHand).toBeNull();
     expect(JSON.stringify(report)).not.toContain('Main Street Store');
+  });
+});
+
+describe('OneSkuBootstrapService.report — no-proposal NO_OP evidence (Codex P1)', () => {
+  const noProposalClip = (n: number) => ({
+    truth: truthRow({
+      videoAssetId: `va-neg${n}`,
+      eventKind: 'NONE',
+      productId: null,
+      product: null,
+    }),
+    run: fusionRun({
+      id: `fusion-neg${n}`,
+      videoAssetId: `va-neg${n}`,
+      policy: 'NEEDS_VLM',
+      evidence: evidence({ fused: [] }),
+    }),
+    event: {
+      id: `jevt-neg${n}`,
+      videoAssetId: `va-neg${n}`,
+      fusionRunId: `fusion-neg${n}`,
+      productId: null,
+      sku: null,
+      eventType: 'REVIEW_REQUIRED',
+    },
+    review: pilotReview({
+      journeyEventId: `jevt-neg${n}`,
+      verdict: 'FALSE_TOUCH',
+      expectedAction: 'NO_OP',
+    }),
+  });
+
+  it('counts a FALSE_TOUCH review on a no-proposal REVIEW_REQUIRED record', async () => {
+    const clip = noProposalClip(1);
+    const { service } = buildHarness({
+      evaluationRun: LINKED_RUN,
+      truths: [clip.truth],
+      runs: [clip.run],
+      importedEvents: [clip.event],
+      pilotReviews: [clip.review],
+    });
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
+    expect(report.videos[0].reviewed).toBe(true);
+    expect(report.videos[0].bootstrapReviewEligible).toBe(true);
+    expect(report.counts.reviewedFalseTouchExamples).toBe(1);
+    // A true negative is NOT a pickup/return example.
+    expect(report.counts.reviewedPickupExamples).toBe(0);
+  });
+
+  it('five reviewed no-proposal true negatives satisfy the FALSE_TOUCH gate', async () => {
+    const clips = [1, 2, 3, 4, 5].map(noProposalClip);
+    const { service } = buildHarness({
+      evaluationRun: LINKED_RUN,
+      truths: clips.map((clip) => clip.truth),
+      runs: clips.map((clip) => clip.run),
+      importedEvents: clips.map((clip) => clip.event),
+      pilotReviews: clips.map((clip) => clip.review),
+    });
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
+    expect(report.counts.reviewedFalseTouchExamples).toBe(5);
+    expect(
+      report.gates.items.find((item) => item.key === 'FALSE_TOUCH_EXAMPLES')
+        ?.satisfied,
+    ).toBe(true);
+  });
+
+  it('an UNREVIEWED no-proposal NONE clip is auto-reviewed but never counts as an example', async () => {
+    const clip = noProposalClip(1);
+    const { service } = buildHarness({
+      evaluationRun: LINKED_RUN,
+      truths: [clip.truth],
+      runs: [clip.run],
+    });
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
+    // Completed no-proposal → the NONE label is the record (ALL_REVIEWED
+    // does not block)...
+    expect(report.videos[0].reviewed).toBe(true);
+    // ...but only an explicit FALSE_TOUCH review banks an example.
+    expect(report.counts.reviewedFalseTouchExamples).toBe(0);
+  });
+});
+
+describe('OneSkuBootstrapService.report — full video-boundary redaction (Codex P1)', () => {
+  const fixtures: HarnessData = {
+    evaluationRun: LINKED_RUN,
+    truths: [truthRow()],
+    runs: [fusionRun()],
+    importedEvents: [importedEvent()],
+    pilotReviews: [pilotReview()],
+  };
+
+  it('redacts the latest fusion summary, failure reasons, and crop gate detail', async () => {
+    const { service } = buildHarness(fixtures);
+    const report = await service.report(TENANT, PRODUCT.id); // no video access
+    expect(report.videoDetailsVisible).toBe(false);
+    // Fusion-derived fields leave through ONE central gate: all hidden.
+    expect(report.latest).toBeNull();
+    expect(report.failureReasons).toEqual([]);
+    const cropGate = report.gates.items.find(
+      (item) => item.key === 'CLEAN_CROP',
+    );
+    expect(cropGate?.detail).toBe(
+      'details hidden — video asset permission required',
+    );
+    // Aggregate readiness still present (booleans and counts only).
+    expect(typeof cropGate?.satisfied).toBe('boolean');
+    expect(report.counts.reviewedPickupExamples).toBe(1);
+    // Nothing fusion-derived anywhere in the serialized response.
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain('AUTO_PROPOSE');
+    expect(serialized).not.toContain('artifact-auto-1');
+    expect(serialized).not.toContain('fusion-1');
+    expect(serialized).not.toContain('2026-08-24T10:00:00');
+    expect(serialized).not.toContain('topScore');
+    expect(serialized).not.toContain('clip.mp4');
+  });
+
+  it('returns latest summary and failure reasons to an authorized viewer', async () => {
+    const { service } = buildHarness(fixtures);
+    const report = await service.report(TENANT, PRODUCT.id, CLIP_VIEWER);
+    expect(report.latest?.predictedSku).toBe(PRODUCT.sku);
+    expect(
+      report.gates.items.find((item) => item.key === 'CLEAN_CROP')?.detail,
+    ).toBe('clean');
   });
 });
