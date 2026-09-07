@@ -2149,8 +2149,19 @@ export interface PretrainedProviderEvidence {
     sharpnessScore: number | null;
     actionCandidate: string;
     topSkuCandidates: PretrainedEmbeddingCandidate[];
+    /** Normalized box of the product the event is about (vanished /
+     *  appeared on the shelf), or null. */
+    eventBox: { x: number; y: number; width: number; height: number } | null;
   } | null;
   notes: string[];
+}
+
+/** Normalized rectangle of the analysis frame the rack occupies. */
+export interface RackFrameRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 export interface PlanogramReportSection {
@@ -2167,6 +2178,12 @@ export interface PlanogramReportSection {
     columnIndex: number;
     confidence: number;
   } | null;
+  normalizedRackX: number | null;
+  normalizedRackY: number | null;
+  /** OPERATOR = typed in; DETECTOR = derived from the detector's event
+   *  product through rackFrameRegion; NONE = rack-level fallback. */
+  coordinateSource: 'OPERATOR' | 'DETECTOR' | 'NONE';
+  rackFrameRegion: RackFrameRegion | null;
   cellAssignmentConfidence: number | null;
   planogramCandidateSkus: string[];
   adjacentCellCandidateSkus: string[];

@@ -242,6 +242,64 @@ lazily so a bare machine yields `RUNTIME_MISSING`, never a crash.
 5. Confirm nothing leaks: the JSON must contain no filesystem path, no
    model file name, no interpreter path, and no class names.
 
+## Multi-product shelves and detector-supplied cell (Phase 21)
+
+Real shelves hold several products at once, so "is any product visible"
+cannot tell a pickup from a still shelf. The detector evidence therefore
+works on **counts and localization**:
+
+- **Count-based change.** Per sampled frame the runtime's PRODUCT-role
+  detections are counted (all of them, before the two-per-frame evidence
+  cap). The median count of the first third of frames is compared with
+  the median of the last third: lower → `objectDisappeared` (pickup-shaped,
+  note `PRODUCT_COUNT_DECREASED`), higher → `objectAppeared` (return-shaped,
+  `PRODUCT_COUNT_INCREASED`). Medians ignore a single flickering frame.
+  Equal counts fall back to the presence rule, so a lone product that
+  vanishes still counts, and "present throughout" reads as no change.
+- **Event product.** Early boxes are matched to late boxes by IoU (≥ 0.3,
+  greedy, best pairs first). The unmatched early box (or, for an
+  appearance, the unmatched late box) is the product the event is about.
+  Its normalized box is exposed as `features.eventBox`
+  (`EVENT_PRODUCT_LOCALIZED`); movement and hand proximity are measured on
+  that product's own track, never on "first product vs last product" of
+  different items. The classical adapter sets `eventBox` to its selected
+  crop.
+- **Detector-only events.** When the classical motion stage found no
+  event but a READY, non-synthetic detector proposes PICKUP / RETURN, the
+  fusion suggestion carries the detector's action with the note
+  `DETECTOR_ONLY_EVENT`. The Phase 20 review gate still applies: every
+  real pretrained contribution stays `reviewRequired`.
+
+**Models without a HAND role (e.g. COCO):** hand contact cannot be observed, so when a person was seen while the product count changed, the normalization raises a *contact proxy* (note `PERSON_PRESENCE_CONTACT_PROXY`). It only lets the count change become a PICKUP / RETURN *candidate*; the Phase 20 review gate still forces human review.
+
+
+### Detector-supplied planogram coordinates
+
+Cell narrowing needs a point on the rack. Precedence:
+
+1. Operator `normalizedRackX` / `normalizedRackY` in the request → used as
+   typed (`coordinateSource: OPERATOR`).
+2. Otherwise, if a planogram context (store + rack code) exists and a READY,
+   non-synthetic detector run carries an `eventBox`, the box **center** is
+   mapped through the rack frame region and narrowing is re-run before the
+   snapshot is persisted (`coordinateSource: DETECTOR`).
+3. Otherwise rack-level fallback (`coordinateSource: NONE`).
+
+The mapping is `rx = (cx − region.x) / region.width` (same for y), clamped
+to 0..1. `rackFrameRegion` `{ x, y, width, height }` (normalized, top-left
+origin) says where the rack sits in the analysis frame; omit it when the
+rack fills the frame — **frame the rack tightly** and you never need it.
+On the report route the same region is passed as `rx`, `ry`, `rw`, `rh`
+query parameters. A center outside the region yields no coordinates and
+the planogram flag `EVENT_OUTSIDE_RACK_REGION`.
+
+The adapters' reference-candidate ordering still uses the rack-level
+narrowing computed before the detector ran (it only orders candidates,
+never excludes any); the persisted `planogramEvidence` snapshot records
+the coordinates actually scored, their `coordinateSource`, and the region.
+Store binding, snapshot immutability, and the uncapped candidate scope
+from Phase 19 are unchanged.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |

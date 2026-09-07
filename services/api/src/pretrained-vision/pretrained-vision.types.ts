@@ -110,6 +110,12 @@ export interface InteractionFeatures {
   brightnessScore: number | null;
   topSkuCandidates: EmbeddingCandidate[];
   actionCandidate: ActionCandidate;
+  /** Normalized box (analysis frame) of the product the event is ABOUT:
+   *  the one that vanished (pickup-shaped) or appeared (return-shaped)
+   *  on a multi-product shelf, or the classical selected crop. Null when
+   *  no single product could be localized. Drives detector-supplied
+   *  planogram coordinates — never a pixel box, never a crop path. */
+  eventBox: NormalizedBox | null;
 }
 
 export interface ProviderEvidence {
@@ -299,6 +305,7 @@ function sanitizeFeatures(value: unknown): InteractionFeatures | null {
       action === 'UNKNOWN'
         ? action
         : 'UNKNOWN',
+    eventBox: sanitizeBox(raw.eventBox),
   };
 }
 
@@ -387,15 +394,33 @@ export function buildInteractionFeatures(input: {
   objectDisappeared: boolean | null;
   objectAppeared: boolean | null;
   topSkuCandidates: EmbeddingCandidate[];
+  /** The product the event is about (see InteractionFeatures.eventBox). */
+  eventBox?: NormalizedBox | null;
+  /** That product's box across the sampled frames it was seen in, in
+   *  time order — movement and hand proximity are measured on THIS track
+   *  when given, never on "first product box vs last product box" of a
+   *  multi-product shelf. */
+  eventTrack?: NormalizedBox[];
+  /** Contact PROXY for models that cannot see hands: a person was seen
+   *  while the product count changed. Only ever raises a candidate that
+   *  stays review-required downstream — never a decision. */
+  contactProxy?: boolean;
 }): InteractionFeatures {
   const productBoxes = input.detections.filter(
     (row) => row.label === 'PRODUCT' || row.label === 'PRODUCT_IN_HAND',
   );
   const handBoxes = input.detections.filter((row) => row.label === 'HAND');
+  const eventBox = input.eventBox ?? null;
+  const track =
+    input.eventTrack && input.eventTrack.length
+      ? input.eventTrack
+      : eventBox
+        ? [eventBox]
+        : productBoxes.map((row) => row.box);
   let bboxMovement: number | null = null;
-  if (productBoxes.length >= 2) {
-    const first = productBoxes[0].box;
-    const last = productBoxes[productBoxes.length - 1].box;
+  if (track.length >= 2) {
+    const first = track[0];
+    const last = track[track.length - 1];
     bboxMovement =
       Math.round(
         Math.min(
@@ -405,20 +430,28 @@ export function buildInteractionFeatures(input: {
       ) / 1000;
   }
   let handProximity: number | null = null;
-  if (productBoxes.length && handBoxes.length) {
-    const product = productBoxes[0].box;
-    const hand = handBoxes[0].box;
-    const distance = Math.hypot(
-      product.x + product.width / 2 - (hand.x + hand.width / 2),
-      product.y + product.height / 2 - (hand.y + hand.height / 2),
-    );
-    handProximity = Math.round(Math.max(0, 1 - distance) * 1000) / 1000;
+  if (track.length && handBoxes.length) {
+    // Proximity of the NEAREST hand to the event product (or, without an
+    // event product, to the first product box) — 1 = same center.
+    const product = eventBox ?? track[0];
+    const productCx = product.x + product.width / 2;
+    const productCy = product.y + product.height / 2;
+    let nearest = Number.POSITIVE_INFINITY;
+    for (const hand of handBoxes) {
+      const distance = Math.hypot(
+        productCx - (hand.box.x + hand.box.width / 2),
+        productCy - (hand.box.y + hand.box.height / 2),
+      );
+      nearest = Math.min(nearest, distance);
+    }
+    handProximity = Math.round(Math.max(0, 1 - nearest) * 1000) / 1000;
   }
-  const handContact =
+  const observedContact =
     input.handSignal?.contactDurationMs !== null &&
     input.handSignal?.contactDurationMs !== undefined
       ? input.handSignal.contactDurationMs > 0
       : (handProximity ?? 0) > 0.7;
+  const handContact = observedContact || input.contactProxy === true;
   return {
     preCropQuality: input.cropQuality.pre,
     peakCropQuality: input.cropQuality.peak,
@@ -436,6 +469,7 @@ export function buildInteractionFeatures(input: {
       objectDisappeared: input.objectDisappeared,
       objectAppeared: input.objectAppeared,
     }),
+    eventBox,
   };
 }
 

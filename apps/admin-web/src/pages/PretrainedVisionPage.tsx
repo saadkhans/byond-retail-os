@@ -47,6 +47,30 @@ const IMPROVEMENT_LABELS: Record<string, string> = {
   NO_IMPROVEMENT_OVER_CLASSICAL: 'No improvement over classical fallback',
 };
 
+/** Evidence / suggestion / planogram note codes worth a sentence for the
+ *  operator (unknown codes are not rendered here). */
+const NOTE_LABELS: Record<string, string> = {
+  PRODUCT_COUNT_DECREASED: 'Product count decreased on shelf',
+  PRODUCT_COUNT_INCREASED: 'Product count increased on shelf',
+  EVENT_PRODUCT_LOCALIZED: 'Event product localized',
+  PERSON_PRESENCE_CONTACT_PROXY: 'Person presence used as contact proxy (model cannot see hands)',
+  DETECTOR_ONLY_EVENT: 'Event proposed by detector only (classical found none)',
+  EVENT_OUTSIDE_RACK_REGION: 'Event outside the rack region',
+};
+
+function noteSentences(codes: string[]): string {
+  return codes
+    .filter((code) => NOTE_LABELS[code] !== undefined)
+    .map((code) => NOTE_LABELS[code])
+    .join(' · ');
+}
+
+const COORDINATE_SOURCE_LABELS: Record<string, string> = {
+  OPERATOR: 'operator supplied',
+  DETECTOR: 'from detector',
+  NONE: 'no coordinates',
+};
+
 const MATCH_LABELS: Record<string, string> = {
   MATCH: 'Expected in this cell',
   ADJACENT_MATCH: 'Found in neighboring cell',
@@ -203,6 +227,13 @@ export function PretrainedVisionPage() {
   const [locationId, setLocationId] = useState('');
   const [rackX, setRackX] = useState('');
   const [rackY, setRackY] = useState('');
+  // Rack region in the analysis frame (blank = the whole frame is the
+  // rack) — lets the detector's localized event product supply the cell
+  // when x/y are left blank.
+  const [regionX, setRegionX] = useState('');
+  const [regionY, setRegionY] = useState('');
+  const [regionW, setRegionW] = useState('');
+  const [regionH, setRegionH] = useState('');
   const [busy, setBusy] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [report, setReport] = useState<PretrainedComparisonReport | null>(null);
@@ -237,6 +268,11 @@ export function PretrainedVisionPage() {
         const num = Number(value);
         return value.trim() !== '' && Number.isFinite(num) ? num : undefined;
       };
+      const region = [regionX, regionY, regionW, regionH].map(parsed);
+      const rackFrameRegion =
+        region.every((value) => value !== undefined)
+          ? { x: region[0], y: region[1], width: region[2], height: region[3] }
+          : undefined;
       const result = await api<PretrainedComparisonReport>(
         pretrainedEvaluatePath(selectedAssetId),
         {
@@ -246,6 +282,7 @@ export function PretrainedVisionPage() {
             ...(rackCode ? { rackCode } : {}),
             ...(parsed(rackX) !== undefined ? { normalizedRackX: parsed(rackX) } : {}),
             ...(parsed(rackY) !== undefined ? { normalizedRackY: parsed(rackY) } : {}),
+            ...(rackFrameRegion ? { rackFrameRegion } : {}),
           },
         },
       );
@@ -328,6 +365,41 @@ export function PretrainedVisionPage() {
             value={rackY}
             onChange={(e) => setRackY(e.target.value)}
           />
+          <span className="muted" title="Where the rack sits in the frame (0..1). Leave blank when the rack fills the frame; with x/y blank the detector's event product supplies the cell.">
+            rack region in frame
+          </span>
+          <input
+            type="text"
+            placeholder="rx"
+            style={{ width: '4rem' }}
+            title="Rack region left edge (0..1)"
+            value={regionX}
+            onChange={(e) => setRegionX(e.target.value)}
+          />
+          <input
+            type="text"
+            placeholder="ry"
+            style={{ width: '4rem' }}
+            title="Rack region top edge (0..1)"
+            value={regionY}
+            onChange={(e) => setRegionY(e.target.value)}
+          />
+          <input
+            type="text"
+            placeholder="rw"
+            style={{ width: '4rem' }}
+            title="Rack region width (0..1)"
+            value={regionW}
+            onChange={(e) => setRegionW(e.target.value)}
+          />
+          <input
+            type="text"
+            placeholder="rh"
+            style={{ width: '4rem' }}
+            title="Rack region height (0..1)"
+            value={regionH}
+            onChange={(e) => setRegionH(e.target.value)}
+          />
           <button
             className="primary"
             disabled={busy || !selectedAssetId}
@@ -368,7 +440,10 @@ export function PretrainedVisionPage() {
                               : run.evidence.handSignal?.handPresent
                                 ? 'hand near shelf zone'
                                 : 'no signal') +
-                          (run.synthetic ? ' · lab stub' : ' · real local inference')}
+                          (run.synthetic ? ' · lab stub' : ' · real local inference') +
+                          (noteSentences(run.evidence.notes)
+                            ? ` · ${noteSentences(run.evidence.notes)}`
+                            : '')}
                     </dd>
                   </div>
                 ))}
@@ -396,6 +471,11 @@ export function PretrainedVisionPage() {
                 {report.fusionSuggestion.reviewRequired ? (
                   <span className="badge warn" style={{ marginLeft: '0.5rem' }}>
                     Still needs review
+                  </span>
+                ) : null}
+                {noteSentences(report.fusionSuggestion.notes) ? (
+                  <span className="muted" style={{ marginLeft: '0.5rem' }}>
+                    {noteSentences(report.fusionSuggestion.notes)}
                   </span>
                 ) : null}
               </dd>
@@ -427,12 +507,22 @@ export function PretrainedVisionPage() {
             <h3>Planogram</h3>
             {planogram && planogram.configured ? (
               <dl className="detail">
-                <dt>Detected cell</dt>
+                <dt>
+                  Detected cell (
+                  {COORDINATE_SOURCE_LABELS[planogram.coordinateSource] ??
+                    'no coordinates'}
+                  )
+                </dt>
                 <dd>
                   {planogram.cell
                     ? `${planogram.rackCode} · ${planogram.cell.cellCode} ` +
                       `(confidence ${planogram.cell.confidence.toFixed(2)})`
                     : 'Cell mapping uncertain'}
+                  {noteSentences(planogram.flags) ? (
+                    <span className="muted" style={{ marginLeft: '0.5rem' }}>
+                      {noteSentences(planogram.flags)}
+                    </span>
+                  ) : null}
                 </dd>
                 <dt>Expected in this cell</dt>
                 <dd>

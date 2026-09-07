@@ -67,6 +67,26 @@ describe('Pretrained Vision page safety', () => {
     }
   });
 
+  it('labels detector-supplied shelf events and planogram coordinates for operators (Phase 21)', () => {
+    for (const label of [
+      'Product count decreased on shelf',
+      'Product count increased on shelf',
+      'Event product localized',
+      'Event proposed by detector only (classical found none)',
+      'Event outside the rack region',
+      'from detector',
+      'operator supplied',
+    ]) {
+      expect(pageSource.includes(label)).toBe(true);
+    }
+    // The rack region is sent as normalized numbers only — never a frame,
+    // crop, or file reference.
+    expect(pageSource).toContain('rackFrameRegion');
+    for (const needle of ['frameUrl', 'cropUrl', 'imageUrl']) {
+      expect(pageSource.includes(needle)).toBe(false);
+    }
+  });
+
   it('never renders similarity/ranking numbers as percentages', () => {
     expect(pageSource).not.toMatch(/topScore \* 100|similarity \* 100/);
   });

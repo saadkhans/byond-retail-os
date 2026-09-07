@@ -162,6 +162,8 @@ export class ClassicalVisionAdapter implements VisionProviderAdapter {
       objectDisappeared: detectedKind === 'PICKUP' ? true : null,
       objectAppeared: detectedKind === 'RETURN' ? true : null,
       topSkuCandidates: embeddingCandidates,
+      // The classical event is ABOUT its selected crop.
+      eventBox: normalized,
     });
     // The classical detector decides the action directly from its event
     // window — mirror it instead of the hand heuristic.
@@ -360,6 +362,7 @@ export class YoloVisionAdapter extends OptionalLocalAdapter {
     const features = buildInteractionFeatures({
       detections: normalized.detections,
       handSignal: normalized.handSignal,
+      contactProxy: normalized.contactProxy,
       cropQuality: {
         pre: null,
         peak: crop !== null && crop.qualityKnown ? 1 : null,
@@ -373,6 +376,12 @@ export class YoloVisionAdapter extends OptionalLocalAdapter {
       // Embedding retrieval is the next local provider — the detector
       // never names a SKU.
       topSkuCandidates: [],
+      // The product that vanished / appeared on the shelf (multi-product
+      // aware) and its per-frame track — movement and hand proximity are
+      // measured on it, and the service may map its center onto the
+      // planogram rack when the operator supplied no coordinates.
+      eventBox: normalized.eventBox,
+      eventTrack: normalized.eventTrack,
     });
     return sanitizeProviderEvidence({
       provider: this.provider,
