@@ -22,9 +22,15 @@ import {
  *                     -> 'PRODUCT_IN_HAND'
  * - PERSON / OBJECT   -> never a detection; PERSON adds a note only
  *
- * Per-frame caps (2 product + 1 hand, by confidence) keep the evidence
- * inside the sanitizer's 64-detection ceiling for a 32-frame sample
- * without silently dropping late frames. Nothing here decides anything
+ * Per-frame caps (2 product + 1 hand, by confidence) bound the rows;
+ * when the whole timeline still exceeds the sanitizer's 64-detection
+ * ceiling, frames are evenly subsampled HERE (first and last frame
+ * always kept) so the sanitizer never truncates the clip's tail. The
+ * hand signal and presence timeline are derived from ALL frames before
+ * that subsampling. Detector detections carry NO quality block: no
+ * per-frame sharpness/occlusion/brightness is measured for them, and
+ * the classical crop's numbers belong to the classical baseline only.
+ * Nothing here decides anything
  * downstream: the action candidate stays a CANDIDATE and the service
  * forces review for every real pretrained contribution.
  */
@@ -35,17 +41,14 @@ const HANDS_PER_FRAME = 1;
  *  usually covers a sliver of the product box, and either center being
  *  inside the other box also qualifies. */
 const IN_HAND_MIN_IOU = 0.05;
+/** Same ceiling as sanitizeProviderEvidence - kept in sync by a test. */
+export const MAX_EVIDENCE_DETECTIONS = 64;
 
 export interface DetectorNormalizationInput {
   frames: DetectorFrameResult[];
   /** Whether the model has at least one class mapped to HAND — a COCO
    *  model does not, so it can never emit a hand signal. */
   handRoleSupported: boolean;
-  cropQuality: {
-    sharpness: number | null;
-    occlusion: number | null;
-    brightness: number | null;
-  };
 }
 
 export interface DetectorNormalizationOutput {
@@ -143,6 +146,76 @@ export function deriveObjectPresenceChange(productPresentByFrame: boolean[]): {
   return { objectDisappeared: null, objectAppeared: null };
 }
 
+/** Smallest positive gap between consecutive sampled timestamps; 1 ms
+ *  when the sample has no such gap (single frame). Exported for tests. */
+export function samplingIntervalMs(timestamps: number[]): number {
+  const sorted = [...timestamps].sort((a, b) => a - b);
+  let smallest = Number.POSITIVE_INFINITY;
+  for (let i = 1; i < sorted.length; i += 1) {
+    const gap = sorted[i] - sorted[i - 1];
+    if (gap > 0 && gap < smallest) {
+      smallest = gap;
+    }
+  }
+  return Number.isFinite(smallest) ? smallest : 1;
+}
+
+/**
+ * A contact seen in the sampled frames spans at least one sampling
+ * interval: a grab visible in exactly ONE frame is still a contact, not
+ * a zero-length one (Codex P2 - contactDurationMs 0 read as "no
+ * contact" downstream). Exported for tests.
+ */
+export function sampledContactDurationMs(
+  firstContactMs: number,
+  lastContactMs: number,
+  intervalMs: number,
+): number {
+  return Math.max(1, Math.max(intervalMs, lastContactMs - firstContactMs));
+}
+
+/**
+ * Keep the detection list within `limit` by evenly subsampling FRAMES
+ * (never individual rows), always retaining the first and last frame, so
+ * a crowded 32-frame clip loses interior coverage rather than its tail.
+ * Exported for tests.
+ */
+export function boundDetectionsAcrossTimeline(
+  detections: NormalizedDetection[],
+  limit: number,
+): NormalizedDetection[] {
+  if (detections.length <= limit) {
+    return detections;
+  }
+  const timestamps = [...new Set(detections.map((row) => row.timestampMs))].sort(
+    (a, b) => a - b,
+  );
+  const byTimestamp = new Map<number, NormalizedDetection[]>();
+  for (const row of detections) {
+    const bucket = byTimestamp.get(row.timestampMs) ?? [];
+    bucket.push(row);
+    byTimestamp.set(row.timestampMs, bucket);
+  }
+  for (let keep = timestamps.length - 1; keep >= 1; keep -= 1) {
+    const picked = new Set<number>();
+    for (let i = 0; i < keep; i += 1) {
+      const position =
+        keep === 1 ? 0 : Math.round((i * (timestamps.length - 1)) / (keep - 1));
+      picked.add(timestamps[position]);
+    }
+    const rows = timestamps
+      .filter((timestamp) => picked.has(timestamp))
+      .flatMap((timestamp) => byTimestamp.get(timestamp) ?? []);
+    if (rows.length <= limit) {
+      return rows;
+    }
+  }
+  // A single frame alone exceeds the limit: keep its highest-confidence rows.
+  return [...(byTimestamp.get(timestamps[timestamps.length - 1]) ?? [])]
+    .sort((a, b) => b.confidence - a.confidence)
+    .slice(0, limit);
+}
+
 export function normalizeDetectorFrames(
   input: DetectorNormalizationInput,
 ): DetectorNormalizationOutput {
@@ -180,11 +253,9 @@ export function normalizeDetectorFrames(
         timestampMs: frame.timestampMs,
         box: product.box,
         confidence: product.confidence,
-        quality: {
-          sharpness: input.cropQuality.sharpness,
-          occlusion: input.cropQuality.occlusion,
-          brightness: input.cropQuality.brightness,
-        },
+        // No per-detection quality measurement exists for the detector -
+        // never stamp the classical crop's numbers here (Codex P2).
+        quality: null,
       });
     }
     for (const hand of hands) {
@@ -213,7 +284,11 @@ export function normalizeDetectorFrames(
         leftZoneAtMs: lastHandMs,
         contactDurationMs:
           firstContactMs !== null && lastContactMs !== null
-            ? Math.max(0, lastContactMs - firstContactMs)
+            ? sampledContactDurationMs(
+                firstContactMs,
+                lastContactMs,
+                samplingIntervalMs(frames.map((row) => row.timestampMs)),
+              )
             : null,
       }
     : null;
@@ -235,8 +310,13 @@ export function normalizeDetectorFrames(
     notes.push('PERSON_DETECTED');
   }
 
+  const bounded = boundDetectionsAcrossTimeline(detections, MAX_EVIDENCE_DETECTIONS);
+  if (bounded.length < detections.length) {
+    notes.push('DETECTIONS_SUBSAMPLED');
+  }
+
   return {
-    detections,
+    detections: bounded,
     handSignal,
     objectDisappeared: presence.objectDisappeared,
     objectAppeared: presence.objectAppeared,
@@ -248,11 +328,9 @@ export function normalizeDetectorFrames(
  *  from the model descriptor. */
 export function normalizeDetectorResult(
   result: Pick<LocalDetectorResult, 'frames' | 'model'>,
-  cropQuality: DetectorNormalizationInput['cropQuality'],
 ): DetectorNormalizationOutput {
   return normalizeDetectorFrames({
     frames: result.frames,
     handRoleSupported: (result.model?.roleClassCounts.HAND ?? 0) > 0,
-    cropQuality,
   });
 }

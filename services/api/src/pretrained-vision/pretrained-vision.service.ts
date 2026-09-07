@@ -489,7 +489,15 @@ export class PretrainedVisionService {
     const embeddingRun = byProvider.get('EMBEDDING_LOCAL');
     const embeddingCandidates =
       embeddingRun?.evidence.embeddingCandidates ?? [];
-    const handSignal = handRun?.evidence.handSignal ?? null;
+    // Report-level hand signal: the dedicated hand provider when it has
+    // one, otherwise the detector's own (a hand-capable YOLO model under
+    // CV_PRETRAINED_PROVIDER=yolo_local is the documented way to get
+    // hands without MediaPipe) - never silently "no hand" while the
+    // detector evidence carries contact.
+    const handSignal =
+      handRun?.evidence.handSignal ??
+      detectorRun?.evidence.handSignal ??
+      null;
 
     // Final fusion SUGGESTION (advisory only — never applied anywhere):
     // planogram-boosted top candidate + the strongest available action
@@ -541,7 +549,13 @@ export class PretrainedVisionService {
     const pretrainedReady = [detectorRun, handRun, embeddingRun].some(
       (run) => run && run.evidence.availability === 'READY',
     );
-    if (detectorRun?.evidence.detections.length) {
+    // A hand-capable model can legitimately return only HAND rows -
+    // "product detected" needs an actual product label.
+    if (
+      detectorRun?.evidence.detections.some(
+        (row) => row.label === 'PRODUCT' || row.label === 'PRODUCT_IN_HAND',
+      )
+    ) {
       improvementNotes.push('PRODUCT_DETECTED');
     }
     // Detection coverage: the classical baseline yields at most one

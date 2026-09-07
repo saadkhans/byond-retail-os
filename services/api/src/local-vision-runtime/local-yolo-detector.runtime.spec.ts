@@ -12,6 +12,8 @@ import { LocalModelDescriptor } from './local-vision-runtime.port';
 import {
   LocalYoloDetectorRuntime,
   MAX_ANALYSIS_FRAMES,
+  MAX_WAITING_WORKER_JOBS,
+  WorkerJobGate,
   boundedAnalysisGeometry,
   effectiveSamplingFps,
   subsampleFrames,
@@ -36,6 +38,7 @@ const descriptor: LocalModelDescriptor = {
   version: '1.0.0',
   inputSize: 640,
   classCount: 4,
+  classDigest: '0123456789abcdef0123456789abcdef',
   roleClassCounts: { PRODUCT: 2, HAND: 1, PERSON: 0, OBJECT: 0 },
 };
 
@@ -95,6 +98,7 @@ function buildHarness(options: HarnessOptions = {}) {
         options.probe ?? {
           ok: true,
           classCount: 4,
+          classDigest: descriptor.classDigest,
           device: 'CUDA',
           runtimeVersion: '8.3.40',
           elapsedMs: 500,
@@ -182,7 +186,50 @@ describe('LocalYoloDetectorRuntime.status', () => {
 
   it('flags a class-count mismatch between manifest and loaded model', async () => {
     const { runtime } = buildHarness({
-      probe: { ok: true, classCount: 80, device: 'CPU', runtimeVersion: null, elapsedMs: 1 },
+      probe: {
+        ok: true,
+        classCount: 80,
+        classDigest: descriptor.classDigest,
+        device: 'CPU',
+        runtimeVersion: null,
+        elapsedMs: 1,
+      },
+    });
+    const status = await runtime.status();
+    expect(status.availability).toBe('UNAVAILABLE');
+    expect(status.reasonCode).toBe('MODEL_MANIFEST_MISMATCH');
+  });
+
+  it('flags a same-count model whose ORDERED class identity differs (Codex P2)', async () => {
+    const { runtime, detectCalls } = buildHarness({
+      probe: {
+        ok: true,
+        classCount: 4,
+        classDigest: 'ffffffffffffffffffffffffffffffff',
+        device: 'CPU',
+        runtimeVersion: null,
+        elapsedMs: 1,
+      },
+    });
+    const status = await runtime.status();
+    expect(status.availability).toBe('UNAVAILABLE');
+    expect(status.reasonCode).toBe('MODEL_MANIFEST_MISMATCH');
+    const result = await runtime.detect({ tenantId: 't1', videoAssetId: 'v1' });
+    expect(result.status).toBe('UNAVAILABLE');
+    expect(result.reasonCode).toBe('MODEL_MANIFEST_MISMATCH');
+    expect(detectCalls).toHaveLength(0);
+  });
+
+  it('fails CLOSED when the worker reports no class digest at all', async () => {
+    const { runtime } = buildHarness({
+      probe: {
+        ok: true,
+        classCount: 4,
+        classDigest: null,
+        device: 'CPU',
+        runtimeVersion: null,
+        elapsedMs: 1,
+      },
     });
     const status = await runtime.status();
     expect(status.availability).toBe('UNAVAILABLE');
@@ -434,5 +481,96 @@ describe('LocalYoloDetectorRuntime.detect', () => {
       expect(serialized).not.toContain('model.pt');
       expect(serialized).not.toMatch(/[A-Za-z]:\\/);
     }
+  });
+});
+
+describe('LocalYoloDetectorRuntime — single-owner worker gate (Codex P2)', () => {
+  const settle = async () => {
+    for (let i = 0; i < 6; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  };
+
+  it('serializes concurrent evaluations: the second job starts only after the first finishes', async () => {
+    const releases: (() => void)[] = [];
+    const { runtime, detectCalls } = buildHarness({
+      detect: () =>
+        new Promise<DetectOutcome>((resolve) => {
+          releases.push(() =>
+            resolve({ ok: true, device: 'CPU', runtimeVersion: null, elapsedMs: 1, frames: [] }),
+          );
+        }) as unknown as DetectOutcome,
+    });
+    const first = runtime.detect({ tenantId: 't1', videoAssetId: 'v1' });
+    const second = runtime.detect({ tenantId: 't1', videoAssetId: 'v2' });
+    await settle();
+    expect(detectCalls).toHaveLength(1);
+    releases[0]();
+    await settle();
+    expect(detectCalls).toHaveLength(2);
+    releases[1]();
+    const [a, b] = await Promise.all([first, second]);
+    expect(a.status).toBe('OK');
+    expect(b.status).toBe('OK');
+  });
+
+  it('refuses with RUNTIME_BUSY once the waiting line is full instead of queueing unboundedly', async () => {
+    const releases: (() => void)[] = [];
+    const { runtime, detectCalls } = buildHarness({
+      detect: () =>
+        new Promise<DetectOutcome>((resolve) => {
+          releases.push(() =>
+            resolve({ ok: true, device: 'CPU', runtimeVersion: null, elapsedMs: 1, frames: [] }),
+          );
+        }) as unknown as DetectOutcome,
+    });
+    const total = MAX_WAITING_WORKER_JOBS + 2; // 1 in flight + 4 waiting + 1 refused
+    const pending = Array.from({ length: total }, (_, i) =>
+      runtime.detect({ tenantId: 't1', videoAssetId: `v${i}` }),
+    );
+    await settle();
+    expect(detectCalls).toHaveLength(1);
+    // Drain the line one job at a time.
+    for (let i = 0; i < total - 1; i += 1) {
+      releases[i]?.();
+      await settle();
+    }
+    const results = await Promise.all(pending);
+    const busy = results.filter((row) => row.reasonCode === 'RUNTIME_BUSY');
+    expect(busy).toHaveLength(1);
+    expect(busy[0].status).toBe('UNAVAILABLE');
+    expect(results.filter((row) => row.status === 'OK')).toHaveLength(total - 1);
+    expect(detectCalls).toHaveLength(total - 1);
+  });
+
+  it('WorkerJobGate runs jobs FIFO, one at a time, and bounds the waiting line', async () => {
+    const gate = new WorkerJobGate(1);
+    const order: string[] = [];
+    let releaseA: () => void = () => undefined;
+    const a = gate.run(
+      () =>
+        new Promise<string>((resolve) => {
+          releaseA = () => resolve('a');
+        }),
+    );
+    const b = gate.run(async () => {
+      order.push('b');
+      return 'b';
+    });
+    const c = gate.run(async () => 'c');
+    expect(c).toBeNull();
+    expect(gate.depth).toBe(2);
+    expect(order).toEqual([]);
+    // Job A starts on a microtask; let it run before releasing it.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(order).toEqual([]);
+    releaseA();
+    expect(await a).toBe('a');
+    expect(await b).toBe('b');
+    expect(order).toEqual(['b']);
+    // Drained: accepts again, and a rejecting job never wedges the gate.
+    const failing = gate.run(() => Promise.reject(new Error('boom')));
+    await expect(failing).rejects.toThrow('boom');
+    expect(await gate.run(async () => 'd')).toBe('d');
   });
 });

@@ -42,6 +42,58 @@ export const DEFAULT_CONF_THRESHOLD = 0.25;
 export const DEFAULT_TIMEOUT_MS = 60_000;
 /** Probe memo TTL — same cadence as the registry and ffmpeg readiness. */
 export const PROBE_CACHE_TTL_MS = 60_000;
+/** Worker jobs allowed to WAIT behind the single in-flight job. Beyond
+ *  this the caller gets RUNTIME_BUSY instead of a queue that grows with
+ *  every concurrent operator evaluation. */
+export const MAX_WAITING_WORKER_JOBS = 4;
+
+/**
+ * Runtime-wide FIFO gate: ONE worker process at a time (the model, its
+ * frame buffers and the GPU/CPU budget are single-owner), a bounded
+ * waiting line, and a classified refusal past it. Shared by the probe
+ * and detection so a readiness check can never race an inference.
+ * Exported for tests.
+ */
+export class WorkerJobGate {
+  private tail: Promise<void> = Promise.resolve();
+  private waiting = 0;
+  private inFlight = false;
+
+  constructor(private readonly maxWaiting: number = MAX_WAITING_WORKER_JOBS) {}
+
+  get depth(): number {
+    return this.waiting + (this.inFlight ? 1 : 0);
+  }
+
+  /** Runs `job` once every earlier job has settled; returns null when the
+   *  waiting line is full (never queues unboundedly). */
+  run<T>(job: () => Promise<T>): Promise<T> | null {
+    if (this.inFlight && this.waiting >= this.maxWaiting) {
+      return null;
+    }
+    if (this.inFlight) {
+      this.waiting += 1;
+    }
+    const wasWaiting = this.inFlight;
+    this.inFlight = true;
+    const started = this.tail.then(() => {
+      if (wasWaiting) {
+        this.waiting -= 1;
+      }
+      return job();
+    });
+    this.tail = started.then(
+      () => undefined,
+      () => undefined,
+    );
+    void this.tail.then(() => {
+      if (this.waiting === 0) {
+        this.inFlight = false;
+      }
+    });
+    return started;
+  }
+}
 
 function boundedNumber(
   value: unknown,
@@ -115,6 +167,7 @@ export class LocalYoloDetectorRuntime implements LocalDetectorRuntimePort {
   } | null = null;
   private probeInFlight: { key: string; promise: Promise<ProbeOutcome> } | null =
     null;
+  private readonly gate = new WorkerJobGate();
 
   constructor(
     config: ConfigService,
@@ -213,7 +266,14 @@ export class LocalYoloDetectorRuntime implements LocalDetectorRuntimePort {
         resolution,
       };
     }
-    if (probe.classCount !== resolution.descriptor.classCount) {
+    // Ordered class IDENTITY, not just count: role mapping is index-based,
+    // so a reordered/swapped model with the same class count would label
+    // every detection wrongly. A worker that reports no digest fails CLOSED.
+    if (
+      probe.classCount !== resolution.descriptor.classCount ||
+      probe.classDigest === null ||
+      probe.classDigest !== resolution.descriptor.classDigest
+    ) {
       return {
         availability: 'UNAVAILABLE',
         reasonCode: 'MODEL_MANIFEST_MISMATCH',
@@ -251,13 +311,20 @@ export class LocalYoloDetectorRuntime implements LocalDetectorRuntimePort {
     if (this.probeInFlight !== null && this.probeInFlight.key === key) {
       return this.probeInFlight.promise;
     }
-    const promise = this.runner
-      .probe({
+    const gated = this.gate.run(() =>
+      this.runner.probe({
         modelFile: resolution.internalModelFile,
         inputSize: resolution.descriptor.inputSize,
         device: this.device,
         timeoutMs: this.timeoutMs,
-      })
+      }),
+    );
+    if (gated === null) {
+      // Waiting line full: report busy WITHOUT memoizing it — the next
+      // status call must re-probe once the line drains.
+      return Promise.resolve({ ok: false, reasonCode: 'RUNTIME_BUSY' });
+    }
+    const promise = gated
       .catch(
         (): ProbeOutcome => ({
           ok: false,
@@ -370,7 +437,8 @@ export class LocalYoloDetectorRuntime implements LocalDetectorRuntimePort {
         ? samplingFps
         : Math.round((frames.length * 1000 * 1000) / asset.durationMs) / 1000;
 
-    const outcome = await this.runner.detect(
+    const gated = this.gate.run(() =>
+      this.runner.detect(
       {
         modelFile: resolution.internalModelFile,
         inputSize: descriptor.inputSize,
@@ -387,7 +455,12 @@ export class LocalYoloDetectorRuntime implements LocalDetectorRuntimePort {
         classCount: descriptor.classCount,
       },
       Buffer.concat(frames.map((frame) => frame.rgb)),
+      ),
     );
+    if (gated === null) {
+      return this.failure('UNAVAILABLE', 'RUNTIME_BUSY', descriptor);
+    }
+    const outcome = await gated;
     if (!outcome.ok) {
       return this.failure('FAILED', outcome.reasonCode, descriptor);
     }

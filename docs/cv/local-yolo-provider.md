@@ -131,7 +131,7 @@ Field rules:
 | `file` | `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(pt\|onnx)$`; no directories; must exist under the model directory and be ≤ 2 GiB. Ultralytics loads both `.pt` and `.onnx`. |
 | `version` | Operator label, `^[A-Za-z0-9._-]{1,32}$`. |
 | `inputSize` | 320–1280, multiple of 32. |
-| `classes` | The model's class list **in index order**. The probe cross-checks `len(model.names)` against it — a mismatch makes the provider `UNAVAILABLE` (`MODEL_MANIFEST_MISMATCH`) rather than silently mislabeling. |
+| `classes` | The model's class list **in index order**. The probe cross-checks both `len(model.names)` and an ordered class-name digest against it — a different count, order, or set of names makes the provider `UNAVAILABLE` (`MODEL_MANIFEST_MISMATCH`) rather than silently mislabeling. |
 | `roles` | Maps each generic role to class **names** from `classes`. Any class not listed under a role is ignored. A role with an empty list is unsupported for this model. |
 
 **COCO has no hand class.** With the example above `HAND` stays
@@ -182,6 +182,7 @@ stored `ProviderEvidence` envelope. Codes only — never a message or path.
 | `INFERENCE_TIMEOUT` | Detect job exceeded `CV_LOCAL_YOLO_TIMEOUT_MS` and was killed. |
 | `RUNTIME_OUTPUT_INVALID` | Worker stdout was not a valid protocol v1 document (or the runner sent a bad job — exit 5). |
 | `RUNTIME_OUTPUT_TOO_LARGE` | Worker stdout exceeded the 8 MiB cap. |
+| `RUNTIME_BUSY` | One inference runs at a time and at most 4 evaluations may wait behind it; this evaluation was refused instead of queued. Retry when the line drains. |
 | `CLIP_NOT_FOUND` | No video asset with that id in the caller's tenant. |
 | `CLIP_NOT_DECODABLE` | ffmpeg could not decode analysis frames. |
 | `NO_FRAMES_DECODED` | Decoding succeeded but yielded zero frames. |
@@ -201,7 +202,11 @@ with `shell: false`, stderr ignored, an 8 MiB stdout cap, and a kill timer.
   frame list `[{ index, timestampMs }]`. Limits: 1–64 frames, 16–4096 px
   sides, ≤ 256 MiB total, `inputSize` 320–1280 (multiple of 32).
 - **stdout:** exactly one JSON document.
-  - probe OK: `{ protocol, status: "OK", mode: "probe", classCount, device, runtimeVersion, elapsedMs }`
+  - probe OK: `{ protocol, status: "OK", mode: "probe", classCount, classDigest, device, runtimeVersion, elapsedMs }`
+    — `classDigest` is sha256 (first 32 hex chars) over `model.names` in
+    index order joined by `\n`; the API computes the same digest over the
+    manifest `classes` and refuses the model (`MODEL_MANIFEST_MISMATCH`)
+    on any difference — or when the digest is missing (fail closed).
   - detect OK: `{ ..., mode: "detect", frames: [{ index, detections: [{ classIndex, confidence, box: { x, y, width, height } }] }] }`
     — boxes are normalized top-left `xywh` in 0..1, sorted by confidence,
     truncated to `maxDetectionsPerFrame`.

@@ -3,14 +3,17 @@ import type {
   DetectorFrameResult,
 } from '../local-vision-runtime/local-vision-runtime.port';
 import {
+  MAX_EVIDENCE_DETECTIONS,
+  boundDetectionsAcrossTimeline,
   boxesOverlap,
   deriveObjectPresenceChange,
   normalizeDetectorFrames,
   normalizeDetectorResult,
+  sampledContactDurationMs,
+  samplingIntervalMs,
   selectFrameDetections,
 } from './pretrained-vision.detector-normalization';
-
-const QUALITY = { sharpness: 20, occlusion: 0.1, brightness: 120 };
+import { sanitizeProviderEvidence } from './pretrained-vision.types';
 
 function det(
   role: DetectorDetection['role'],
@@ -107,7 +110,6 @@ describe('normalizeDetectorFrames', () => {
   it('maps roles to labels, derives PRODUCT_IN_HAND from overlap, and builds the hand signal', () => {
     const out = normalizeDetectorFrames({
       handRoleSupported: true,
-      cropQuality: QUALITY,
       frames: [
         frame(0, [det('PRODUCT', 0.8, productBox)]),
         frame(500, [det('PRODUCT', 0.8, productBox), det('HAND', 0.7, handBox)]),
@@ -125,9 +127,9 @@ describe('normalizeDetectorFrames', () => {
       [1000, 'HAND'],
       [1500, 'HAND'],
     ]);
-    // Product detections carry the classical crop quality; hands none.
-    expect(out.detections[0].quality).toEqual(QUALITY);
-    expect(out.detections[2].quality).toBeNull();
+    // No per-detection quality is measured for the detector: never the
+    // classical crop's numbers (Codex P2).
+    expect(out.detections.every((row) => row.quality === null)).toBe(true);
     expect(out.handSignal).toEqual({
       handPresent: true,
       nearShelfZone: true,
@@ -151,7 +153,6 @@ describe('normalizeDetectorFrames', () => {
   it('a model without a HAND class yields no hand signal, no PRODUCT_IN_HAND, and a note', () => {
     const out = normalizeDetectorFrames({
       handRoleSupported: false,
-      cropQuality: QUALITY,
       frames: [
         frame(0, [det('PRODUCT', 0.8, productBox), det('HAND', 0.7, handBox)]),
         frame(500, [det('PRODUCT', 0.8, productBox)]),
@@ -167,7 +168,6 @@ describe('normalizeDetectorFrames', () => {
   it('a hand-capable model that saw no hand reports handPresent false with null timings', () => {
     const out = normalizeDetectorFrames({
       handRoleSupported: true,
-      cropQuality: QUALITY,
       frames: [frame(0, [det('PRODUCT', 0.8, productBox)]), frame(500, []), frame(1000, [])],
     });
     expect(out.handSignal).toEqual({
@@ -182,7 +182,7 @@ describe('normalizeDetectorFrames', () => {
     expect(out.notes).not.toContain('PRODUCT_IN_HAND_DETECTED');
   });
 
-  it('caps detections per frame so 32 crowded frames stay under the 64-detection ceiling', () => {
+  it('caps per frame AND bounds the whole timeline to the sanitizer ceiling without dropping the tail (Codex P2)', () => {
     const crowded = Array.from({ length: 32 }, (_, index) =>
       frame(index * 250, [
         det('PRODUCT', 0.9, productBox),
@@ -194,11 +194,15 @@ describe('normalizeDetectorFrames', () => {
     );
     const out = normalizeDetectorFrames({
       handRoleSupported: true,
-      cropQuality: QUALITY,
       frames: crowded,
     });
-    // 2 products + 1 hand per frame → 96 raw; the sanitizer trims to 64
-    // downstream, but no frame exceeds its own cap here.
+    // 2 products + 1 hand per frame → 96 raw rows; bounded to ≤ 64 by
+    // subsampling FRAMES, keeping the first and the LAST frame.
+    expect(out.detections.length).toBeLessThanOrEqual(MAX_EVIDENCE_DETECTIONS);
+    const timestamps = out.detections.map((row) => row.timestampMs);
+    expect(timestamps[0]).toBe(0);
+    expect(timestamps[timestamps.length - 1]).toBe(31 * 250);
+    expect(new Set(timestamps).size).toBeGreaterThanOrEqual(21);
     const perFrame = new Map<number, number>();
     for (const row of out.detections) {
       perFrame.set(row.timestampMs, (perFrame.get(row.timestampMs) ?? 0) + 1);
@@ -206,12 +210,70 @@ describe('normalizeDetectorFrames', () => {
     expect([...perFrame.values()].every((count) => count <= 3)).toBe(true);
     expect(out.detections.filter((row) => row.confidence === 0.7)).toHaveLength(0);
     expect(out.detections.filter((row) => row.confidence === 0.5)).toHaveLength(0);
+    expect(out.notes).toContain('DETECTIONS_SUBSAMPLED');
+    // The hand signal still spans the FULL clip (derived before bounding).
+    expect(out.handSignal?.contactEndMs).toBe(31 * 250);
+    // And the sanitizer would not have to truncate anything.
+    expect(
+      sanitizeProviderEvidence({
+        provider: 'YOLO_LOCAL',
+        availability: 'READY',
+        detections: out.detections,
+      }).detections,
+    ).toHaveLength(out.detections.length);
+  });
+
+  it('a grab visible in exactly ONE sampled frame is a positive-duration contact (Codex P2)', () => {
+    const out = normalizeDetectorFrames({
+      handRoleSupported: true,
+      frames: [
+        frame(0, [det('PRODUCT', 0.8, productBox)]),
+        frame(500, [det('PRODUCT', 0.8, productBox), det('HAND', 0.7, handBox)]),
+        frame(1000, []),
+        frame(1500, []),
+      ],
+    });
+    expect(out.handSignal).toMatchObject({
+      contactStartMs: 500,
+      contactEndMs: 500,
+      contactDurationMs: 500,
+      nearShelfZone: true,
+    });
+    expect(out.notes).toContain('PRODUCT_IN_HAND_DETECTED');
+    // Single-frame sample: no interval is known → 1 ms, never 0.
+    const single = normalizeDetectorFrames({
+      handRoleSupported: true,
+      frames: [frame(700, [det('PRODUCT', 0.8, productBox), det('HAND', 0.7, handBox)])],
+    });
+    expect(single.handSignal?.contactDurationMs).toBe(1);
+    expect(samplingIntervalMs([])).toBe(1);
+    expect(samplingIntervalMs([2000, 0, 500, 1500])).toBe(500);
+    expect(sampledContactDurationMs(500, 500, 500)).toBe(500);
+    expect(sampledContactDurationMs(500, 2000, 500)).toBe(1500);
+  });
+
+  it('boundDetectionsAcrossTimeline keeps first and last frames and never exceeds the limit', () => {
+    const rows = Array.from({ length: 10 }, (_, i) => ({
+      label: 'PRODUCT' as const,
+      timestampMs: i * 100,
+      box: productBox,
+      confidence: 0.5 + i / 100,
+      quality: null,
+    }));
+    const doubled = rows.flatMap((row) => [row, { ...row, confidence: 0.4 }]);
+    const bounded = boundDetectionsAcrossTimeline(doubled, 7);
+    expect(bounded.length).toBeLessThanOrEqual(7);
+    expect(bounded[0].timestampMs).toBe(0);
+    expect(bounded[bounded.length - 1].timestampMs).toBe(900);
+    expect(boundDetectionsAcrossTimeline(rows, 64)).toBe(rows);
+    // One frame alone over the limit → its highest-confidence rows.
+    const oneFrame = Array.from({ length: 5 }, (_, i) => ({ ...rows[0], confidence: i / 10 }));
+    expect(boundDetectionsAcrossTimeline(oneFrame, 2).map((row) => row.confidence)).toEqual([0.4, 0.3]);
   });
 
   it('sorts frames by timestamp before deriving the timeline', () => {
     const out = normalizeDetectorFrames({
       handRoleSupported: false,
-      cropQuality: QUALITY,
       frames: [
         frame(2000, []),
         frame(0, [det('PRODUCT', 0.8, productBox)]),
@@ -228,7 +290,6 @@ describe('normalizeDetectorFrames', () => {
   it('no product anywhere → NO_PRODUCT_FRAME and inconclusive presence', () => {
     const out = normalizeDetectorFrames({
       handRoleSupported: false,
-      cropQuality: { sharpness: null, occlusion: null, brightness: null },
       frames: [frame(0, [det('PERSON', 0.9)]), frame(500, []), frame(1000, [])],
     });
     expect(out.detections).toEqual([]);
@@ -254,15 +315,15 @@ describe('normalizeDetectorResult', () => {
       version: '1',
       inputSize: 640,
       classCount: 2,
+      classDigest: '0123456789abcdef0123456789abcdef',
       roleClassCounts: { PRODUCT: 1, HAND: 1, PERSON: 0, OBJECT: 0 },
     };
-    expect(normalizeDetectorResult({ frames, model }, QUALITY).handSignal?.handPresent).toBe(true);
+    expect(normalizeDetectorResult({ frames, model }).handSignal?.handPresent).toBe(true);
     expect(
       normalizeDetectorResult(
         { frames, model: { ...model, roleClassCounts: { ...model.roleClassCounts, HAND: 0 } } },
-        QUALITY,
       ).handSignal,
     ).toBeNull();
-    expect(normalizeDetectorResult({ frames, model: null }, QUALITY).handSignal).toBeNull();
+    expect(normalizeDetectorResult({ frames, model: null }).handSignal).toBeNull();
   });
 });

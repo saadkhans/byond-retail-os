@@ -109,6 +109,10 @@ export type ProbeOutcome =
   | {
       ok: true;
       classCount: number;
+      /** Ordered class-identity digest reported by the worker (see
+       *  classListDigest); null when absent or malformed — the runtime
+       *  then fails CLOSED with MODEL_MANIFEST_MISMATCH. */
+      classDigest: string | null;
       device: 'CPU' | 'CUDA' | null;
       runtimeVersion: string | null;
       elapsedMs: number | null;
@@ -365,6 +369,15 @@ function deviceCode(value: unknown): 'CPU' | 'CUDA' | null {
   return value === 'cpu' ? 'CPU' : value === 'cuda' ? 'CUDA' : null;
 }
 
+const CLASS_DIGEST_PATTERN = /^[0-9a-f]{32}$/;
+
+/** Allowlist: exactly 32 lowercase hex characters, else null. */
+export function classDigest(value: unknown): string | null {
+  return typeof value === 'string' && CLASS_DIGEST_PATTERN.test(value)
+    ? value
+    : null;
+}
+
 function runtimeVersion(value: unknown): string | null {
   return typeof value === 'string' && RUNTIME_VERSION_PATTERN.test(value)
     ? value
@@ -487,6 +500,7 @@ export class PythonYoloWorkerRunner {
     return {
       ok: true,
       classCount,
+      classDigest: classDigest(doc.classDigest),
       device: deviceCode(doc.device),
       runtimeVersion: runtimeVersion(doc.runtimeVersion),
       elapsedMs: nonNegativeMs(doc.elapsedMs),

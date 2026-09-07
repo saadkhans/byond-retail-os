@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFile, realpath, stat } from 'node:fs/promises';
 import { isAbsolute, resolve, sep } from 'node:path';
 import { Injectable } from '@nestjs/common';
@@ -210,6 +211,20 @@ export function parseManifest(raw: unknown): ParsedManifest | null {
   };
 }
 
+/**
+ * Ordered class-identity digest shared with the worker protocol: sha256
+ * over the class names joined by a newline, first 32 hex characters. The
+ * Python worker computes the identical digest over `model.names` in
+ * index order, so a manifest that lists the right NUMBER of classes in
+ * the wrong ORDER (or for different weights) is rejected at probe time.
+ */
+export function classListDigest(classes: readonly string[]): string {
+  return createHash('sha256')
+    .update(classes.join(String.fromCharCode(10)), 'utf8')
+    .digest('hex')
+    .slice(0, 32);
+}
+
 @Injectable()
 export class LocalModelRegistry {
   private readonly root: string;
@@ -356,6 +371,7 @@ export class LocalModelRegistry {
         version: parsed.version,
         inputSize: parsed.inputSize,
         classCount: parsed.classes.length,
+        classDigest: classListDigest(parsed.classes),
         roleClassCounts: { ...parsed.roleClassCounts },
       },
       classRoles: [...parsed.classRoles],

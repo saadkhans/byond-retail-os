@@ -11,6 +11,7 @@ normalization with confidence ordering + truncation.
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import sys
@@ -340,10 +341,18 @@ class HappyPathTests(WorkerTestCase):
         with _install_fakes():
             code, body, _ = _run(["--probe"], _stdin(_header("probe", str(self.model_file), device="cpu")))
         self.assertEqual(code, worker.EXIT_OK)
-        self.assertEqual(set(body), {"protocol", "status", "mode", "classCount", "device", "runtimeVersion", "elapsedMs"})
+        self.assertEqual(
+            set(body),
+            {"protocol", "status", "mode", "classCount", "classDigest", "device", "runtimeVersion", "elapsedMs"},
+        )
         self.assertEqual(body["status"], "OK")
         self.assertEqual(body["mode"], "probe")
         self.assertEqual(body["classCount"], 3)
+        # Ordered class identity: sha256 over names in index order, joined by
+        # newlines, first 32 hex chars — the Node registry computes the same.
+        expected = hashlib.sha256(b"person\nbottle\ncup").hexdigest()[:32]
+        self.assertEqual(body["classDigest"], expected)
+        self.assertRegex(body["classDigest"], r"^[0-9a-f]{32}$")
         self.assertEqual(body["device"], "cpu")
         self.assertEqual(body["runtimeVersion"], "8.3.40")
         self.assertIsInstance(body["elapsedMs"], int)
@@ -488,3 +497,15 @@ class PureHelperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClassDigestTests(unittest.TestCase):
+    def test_digest_is_order_sensitive_and_accepts_dict_or_list(self):
+        as_dict = worker.class_list_digest({0: "person", 39: "bottle", 41: "cup"})
+        as_list = worker.class_list_digest(["person", "bottle", "cup"])
+        self.assertEqual(as_dict, as_list)
+        self.assertEqual(as_dict, hashlib.sha256(b"person\nbottle\ncup").hexdigest()[:32])
+        self.assertNotEqual(as_list, worker.class_list_digest(["bottle", "person", "cup"]))
+        self.assertNotEqual(as_list, worker.class_list_digest(["person", "bottle"]))
+        # Dict keys are ordered numerically, not by insertion.
+        self.assertEqual(worker.class_list_digest({41: "cup", 0: "person", 39: "bottle"}), as_list)
