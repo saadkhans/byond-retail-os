@@ -1,5 +1,25 @@
 import { ReactNode, useEffect, useState } from 'react';
 import { ApiError } from './api';
+import { PageHeader, usePageTitle } from './ui/primitives';
+
+export {
+  Badge,
+  Card,
+  DataTable,
+  Disclosure,
+  EmptyState,
+  Field,
+  FormRow,
+  Notice,
+  PageHeader,
+  Pagination,
+  Section,
+  StatTiles,
+  Tabs,
+  usePageTitle,
+} from './ui/primitives';
+export type { BadgeTone, DataColumn } from './ui/primitives';
+export { AppShell, Sidebar, ThemeSwitch, TopBar } from './ui/shell';
 
 /** Shared hook: load data, expose loading/error, reload on dependency change. */
 export function useLoad<T>(
@@ -67,20 +87,30 @@ export function StatusBadge({ status }: { status: string }) {
   return <span className={`badge ${tone}`}>{status}</span>;
 }
 
+/**
+ * Page chrome used by every routed page: header (title + optional
+ * description/actions), error banner, loading state. The title is also
+ * published to the shell's top bar.
+ */
 export function Page({
   title,
+  description,
+  actions,
   error,
   loading,
   children,
 }: {
   title: string;
+  description?: ReactNode;
+  actions?: ReactNode;
   error?: string | null;
   loading?: boolean;
   children?: ReactNode;
 }) {
+  usePageTitle(title);
   return (
     <>
-      <h1>{title}</h1>
+      <PageHeader title={title} description={description} actions={actions} />
       {error ? <div className="error">{error}</div> : null}
       {loading ? <p className="muted">Loading…</p> : children}
     </>

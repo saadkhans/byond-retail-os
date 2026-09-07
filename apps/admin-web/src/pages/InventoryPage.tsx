@@ -102,7 +102,7 @@ function RecordMovementForm({ onRecorded }: { onRecorded: () => void }) {
   }
 
   return (
-    <div style={{ margin: '1rem 0', border: '1px solid var(--border, #d8d8e0)', borderRadius: 6, padding: '0.75rem' }}>
+    <div style={{ margin: '1rem 0', border: '1px solid var(--rule)', borderRadius: 6, padding: '0.75rem' }}>
       <h2 style={{ marginTop: 0 }}>Record inventory movement</h2>
       <p className="muted">
         Appends to the immutable ledger (never overwrites a quantity). The
@@ -111,7 +111,7 @@ function RecordMovementForm({ onRecorded }: { onRecorded: () => void }) {
       </p>
       {error ? <div className="error">{error}</div> : null}
       {notice ? (
-        <p className="muted" style={{ color: '#1e7e34' }}>
+        <p className="muted" style={{ color: 'var(--good)' }}>
           ✓ {notice}
         </p>
       ) : null}
@@ -172,7 +172,7 @@ function RecordMovementForm({ onRecorded }: { onRecorded: () => void }) {
         </button>
       </form>
       {confirming ? (
-        <div className="toolbar" style={{ background: 'rgba(255, 200, 80, 0.15)', borderRadius: 4, padding: '0.5rem' }}>
+        <div className="toolbar" style={{ background: 'var(--warn-soft)', borderRadius: 4, padding: '0.5rem' }}>
           <span>
             Confirm: <strong>{movementType}</strong> of{' '}
             <strong>{parsedQuantity}</strong> × {productLabel} at{' '}

@@ -7,7 +7,7 @@ import {
   PaymentEvent,
   PaymentEventType,
 } from '../api';
-import { formatDate, Page, StatusBadge, useLoad } from '../components';
+import { formatDate, Page, Pagination, StatusBadge, useLoad } from '../components';
 
 const EVENT_TYPES: PaymentEventType[] = [
   'AUTHORIZATION_SUCCEEDED',
@@ -141,17 +141,7 @@ export function PaymentEventsPage() {
           ))}
         </tbody>
       </table>
-      <div className="pagination">
-        <button disabled={skip === 0} onClick={() => setSkip(Math.max(0, skip - take))}>
-          Previous
-        </button>
-        <button
-          disabled={!data || skip + take >= data.total}
-          onClick={() => setSkip(skip + take)}
-        >
-          Next
-        </button>
-      </div>
+      <Pagination skip={skip} take={take} total={data?.total} onChange={setSkip} />
     </Page>
   );
 }

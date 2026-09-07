@@ -1,3 +1,4 @@
+import type React from 'react';
 import { Link } from 'react-router-dom';
 import { ValidationSummary, api } from '../api';
 import { Page, useLoad } from '../components';
@@ -21,7 +22,8 @@ const OUTCOME_LABEL: Record<string, { label: string; tone: string }> = {
  * reviewed. Match scores are raw HSV+NCC numbers — deliberately NOT
  * presented as probabilities.
  */
-export function PickupValidationPage() {
+/** The validation dashboard body, embeddable as a tab (CV Evaluation). */
+export function PickupValidationContent() {
   const summary = useLoad<ValidationSummary>(
     () => api('/pickup-validation/summary'),
     [],
@@ -29,11 +31,7 @@ export function PickupValidationPage() {
   const data = summary.data;
 
   return (
-    <Page
-      title="Pickup validation"
-      error={summary.error}
-      loading={summary.loading}
-    >
+    <PanelBody error={summary.error} loading={summary.loading}>
       {data ? (
         <>
           <div className="toolbar" style={{ flexWrap: 'wrap' }}>
@@ -207,6 +205,32 @@ export function PickupValidationPage() {
           )}
         </>
       ) : null}
+    </PanelBody>
+  );
+}
+
+function PanelBody({
+  error,
+  loading,
+  children,
+}: {
+  error: string | null;
+  loading: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <>
+      {error ? <div className="error">{error}</div> : null}
+      {loading ? <p className="muted">Loading…</p> : children}
+    </>
+  );
+}
+
+/** Standalone route kept for deep links; the sidebar reaches it via CV Evaluation. */
+export function PickupValidationPage() {
+  return (
+    <Page title="Pickup validation">
+      <PickupValidationContent />
     </Page>
   );
 }

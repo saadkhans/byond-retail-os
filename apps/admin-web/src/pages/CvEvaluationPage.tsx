@@ -1,17 +1,18 @@
 import { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import {
   ApiError,
   EvaluationSummary,
   EvaluationTestRuns,
   api,
 } from '../api';
-import { Page, useLoad } from '../components';
+import { Page, Tabs, useLoad } from '../components';
 import {
   formatRate,
   passBadge,
   testTypeLabel,
 } from '../cv-evaluation-utils';
+import { PickupValidationContent } from './PickupValidationPage';
 
 function errorMessage(err: unknown): string {
   return err instanceof ApiError ? err.message : 'Unexpected error';
@@ -23,6 +24,8 @@ function errorMessage(err: unknown): string {
  * Fused scores are UNCALIBRATED ranking scores — labeled as such.
  */
 export function CvEvaluationPage() {
+  const [params, setParams] = useSearchParams();
+  const tab = params.get('tab') === 'validation' ? 'validation' : 'accuracy';
   const [reload, setReload] = useState(0);
   const [busyAssetId, setBusyAssetId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -95,10 +98,20 @@ export function CvEvaluationPage() {
   return (
     <Page
       title="CV evaluation"
-      error={summary.error ?? testRuns.error}
-      loading={summary.loading && !data}
+      description="Accuracy over ground-truthed clips, the controlled test matrix, and the legacy per-clip validation view."
+      error={tab === 'accuracy' ? (summary.error ?? testRuns.error) : null}
+      loading={tab === 'accuracy' && summary.loading && !data}
     >
-      {data ? (
+      <Tabs
+        tabs={[
+          { id: 'accuracy', label: 'Accuracy' },
+          { id: 'validation', label: 'Legacy validation' },
+        ]}
+        value={tab}
+        onChange={(id) => setParams(id === 'accuracy' ? {} : { tab: id })}
+      />
+      {tab === 'validation' ? <PickupValidationContent /> : null}
+      {tab === 'accuracy' && data ? (
         <>
           <p className="muted">
             Accuracy counts ONLY clips with saved ground truth

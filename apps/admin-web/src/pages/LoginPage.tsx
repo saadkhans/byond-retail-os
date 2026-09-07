@@ -37,7 +37,15 @@ export function LoginPage() {
   return (
     <div className="login">
       <form onSubmit={submit}>
-        <h1>BYOND Admin</h1>
+        <h1>
+          <span className="brand-mark" aria-hidden="true">
+            BY
+          </span>
+          BYOND Admin
+        </h1>
+        <p className="muted" style={{ margin: 0 }}>
+          Sign in to the retail operations console.
+        </p>
         {error ? <div className="error">{error}</div> : null}
         {mode === 'password' ? (
           <>

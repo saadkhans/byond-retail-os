@@ -2,21 +2,19 @@ import { ReactNode } from 'react';
 import {
   BrowserRouter,
   Navigate,
-  NavLink,
   Route,
   Routes,
   useLocation,
 } from 'react-router-dom';
 import { AuthProvider, useAuth } from './auth';
+import { AppShell } from './components';
 import {
   CameraCalibrationDetailPage,
   CameraCalibrationPage,
 } from './pages/CameraCalibrationPage';
+import { CameraRunsPage } from './pages/CameraRunsPage';
 import { CamerasPage } from './pages/CamerasPage';
-import {
-  LiveSessionDetailPage,
-  LiveSessionsPage,
-} from './pages/LiveSessionsPage';
+import { LiveSessionDetailPage } from './pages/LiveSessionsPage';
 import {
   PilotEvaluationDetailPage,
   PilotEvaluationsPage,
@@ -53,11 +51,7 @@ import {
   PaymentIntentDetailPage,
   PaymentsPage,
 } from './pages/PaymentsPage';
-import { PickupValidationPage } from './pages/PickupValidationPage';
-import {
-  PilotRunDetailPage,
-  PilotRunsPage,
-} from './pages/PilotRunsPage';
+import { PilotRunDetailPage } from './pages/PilotRunsPage';
 import {
   ReconciliationDetailPage,
   ReconciliationPage,
@@ -87,52 +81,6 @@ function RequireAuth({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
-function Shell({ children }: { children: ReactNode }) {
-  const { user, logout } = useAuth();
-  return (
-    <div className="layout">
-      <nav className="sidebar">
-        <div className="brand">BYOND Admin</div>
-        <NavLink to="/" end>
-          Dashboard
-        </NavLink>
-        <NavLink to="/stores">Stores</NavLink>
-        <NavLink to="/units">Units</NavLink>
-        <NavLink to="/devices">Devices</NavLink>
-        <NavLink to="/catalog">Catalog</NavLink>
-        <NavLink to="/inventory">Inventory</NavLink>
-        <NavLink to="/checkout-sessions">Checkout sessions</NavLink>
-        <NavLink to="/orders">Orders</NavLink>
-        <NavLink to="/payments">Payments</NavLink>
-        <NavLink to="/payment-events">Payment events</NavLink>
-        <NavLink to="/reconciliation">Reconciliation</NavLink>
-        <NavLink to="/vision-events">CV events</NavLink>
-        <NavLink to="/inference">Inference jobs</NavLink>
-        <NavLink to="/video-assets">Test videos</NavLink>
-        <NavLink to="/clip-lab">Clip Lab</NavLink>
-        <NavLink to="/reference-library">Reference library</NavLink>
-        <NavLink to="/one-sku-bootstrap">One SKU bootstrap</NavLink>
-        <NavLink to="/pickup-validation">Pickup validation</NavLink>
-        <NavLink to="/cv-evaluation">CV Evaluation</NavLink>
-        <NavLink to="/journeys">Journeys</NavLink>
-        <NavLink to="/cameras">Cameras</NavLink>
-        <NavLink to="/camera-calibration">Camera calibration</NavLink>
-        <NavLink to="/pilot-runs">Pilot runs</NavLink>
-        <NavLink to="/live-sessions">Live sessions</NavLink>
-        <NavLink to="/pilot-evaluations">Pilot evaluations</NavLink>
-        <NavLink to="/cv-test-protocols">Test protocols</NavLink>
-        <NavLink to="/cv-dataset-improvement">Dataset improvement</NavLink>
-        <NavLink to="/pretrained-vision">Pretrained vision</NavLink>
-        <NavLink to="/review-queue">Review queue</NavLink>
-        <div className="spacer" />
-        <div className="who">{user?.email}</div>
-        <button onClick={() => void logout()}>Sign out</button>
-      </nav>
-      <main>{children}</main>
-    </div>
-  );
-}
-
 export function App() {
   return (
     <AuthProvider>
@@ -143,7 +91,7 @@ export function App() {
             path="/*"
             element={
               <RequireAuth>
-                <Shell>
+                <AppShell>
                   <Routes>
                     <Route index element={<DashboardPage />} />
                     <Route path="stores" element={<StoresPage />} />
@@ -209,9 +157,10 @@ export function App() {
                       path="pretrained-vision"
                       element={<PretrainedVisionPage />}
                     />
+                    {/* Pickup validation lives on as a tab of CV Evaluation. */}
                     <Route
                       path="pickup-validation"
-                      element={<PickupValidationPage />}
+                      element={<Navigate to="/cv-evaluation?tab=validation" replace />}
                     />
                     <Route
                       path="cv-evaluation"
@@ -231,14 +180,24 @@ export function App() {
                       path="camera-calibration/:cameraSourceId"
                       element={<CameraCalibrationDetailPage />}
                     />
-                    <Route path="pilot-runs" element={<PilotRunsPage />} />
+                    {/* Replay runs and live sessions share one list; the
+                        detail routes keep their type-specific controls. */}
+                    <Route path="camera-runs" element={<CameraRunsPage />} />
+                    <Route
+                      path="pilot-runs"
+                      element={<Navigate to="/camera-runs?type=replay" replace />}
+                    />
                     <Route
                       path="pilot-runs/:id"
                       element={<PilotRunDetailPage />}
                     />
                     <Route
                       path="live-sessions"
-                      element={<LiveSessionsPage />}
+                      element={<Navigate to="/camera-runs?type=live" replace />}
+                    />
+                    <Route
+                      path="live-sessions/:id"
+                      element={<LiveSessionDetailPage />}
                     />
                     <Route
                       path="pilot-evaluations"
@@ -265,16 +224,12 @@ export function App() {
                       element={<CvDatasetImprovementDetailPage />}
                     />
                     <Route
-                      path="live-sessions/:id"
-                      element={<LiveSessionDetailPage />}
-                    />
-                    <Route
                       path="review-queue"
                       element={<ReviewQueuePage />}
                     />
                     <Route path="*" element={<Navigate to="/" replace />} />
                   </Routes>
-                </Shell>
+                </AppShell>
               </RequireAuth>
             }
           />
