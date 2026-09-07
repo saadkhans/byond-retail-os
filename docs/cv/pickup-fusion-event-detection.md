@@ -56,3 +56,7 @@ Operators should still prefer the footage guidance in
 in shot): the fallback recovers the event window, but the pickup/return
 classification of a low-contrast product remains less reliable than on a
 close-up clip.
+
+### Fallback region ranking (`LOCALIZED_REGION_RANKED`)
+
+In fallback mode the endpoint difference of a noisy clip returns several durable regions and, by default, the largest one became the primary event - on a fridge shelf that is the shelf lip (a ~390x50 px strip), so the crop, the VLM and the pickup/return discriminator all looked at the wrong pixels. `rankRegionsForFallback` now orders regions product-shaped first (aspect 0.25-4, both edges >= 24 px), then those intersecting the hand's peak-cell neighbourhood, then nearest to it, then by area. The warning `LOCALIZED_REGION_RANKED` is added whenever the order changed. The strict global path is untouched.

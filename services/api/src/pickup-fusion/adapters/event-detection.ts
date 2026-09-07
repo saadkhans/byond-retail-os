@@ -138,6 +138,59 @@ function intersects(a: BoundingBox, b: BoundingBox): boolean {
   );
 }
 
+/** Aspect ratios outside this band are shelf lips, dividers, or shadow
+ *  strips, never a graspable product. */
+const PRODUCT_ASPECT_MIN = 0.25;
+const PRODUCT_ASPECT_MAX = 4;
+/** A region shorter than this (analysis pixels) cannot hold a product crop. */
+const PRODUCT_MIN_EDGE = 24;
+
+function productLike(box: BoundingBox): boolean {
+  if (box.width < PRODUCT_MIN_EDGE || box.height < PRODUCT_MIN_EDGE) {
+    return false;
+  }
+  const aspect = box.width / box.height;
+  return aspect >= PRODUCT_ASPECT_MIN && aspect <= PRODUCT_ASPECT_MAX;
+}
+
+function centerDistance(a: BoundingBox, b: BoundingBox): number {
+  return Math.hypot(
+    a.x + a.width / 2 - (b.x + b.width / 2),
+    a.y + a.height / 2 - (b.y + b.height / 2),
+  );
+}
+
+/**
+ * Fallback-mode region ranking. The endpoint difference of a noisy clip
+ * returns several durable regions and the largest one wins by default -
+ * on a fridge shelf that is the shelf lip (a 390x50 strip), so the crop,
+ * the VLM, and the kind discriminator all look at the wrong pixels.
+ * Rank product-shaped regions first, then the ones nearest the cell the
+ * hand actually moved through, then by area. Pure; exported for tests.
+ */
+export function rankRegionsForFallback(
+  regions: BoundingBox[],
+  hotspot: BoundingBox,
+): BoundingBox[] {
+  return [...regions].sort((a, b) => {
+    const shapeA = productLike(a) ? 1 : 0;
+    const shapeB = productLike(b) ? 1 : 0;
+    if (shapeA !== shapeB) {
+      return shapeB - shapeA;
+    }
+    const nearA = intersects(a, hotspot) ? 1 : 0;
+    const nearB = intersects(b, hotspot) ? 1 : 0;
+    if (nearA !== nearB) {
+      return nearB - nearA;
+    }
+    const distance = centerDistance(a, hotspot) - centerDistance(b, hotspot);
+    if (Math.abs(distance) > 1e-6) {
+      return distance;
+    }
+    return b.width * b.height - a.width * a.height;
+  });
+}
+
 function iou(a: BoundingBox, b: BoundingBox): number {
   const x1 = Math.max(a.x, b.x);
   const y1 = Math.max(a.y, b.y);
@@ -340,6 +393,15 @@ export class ClassicalMotionEventDetector implements PickupEventDetector {
       // Motion happened, nothing changed durably — a sweep over an empty
       // shelf (or a pickup immediately returned).
       return { events: [], tracks, warnings: [...warnings, 'NO_DURABLE_CHANGE'] };
+    }
+    if (regions.length > 1 && localizedArea !== null) {
+      // Fallback mode only: the primary event (crop, VLM, kind) must be the
+      // product-shaped region where the hand moved, not the biggest blob.
+      const ranked = rankRegionsForFallback(regions, localizedArea);
+      if (ranked[0] !== regions[0]) {
+        warnings.push('LOCALIZED_REGION_RANKED');
+      }
+      regions = ranked;
     }
     const events: PickupEventProposal[] = regions.slice(0, 4).map((box) => {
       // Removal makes the region's stand-out contrast against its
