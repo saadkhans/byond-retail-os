@@ -1,3 +1,4 @@
+import { availableSignalClasses, effectiveWeights } from '../fusion-weighting';
 import {
   FUSION_WEIGHTS,
   PrismaContextSignalProvider,
@@ -137,7 +138,18 @@ describe('WeightedCandidateFusion', () => {
       PRODUCT_META,
     );
     expect(fused).toHaveLength(1);
-    expect(fused[0].fusedScore).toBe(FUSION_WEIGHTS.barcode);
+    // Renormalized over the AVAILABLE classes (barcode + context) and
+    // scaled by the coverage factor — identical to a single barcode row,
+    // never the sum of the two.
+    const single = new WeightedCandidateFusion().fuse(
+      { barcode: [signal('A', 1, 'crop-frame')], classical: [], retrieval: [], ocr: [], context: [] },
+      PRODUCT_META,
+    );
+    expect(fused[0].fusedScore).toBe(single[0].fusedScore);
+    const weighting = effectiveWeights(new Set(['barcode', 'context']));
+    expect(fused[0].fusedScore).toBe(
+      Math.round(weighting.weights.barcode * 1 * weighting.coverage * 10_000) / 10_000,
+    );
     // Both rows are still retained verbatim as evidence.
     expect(fused[0].signals).toHaveLength(2);
     expect(fused[0].signals.map((s) => s.detail)).toEqual([
@@ -157,8 +169,9 @@ describe('WeightedCandidateFusion', () => {
       },
       PRODUCT_META,
     );
+    const weighting = effectiveWeights(new Set(['classical', 'context']));
     expect(fused[0].fusedScore).toBe(
-      Math.round(FUSION_WEIGHTS.classical * 0.9 * 10_000) / 10_000,
+      Math.round(weighting.weights.classical * 0.9 * weighting.coverage * 10_000) / 10_000,
     );
   });
 
@@ -173,11 +186,23 @@ describe('WeightedCandidateFusion', () => {
       },
       PRODUCT_META,
     );
+    const inputs = {
+      barcode: [signal('A', 1)],
+      classical: [signal('A', 0.5)],
+      retrieval: [],
+      ocr: [],
+      context: [signal('A', 0.5), signal('B', 0.5)],
+    };
+    const weighting = effectiveWeights(availableSignalClasses(inputs));
+    expect(weighting.available).toEqual(['barcode', 'classical', 'context']);
     const expected =
-      FUSION_WEIGHTS.barcode * 1 +
-      FUSION_WEIGHTS.classical * 0.5 +
-      FUSION_WEIGHTS.context * 0.5;
+      (weighting.weights.barcode * 1 +
+        weighting.weights.classical * 0.5 +
+        weighting.weights.context * 0.5) *
+      weighting.coverage;
     expect(fused[0].sku).toBe('A');
     expect(fused[0].fusedScore).toBe(Math.round(expected * 10_000) / 10_000);
+    // The base table is still the documented one.
+    expect(FUSION_WEIGHTS.barcode + FUSION_WEIGHTS.classical + FUSION_WEIGHTS.retrieval + FUSION_WEIGHTS.ocr + FUSION_WEIGHTS.context + FUSION_WEIGHTS.planogram).toBeCloseTo(1, 6);
   });
 });

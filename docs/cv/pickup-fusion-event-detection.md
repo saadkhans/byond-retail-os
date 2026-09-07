@@ -72,3 +72,35 @@ The local verifier (`PICKUP_VLM_PROVIDER=local`, Ollama on loopback only) is sho
 The prompt is sized to `PICKUP_VLM_NUM_CTX`: about 768 tokens per image plus a fixed text overhead. When the evidence would not fit, the planner reduces reference photos per candidate first (down to one), then drops the enlarged crop, then event frames from the end — the pre-event crop is always kept. `vlm.imagesSent` and `vlm.referencesPerCandidate` on the evidence record what was actually sent (numbers only).
 
 With three candidates or fewer — the planogram-scoped case — the question is **comparative**: "Which ONE of these N products is being taken in the event images? Compare the product crop against each candidate's reference photos (shape, colour, label). Answer with exactly one SKU from the list, or NONE if none matches." Larger candidate sets keep the open question. The strict JSON schema, the SKU whitelist, the support levels (`STRONG`/`MEDIUM`/`WEAK`/`NONE`) and `parseStrictVerdict` are unchanged; nothing the model writes is persisted except the classified fields.
+
+## Fusion weights (Phase 23)
+
+The fused score is a weighted sum of one best score per signal class, **explicitly uncalibrated** (a ranking value, not a probability). Base table (sums to 1.0):
+
+| Class | Base weight | Identity class |
+| --- | --- | --- |
+| barcode | 0.30 | yes |
+| classical (HSV+NCC) | 0.18 | yes |
+| retrieval (embedding index) | 0.18 | yes |
+| ocr | 0.12 | yes |
+| context (inventory prior) | 0.07 | no |
+| planogram (bound rack) | 0.15 | yes |
+
+**Available-signal renormalization.** A shelf camera rarely reads a barcode or text, so a visual-only pickup used to be capped at the sum of the visual weights regardless of how strongly its signals agreed. For each event, classes that produced *no* signal at all are marked unavailable (barcode: no catalog-matched decode; ocr: no text match; classical/retrieval: adapter unavailable or empty index; planogram: no rack bound; context: never unavailable). The remaining base weights are renormalized to sum to 1 and the fused score is multiplied by a **coverage factor**:
+
+```
+coverage = sqrt( sum of BASE weights of the available IDENTITY classes )
+```
+
+Context never counts toward coverage, so one strong classical match plus "in stock" cannot impersonate corroboration. Worked examples with an in-stock prior of 0.8:
+
+| Signals available | Renormalized sum | Coverage | Fused |
+| --- | --- | --- | --- |
+| classical 0.95 only | 0.908 | √0.18 = 0.42 | 0.385 (below 0.42) |
+| barcode 1.0 only | 0.962 | √0.30 = 0.55 | 0.527 (clears) |
+| classical 0.34 + retrieval 0.45 (lab clip, unbound) | 0.460 | √0.36 = 0.60 | 0.276 (below) |
+| … + planogram cell 1.0 (lab clip, bound) | 0.601 | √0.51 = 0.71 | 0.429 (clears narrowly) |
+
+The evidence records `fusion.weighting = { available, unavailable, weights, coverage }` and the note `AVAILABLE_SIGNAL_RENORMALIZED` whenever a class was unavailable.
+
+**Planogram signal.** When the clip is bound to an ACTIVE rack (Phase 22), the primary event's centre in the analysis frame is mapped through the asset's rack frame region (blank = the rack fills the frame) into rack coordinates and then to a cell (`planogram.logic.cellFromNormalized`). Candidates assigned to that cell score 1.0 (`planogram:cell(B1)`), candidates elsewhere on the rack 0.6 (`planogram:rack`), everything else 0. Without a usable point (event off the rack, live windows) every rack SKU scores at rack level. The evidence records `planogram = { rackCode, cellCode, candidates }`. The context signal is inventory only; the earlier rack prior inside it was removed so the planogram is never counted twice.

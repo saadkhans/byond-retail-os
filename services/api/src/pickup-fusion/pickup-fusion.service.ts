@@ -21,6 +21,14 @@ import { PrismaService } from '../prisma/prisma.service';
 import { containsSensitiveFreeText } from '../video-ingest/media-safety';
 import { VideoAssetsRepository } from '../video-ingest/video-assets.repository';
 import { VideoAssetsService } from '../video-ingest/video-assets.service';
+import { sanitizeStoredRackFrameRegion } from '../video-ingest/video-asset-binding';
+import {
+  FusionSignalClass,
+  availableSignalClasses,
+  effectiveWeights,
+  planogramSignalsFor,
+  rackPointFor,
+} from './fusion-weighting';
 import { analysisGeometryFor } from '../pickup-detection/analysis/analysis-frames';
 import { AnalysisFrame, BoundingBox } from '../pickup-detection/analysis/pickup-analyzer';
 import { RgbImage, cropRgb } from '../pickup-detection/analysis/product-matcher';
@@ -402,6 +410,10 @@ export interface PlanogramScope {
   rackCode: string;
   rackVersion: number;
   productIds: Set<string>;
+  /** Rack geometry for the planogram SIGNAL (fusion-weighting.ts). */
+  rows: number;
+  columns: number;
+  cells: { productId: string; rowIndex: number; columnIndex: number; cellCode: string }[];
 }
 
 export interface FusionEvidence {
@@ -513,6 +525,24 @@ export interface FusionEvidence {
   } | null;
   /** Classified evidence notes (UPPER_SNAKE codes only). */
   notes?: string[];
+  /** Phase 23 — how the fused score was weighted for THIS event:
+   *  available/unavailable signal classes, the renormalized weights and
+   *  the coverage factor (fusion-weighting.ts). Codes and numbers only. */
+  fusion?: {
+    weighting: {
+      available: FusionSignalClass[];
+      unavailable: FusionSignalClass[];
+      weights: Record<FusionSignalClass, number>;
+      coverage: number;
+    };
+  };
+  /** Phase 23 — the planogram SIGNAL: the rack cell the event mapped to
+   *  (null = rack level) and the per-candidate scores. */
+  planogram?: {
+    rackCode: string;
+    cellCode: string | null;
+    candidates: { sku: string; score: number; detail?: string }[];
+  };
 }
 
 @Injectable()
@@ -910,6 +940,14 @@ export class PickupFusionService {
       rackCode: rack.rackCode,
       rackVersion: rack.version,
       productIds: new Set(rack.cells.map((cell) => cell.productId)),
+      rows: rack.rows,
+      columns: rack.columns,
+      cells: rack.cells.map((cell) => ({
+        productId: cell.productId,
+        rowIndex: cell.rowIndex,
+        columnIndex: cell.columnIndex,
+        cellCode: cell.cellCode,
+      })),
     };
   }
 
@@ -1174,6 +1212,15 @@ export class PickupFusionService {
           locationId: internal.locationId,
           planogramRackCode: internal.planogramRackCode ?? null,
         }),
+        // The event centre in the analysis frame, mapped through the
+        // asset's rack frame region (null = the rack fills the frame).
+        planogramPoint: rackPointFor(
+          {
+            x: (primary.box.x + primary.box.width / 2) / geometrySmall.width,
+            y: (primary.box.y + primary.box.height / 2) / geometrySmall.height,
+          },
+          sanitizeStoredRackFrameRegion(internal.rackFrameRegion),
+        ),
       });
       return this.persist(tenantId, { videoAssetId }, evidence, startedAt);
     } catch (error) {
@@ -1214,6 +1261,10 @@ export class PickupFusionService {
       };
       /** Phase 22 candidate scope (null = unscoped, unchanged behaviour). */
       planogramScope: PlanogramScope | null;
+      /** Phase 23 — the primary event's centre in RACK coordinates (0..1,
+       *  mapped through the asset's rack frame region); null = unknown or
+       *  off the rack, the planogram signal falls back to rack level. */
+      planogramPoint: { x: number; y: number } | null;
     },
   ): Promise<void> {
       // ---- catalog snapshot -------------------------------------------
@@ -1417,18 +1468,58 @@ export class PickupFusionService {
         detail: signal.detail,
       }));
 
+      // ---- planogram signal (Phase 23) --------------------------------
+      // Its own fusion class: 1.0 for a candidate assigned to the cell the
+      // event mapped to, 0.6 elsewhere on the bound rack, 0 off-rack.
+      // Unbound clip → the class is unavailable (null), never a zero.
+      let planogramSignals: CandidateSignal[] | null = null;
+      if (ctx.planogramScope) {
+        const candidateRows = candidateIds.map((productId) => ({
+          productId,
+          sku: productMeta.get(productId)?.sku ?? productId,
+        }));
+        const planogram = planogramSignalsFor(
+          candidateRows,
+          {
+            rackCode: ctx.planogramScope.rackCode,
+            rows: ctx.planogramScope.rows,
+            columns: ctx.planogramScope.columns,
+            cells: ctx.planogramScope.cells,
+          },
+          ctx.planogramPoint,
+        );
+        planogramSignals = planogram.signals;
+        ctx.evidence.planogram = {
+          rackCode: ctx.planogramScope.rackCode,
+          cellCode: planogram.cellCode,
+          candidates: planogram.signals.map((signal) => ({
+            sku: signal.sku,
+            score: signal.score,
+            ...(signal.detail ? { detail: signal.detail } : {}),
+          })),
+        };
+      }
+
       // ---- fusion (req 10) --------------------------------------------
-      const fused = this.fusion.fuse(
-        {
-          classical: classicalForFusion,
-          retrieval: retrievalForFusion,
-          barcode: barcodeSignals,
-          ocr: ocrForFusion,
-          context: contextSignals,
-        },
-        productMeta,
-      );
+      // Only products in the ACTIVE catalog snapshot may become candidates:
+      // a stray adapter signal for a retired product (stale index, cache)
+      // is dropped here, at the fusion boundary, before it can be ranked.
+      const inCatalog = (signal: CandidateSignal) => productMeta.has(signal.productId);
+      const fusionInputs = {
+        classical: classicalForFusion.filter(inCatalog),
+        retrieval: retrievalForFusion.filter(inCatalog),
+        barcode: barcodeSignals.filter(inCatalog),
+        ocr: ocrForFusion.filter(inCatalog),
+        context: contextSignals.filter(inCatalog),
+        planogram: planogramSignals === null ? null : planogramSignals.filter(inCatalog),
+      };
+      const fused = this.fusion.fuse(fusionInputs, productMeta);
       ctx.evidence.fused = fused;
+      const weighting = effectiveWeights(availableSignalClasses(fusionInputs));
+      ctx.evidence.fusion = { weighting };
+      if (weighting.unavailable.length > 0) {
+        ctx.evidence.notes = [...(ctx.evidence.notes ?? []), 'AVAILABLE_SIGNAL_RENORMALIZED'];
+      }
 
       // ---- inventory validation (req 1/13) ----------------------------
       const inventoryValidations = await ctx.timed(
@@ -1806,6 +1897,7 @@ export class PickupFusionService {
           deviceId: null,
         },
         planogramScope: null,
+        planogramPoint: null,
       });
       return this.persist(
         tenantId,
