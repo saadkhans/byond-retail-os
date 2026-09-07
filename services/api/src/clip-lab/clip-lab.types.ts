@@ -19,12 +19,33 @@ export interface ClipLabStepResult {
   ms: number | null;
 }
 
+export interface ClipLabConfidence {
+  detection: { status: 'OK' | 'FAILED' | 'SKIPPED' | 'NOT_RUN'; score: number | null };
+  detector: {
+    provider: string | null;
+    topDetection: number | null;
+    productFrames: number | null;
+    sampledFrames: number | null;
+  };
+  fusionTop: { sku: string; score: number; margin: number } | null;
+  planogramCell: { cell: string; confidence: number } | null;
+  vlm: {
+    status: string | null;
+    verdict: string | null;
+    sku: string | null;
+    support: string | null;
+  } | null;
+  overall: { reviewRequired: true; gate: 'REVIEW_REQUIRED' };
+}
+
 export interface ClipLabReport {
   asset: {
     id: string;
     name: string;
     status: string;
     store: { id: string; name: string; code: string } | null;
+    /** Retail unit the clip is bound to — classical v1 detection needs it. */
+    unit: { id: string; name: string } | null;
     rackCode: string | null;
     rackFrameRegion: { x: number; y: number; width: number; height: number } | null;
     groundTruth: {
@@ -62,6 +83,13 @@ export interface ClipLabReport {
     reasonCode: string | null;
     modelId: string | null;
   }[];
+  /**
+   * Confidence summary. Every number is a 0..1 signal as its stage
+   * produced it (uncalibrated ranking values until calibration lands —
+   * the page labels them so). Strings are classified codes / SKUs only.
+   * `overall` is never a number: the Phase 20 gate keeps review on.
+   */
+  confidence: ClipLabConfidence;
   /** Codes explaining the outcome (labels live in the admin web). */
   why: string[];
   links: { videoAssetPage: string; pretrainedPage: string };

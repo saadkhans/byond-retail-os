@@ -700,6 +700,7 @@ export interface ClipLabReport {
     name: string;
     status: string;
     store: { id: string; name: string; code: string } | null;
+    unit: { id: string; name: string } | null;
     rackCode: string | null;
     rackFrameRegion: { x: number; y: number; width: number; height: number } | null;
     groundTruth: { eventKind: string; sku: string | null; actualTimestampMs: number | null } | null;
@@ -718,8 +719,24 @@ export interface ClipLabReport {
   } | null;
   candidates: { scoped: boolean; excludedProductCount: number; items: { sku: string; score: number }[] };
   providers: { provider: string; availability: string; reasonCode: string | null; modelId: string | null }[];
+  /** Uncalibrated 0..1 signals per stage (never probabilities); overall is the review gate. */
+  confidence: ClipLabConfidence;
   why: string[];
   links: { videoAssetPage: string; pretrainedPage: string };
+}
+
+export interface ClipLabConfidence {
+  detection: { status: 'OK' | 'FAILED' | 'SKIPPED' | 'NOT_RUN'; score: number | null };
+  detector: {
+    provider: string | null;
+    topDetection: number | null;
+    productFrames: number | null;
+    sampledFrames: number | null;
+  };
+  fusionTop: { sku: string; score: number; margin: number } | null;
+  planogramCell: { cell: string; confidence: number } | null;
+  vlm: { status: string | null; verdict: string | null; sku: string | null; support: string | null } | null;
+  overall: { reviewRequired: true; gate: 'REVIEW_REQUIRED' };
 }
 
 // Quarantine screening preview — the ONE deliberate exception to the

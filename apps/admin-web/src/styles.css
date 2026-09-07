@@ -987,3 +987,17 @@ details.disclosure > .disclosure-body {
 .frame-thumb {
   border: 1px solid var(--rule);
 }
+
+/* Clip Lab — confidence summary (stage signals as percentages, uncalibrated) */
+.confidence-summary {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+.confidence-summary h4 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+.confidence-summary table td:first-child {
+  white-space: nowrap;
+}

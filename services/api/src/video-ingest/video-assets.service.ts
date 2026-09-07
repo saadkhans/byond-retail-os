@@ -1893,6 +1893,7 @@ export class VideoAssetsService {
   ): Promise<VideoAssetView> {
     assertPlainId('id', id);
     assertPlainId('locationId', dto.locationId);
+    assertPlainId('unitId', dto.unitId ?? undefined);
     const asset = await this.repository.findById(tenantId, id);
     if (!asset) {
       throw new NotFoundException('Video asset not found');
@@ -1900,7 +1901,7 @@ export class VideoAssetsService {
     if (
       dto.locationId !== undefined &&
       dto.locationId !== asset.locationId &&
-      (asset.unitId || asset.deviceId || asset.sessionId)
+      (asset.deviceId || asset.sessionId || (asset.unitId && dto.unitId === undefined))
     ) {
       throw new BadRequestException(
         'The store of a clip bound to a unit, device, or session is derived from that binding and cannot be changed here',
@@ -1913,6 +1914,30 @@ export class VideoAssetsService {
       }
     }
     const effectiveLocationId = dto.locationId ?? asset.locationId ?? null;
+    // Phase 22b: a unit must belong to the effective store of the SAME
+    // tenant (classical v1 detection records a pickup event on it). A
+    // device- or session-bound clip derives its unit and keeps it.
+    if (dto.unitId !== undefined && dto.unitId !== asset.unitId) {
+      if (asset.deviceId || asset.sessionId) {
+        throw new BadRequestException(
+          'The unit of a clip bound to a device or session is derived from that binding and cannot be changed here',
+        );
+      }
+      if (dto.unitId !== null) {
+        if (!effectiveLocationId) {
+          throw new BadRequestException('Bind a store before binding a unit');
+        }
+        const unit = await this.repository.findUnit(tenantId, dto.unitId);
+        if (!unit) {
+          throw new BadRequestException(`Unit "${safeReference(dto.unitId)}" not found`);
+        }
+        if (unit.locationId !== effectiveLocationId) {
+          throw new BadRequestException(
+            `Unit "${safeReference(dto.unitId)}" does not belong to store "${safeReference(effectiveLocationId)}"`,
+          );
+        }
+      }
+    }
     const rackCode =
       dto.planogramRackCode === undefined
         ? asset.planogramRackCode
@@ -1929,6 +1954,7 @@ export class VideoAssetsService {
       id,
       {
         ...(dto.locationId !== undefined ? { locationId: dto.locationId } : {}),
+        ...(dto.unitId !== undefined ? { unitId: dto.unitId } : {}),
         planogramRackCode: binding.planogramRackCode,
         rackFrameRegion: binding.rackFrameRegion,
       },

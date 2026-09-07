@@ -7176,6 +7176,58 @@ describe('Phase 22 — planogram binding at upload and afterwards', () => {
     );
   });
 
+  it('updateBinding binds a unit that belongs to the effective store (Phase 22b)', async () => {
+    const resolve = jest.fn(async () => ({ planogramRackCode: null, rackFrameRegion: null }));
+    const updateBinding = jest.fn(async (_t: string, _id: string, data: unknown) => assetRow({ ...(data as object) }));
+    const findUnit = jest.fn(async () => ({ id: 'unit-1', locationId: 'store-1' }));
+    const { service } = buildService({
+      bindingValidator: { resolve },
+      repository: {
+        findById: jest.fn(async () => assetRow({ locationId: 'store-1' })),
+        findUnit,
+        updateBinding,
+      },
+    });
+    await service.updateBinding(TENANT, 'asset-1', { unitId: 'unit-1' }, { id: 'u1', email: 'u@x.io' });
+    expect(findUnit).toHaveBeenCalledWith(TENANT, 'unit-1');
+    expect(updateBinding).toHaveBeenCalledWith(
+      TENANT,
+      'asset-1',
+      { unitId: 'unit-1', planogramRackCode: null, rackFrameRegion: null },
+      expect.any(Function),
+    );
+  });
+
+  it('updateBinding rejects a unit of another store, an unknown unit, and a unit without a store', async () => {
+    const otherStore = buildService({
+      bindingValidator: { resolve: jest.fn() },
+      repository: {
+        findById: jest.fn(async () => assetRow({ locationId: 'store-1' })),
+        findUnit: jest.fn(async () => ({ id: 'unit-9', locationId: 'store-2' })),
+      },
+    });
+    await expect(otherStore.service.updateBinding(TENANT, 'asset-1', { unitId: 'unit-9' })).rejects.toThrow(
+      BadRequestException,
+    );
+    const unknown = buildService({
+      bindingValidator: { resolve: jest.fn() },
+      repository: {
+        findById: jest.fn(async () => assetRow({ locationId: 'store-1' })),
+        findUnit: jest.fn(async () => null),
+      },
+    });
+    await expect(unknown.service.updateBinding(TENANT, 'asset-1', { unitId: 'unit-x' })).rejects.toThrow(
+      BadRequestException,
+    );
+    const storeless = buildService({
+      bindingValidator: { resolve: jest.fn() },
+      repository: { findById: jest.fn(async () => assetRow({ locationId: null })) },
+    });
+    await expect(storeless.service.updateBinding(TENANT, 'asset-1', { unitId: 'unit-1' })).rejects.toThrow(
+      BadRequestException,
+    );
+  });
+
   it('updateBinding refuses to move a unit-bound clip to another store and 404s on a missing asset', async () => {
     const { service } = buildService({
       bindingValidator: { resolve: jest.fn() },

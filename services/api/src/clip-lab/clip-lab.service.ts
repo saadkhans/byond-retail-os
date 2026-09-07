@@ -15,6 +15,7 @@ import { VideoAssetsRepository } from '../video-ingest/video-assets.repository';
 import { VideoAssetsService } from '../video-ingest/video-assets.service';
 import { sanitizeStoredRackFrameRegion } from '../video-ingest/video-asset-binding';
 import {
+  ClipLabConfidence,
   ClipLabReport,
   ClipLabStep,
   ClipLabStepResult,
@@ -22,6 +23,23 @@ import {
 } from './clip-lab.types';
 
 const CODE_PATTERN = /^[A-Z0-9_]{1,64}$/;
+/** SKU codes as the catalog stores them — safe identifiers. */
+const SKU_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 _.\-()]{0,63}$/;
+
+function codeOrNull(value: unknown): string | null {
+  return typeof value === 'string' && CODE_PATTERN.test(value) ? value : null;
+}
+
+function skuOrNull(value: unknown): string | null {
+  return typeof value === 'string' && SKU_PATTERN.test(value) ? value : null;
+}
+
+/** 0..1 signal rounded to 3 decimals; anything else is unknown. */
+function signal(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.round(Math.min(1, Math.max(0, value)) * 1000) / 1000
+    : null;
+}
 
 /** Classified code or a fixed fallback — never a message. */
 function code(value: unknown, fallback: string): string {
@@ -133,7 +151,12 @@ export class ClipLabService {
     }
 
     // ---- DETECTION (v1, idempotent; a NO_MOTION_EVENT does not stop) --
-    {
+    if (!asset.unitId) {
+      // v1 records a pickup EVENT, which needs a store AND a unit. Without
+      // a unit the stage is skipped (not failed) and the run continues —
+      // fusion v2 and the pretrained stage carry the clip.
+      step('DETECTION', 'SKIPPED', 'MISSING_UNIT_BINDING', null);
+    } else {
       const startedAt = Date.now();
       try {
         const state = await this.detection.detectForAsset(tenantId, videoAssetId, {
@@ -223,8 +246,15 @@ export class ClipLabService {
           ? 'OK'
           : detection.job?.status === 'FAILED'
             ? 'FAILED'
-            : 'NOT_RUN',
-      reasonCode: detection.job?.status === 'FAILED' ? code(detection.job.errorCode, 'DETECTION_FAILED') : null,
+            : !asset.unitId
+              ? 'SKIPPED'
+              : 'NOT_RUN',
+      reasonCode:
+        detection.job?.status === 'FAILED'
+          ? code(detection.job.errorCode, 'DETECTION_FAILED')
+          : !detection.job && !asset.unitId
+            ? 'MISSING_UNIT_BINDING'
+            : null,
       ms: null,
     });
     const fusionRow = await this.prisma.pickupFusionRun.findFirst({
@@ -282,7 +312,19 @@ export class ClipLabService {
     const evidence = (fusionRow?.evidence ?? null) as {
       fused?: { sku?: unknown; fusedScore?: unknown }[];
       planogramScope?: { excludedProductCount?: unknown } | null;
+      vlm?: {
+        status?: unknown;
+        verdict?: unknown;
+        selectedSku?: unknown;
+        visualSupport?: unknown;
+      } | null;
     } | null;
+    const unit = asset.unitId
+      ? await this.prisma.retailUnit.findFirst({
+          where: { id: asset.unitId, tenantId },
+          select: { id: true, name: true },
+        })
+      : null;
     const fused = Array.isArray(evidence?.fused) ? evidence.fused : [];
     const items = fused
       .filter((row) => typeof row.sku === 'string' && typeof row.fusedScore === 'number')
@@ -302,16 +344,25 @@ export class ClipLabService {
     for (const note of detectorRun?.evidence.notes ?? []) why.add(code(note, 'NOTE'));
     if (scope) why.add('PLANOGRAM_SCOPED_CANDIDATES');
     for (const row of steps) {
-      if (row.status === 'FAILED' || row.status === 'BLOCKED') {
+      if (
+        row.status === 'FAILED' ||
+        row.status === 'BLOCKED' ||
+        (row.status === 'SKIPPED' && row.step === 'DETECTION' && row.reasonCode)
+      ) {
         why.add(`${row.step}_${row.reasonCode ?? row.status}`.slice(0, 64));
       }
     }
+    const confidence = await this.confidenceFor(tenantId, videoAssetId, steps, report, {
+      fused,
+      vlm: evidence?.vlm ?? null,
+    });
     return {
       asset: {
         id: asset.id,
         name: asset.originalFilename,
         status: asset.status,
         store: asset.location ? { id: asset.location.id, name: asset.location.name, code: asset.location.code } : null,
+        unit: unit ? { id: unit.id, name: unit.name } : null,
         rackCode: asset.planogramRackCode ?? null,
         rackFrameRegion: sanitizeStoredRackFrameRegion(asset.rackFrameRegion),
         groundTruth: truth
@@ -356,11 +407,114 @@ export class ClipLabService {
         reasonCode: provider.reasonCode,
         modelId: provider.runtime?.modelId ?? null,
       })),
+      confidence,
       why: [...why].filter((row) => CODE_PATTERN.test(row)),
       links: {
         videoAssetPage: `/video-assets/${asset.id}`,
         pretrainedPage: '/pretrained-vision',
       },
+    };
+  }
+
+  /**
+   * The confidence summary: one row per stage, each number exactly as
+   * that stage produced it (0..1, uncalibrated). Missing pieces are null
+   * — nothing here is ever invented, and `overall` is the review gate,
+   * never a number.
+   */
+  private async confidenceFor(
+    tenantId: string,
+    videoAssetId: string,
+    steps: ClipLabStepResult[],
+    report: Awaited<ReturnType<PretrainedVisionService['report']>> | null,
+    fusion: {
+      fused: { sku?: unknown; fusedScore?: unknown }[];
+      vlm: { status?: unknown; verdict?: unknown; selectedSku?: unknown; visualSupport?: unknown } | null;
+    },
+  ): Promise<ClipLabConfidence> {
+    const detectionStep = steps.find((row) => row.step === 'DETECTION');
+    let detectionScore: number | null = null;
+    if (detectionStep?.status === 'OK') {
+      try {
+        const state = await this.detection.getState(tenantId, videoAssetId);
+        detectionScore = signal(state.detection?.confidence);
+      } catch {
+        detectionScore = null;
+      }
+    }
+    const detectionStatus: ClipLabConfidence['detection']['status'] =
+      detectionStep?.status === 'OK'
+        ? 'OK'
+        : detectionStep?.status === 'FAILED' || detectionStep?.status === 'BLOCKED'
+          ? 'FAILED'
+          : detectionStep?.status === 'SKIPPED'
+            ? 'SKIPPED'
+            : 'NOT_RUN';
+
+    const detectorRun = report?.runs.find(
+      (row) =>
+        row.provider !== 'CLASSICAL' && row.evidence.availability === 'READY' && !row.synthetic,
+    );
+    let topDetection: number | null = null;
+    const productTimestamps = new Set<number>();
+    const allTimestamps = new Set<number>();
+    for (const detection of detectorRun?.evidence.detections ?? []) {
+      const conf = signal(detection.confidence);
+      if (conf !== null && (topDetection === null || conf > topDetection)) {
+        topDetection = conf;
+      }
+      allTimestamps.add(detection.timestampMs);
+      if (detection.label === 'PRODUCT' || detection.label === 'PRODUCT_IN_HAND') {
+        productTimestamps.add(detection.timestampMs);
+      }
+    }
+
+    const ranked = fusion.fused.filter(
+      (row) => skuOrNull(row.sku) !== null && signal(row.fusedScore) !== null,
+    );
+    const top = ranked[0];
+    const second = ranked[1];
+    const topScore = top ? (signal(top.fusedScore) as number) : null;
+    const fusionTop =
+      top && topScore !== null
+        ? {
+            sku: skuOrNull(top.sku) as string,
+            score: topScore,
+            margin:
+              second && signal(second.fusedScore) !== null
+                ? Math.round((topScore - (signal(second.fusedScore) as number)) * 1000) / 1000
+                : 0,
+          }
+        : null;
+
+    const cell = report?.planogram.cell ?? null;
+    const cellConfidence = cell ? signal(cell.confidence) : null;
+    const planogramCell =
+      cell && codeOrNull(cell.cellCode) !== null && cellConfidence !== null
+        ? { cell: cell.cellCode, confidence: cellConfidence }
+        : null;
+
+    const vlm = fusion.vlm
+      ? {
+          status: codeOrNull(fusion.vlm.status),
+          verdict: codeOrNull(fusion.vlm.verdict),
+          sku: skuOrNull(fusion.vlm.selectedSku),
+          support: codeOrNull(fusion.vlm.visualSupport),
+        }
+      : null;
+
+    return {
+      detection: { status: detectionStatus, score: detectionScore },
+      detector: {
+        provider: detectorRun ? codeOrNull(detectorRun.provider) : null,
+        topDetection,
+        productFrames: detectorRun ? productTimestamps.size : null,
+        sampledFrames: detectorRun ? allTimestamps.size : null,
+      },
+      fusionTop,
+      planogramCell,
+      vlm: vlm && (vlm.status || vlm.verdict || vlm.sku || vlm.support) ? vlm : null,
+      overall: { reviewRequired: true, gate: 'REVIEW_REQUIRED' },
     };
   }
 }

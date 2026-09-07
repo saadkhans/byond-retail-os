@@ -48,6 +48,18 @@ export class UpdateVideoAssetBindingDto {
   locationId?: string;
 
   @ApiPropertyOptional({
+    description:
+      'Retail unit at the clip\'s store. Classical v1 detection records a ' +
+      'pickup event and needs it; null clears it.',
+    nullable: true,
+  })
+  @IsOptional()
+  @IsString()
+  @MinLength(1)
+  @MaxLength(64)
+  unitId?: string | null;
+
+  @ApiPropertyOptional({
     description: 'ACTIVE planogram rack code at that store; null clears the binding.',
     nullable: true,
   })

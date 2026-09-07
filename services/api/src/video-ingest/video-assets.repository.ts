@@ -363,6 +363,7 @@ export class VideoAssetsRepository extends TenantScopedRepository {
     id: string,
     data: {
       locationId?: string;
+      unitId?: string | null;
       planogramRackCode: string | null;
       rackFrameRegion: Prisma.InputJsonValue | null;
     },
@@ -381,6 +382,7 @@ export class VideoAssetsRepository extends TenantScopedRepository {
         where: { id_tenantId: { id, tenantId: scopedTenantId } },
         data: {
           ...(data.locationId !== undefined ? { locationId: data.locationId } : {}),
+          ...(data.unitId !== undefined ? { unitId: data.unitId } : {}),
           planogramRackCode: data.planogramRackCode,
           rackFrameRegion:
             data.rackFrameRegion === null ? Prisma.JsonNull : data.rackFrameRegion,
@@ -397,6 +399,17 @@ export class VideoAssetsRepository extends TenantScopedRepository {
     return this.prisma.location.findFirst({
       where: { id, tenantId: this.requireTenantId(tenantId) },
       select: { id: true },
+    });
+  }
+
+  /** Tenant-scoped unit lookup for the binding update (Phase 22b). */
+  findUnit(
+    tenantId: string,
+    id: string,
+  ): Promise<{ id: string; locationId: string } | null> {
+    return this.prisma.retailUnit.findFirst({
+      where: { id, tenantId: this.requireTenantId(tenantId) },
+      select: { id: true, locationId: true },
     });
   }
 
