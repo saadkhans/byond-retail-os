@@ -24,6 +24,7 @@ const READY: LocalEmbeddingStatus = {
 
 function runtimeWith(status: LocalEmbeddingStatus | Error): LocalEmbeddingRuntimePort {
   return {
+    describeModel: jest.fn(async () => (status instanceof Error ? null : status.model)),
     status: jest.fn(async () => {
       if (status instanceof Error) throw status;
       return status;

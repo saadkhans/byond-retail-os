@@ -196,5 +196,9 @@ export interface LocalEmbeddingResult {
  */
 export interface LocalEmbeddingRuntimePort {
   status(): Promise<LocalEmbeddingStatus>;
+  /** Manifest-only description of the configured encoder (no worker is
+   *  spawned, no probe) — safe to call at module construction. Null when
+   *  no model is configured or the manifest is invalid. */
+  describeModel(): Promise<LocalEmbeddingModelDescriptor | null>;
   embed(images: EmbeddingImageInput[]): Promise<LocalEmbeddingResult>;
 }

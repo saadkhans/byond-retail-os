@@ -86,6 +86,17 @@ export class LocalEmbeddingRuntime implements LocalEmbeddingRuntimePort {
     }
   }
 
+  /** Manifest-only: never spawns the worker, so boot-time callers (the
+   *  fusion module's index-generation label) stay fast. */
+  async describeModel(): Promise<LocalEmbeddingModelDescriptor | null> {
+    try {
+      const resolution = await this.registry.resolveEmbedding();
+      return resolution.ok ? resolution.descriptor : null;
+    } catch {
+      return null;
+    }
+  }
+
   async embed(images: EmbeddingImageInput[]): Promise<LocalEmbeddingResult> {
     try {
       return await this.runEmbed(images);

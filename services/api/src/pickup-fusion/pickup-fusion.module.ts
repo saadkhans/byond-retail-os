@@ -211,8 +211,9 @@ export function buildVisualRetriever(
     { provide: PICKUP_OCR_READER, useExisting: TesseractOcrReader },
     // Keyed retrieval provider (PICKUP_RETRIEVAL_PROVIDER, Phase 24). The
     // clip_local retriever's index generation label is the encoder's
-    // manifest version, read once from the runtime status at boot; an
-    // unavailable runtime yields 'unknown' and an honest not-ready adapter.
+    // MANIFEST version (describeModel: no worker spawn, no probe — boot
+    // must never load a model); a missing manifest yields 'unknown' and
+    // an honest not-ready adapter.
     {
       provide: PICKUP_VISUAL_RETRIEVER,
       inject: [
@@ -232,7 +233,7 @@ export function buildVisualRetriever(
         const provider = retrievalProviderFrom(config);
         const version =
           provider === 'clip_local'
-            ? ((await embeddingRuntime.status()).model?.version ?? 'unknown')
+            ? ((await embeddingRuntime.describeModel())?.version ?? 'unknown')
             : 'unknown';
         return buildVisualRetriever(provider, prisma, storage, decoder, embeddingRuntime, version);
       },

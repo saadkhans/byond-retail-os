@@ -90,6 +90,7 @@ function buildHarness(options: HarnessOptions = {}) {
   const embedCalls: EmbeddingImageInput[][] = [];
   const runtime: LocalEmbeddingRuntimePort = {
     status: jest.fn(async () => options.status ?? READY),
+    describeModel: jest.fn(async () => (options.status ?? READY).model ?? null),
     embed: jest.fn(async (images: EmbeddingImageInput[]): Promise<LocalEmbeddingResult> => {
       embedCalls.push(images);
       const status = options.status ?? READY;

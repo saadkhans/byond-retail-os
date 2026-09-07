@@ -16,6 +16,7 @@ const storage = {} as LocalVideoStorageAdapter;
 const decoder = {} as PickupAnalysisFrameDecoder;
 const runtime = {
   status: jest.fn(),
+  describeModel: jest.fn(async () => null),
   embed: jest.fn(),
 } as unknown as LocalEmbeddingRuntimePort;
 
