@@ -333,11 +333,19 @@ export const COMPARATIVE_MAX_CANDIDATES = 3;
 /** Rough per-image token cost and fixed prompt overhead used to turn
  *  num_ctx into an image cap — conservative for current local vision
  *  models (a 6-image prompt was measured at ≈ 4600 tokens). */
-export const PROMPT_TOKENS_PER_IMAGE = 768;
+/** Measured, not assumed: Ollama's qwen2.5-vl encodes one of our images as
+ *  512 + 512 + 65 = 1089 prompt tokens (server log: "n_tokens_batch"); a
+ *  768 estimate let an 8-image prompt reach 9206 tokens against an 8192
+ *  context and fail with PROVIDER_ERROR. Overridable per deployment via
+ *  PICKUP_VLM_TOKENS_PER_IMAGE for other vision models. */
+export const PROMPT_TOKENS_PER_IMAGE = 1100;
 export const PROMPT_TEXT_TOKENS = 1024;
 
-export function maxImagesForContext(numCtx: number): number {
-  return Math.max(2, Math.floor((numCtx - PROMPT_TEXT_TOKENS) / PROMPT_TOKENS_PER_IMAGE));
+export function maxImagesForContext(
+  numCtx: number,
+  tokensPerImage: number = PROMPT_TOKENS_PER_IMAGE,
+): number {
+  return Math.max(2, Math.floor((numCtx - PROMPT_TEXT_TOKENS) / tokensPerImage));
 }
 
 /** Reads and bounds PICKUP_VLM_REFERENCES_PER_CANDIDATE; throws on an

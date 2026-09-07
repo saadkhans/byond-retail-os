@@ -7,6 +7,7 @@ import {
   parseStrictVerdict,
   safeRawPreview,
   maxImagesForContext,
+  PROMPT_TOKENS_PER_IMAGE,
   referencesPerCandidateFromConfig,
 } from './vlm-shared';
 
@@ -75,6 +76,7 @@ export class OllamaVlmVerifier implements VlmVerifier {
   private readonly baseUrlLoopback: boolean;
   private readonly model: string;
   private readonly numCtx: number;
+  private readonly tokensPerImage: number;
   private readonly referencesPerCandidate: number;
   private readonly legacyCompat: boolean;
   private lastInference: OllamaReadiness['lastInference'] = null;
@@ -110,6 +112,13 @@ export class OllamaVlmVerifier implements VlmVerifier {
       );
     }
     this.numCtx = Number.isFinite(configured) ? configured : 8192;
+    const perImage = Number(config.get<string>('PICKUP_VLM_TOKENS_PER_IMAGE'));
+    if (Number.isFinite(perImage) && (perImage < 256 || perImage > 4096)) {
+      throw new Error(
+        `PICKUP_VLM_TOKENS_PER_IMAGE=${perImage} is outside its safe range [256, 4096]`,
+      );
+    }
+    this.tokensPerImage = Number.isFinite(perImage) ? perImage : PROMPT_TOKENS_PER_IMAGE;
     // Reference photos per candidate (1..4, default 3) — bounded at boot
     // like num_ctx; the prompt planner may still reduce it to fit num_ctx.
     this.referencesPerCandidate = referencesPerCandidateFromConfig(
@@ -251,7 +260,7 @@ export class OllamaVlmVerifier implements VlmVerifier {
 
     const prompt = buildPromptParts(evidence, {
       referencesPerCandidate: this.referencesPerCandidate,
-      maxImages: maxImagesForContext(this.numCtx),
+      maxImages: maxImagesForContext(this.numCtx, this.tokensPerImage),
     });
     const { instruction, images } = prompt;
     base.imagesSent = prompt.imagesSent;
