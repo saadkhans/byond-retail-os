@@ -11,6 +11,7 @@ import {
   VlmVerdictKind,
 } from '../ports';
 import { encodeRgbPng } from './text-signals';
+import { RgbImage, resizeRgb } from '../../pickup-detection/analysis/product-matcher';
 
 /**
  * Provider-independent halves of the VLM verifier contract: the STRICT
@@ -303,37 +304,176 @@ export function parseStrictVerdict(
 
 export interface VlmPromptParts {
   instruction: string;
-  /** base64 PNGs in presentation order (frames, then references). */
+  /** base64 PNGs in presentation order (frames, product crop, then
+   *  references — grouped per candidate). */
   images: { label: string; base64: string }[];
+  /** Images actually sent after the context budget was applied. */
+  imagesSent: number;
+  /** Reference photos shown per candidate after budget reduction. */
+  referencesPerCandidate: number;
 }
 
-export function buildPromptParts(evidence: VlmRequestEvidence): VlmPromptParts {
+export interface VlmPromptOptions {
+  /** Reference photos per candidate the caller WANTS (1..4). */
+  referencesPerCandidate?: number;
+  /** Hard cap on images the prompt may carry (derived from num_ctx). */
+  maxImages?: number;
+}
+
+/** Default reference photos per candidate; the env key
+ *  PICKUP_VLM_REFERENCES_PER_CANDIDATE (1..4) overrides it. */
+export const DEFAULT_REFERENCES_PER_CANDIDATE = 3;
+export const MAX_REFERENCES_PER_CANDIDATE = 4;
+/** Product crops are upsampled to at least this short edge so the model
+ *  sees the label, not a thumbnail. */
+export const MIN_CROP_EDGE = 224;
+/** Candidate sets up to this size get the COMPARATIVE question (the
+ *  planogram-scoped case); larger sets keep the open question. */
+export const COMPARATIVE_MAX_CANDIDATES = 3;
+/** Rough per-image token cost and fixed prompt overhead used to turn
+ *  num_ctx into an image cap — conservative for current local vision
+ *  models (a 6-image prompt was measured at ≈ 4600 tokens). */
+export const PROMPT_TOKENS_PER_IMAGE = 768;
+export const PROMPT_TEXT_TOKENS = 1024;
+
+export function maxImagesForContext(numCtx: number): number {
+  return Math.max(2, Math.floor((numCtx - PROMPT_TEXT_TOKENS) / PROMPT_TOKENS_PER_IMAGE));
+}
+
+/** Reads and bounds PICKUP_VLM_REFERENCES_PER_CANDIDATE; throws on an
+ *  out-of-range value so a misconfiguration fails at boot, not per call. */
+export function referencesPerCandidateFromConfig(value: string | undefined): number {
+  if (value === undefined || value.trim().length === 0) {
+    return DEFAULT_REFERENCES_PER_CANDIDATE;
+  }
+  const parsed = Number(value);
+  if (
+    !Number.isInteger(parsed) ||
+    parsed < 1 ||
+    parsed > MAX_REFERENCES_PER_CANDIDATE
+  ) {
+    throw new Error(
+      `PICKUP_VLM_REFERENCES_PER_CANDIDATE=${value} is outside its safe range ` +
+        `[1, ${MAX_REFERENCES_PER_CANDIDATE}]`,
+    );
+  }
+  return parsed;
+}
+
+export interface VlmImagePlan {
+  frameCount: number;
+  includeCrop: boolean;
+  referencesPerCandidate: number;
+  total: number;
+}
+
+/**
+ * Fit the evidence into the image budget. Reduction order: reference
+ * photos per candidate first (down to 1), then the enlarged product crop,
+ * then event frames from the END (the pre frame — the crop the other
+ * signals ran on — is kept last). Pure; exported for tests.
+ */
+export function planPromptImages(
+  evidence: VlmRequestEvidence,
+  options: VlmPromptOptions = {},
+): VlmImagePlan {
+  const wanted = Math.min(
+    MAX_REFERENCES_PER_CANDIDATE,
+    Math.max(1, Math.floor(options.referencesPerCandidate ?? DEFAULT_REFERENCES_PER_CANDIDATE)),
+  );
+  const maxImages = Math.max(1, Math.floor(options.maxImages ?? Number.POSITIVE_INFINITY));
+  const hasCrop = peakCrop(evidence) !== null;
+  const referenceTotal = (perCandidate: number) =>
+    evidence.candidates.reduce(
+      (sum, candidate) => sum + Math.min(perCandidate, candidate.referenceImages.length),
+      0,
+    );
+  let frameCount = evidence.frames.length;
+  let includeCrop = hasCrop;
+  let perCandidate = wanted;
+  const total = () => frameCount + (includeCrop ? 1 : 0) + referenceTotal(perCandidate);
+  while (total() > maxImages && perCandidate > 1) {
+    perCandidate -= 1;
+  }
+  if (total() > maxImages && includeCrop) {
+    includeCrop = false;
+  }
+  while (total() > maxImages && frameCount > 1) {
+    frameCount -= 1;
+  }
+  return { frameCount, includeCrop, referencesPerCandidate: perCandidate, total: total() };
+}
+
+function peakCrop(evidence: VlmRequestEvidence): RgbImage | null {
+  const peak = evidence.crops.find((crop) => crop.phase === 'peak') ?? evidence.crops[0];
+  return peak?.image ?? null;
+}
+
+/** Nearest-neighbour upsample so the short edge is at least MIN_CROP_EDGE
+ *  (never downsamples). Exported for tests. */
+export function enlargeCrop(image: RgbImage): RgbImage {
+  const shortEdge = Math.min(image.width, image.height);
+  if (shortEdge <= 0 || shortEdge >= MIN_CROP_EDGE) {
+    return image;
+  }
+  const scale = Math.ceil(MIN_CROP_EDGE / shortEdge);
+  return resizeRgb(image, image.width * scale, image.height * scale);
+}
+
+export function buildPromptParts(
+  evidence: VlmRequestEvidence,
+  options: VlmPromptOptions = {},
+): VlmPromptParts {
+  const plan = planPromptImages(evidence, options);
   const images: VlmPromptParts['images'] = [];
-  for (const frame of evidence.frames) {
+  for (const frame of evidence.frames.slice(0, plan.frameCount)) {
     images.push({
       label: `Video frame (${frame.phase})`,
       base64: encodeRgbPng(frame.image).toString('base64'),
     });
   }
+  const crop = plan.includeCrop ? peakCrop(evidence) : null;
+  if (crop) {
+    images.push({
+      label: 'Product crop (peak instant, enlarged)',
+      base64: encodeRgbPng(enlargeCrop(crop)).toString('base64'),
+    });
+  }
   for (const candidate of evidence.candidates) {
-    const reference = candidate.referenceImages[0];
-    if (reference) {
-      images.push({
-        label: `Reference image for candidate ${candidate.sku}`,
-        base64: encodeRgbPng(reference).toString('base64'),
+    candidate.referenceImages
+      .slice(0, plan.referencesPerCandidate)
+      .forEach((reference, index) => {
+        images.push({
+          label: `Reference image ${index + 1} for candidate ${candidate.sku}`,
+          base64: encodeRgbPng(reference).toString('base64'),
+        });
       });
-    }
   }
   const skus = [...allowedSkus(evidence)];
-  const instruction =
-    `A shopper interacted with a retail shelf. The first images are event ` +
-    `frames (pre/peak/post); the remaining images are catalog reference ` +
-    `photos for the candidate products, in this order: ${evidence.candidates
-      .map((candidate) => `${candidate.sku} (${candidate.name}, fused score ${candidate.fusedScore})`)
-      .join('; ')}. ` +
+  const candidateList = evidence.candidates
+    .map((candidate) => `${candidate.sku} (${candidate.name}, fused score ${candidate.fusedScore})`)
+    .join('; ');
+  const layout =
+    `A shopper interacted with a retail shelf. The first ${plan.frameCount} image(s) are event ` +
+    `frames (pre/peak/post)` +
+    (crop
+      ? `; the next image is an enlarged crop of the product at the peak instant`
+      : '') +
+    `; the remaining images are catalog reference photos for the candidate ` +
+    `products (up to ${plan.referencesPerCandidate} per candidate, grouped per ` +
+    `candidate), in this order: ${candidateList}. ` +
     `OCR text seen on the product: ${JSON.stringify(evidence.ocrText ?? '')}. ` +
-    `Barcode: ${evidence.barcode ?? 'none'}. Shelf context: ${evidence.shelfContext ?? 'none'}.\n` +
-    `Which candidate product was picked up? Return EXACTLY ONE JSON object ` +
+    `Barcode: ${evidence.barcode ?? 'none'}. Shelf context: ${evidence.shelfContext ?? 'none'}.\n`;
+  const question =
+    evidence.candidates.length > 0 && evidence.candidates.length <= COMPARATIVE_MAX_CANDIDATES
+      ? `Which ONE of these ${evidence.candidates.length} products is being taken in the ` +
+        `event images? Compare the product crop against each candidate's reference ` +
+        `photos (shape, colour, label). Answer with exactly one SKU from the list, or ` +
+        `NONE if none matches.`
+      : `Which candidate product was picked up?`;
+  const instruction =
+    layout +
+    `${question} Return EXACTLY ONE JSON object ` +
     `and nothing else: no markdown, no code fences, no prose before or after.\n` +
     `Schema: {"verdict": "MATCH"|"AMBIGUOUS"|"UNKNOWN"|"INVALID_INPUT", ` +
     `"selectedSku": string|null, ` +
@@ -349,5 +489,10 @@ export function buildPromptParts(evidence: VlmRequestEvidence): VlmPromptParts {
     `"reasonCodes" may ONLY use: ${VLM_REASON_CODES.filter((code) => code !== 'LEGACY_SCHEMA_MAPPED').join(', ')}. ` +
     `"contradictions" may ONLY use: ${VLM_CONTRADICTION_CODES.join(', ')}. ` +
     `Set "requiresHumanReview" true whenever the evidence is not clearly conclusive.`;
-  return { instruction, images };
+  return {
+    instruction,
+    images,
+    imagesSent: images.length,
+    referencesPerCandidate: plan.referencesPerCandidate,
+  };
 }

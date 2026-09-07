@@ -786,6 +786,16 @@ describe('validateEnv', () => {
       expect(() =>
         validateEnv({ ...validConfig, PICKUP_VLM_NUM_CTX: '256' }),
       ).toThrow(/PICKUP_VLM_NUM_CTX/);
+      expect(() =>
+        validateEnv({ ...validConfig, PICKUP_VLM_REFERENCES_PER_CANDIDATE: '5' }),
+      ).toThrow(/PICKUP_VLM_REFERENCES_PER_CANDIDATE/);
+      expect(() =>
+        validateEnv({ ...validConfig, PICKUP_VLM_REFERENCES_PER_CANDIDATE: '0' }),
+      ).toThrow(/PICKUP_VLM_REFERENCES_PER_CANDIDATE/);
+      expect(
+        validateEnv({ ...validConfig, PICKUP_VLM_REFERENCES_PER_CANDIDATE: '2' })
+          .PICKUP_VLM_REFERENCES_PER_CANDIDATE,
+      ).toBe(2);
     });
 
     it('constrains provider and mode to their supported values', () => {

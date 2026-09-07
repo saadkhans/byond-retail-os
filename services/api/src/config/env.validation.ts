@@ -368,6 +368,14 @@ class EnvironmentVariables {
   @Max(131_072)
   PICKUP_VLM_NUM_CTX?: number;
 
+  // Reference photos shown to the VLM PER candidate (default 3). The
+  // adapter reduces it to fit PICKUP_VLM_NUM_CTX before dropping frames.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(4)
+  PICKUP_VLM_REFERENCES_PER_CANDIDATE?: number;
+
   // Local-dev ONLY: map the retired {choice, confidence} VLM response
   // shape onto the strict schema (always review-flagged). Default off.
   @IsOptional()

@@ -124,6 +124,42 @@ describe('applyVlmVerdictToEvidence (payment-safe persistence boundary)', () => 
     }
   });
 
+  it('records the prompt size (images sent, references per candidate) as numbers only', () => {
+    const evidence = emptyEvidence();
+    const verdict: VlmVerdict = {
+      status: 'VERDICT',
+      result: {
+        verdict: 'AMBIGUOUS',
+        selectedSku: null,
+        visualSupport: 'MEDIUM',
+        ocrSupport: 'NONE',
+        barcodeSupport: 'NONE',
+        reasonCodes: [],
+        contradictions: [],
+        requiresHumanReview: true,
+      },
+      modelKey: 'test-vision:7b',
+      modelVersion: 'test-vision:7b',
+      latencyMs: 10,
+      imagesSent: 8,
+      referencesPerCandidate: 2,
+    };
+    applyVlmVerdictToEvidence(evidence, verdict, 'NEEDS_VLM', 'SKU-A', 'routed to review');
+    expect(evidence.vlm.imagesSent).toBe(8);
+    expect(evidence.vlm.referencesPerCandidate).toBe(2);
+
+    const bare = emptyEvidence();
+    applyVlmVerdictToEvidence(
+      bare,
+      { ...verdict, imagesSent: undefined, referencesPerCandidate: undefined },
+      'NEEDS_VLM',
+      'SKU-A',
+      'routed to review',
+    );
+    expect(bare.vlm.imagesSent).toBeNull();
+    expect(bare.vlm.referencesPerCandidate).toBeNull();
+  });
+
   it('a VERDICT persists whitelist-validated fields only — the raw completion preview never travels', () => {
     const evidence = emptyEvidence();
     const verdict: VlmVerdict = {
