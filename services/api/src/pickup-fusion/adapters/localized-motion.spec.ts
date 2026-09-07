@@ -1,3 +1,4 @@
+import { rankRegionsForFallback } from './event-detection';
 import {
   AnalysisFrame,
   AnalysisGeometry,
@@ -170,5 +171,32 @@ describe('cell helpers', () => {
     const far = cellBox({ row: 7, col: 7 }, GEOMETRY, 8);
     expect(far.x + far.width).toBe(GEOMETRY.width);
     expect(far.y + far.height).toBe(GEOMETRY.height);
+  });
+});
+
+describe('rankRegionsForFallback (fallback-mode primary region)', () => {
+  const hotspot = { x: 0, y: 464, width: 174, height: 232 }; // lower-left cell neighbourhood
+  const lip = { x: 7, y: 402, width: 392, height: 51 }; // shelf lip strip, largest area
+  const bottle = { x: 36, y: 532, width: 133, height: 78 }; // product-shaped, in the hotspot
+  const sliver = { x: 0, y: 583, width: 39, height: 56 }; // product-shaped but tiny... still ok
+  const farBox = { x: 300, y: 100, width: 60, height: 90 }; // product-shaped, far away
+
+  it('puts the product-shaped region nearest the hand hotspot first, not the biggest strip', () => {
+    const ranked = rankRegionsForFallback([lip, bottle, farBox], hotspot);
+    expect(ranked[0]).toEqual(bottle);
+    expect(ranked[ranked.length - 1]).toEqual(lip);
+  });
+
+  it('prefers a region inside the hotspot over a nearer-by-center one outside it', () => {
+    const ranked = rankRegionsForFallback([farBox, sliver, bottle], hotspot);
+    expect(ranked[0]).toEqual(bottle);
+  });
+
+  it('is a pure reordering: same members, input untouched', () => {
+    const input = [lip, farBox, bottle];
+    const ranked = rankRegionsForFallback(input, hotspot);
+    expect(ranked).toHaveLength(3);
+    expect(new Set(ranked)).toEqual(new Set(input));
+    expect(input[0]).toEqual(lip);
   });
 });
