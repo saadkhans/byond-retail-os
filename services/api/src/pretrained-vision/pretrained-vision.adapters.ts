@@ -1,6 +1,8 @@
 import type {
   LocalDetectorRuntimePort,
   LocalDetectorStatus,
+  LocalEmbeddingRuntimePort,
+  LocalEmbeddingStatus,
 } from '../local-vision-runtime/local-vision-runtime.port';
 import {
   SafeFusionSummary,
@@ -491,12 +493,107 @@ export class HandSignalAdapter extends OptionalLocalAdapter {
   }
 }
 
-/** DINOv2/CLIP/SigLIP-class SKU crop-embedding retrieval slot (FAISS or
- *  a simple local NN index later). The stub ranks ONLY the tenant's own
- *  reference library — candidates can never leave that scope. */
+/**
+ * DINOv2/CLIP/SigLIP-class SKU crop-embedding retrieval slot.
+ *
+ * Precedence mirrors the detector slot: DISABLED > lab STUB > REAL local
+ * runtime (LOCAL_EMBEDDING_RUNTIME, when bound and READY) > UNAVAILABLE.
+ * In real mode this slot reports the encoder's status and model; the
+ * actual crop ranking runs inside pickup-fusion's retrieval stage (the
+ * `clip_local` visual retriever), because THIS module never reads media —
+ * the fusion evidence already persists those ranked candidates and the
+ * classical adapter surfaces the fused top-1 here. The stub ranks ONLY
+ * the tenant's own reference library — candidates can never leave that
+ * scope.
+ */
 export class EmbeddingRetrievalAdapter extends OptionalLocalAdapter {
   readonly provider = 'EMBEDDING_LOCAL' as const;
   readonly kind = 'EMBEDDING' as const;
+
+  constructor(
+    enabled: boolean,
+    stubMode: boolean,
+    private readonly runtime: LocalEmbeddingRuntimePort | null = null,
+  ) {
+    super(enabled, stubMode);
+  }
+
+  private realRuntime(): LocalEmbeddingRuntimePort | null {
+    return this.enabled && !this.stubMode ? this.runtime : null;
+  }
+
+  private runtimeStatusToProvider(status: LocalEmbeddingStatus): ProviderStatus {
+    const ready = status.availability === 'READY';
+    return {
+      provider: this.provider,
+      kind: this.kind,
+      availability: status.availability,
+      reasonCode: ready ? null : (status.reasonCode ?? 'LOCAL_RUNTIME_NOT_INSTALLED'),
+      stubMode: false,
+      runtime:
+        ready && status.model
+          ? sanitizeProviderRuntime({
+              modelId: status.model.modelId,
+              runtimeKind: status.model.runtime,
+              format: status.model.format,
+              version: status.model.version,
+              device: status.device,
+            })
+          : null,
+    };
+  }
+
+  override status(): Promise<ProviderStatus> | ProviderStatus {
+    const runtime = this.realRuntime();
+    if (runtime === null) {
+      return this.slotStatus();
+    }
+    return runtime.status().then(
+      (status) => this.runtimeStatusToProvider(status),
+      (): ProviderStatus => ({
+        provider: this.provider,
+        kind: this.kind,
+        availability: 'UNAVAILABLE',
+        reasonCode: 'LOCAL_RUNTIME_PROBE_FAILED',
+        stubMode: false,
+        runtime: null,
+      }),
+    );
+  }
+
+  override analyze(
+    ctx: AdapterAnalysisContext,
+  ): Promise<ProviderEvidence> | ProviderEvidence {
+    const runtime = this.realRuntime();
+    if (runtime === null) {
+      return this.analyzeSlot(ctx);
+    }
+    return runtime.status().then(
+      (status) => {
+        if (status.availability !== 'READY') {
+          return unavailableEvidence(
+            this.provider,
+            status.availability,
+            status.reasonCode ?? 'LOCAL_RUNTIME_NOT_INSTALLED',
+          );
+        }
+        // Real encoder present: the crop ranking itself is served by the
+        // fusion retrieval stage (this module cannot read media). The
+        // envelope stays READY and non-synthetic so the comparison shows
+        // the encoder is live; candidates arrive through fusion.
+        return sanitizeProviderEvidence({
+          provider: this.provider,
+          availability: 'READY',
+          reasonCode: null,
+          synthetic: false,
+          embeddingCandidates: [],
+          notes: ['EMBEDDING_RANKING_SERVED_BY_FUSION_RETRIEVAL'],
+        });
+      },
+      () =>
+        unavailableEvidence(this.provider, 'UNAVAILABLE', 'LOCAL_RUNTIME_PROBE_FAILED'),
+    );
+  }
 
   protected analyzeStub(ctx: AdapterAnalysisContext): ProviderEvidence {
     if (ctx.referenceSkus.length === 0) {

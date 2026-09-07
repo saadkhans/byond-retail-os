@@ -203,6 +203,15 @@ the gitignored `ml/models/<modelId>/` registry and **never enter the
 repo**. Setup, manifest format, env keys, reason codes, and
 troubleshooting: [`docs/cv/local-yolo-provider.md`](../docs/cv/local-yolo-provider.md).
 
+`ml/runtime/embed_worker.py` (Phase 24) is the second worker under the
+same discipline: an open_clip-class image encoder that turns reference
+photos and event crops into L2-normalized embeddings for the fusion
+retrieval signal. `numpy`, `torch` and `open_clip` load lazily;
+`ml/tests/test_embed_worker.py` pins its protocol with fake modules. Model
+weights come from open_clip's own local cache (by tag) or a checkpoint in
+the registry — never the repo. See
+[`docs/cv/local-embedding-retrieval.md`](../docs/cv/local-embedding-retrieval.md).
+
 ## Future training
 
 `ml/configs/training.example.yaml` documents the intended shape of a

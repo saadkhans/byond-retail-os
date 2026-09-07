@@ -21,7 +21,10 @@ What it is **not**:
   absent.
 - Not a SKU classifier. Labels are generic roles (`PRODUCT`, `HAND`,
   `PERSON`, `OBJECT`). SKU identity still comes from the classical
-  matcher, the reference library, and (later) local embedding retrieval.
+  matcher, the reference library, and — since Phase 24 — local embedding
+  retrieval from the reference photos, which reuses this registry, worker
+  confinement and reason-code vocabulary:
+  [`docs/cv/local-embedding-retrieval.md`](./local-embedding-retrieval.md).
 
 ## Local-only guarantees
 
