@@ -26,6 +26,14 @@ import {
   ClassicalHsvNccMatcher,
   HogLabVisualRetriever,
 } from './adapters/visual-signals';
+import { ClipLocalVisualRetriever } from './adapters/clip-retriever';
+import { ConfigService } from '@nestjs/config';
+import type {
+  LocalEmbeddingRuntimePort,
+} from '../local-vision-runtime/local-vision-runtime.port';
+import { LOCAL_EMBEDDING_RUNTIME } from '../local-vision-runtime/local-vision-runtime.tokens';
+import { LocalVisionRuntimeModule } from '../local-vision-runtime/local-vision-runtime.module';
+import { VisualRetriever } from './ports';
 import { AnthropicVlmVerifier } from './adapters/vlm-verifier';
 import { OllamaVlmVerifier } from './adapters/ollama-vlm';
 import { LocalStorageMediaDecoder } from './adapters/storage-media-decoder';
@@ -126,6 +134,37 @@ export class FusionOpsController {
 }
 
 /**
+ * Phase 24 — keyed retrieval provider selection (PICKUP_RETRIEVAL_PROVIDER):
+ * hog_lab (default) keeps the dependency-free index; clip_local binds the
+ * local open_clip embedding retriever. The service injects the
+ * PICKUP_VISUAL_RETRIEVER token only. An unavailable clip_local runtime is
+ * reported honestly (not-ready adapter, empty signal) — never a silent
+ * switch back to HOG. Exported for tests.
+ */
+export function retrievalProviderFrom(config: ConfigService): 'hog_lab' | 'clip_local' {
+  const configured = (config.get<string>('PICKUP_RETRIEVAL_PROVIDER') ?? 'hog_lab')
+    .trim()
+    .toLowerCase();
+  return configured === 'clip_local' ? 'clip_local' : 'hog_lab';
+}
+
+/** Builds the retriever for one Prisma client (the request-scoped one or a
+ *  transaction) according to the configured provider. Exported for tests. */
+export function buildVisualRetriever(
+  provider: 'hog_lab' | 'clip_local',
+  prisma: PrismaService,
+  storage: LocalVideoStorageAdapter,
+  decoder: PickupAnalysisFrameDecoder,
+  embeddingRuntime: LocalEmbeddingRuntimePort | null,
+  modelVersion: string,
+): VisualRetriever {
+  if (provider === 'clip_local' && embeddingRuntime !== null) {
+    return new ClipLocalVisualRetriever(prisma, storage, decoder, embeddingRuntime, modelVersion);
+  }
+  return new HogLabVisualRetriever(prisma, storage, decoder);
+}
+
+/**
  * pickup-fusion-v2 — versioned, adapter-based multimodal recognition in
  * SHADOW mode. pickup-classical-v1 (the pickup-detection module) remains
  * untouched as baseline and fallback; this module only ADDS adapters and
@@ -133,7 +172,15 @@ export class FusionOpsController {
  */
 @Module({
   // PlanogramModule: READ-ONLY rack lookup for Phase 22 candidate scoping.
-  imports: [VideoIngestModule, PickupDetectionModule, PlatformModulesModule, PlanogramModule],
+  // LocalVisionRuntimeModule: the LOCAL_EMBEDDING_RUNTIME port for the
+  // clip_local retriever (Phase 24).
+  imports: [
+    VideoIngestModule,
+    PickupDetectionModule,
+    PlatformModulesModule,
+    PlanogramModule,
+    LocalVisionRuntimeModule,
+  ],
   controllers: [PickupFusionController, FusionOpsController],
   providers: [
     MotionObjectDetector,
@@ -162,7 +209,35 @@ export class FusionOpsController {
     { provide: PICKUP_OBJECT_DETECTOR, useExisting: YoloOnnxObjectDetector },
     { provide: PICKUP_BARCODE_READER, useExisting: ZxingBarcodeReader },
     { provide: PICKUP_OCR_READER, useExisting: TesseractOcrReader },
-    { provide: PICKUP_VISUAL_RETRIEVER, useExisting: HogLabVisualRetriever },
+    // Keyed retrieval provider (PICKUP_RETRIEVAL_PROVIDER, Phase 24). The
+    // clip_local retriever's index generation label is the encoder's
+    // MANIFEST version (describeModel: no worker spawn, no probe — boot
+    // must never load a model); a missing manifest yields 'unknown' and
+    // an honest not-ready adapter.
+    {
+      provide: PICKUP_VISUAL_RETRIEVER,
+      inject: [
+        ConfigService,
+        PrismaService,
+        LocalVideoStorageAdapter,
+        PickupAnalysisFrameDecoder,
+        LOCAL_EMBEDDING_RUNTIME,
+      ],
+      useFactory: async (
+        config: ConfigService,
+        prisma: PrismaService,
+        storage: LocalVideoStorageAdapter,
+        decoder: PickupAnalysisFrameDecoder,
+        embeddingRuntime: LocalEmbeddingRuntimePort,
+      ): Promise<VisualRetriever> => {
+        const provider = retrievalProviderFrom(config);
+        const version =
+          provider === 'clip_local'
+            ? ((await embeddingRuntime.describeModel())?.version ?? 'unknown')
+            : 'unknown';
+        return buildVisualRetriever(provider, prisma, storage, decoder, embeddingRuntime, version);
+      },
+    },
     { provide: PICKUP_CLASSICAL_MATCHER, useExisting: ClassicalHsvNccMatcher },
     { provide: PICKUP_CONTEXT_PROVIDER, useExisting: PrismaContextSignalProvider },
     { provide: PICKUP_CANDIDATE_FUSION, useExisting: WeightedCandidateFusion },
@@ -170,16 +245,34 @@ export class FusionOpsController {
     // The atomic index rebuild reconstructs through the transaction that
     // deleted the old generation; tx clients cannot travel through DI, so
     // the module hands the service a factory instead of a class import.
+    // The factory builds the SAME provider kind as the request-scoped
+    // retriever so a rebuild never mixes index generations.
     {
       provide: PICKUP_TX_RETRIEVER_FACTORY,
-      inject: [LocalVideoStorageAdapter, PickupAnalysisFrameDecoder],
+      inject: [
+        ConfigService,
+        LocalVideoStorageAdapter,
+        PickupAnalysisFrameDecoder,
+        LOCAL_EMBEDDING_RUNTIME,
+        PICKUP_VISUAL_RETRIEVER,
+      ],
       useFactory:
         (
+          config: ConfigService,
           storage: LocalVideoStorageAdapter,
           decoder: PickupAnalysisFrameDecoder,
+          embeddingRuntime: LocalEmbeddingRuntimePort,
+          requestScoped: VisualRetriever,
         ): TxScopedRetrieverFactory =>
         (tx: PrismaService) =>
-          new HogLabVisualRetriever(tx, storage, decoder),
+          buildVisualRetriever(
+            retrievalProviderFrom(config),
+            tx,
+            storage,
+            decoder,
+            embeddingRuntime,
+            requestScoped.embeddingModelVersion,
+          ),
     },
     PickupFusionService,
   ],

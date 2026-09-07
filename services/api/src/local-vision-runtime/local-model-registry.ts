@@ -5,6 +5,7 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   DetectorRole,
+  LocalEmbeddingModelDescriptor,
   LocalModelDescriptor,
   LocalRuntimeReasonCode,
 } from './local-vision-runtime.port';
@@ -16,11 +17,14 @@ import {
  * root (CV_LOCAL_MODEL_ROOT, default `<repo>/ml/models`):
  *
  *   <root>/<modelId>/manifest.json
- *   <root>/<modelId>/<manifest.file>        (.pt or .onnx weights)
+ *   <root>/<modelId>/<manifest.file>        (.pt or .onnx weights; an
+ *                                            open_clip HUB_CACHE model has
+ *                                            no file at all)
  *
- * The API selects a model by REGISTRY KEY only (CV_LOCAL_YOLO_MODEL_ID) —
- * never by path. Every filesystem access re-verifies the resolved path
- * stays INSIDE the root (charset allowlist + traversal rejection +
+ * The API selects a model by REGISTRY KEY only (CV_LOCAL_YOLO_MODEL_ID for
+ * the detector, CV_LOCAL_EMBED_MODEL_ID for the embedding encoder) — never
+ * by path. Every filesystem access re-verifies the resolved path stays
+ * INSIDE the root (charset allowlist + traversal rejection +
  * resolved-prefix re-check, the same discipline as the local video
  * storage adapter), the manifest is rebuilt field-by-field through an
  * allowlist, and the ONLY thing that ever carries an absolute path is
@@ -33,12 +37,22 @@ const MODEL_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const MODEL_FILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(pt|onnx)$/;
 const CLASS_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$/;
 const VERSION_PATTERN = /^[A-Za-z0-9._-]{1,32}$/;
+/** open_clip architecture names and pretrained tags: safe tokens only —
+ *  a tag is looked up in the runtime's own local cache, never opened as
+ *  a path by this process. */
+const ARCH_PATTERN = /^[A-Za-z0-9._-]{1,48}$/;
+const PRETRAINED_TAG_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 
 export const MAX_MANIFEST_BYTES = 64 * 1024;
 export const MAX_MODEL_FILE_BYTES = 2 * 1024 * 1024 * 1024;
 export const MIN_INPUT_SIZE = 320;
 export const MAX_INPUT_SIZE = 1280;
 export const MAX_CLASSES = 1024;
+/** Embedding encoders take a small square input (224 for ViT-B-32). */
+export const MIN_EMBED_INPUT_SIZE = 64;
+export const MAX_EMBED_INPUT_SIZE = 1024;
+export const MIN_EMBED_DIM = 16;
+export const MAX_EMBED_DIM = 4096;
 /** Resolution cache TTL — same cadence as the ffmpeg tooling probe. */
 export const REGISTRY_CACHE_TTL_MS = 60_000;
 
@@ -58,6 +72,17 @@ export type ModelResolution =
        * error messages, or persisted rows.
        */
       internalModelFile: string;
+    }
+  | { ok: false; reasonCode: LocalRuntimeReasonCode };
+
+export type EmbeddingModelResolution =
+  | {
+      ok: true;
+      descriptor: LocalEmbeddingModelDescriptor;
+      /** Absolute checkpoint path for a PT model, or null for a HUB_CACHE
+       *  model (the worker resolves the pretrained tag through the
+       *  runtime's own cache). Process-internal — never leaves. */
+      internalModelFile: string | null;
     }
   | { ok: false; reasonCode: LocalRuntimeReasonCode };
 
@@ -82,11 +107,10 @@ function resolveWithinRoot(root: string, segment: string): string | null {
 }
 
 /**
- * Second confinement layer for the two files the registry actually
- * opens: resolve symlinks/junctions on BOTH sides and re-check the
- * prefix, so a link planted inside the root can never point the worker
- * at a file outside it. Null when the real path escapes or cannot be
- * resolved.
+ * Second confinement layer for the files the registry actually opens:
+ * resolve symlinks/junctions on BOTH sides and re-check the prefix, so a
+ * link planted inside the root can never point the worker at a file
+ * outside it. Null when the real path escapes or cannot be resolved.
  */
 async function confinedRealPath(
   root: string,
@@ -115,7 +139,7 @@ interface ParsedManifest {
 }
 
 /**
- * Allowlist rebuild of a manifest document. Anything not explicitly
+ * Allowlist rebuild of a DETECT manifest document. Anything not explicitly
  * picked and validated here is discarded; any violation rejects the whole
  * manifest (no partial trust). Exported for tests.
  */
@@ -211,6 +235,78 @@ export function parseManifest(raw: unknown): ParsedManifest | null {
   };
 }
 
+interface ParsedEmbedManifest {
+  modelId: string;
+  /** Checkpoint file name (PT) or null (HUB_CACHE via `pretrained`). */
+  file: string | null;
+  pretrained: string | null;
+  arch: string;
+  dim: number;
+  version: string;
+  inputSize: number;
+}
+
+/**
+ * Allowlist rebuild of an EMBED manifest document (open_clip-class
+ * encoder). Exactly one of `file` (a .pt checkpoint inside the model
+ * directory) or `pretrained` (an open_clip cache tag) must be present.
+ * Exported for tests.
+ */
+export function parseEmbedManifest(raw: unknown): ParsedEmbedManifest | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return null;
+  }
+  const doc = raw as Record<string, unknown>;
+  const modelId = doc.modelId;
+  const version = doc.version;
+  const arch = doc.arch;
+  const dim = doc.dim;
+  const inputSize = doc.inputSize ?? 224;
+  const file = doc.file;
+  const pretrained = doc.pretrained;
+  if (
+    typeof modelId !== 'string' ||
+    !MODEL_ID_PATTERN.test(modelId) ||
+    modelId.includes('..') ||
+    doc.task !== 'embed' ||
+    doc.runtime !== 'open_clip' ||
+    typeof version !== 'string' ||
+    !VERSION_PATTERN.test(version) ||
+    typeof arch !== 'string' ||
+    !ARCH_PATTERN.test(arch) ||
+    typeof dim !== 'number' ||
+    !Number.isInteger(dim) ||
+    dim < MIN_EMBED_DIM ||
+    dim > MAX_EMBED_DIM ||
+    typeof inputSize !== 'number' ||
+    !Number.isInteger(inputSize) ||
+    inputSize < MIN_EMBED_INPUT_SIZE ||
+    inputSize > MAX_EMBED_INPUT_SIZE
+  ) {
+    return null;
+  }
+  const hasFile = file !== undefined && file !== null;
+  const hasTag = pretrained !== undefined && pretrained !== null;
+  if (hasFile === hasTag) {
+    return null;
+  }
+  if (hasFile) {
+    if (
+      typeof file !== 'string' ||
+      !MODEL_FILE_PATTERN.test(file) ||
+      !file.toLowerCase().endsWith('.pt') ||
+      file.includes('..')
+    ) {
+      return null;
+    }
+    return { modelId, file, pretrained: null, arch, dim, version, inputSize };
+  }
+  if (typeof pretrained !== 'string' || !PRETRAINED_TAG_PATTERN.test(pretrained)) {
+    return null;
+  }
+  return { modelId, file: null, pretrained, arch, dim, version, inputSize };
+}
+
 /**
  * Ordered class-identity digest shared with the worker protocol: sha256
  * over the class names joined by a newline, first 32 hex characters. The
@@ -225,13 +321,28 @@ export function classListDigest(classes: readonly string[]): string {
     .slice(0, 32);
 }
 
+type ManifestLoad =
+  | { ok: true; modelDir: string; document: unknown }
+  | { ok: false; reasonCode: LocalRuntimeReasonCode };
+
+interface CacheSlot<T> {
+  cache: { resolution: T; checkedAtMs: number } | null;
+  inFlight: Promise<T> | null;
+}
+
 @Injectable()
 export class LocalModelRegistry {
   private readonly root: string;
   private readonly configuredModelId: string | null;
-  private cache: { resolution: ModelResolution; checkedAtMs: number } | null =
-    null;
-  private inFlight: Promise<ModelResolution> | null = null;
+  private readonly configuredEmbedModelId: string | null;
+  private readonly detectSlot: CacheSlot<ModelResolution> = {
+    cache: null,
+    inFlight: null,
+  };
+  private readonly embedSlot: CacheSlot<EmbeddingModelResolution> = {
+    cache: null,
+    inFlight: null,
+  };
 
   constructor(config: ConfigService) {
     const configuredRoot = config.get<string>('CV_LOCAL_MODEL_ROOT');
@@ -245,49 +356,61 @@ export class LocalModelRegistry {
           : resolve(repoRoot, configuredRoot)
         : resolve(repoRoot, 'ml', 'models'),
     );
-    const configuredId = config.get<string>('CV_LOCAL_YOLO_MODEL_ID');
-    this.configuredModelId =
-      typeof configuredId === 'string' && configuredId.trim().length > 0
-        ? configuredId.trim()
-        : null;
+    this.configuredModelId = trimmedOrNull(config.get<string>('CV_LOCAL_YOLO_MODEL_ID'));
+    this.configuredEmbedModelId = trimmedOrNull(
+      config.get<string>('CV_LOCAL_EMBED_MODEL_ID'),
+    );
   }
 
-  /** Cached (60 s TTL, single in-flight) resolution. Never rejects. */
+  /** Cached (60 s TTL, single in-flight) DETECT resolution. Never rejects. */
   resolve(): Promise<ModelResolution> {
-    const cached = this.cache;
+    return this.cached(this.detectSlot, () => this.resolveUncached(), {
+      ok: false,
+      reasonCode: 'MODEL_MANIFEST_INVALID',
+    });
+  }
+
+  /** Cached (60 s TTL, single in-flight) EMBED resolution. Never rejects. */
+  resolveEmbedding(): Promise<EmbeddingModelResolution> {
+    return this.cached(this.embedSlot, () => this.resolveEmbeddingUncached(), {
+      ok: false,
+      reasonCode: 'MODEL_MANIFEST_INVALID',
+    });
+  }
+
+  private cached<T>(
+    slot: CacheSlot<T>,
+    compute: () => Promise<T>,
+    onThrow: T,
+  ): Promise<T> {
+    const cached = slot.cache;
     if (
       cached !== null &&
       Date.now() - cached.checkedAtMs < REGISTRY_CACHE_TTL_MS
     ) {
       return Promise.resolve(cached.resolution);
     }
-    if (this.inFlight !== null) {
-      return this.inFlight;
+    if (slot.inFlight !== null) {
+      return slot.inFlight;
     }
-    const pending = this.resolveUncached()
-      .catch(
-        (): ModelResolution => ({
-          ok: false,
-          reasonCode: 'MODEL_MANIFEST_INVALID',
-        }),
-      )
+    const pending = compute()
+      .catch((): T => onThrow)
       .then((resolution) => {
-        this.cache = { resolution, checkedAtMs: Date.now() };
-        this.inFlight = null;
+        slot.cache = { resolution, checkedAtMs: Date.now() };
+        slot.inFlight = null;
         return resolution;
       });
-    this.inFlight = pending;
+    slot.inFlight = pending;
     return pending;
   }
 
-  private async resolveUncached(): Promise<ModelResolution> {
-    if (this.configuredModelId === null) {
+  /** Locate `<root>/<modelId>/manifest.json` under every confinement rule
+   *  and parse it as JSON — the shared first half of both resolutions. */
+  private async loadManifest(modelId: string | null): Promise<ManifestLoad> {
+    if (modelId === null) {
       return { ok: false, reasonCode: 'MODEL_NOT_CONFIGURED' };
     }
-    if (
-      !MODEL_ID_PATTERN.test(this.configuredModelId) ||
-      this.configuredModelId.includes('..')
-    ) {
+    if (!MODEL_ID_PATTERN.test(modelId) || modelId.includes('..')) {
       return { ok: false, reasonCode: 'MODEL_MANIFEST_INVALID' };
     }
     try {
@@ -298,7 +421,7 @@ export class LocalModelRegistry {
     } catch {
       return { ok: false, reasonCode: 'MODEL_ROOT_NOT_FOUND' };
     }
-    const modelDir = resolveWithinRoot(this.root, this.configuredModelId);
+    const modelDir = resolveWithinRoot(this.root, modelId);
     if (modelDir === null) {
       return { ok: false, reasonCode: 'MODEL_MANIFEST_INVALID' };
     }
@@ -328,23 +451,26 @@ export class LocalModelRegistry {
     } catch {
       return { ok: false, reasonCode: 'MODEL_NOT_FOUND' };
     }
-    let parsed: ParsedManifest | null;
     try {
-      parsed = parseManifest(JSON.parse(manifestBytes.toString('utf8')));
+      return {
+        ok: true,
+        modelDir,
+        document: JSON.parse(manifestBytes.toString('utf8')),
+      };
     } catch {
-      parsed = null;
-    }
-    if (parsed === null) {
       return { ok: false, reasonCode: 'MODEL_MANIFEST_INVALID' };
     }
-    if (parsed.modelId !== this.configuredModelId) {
-      return { ok: false, reasonCode: 'MODEL_MANIFEST_MISMATCH' };
-    }
-    const modelFile = resolveWithinRoot(modelDir, parsed.file);
+  }
+
+  /** Confine and size-check one weights file named by a manifest. */
+  private async confinedWeightsFile(
+    modelDir: string,
+    file: string,
+  ): Promise<{ ok: true; path: string } | { ok: false; reasonCode: LocalRuntimeReasonCode }> {
+    const modelFile = resolveWithinRoot(modelDir, file);
     if (modelFile === null) {
       return { ok: false, reasonCode: 'MODEL_MANIFEST_INVALID' };
     }
-    let realModelFile: string;
     try {
       const fileStat = await stat(modelFile);
       if (!fileStat.isFile()) {
@@ -357,9 +483,27 @@ export class LocalModelRegistry {
       if (confined === null) {
         return { ok: false, reasonCode: 'MODEL_MANIFEST_INVALID' };
       }
-      realModelFile = confined;
+      return { ok: true, path: confined };
     } catch {
       return { ok: false, reasonCode: 'MODEL_NOT_FOUND' };
+    }
+  }
+
+  private async resolveUncached(): Promise<ModelResolution> {
+    const loaded = await this.loadManifest(this.configuredModelId);
+    if (!loaded.ok) {
+      return loaded;
+    }
+    const parsed = parseManifest(loaded.document);
+    if (parsed === null) {
+      return { ok: false, reasonCode: 'MODEL_MANIFEST_INVALID' };
+    }
+    if (parsed.modelId !== this.configuredModelId) {
+      return { ok: false, reasonCode: 'MODEL_MANIFEST_MISMATCH' };
+    }
+    const weights = await this.confinedWeightsFile(loaded.modelDir, parsed.file);
+    if (!weights.ok) {
+      return weights;
     }
     return {
       ok: true,
@@ -375,7 +519,48 @@ export class LocalModelRegistry {
         roleClassCounts: { ...parsed.roleClassCounts },
       },
       classRoles: [...parsed.classRoles],
-      internalModelFile: realModelFile,
+      internalModelFile: weights.path,
     };
   }
+
+  private async resolveEmbeddingUncached(): Promise<EmbeddingModelResolution> {
+    const loaded = await this.loadManifest(this.configuredEmbedModelId);
+    if (!loaded.ok) {
+      return loaded;
+    }
+    const parsed = parseEmbedManifest(loaded.document);
+    if (parsed === null) {
+      return { ok: false, reasonCode: 'MODEL_MANIFEST_INVALID' };
+    }
+    if (parsed.modelId !== this.configuredEmbedModelId) {
+      return { ok: false, reasonCode: 'MODEL_MANIFEST_MISMATCH' };
+    }
+    let internalModelFile: string | null = null;
+    if (parsed.file !== null) {
+      const weights = await this.confinedWeightsFile(loaded.modelDir, parsed.file);
+      if (!weights.ok) {
+        return weights;
+      }
+      internalModelFile = weights.path;
+    }
+    return {
+      ok: true,
+      descriptor: {
+        modelId: parsed.modelId,
+        task: 'EMBED',
+        runtime: 'OPEN_CLIP',
+        format: parsed.file !== null ? 'PT' : 'HUB_CACHE',
+        arch: parsed.arch,
+        pretrained: parsed.pretrained,
+        dim: parsed.dim,
+        version: parsed.version,
+        inputSize: parsed.inputSize,
+      },
+      internalModelFile,
+    };
+  }
+}
+
+function trimmedOrNull(value: string | undefined): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
 }

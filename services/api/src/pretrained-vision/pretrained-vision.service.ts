@@ -9,8 +9,14 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { FusionRunScope, PretrainedVisionRunStatus } from '@prisma/client';
-import type { LocalDetectorRuntimePort } from '../local-vision-runtime/local-vision-runtime.port';
-import { LOCAL_DETECTOR_RUNTIME } from '../local-vision-runtime/local-vision-runtime.tokens';
+import type {
+  LocalDetectorRuntimePort,
+  LocalEmbeddingRuntimePort,
+} from '../local-vision-runtime/local-vision-runtime.port';
+import {
+  LOCAL_DETECTOR_RUNTIME,
+  LOCAL_EMBEDDING_RUNTIME,
+} from '../local-vision-runtime/local-vision-runtime.tokens';
 import {
   SafeFusionSummary,
   fusionFrameDimsFor,
@@ -255,6 +261,11 @@ export class PretrainedVisionService {
     @Optional()
     @Inject(LOCAL_DETECTOR_RUNTIME)
     detectorRuntime?: LocalDetectorRuntimePort,
+    // Phase 24: the LOCAL embedding runtime PORT — same optional binding
+    // discipline; without it the embedding slot reports UNAVAILABLE.
+    @Optional()
+    @Inject(LOCAL_EMBEDDING_RUNTIME)
+    embeddingRuntime?: LocalEmbeddingRuntimePort,
   ) {
     const providerConfig = (
       this.config.get<string>('CV_PRETRAINED_PROVIDER') ?? 'classical'
@@ -271,7 +282,7 @@ export class PretrainedVisionService {
       new ClassicalVisionAdapter(),
       new YoloVisionAdapter(yoloEnabled, stubMode, detectorRuntime ?? null),
       new HandSignalAdapter(handEnabled, stubMode),
-      new EmbeddingRetrievalAdapter(embeddingEnabled, stubMode),
+      new EmbeddingRetrievalAdapter(embeddingEnabled, stubMode, embeddingRuntime ?? null),
     ];
   }
 

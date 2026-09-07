@@ -8,3 +8,7 @@
  * adapters never change and never import a runtime class.
  */
 export const LOCAL_DETECTOR_RUNTIME = 'LOCAL_DETECTOR_RUNTIME';
+/** Phase 24 — local image-embedding runtime (open_clip-class encoder)
+ *  behind the same discipline; consumed by the pickup-fusion visual
+ *  retriever and the pretrained-vision EMBEDDING_LOCAL slot. */
+export const LOCAL_EMBEDDING_RUNTIME = 'LOCAL_EMBEDDING_RUNTIME';

@@ -465,12 +465,45 @@ class EnvironmentVariables {
   @Max(8)
   CV_LOCAL_YOLO_FPS?: number;
 
-  // Inference device hint: auto (runtime picks), cpu, or cuda.
+  // Inference device hint: auto (runtime picks), cpu, or cuda. Shared by
+  // the detector and the embedding encoder.
   @IsOptional()
   @Matches(/^(auto|cpu|cuda)$/i, {
     message: 'CV_LOCAL_YOLO_DEVICE must be auto, cpu, or cuda',
   })
   CV_LOCAL_YOLO_DEVICE?: string;
+
+  // Phase 24 — registry key of the local image-EMBEDDING model (an
+  // open_clip-class encoder; directory name under CV_LOCAL_MODEL_ROOT).
+  // Unset → the embedding runtime reports UNAVAILABLE (MODEL_NOT_CONFIGURED).
+  @IsOptional()
+  @Matches(/^[a-z0-9][a-z0-9._-]{0,63}$/, {
+    message:
+      'CV_LOCAL_EMBED_MODEL_ID must be a registry key: lowercase ' +
+      'alphanumerics, dot, underscore, or dash (max 64 chars)',
+  })
+  CV_LOCAL_EMBED_MODEL_ID?: string;
+
+  // Wall-clock kill timeout for one embedding worker invocation (default
+  // 60000). The interpreter (CV_LOCAL_PYTHON_BIN), model root and device
+  // hint are shared with the detector.
+  @IsOptional()
+  @IsInt()
+  @Min(5000)
+  @Max(300_000)
+  CV_LOCAL_EMBED_TIMEOUT_MS?: number;
+
+  // Phase 24 — which adapter serves the fusion RETRIEVAL signal: hog_lab
+  // (default; the dependency-free HOG-and-colour index) or clip_local (the
+  // local open_clip embedding runtime). When clip_local is configured and
+  // its runtime is unavailable the signal is simply empty and the adapter
+  // reports not-ready in the evidence — the provider is never switched
+  // silently.
+  @IsOptional()
+  @Matches(/^(hog_lab|clip_local)$/, {
+    message: 'PICKUP_RETRIEVAL_PROVIDER must be hog_lab or clip_local',
+  })
+  PICKUP_RETRIEVAL_PROVIDER?: string;
 }
 
 // Placeholder markers — banned in EVERY environment (staging and preview

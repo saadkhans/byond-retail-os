@@ -131,6 +131,46 @@ export function buildReferenceDecodeArgs(
   ];
 }
 
+/** Largest square edge the aspect-preserving reference decode accepts. */
+export const MAX_REFERENCE_FIT_EDGE = 1024;
+
+/** The edge becomes an ffmpeg argv value: integers in range only. */
+function assertFitEdge(edge: number): void {
+  if (!Number.isInteger(edge) || edge < 1 || edge > MAX_REFERENCE_FIT_EDGE) {
+    throw new RangeError('reference fit edge out of range');
+  }
+}
+
+/**
+ * Aspect-PRESERVING square decode of one reference image: fit inside
+ * `edge` x `edge`, centred, padded with a neutral grey — the letterbox the
+ * local embedding encoders expect (a stretched product changes its
+ * embedding). Exported for tests.
+ */
+export function buildReferenceFitDecodeArgs(
+  internalPath: string,
+  edge: number,
+): string[] {
+  assertFitEdge(edge);
+  return [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-i',
+    internalPath,
+    '-frames:v',
+    '1',
+    '-vf',
+    `scale=${edge}:${edge}:force_original_aspect_ratio=decrease,` +
+      `pad=${edge}:${edge}:(ow-iw)/2:(oh-ih)/2:color=#727272`,
+    '-f',
+    'rawvideo',
+    '-pix_fmt',
+    'rgb24',
+    'pipe:1',
+  ];
+}
+
 /** Even-dimensioned analysis geometry preserving the source aspect. */
 export function analysisGeometryFor(
   probe: VideoProbeResult,
@@ -341,5 +381,26 @@ export class PickupAnalysisFrameDecoder {
       height: REFERENCE_DECODE_EDGE,
       rgb: stdout.subarray(0, expected),
     };
+  }
+
+  /** Decode ONE reference image as an aspect-preserving, grey-padded
+   *  `edge` x `edge` square (Phase 24 embedding input). */
+  async decodeReferenceImageFit(internalPath: string, edge: number): Promise<RgbImage> {
+    assertFitEdge(edge);
+    let stdout: Buffer;
+    try {
+      ({ stdout } = await this.runCommand(
+        FFMPEG_BINARY,
+        buildReferenceFitDecodeArgs(internalPath, edge),
+        edge * edge * 3 * 4,
+      ));
+    } catch (error) {
+      throw classifyCommandError(error);
+    }
+    const expected = edge * edge * 3;
+    if (stdout.length < expected) {
+      throw new ExtractionFailedError();
+    }
+    return { width: edge, height: edge, rgb: stdout.subarray(0, expected) };
   }
 }

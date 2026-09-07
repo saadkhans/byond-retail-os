@@ -150,7 +150,9 @@ interface CommandError {
   signal?: string | null;
 }
 
-const defaultRunCommand: RunCommand = (binary, args, options) =>
+/** The confined spawn shared by every local worker runner (the embedding
+ *  runner reuses it verbatim). Exported for that reuse only. */
+export const defaultRunCommand: RunCommand = (binary, args, options) =>
   new Promise((resolvePromise, rejectPromise) => {
     let settled = false;
     let killedByTimeout = false;
