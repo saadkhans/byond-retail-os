@@ -6,6 +6,8 @@ import {
   buildPromptParts,
   parseStrictVerdict,
   safeRawPreview,
+  maxImagesForContext,
+  referencesPerCandidateFromConfig,
 } from './vlm-shared';
 
 export type OllamaReadinessClass =
@@ -73,6 +75,7 @@ export class OllamaVlmVerifier implements VlmVerifier {
   private readonly baseUrlLoopback: boolean;
   private readonly model: string;
   private readonly numCtx: number;
+  private readonly referencesPerCandidate: number;
   private readonly legacyCompat: boolean;
   private lastInference: OllamaReadiness['lastInference'] = null;
 
@@ -107,6 +110,11 @@ export class OllamaVlmVerifier implements VlmVerifier {
       );
     }
     this.numCtx = Number.isFinite(configured) ? configured : 8192;
+    // Reference photos per candidate (1..4, default 3) — bounded at boot
+    // like num_ctx; the prompt planner may still reduce it to fit num_ctx.
+    this.referencesPerCandidate = referencesPerCandidateFromConfig(
+      config.get<string>('PICKUP_VLM_REFERENCES_PER_CANDIDATE'),
+    );
   }
 
   /** Rich readiness for the UI panel; checkReady() reduces it. */
@@ -170,9 +178,14 @@ export class OllamaVlmVerifier implements VlmVerifier {
   ): Promise<VlmVerdict> {
     const endpoint = `${this.baseUrl}/api/chat`;
     const startedAt = Date.now();
-    const base = {
+    const base: Pick<
+      VlmVerdict,
+      'modelKey' | 'modelVersion' | 'imagesSent' | 'referencesPerCandidate'
+    > = {
       modelKey: this.model || null,
       modelVersion: this.model || null,
+      imagesSent: null,
+      referencesPerCandidate: null,
     };
     const record = (verdict: VlmVerdict, httpStatus: number | null): VlmVerdict => {
       this.lastInference = {
@@ -236,7 +249,13 @@ export class OllamaVlmVerifier implements VlmVerifier {
       );
     }
 
-    const { instruction, images } = buildPromptParts(evidence);
+    const prompt = buildPromptParts(evidence, {
+      referencesPerCandidate: this.referencesPerCandidate,
+      maxImages: maxImagesForContext(this.numCtx),
+    });
+    const { instruction, images } = prompt;
+    base.imagesSent = prompt.imagesSent;
+    base.referencesPerCandidate = prompt.referencesPerCandidate;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {

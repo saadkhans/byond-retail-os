@@ -367,6 +367,11 @@ export interface VlmVerdict {
   /** Short, safe preview of the model's raw TEXT output (base64 runs are
    *  elided) — for the debugging panel only. */
   rawPreview?: string | null;
+  /** How many images the prompt carried (frames + product crop +
+   *  references) after the context budget was applied — a number only. */
+  imagesSent?: number | null;
+  /** Reference photos shown PER candidate after budget reduction. */
+  referencesPerCandidate?: number | null;
 }
 
 /** Escalation verifier. Returns the strict structured result only —

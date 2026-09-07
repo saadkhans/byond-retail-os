@@ -13,7 +13,7 @@ import { VlmRequestEvidence } from '../ports';
 
 function configFor(
   port: number | null,
-  options: { model?: string; legacyCompat?: boolean; numCtx?: string } = {},
+  options: { model?: string; legacyCompat?: boolean; numCtx?: string; references?: string } = {},
 ): ConfigService {
   const model = options.model ?? 'test-vision:7b';
   return {
@@ -30,7 +30,9 @@ function configFor(
               : undefined
             : key === 'PICKUP_VLM_NUM_CTX'
               ? options.numCtx
-              : undefined,
+              : key === 'PICKUP_VLM_REFERENCES_PER_CANDIDATE'
+                ? options.references
+                : undefined,
   } as unknown as ConfigService;
 }
 
@@ -127,6 +129,63 @@ describe('OllamaVlmVerifier', () => {
       expect(() => new OllamaVlmVerifier(configFor(null, { numCtx: bad }))).toThrow(
         /PICKUP_VLM_NUM_CTX.*outside its safe range/,
       );
+    }
+  });
+
+  it('construction: PICKUP_VLM_REFERENCES_PER_CANDIDATE is bounded to 1..4, default 3', () => {
+    for (const bad of ['0', '5', '2.5']) {
+      expect(() => new OllamaVlmVerifier(configFor(null, { references: bad }))).toThrow(
+        /PICKUP_VLM_REFERENCES_PER_CANDIDATE.*outside its safe range/,
+      );
+    }
+    const fallback = new OllamaVlmVerifier(configFor(null)) as unknown as {
+      referencesPerCandidate: number;
+    };
+    expect(fallback.referencesPerCandidate).toBe(3);
+    expect(
+      (new OllamaVlmVerifier(configFor(null, { references: '2' })) as unknown as {
+        referencesPerCandidate: number;
+      }).referencesPerCandidate,
+    ).toBe(2);
+  });
+
+  it('verify: the verdict reports how many images and references per candidate were sent', async () => {
+    const image = { width: 4, height: 4, rgb: Buffer.alloc(48, 0x40) };
+    const rich: VlmRequestEvidence = {
+      frames: [
+        { phase: 'pre', image },
+        { phase: 'peak', image },
+      ],
+      crops: [
+        {
+          phase: 'peak',
+          timestampMs: 2000,
+          box: { x: 0, y: 0, width: 4, height: 4 },
+          image,
+          quality: { sharpness: 1, occlusion: 0, brightness: 64 },
+        } as VlmRequestEvidence['crops'][number],
+      ],
+      candidates: [
+        { sku: 'SKU-A', name: 'Product A', fusedScore: 0.3, referenceImages: [image, image, image] },
+        { sku: 'SKU-B', name: 'Product B', fusedScore: 0.28, referenceImages: [image] },
+      ],
+      ocrText: null,
+      barcode: null,
+      shelfContext: null,
+    };
+    const { server, port } = await stubOllama({
+      tags: () => ({ models: [{ name: 'test-vision:7b' }] }),
+      chat: () => ({ message: { content: strictJson() } }),
+    });
+    try {
+      const verifier = new OllamaVlmVerifier(configFor(port, { references: '2' }));
+      const verdict = await verifier.verify(rich, 5000);
+      expect(verdict.status).toBe('VERDICT');
+      // 2 frames + crop + (2 for SKU-A, 1 for SKU-B) = 6
+      expect(verdict.imagesSent).toBe(6);
+      expect(verdict.referencesPerCandidate).toBe(2);
+    } finally {
+      server.close();
     }
   });
 

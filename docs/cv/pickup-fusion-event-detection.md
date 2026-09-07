@@ -60,3 +60,15 @@ close-up clip.
 ### Fallback region ranking (`LOCALIZED_REGION_RANKED`)
 
 In fallback mode the endpoint difference of a noisy clip returns several durable regions and, by default, the largest one became the primary event - on a fridge shelf that is the shelf lip (a ~390x50 px strip), so the crop, the VLM and the pickup/return discriminator all looked at the wrong pixels. `rankRegionsForFallback` now orders regions product-shaped first (aspect 0.25-4, both edges >= 24 px), then those intersecting the hand's peak-cell neighbourhood, then nearest to it, then by area. The warning `LOCALIZED_REGION_RANKED` is added whenever the order changed. The strict global path is untouched.
+
+## VLM verifier evidence
+
+The local verifier (`PICKUP_VLM_PROVIDER=local`, Ollama on loopback only) is shown, in this order:
+
+1. The event frames — the selected best pre-event crop, then the peak and post crops.
+2. An **enlarged product crop** of the peak instant (the same product-centred region the crop ranking selected; upsampled so its short edge is at least 224 px).
+3. **Up to `PICKUP_VLM_REFERENCES_PER_CANDIDATE` reference photos per candidate** (1..4, default 3), grouped per candidate, oldest rows first so a re-run shows the same photos. The ids shown are recorded on the run evidence (`vlm.references[].referenceImageIds`).
+
+The prompt is sized to `PICKUP_VLM_NUM_CTX`: about 768 tokens per image plus a fixed text overhead. When the evidence would not fit, the planner reduces reference photos per candidate first (down to one), then drops the enlarged crop, then event frames from the end — the pre-event crop is always kept. `vlm.imagesSent` and `vlm.referencesPerCandidate` on the evidence record what was actually sent (numbers only).
+
+With three candidates or fewer — the planogram-scoped case — the question is **comparative**: "Which ONE of these N products is being taken in the event images? Compare the product crop against each candidate's reference photos (shape, colour, label). Answer with exactly one SKU from the list, or NONE if none matches." Larger candidate sets keep the open question. The strict JSON schema, the SKU whitelist, the support levels (`STRONG`/`MEDIUM`/`WEAK`/`NONE`) and `parseStrictVerdict` are unchanged; nothing the model writes is persisted except the classified fields.

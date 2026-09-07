@@ -24,6 +24,7 @@ import { VideoAssetsService } from '../video-ingest/video-assets.service';
 import { analysisGeometryFor } from '../pickup-detection/analysis/analysis-frames';
 import { AnalysisFrame, BoundingBox } from '../pickup-detection/analysis/pickup-analyzer';
 import { RgbImage, cropRgb } from '../pickup-detection/analysis/product-matcher';
+import { referencesPerCandidateFromConfig } from './adapters/vlm-shared';
 import {
   PickupDetectionRecord,
   pickupSourceId,
@@ -304,6 +305,10 @@ export function applyVlmVerdictToEvidence(
   evidence.vlm.status = verdict.status;
   evidence.vlm.modelKey = verdict.modelKey;
   evidence.vlm.latencyMs = verdict.latencyMs;
+  evidence.vlm.imagesSent =
+    typeof verdict.imagesSent === 'number' ? verdict.imagesSent : null;
+  evidence.vlm.referencesPerCandidate =
+    typeof verdict.referencesPerCandidate === 'number' ? verdict.referencesPerCandidate : null;
   if (verdict.status !== 'VERDICT' || verdict.result === null) {
     // Every classified failure (TIMEOUT / PROVIDER_* / INVALID_* /
     // MALFORMED_RESPONSE / MODEL_NOT_FOUND) routes to review — never a
@@ -462,8 +467,18 @@ export interface FusionEvidence {
     reasonCodes: string[];
     contradictions: string[];
     requiresHumanReview: boolean | null;
-    /** Which reference image each candidate was shown (deterministic). */
-    references?: { sku: string; referenceImageId: string | null }[];
+    /** Which reference images each candidate was shown (deterministic:
+     *  oldest rows first). referenceImageId keeps the first for older
+     *  readers; referenceImageIds lists all of them. */
+    references?: {
+      sku: string;
+      referenceImageId: string | null;
+      referenceImageIds?: string[];
+    }[];
+    /** Prompt size after the context budget: images sent and reference
+     *  photos per candidate — numbers only. */
+    imagesSent?: number | null;
+    referencesPerCandidate?: number | null;
     modelKey: string | null;
     latencyMs: number | null;
     // PAYMENT-SAFETY: no response-derived text (rawPreview, errorDetail,
@@ -507,6 +522,7 @@ export class PickupFusionService {
   private readonly vlmLowBand: number;
   private readonly marginThreshold: number;
   private readonly vlmTimeoutMs: number;
+  private readonly vlmReferencesPerCandidate: number;
 
   private readonly vlmEnabled: boolean;
   private readonly vlmProvider: 'local' | 'anthropic';
@@ -597,6 +613,9 @@ export class PickupFusionService {
       this.vlmProvider === 'local' ? 60_000 : 30_000,
       1_000,
       600_000,
+    );
+    this.vlmReferencesPerCandidate = referencesPerCandidateFromConfig(
+      config.get<string>('PICKUP_VLM_REFERENCES_PER_CANDIDATE'),
     );
     this.vlmMode =
       config.get<string>('PICKUP_VLM_MODE') === 'VALIDATION_ALWAYS'
@@ -1856,11 +1875,12 @@ export class PickupFusionService {
     bestPre: QualifiedCrop,
     top3: FusedCandidate[],
   ): Promise<VlmVerdict> {
-    // One reference image per candidate, decoded from managed storage.
-    // DETERMINISTIC selection: oldest row (createdAt, then id) per
-    // product, and the chosen image id is recorded on the evidence —
-    // re-running against unchanged data must show the model the same
-    // reference photo.
+    // Up to N reference images per candidate (PICKUP_VLM_REFERENCES_PER_
+    // CANDIDATE, default 3), decoded from managed storage. DETERMINISTIC
+    // selection: oldest rows (createdAt, then id) per product, and the
+    // chosen image ids are recorded on the evidence — re-running against
+    // unchanged data must show the model the same reference photos. The
+    // adapter may still show fewer to fit its context window.
     const references = await this.prisma.productReferenceImage.findMany({
       where: { tenantId, productId: { in: top3.map((candidate) => candidate.productId) } },
       select: { id: true, productId: true, storageKey: true },
@@ -1869,22 +1889,23 @@ export class PickupFusionService {
     const referenceImages = new Map<string, RgbImage[]>();
     evidence.vlm.references = [];
     for (const candidate of top3) {
-      const row = references.find((reference) => reference.productId === candidate.productId);
+      const rows = references
+        .filter((reference) => reference.productId === candidate.productId)
+        .slice(0, this.vlmReferencesPerCandidate);
       evidence.vlm.references.push({
         sku: candidate.sku,
-        referenceImageId: row?.id ?? null,
+        referenceImageId: rows[0]?.id ?? null,
+        referenceImageIds: rows.map((row) => row.id),
       });
-      if (!row) {
-        referenceImages.set(candidate.productId, []);
-        continue;
+      const decoded: RgbImage[] = [];
+      for (const row of rows) {
+        try {
+          decoded.push(await this.media.decodeReferenceImage(row.storageKey));
+        } catch {
+          // A broken reference file drops that photo only.
+        }
       }
-      try {
-        referenceImages.set(candidate.productId, [
-          await this.media.decodeReferenceImage(row.storageKey),
-        ]);
-      } catch {
-        referenceImages.set(candidate.productId, []);
-      }
+      referenceImages.set(candidate.productId, decoded);
     }
     return this.vlm.verify(
       {
