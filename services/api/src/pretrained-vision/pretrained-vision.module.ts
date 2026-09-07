@@ -226,5 +226,8 @@ export class PretrainedVisionController {
   imports: [PlatformModulesModule, PlanogramModule, LocalVisionRuntimeModule],
   controllers: [PretrainedVisionController],
   providers: [PretrainedVisionService],
+  // Phase 22: Clip Lab orchestrates the evaluation; the service stays the
+  // single door (boundary + gates enforced inside it).
+  exports: [PretrainedVisionService],
 })
 export class PretrainedVisionModule {}

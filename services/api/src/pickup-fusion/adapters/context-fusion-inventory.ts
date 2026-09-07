@@ -61,6 +61,8 @@ export class PrismaContextSignalProvider implements ContextSignalProvider {
       : ([null, []] as const);
     const stockByProduct = new Map(stock.map((row) => [row.productId, row.quantity]));
     const storeHasInventory = storeProbe !== null;
+    const rackProducts = new Set(context.planogramProductIds ?? []);
+    const rackCode = context.planogramRackCode ?? null;
     return products.map((product) => {
       let score = 0.5; // neutral prior
       const details: string[] = [];
@@ -85,10 +87,20 @@ export class PrismaContextSignalProvider implements ContextSignalProvider {
       if (context.unitId) {
         details.push(`unit:${context.unitId.slice(0, 8)}`);
       }
+      if (rackCode && rackProducts.has(product.id) && product.status === 'ACTIVE') {
+        // Phase 22 planogram prior: a SKU assigned to the clip's bound rack
+        // is at least as plausible as an in-stock product — never more,
+        // so the planogram stays a SOFT prior (see planogram.logic.ts).
+        score = Math.max(score, 0.8);
+        details.push(`planogram:rack(${rackCode})`);
+      }
       if (context.shelfZoneId) {
-        // Planogram slot hook: no planogram data exists yet, so the zone is
-        // recorded as evidence without moving the score.
-        details.push(`zone:${context.shelfZoneId}(no-planogram-data)`);
+        // Planogram slot hook: with a bound rack the candidate set was
+        // scoped to its layout; without one the zone is recorded as
+        // evidence without moving the score.
+        details.push(
+          `zone:${context.shelfZoneId}(${rackCode ? 'planogram-scoped' : 'no-planogram-data'})`,
+        );
       }
       return {
         productId: product.id,

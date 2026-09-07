@@ -8,6 +8,7 @@ import {
   HttpStatus,
   Injectable,
   NotFoundException,
+  Optional,
   PayloadTooLargeException,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -48,6 +49,8 @@ import {
   VideoScreeningDecision,
 } from './dto/screen-video-asset.dto';
 import { UploadVideoAssetDto } from './dto/upload-video-asset.dto';
+import { UpdateVideoAssetBindingDto } from './dto/update-video-asset-binding.dto';
+import { VideoAssetBindingValidator } from './video-asset-binding';
 import {
   BufferInspectionSession,
   ExtractionFailedError,
@@ -634,6 +637,9 @@ export class VideoAssetsService {
     private readonly platformModulesService: PlatformModulesService,
     private readonly auditLog: AuditLogService,
     config: ConfigService,
+    // Phase 22 planogram binding (optional in unit harnesses; ALWAYS wired
+    // by the module — a rack code without the validator fails closed).
+    @Optional() private readonly bindingValidator?: VideoAssetBindingValidator,
   ) {
     const configured = config.get<string>('VIDEO_MAX_UPLOAD_BYTES');
     const parsed = Number(configured);
@@ -778,6 +784,13 @@ export class VideoAssetsService {
     assertPlainId('unitId', dto.unitId);
     assertPlainId('deviceId', dto.deviceId);
     assertPlainId('sessionId', dto.sessionId);
+    // Phase 22: the planogram binding is validated BEFORE any byte is
+    // stored, like every other reference rejection.
+    const binding = await this.resolveBinding(tenantId, {
+      locationId: dto.locationId ?? null,
+      planogramRackCode: dto.planogramRackCode ?? null,
+      rackFrameRegion: dto.rackFrameRegion,
+    });
 
     // Traversal-shaped names are REJECTED, not repaired (see media-safety).
     if (isUnsafeUploadFilename(file.originalname)) {
@@ -863,6 +876,8 @@ export class VideoAssetsService {
           unitId: dto.unitId,
           deviceId: dto.deviceId,
           sessionId: dto.sessionId,
+          planogramRackCode: binding.planogramRackCode ?? undefined,
+          rackFrameRegion: binding.rackFrameRegion ?? undefined,
           originalFilename: sanitized,
           mimeType: file.mimetype.toLowerCase(),
           sizeBytes: file.size,
@@ -1840,6 +1855,97 @@ export class VideoAssetsService {
       case 'session-location-mismatch':
         return `Session "${sessionId}" is not in the asset's store`;
     }
+  }
+
+  private async resolveBinding(
+    tenantId: string,
+    input: {
+      locationId: string | null;
+      planogramRackCode: string | null;
+      rackFrameRegion: unknown;
+    },
+  ): Promise<{
+    planogramRackCode: string | null;
+    rackFrameRegion: { x: number; y: number; width: number; height: number } | null;
+  }> {
+    if (input.planogramRackCode === null && (input.rackFrameRegion === undefined || input.rackFrameRegion === null || input.rackFrameRegion === '')) {
+      return { planogramRackCode: null, rackFrameRegion: null };
+    }
+    if (!this.bindingValidator) {
+      // Fail closed: a rack binding can only be accepted through the
+      // validator the module wires.
+      throw new BadRequestException('planogram binding is not available');
+    }
+    return this.bindingValidator.resolve(tenantId, input);
+  }
+
+  /**
+   * Phase 22: set or change the planogram binding of an uploaded clip.
+   * The store may only be changed on a clip with no unit/device/session
+   * binding (those DERIVE the store); a rack code must name an ACTIVE
+   * planogram rack at the effective store.
+   */
+  async updateBinding(
+    tenantId: string,
+    id: string,
+    dto: UpdateVideoAssetBindingDto,
+    actor?: AuditActor,
+  ): Promise<VideoAssetView> {
+    assertPlainId('id', id);
+    assertPlainId('locationId', dto.locationId);
+    const asset = await this.repository.findById(tenantId, id);
+    if (!asset) {
+      throw new NotFoundException('Video asset not found');
+    }
+    if (
+      dto.locationId !== undefined &&
+      dto.locationId !== asset.locationId &&
+      (asset.unitId || asset.deviceId || asset.sessionId)
+    ) {
+      throw new BadRequestException(
+        'The store of a clip bound to a unit, device, or session is derived from that binding and cannot be changed here',
+      );
+    }
+    if (dto.locationId !== undefined && dto.locationId !== asset.locationId) {
+      const location = await this.repository.findLocation(tenantId, dto.locationId);
+      if (!location) {
+        throw new BadRequestException(`Store "${safeReference(dto.locationId)}" not found`);
+      }
+    }
+    const effectiveLocationId = dto.locationId ?? asset.locationId ?? null;
+    const rackCode =
+      dto.planogramRackCode === undefined
+        ? asset.planogramRackCode
+        : dto.planogramRackCode;
+    const region =
+      dto.rackFrameRegion === undefined ? (asset.rackFrameRegion ?? null) : dto.rackFrameRegion;
+    const binding = await this.resolveBinding(tenantId, {
+      locationId: effectiveLocationId,
+      planogramRackCode: rackCode ?? null,
+      rackFrameRegion: rackCode ? region : null,
+    });
+    const updated = await this.repository.updateBinding(
+      tenantId,
+      id,
+      {
+        ...(dto.locationId !== undefined ? { locationId: dto.locationId } : {}),
+        planogramRackCode: binding.planogramRackCode,
+        rackFrameRegion: binding.rackFrameRegion,
+      },
+      (before, after) =>
+        this.auditEntry(tenantId, actor, {
+          action: AuditAction.UPDATE,
+          entityType: 'VideoAsset',
+          entityId: id,
+          before,
+          after,
+          reason: 'planogram binding updated',
+        }),
+    );
+    if (!updated) {
+      throw new NotFoundException('Video asset not found');
+    }
+    return updated;
   }
 
   async list(

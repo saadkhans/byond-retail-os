@@ -2286,6 +2286,13 @@ model VideoAsset {
   unitId                   String?
   deviceId                 String?
   sessionId                String?
+  // Phase 22 — planogram binding captured at upload (or set afterwards):
+  // the ACTIVE rack code at the bound store the clip shows, and where that
+  // rack sits in the frame (normalized rectangle; null = whole frame).
+  // Downstream stages (fusion v2 candidate scoping, pretrained evaluation)
+  // read these instead of asking the operator again.
+  planogramRackCode        String?
+  rackFrameRegion          Json?
   // Sanitized original filename (basename only, safe charset) — display only,
   // NEVER used to build storage paths.
   originalFilename         String

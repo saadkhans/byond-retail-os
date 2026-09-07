@@ -680,6 +680,46 @@ export interface VideoAsset {
   location?: { id: string; name: string; code: string } | null;
   unit?: { id: string; name: string; code: string } | null;
   session?: { id: string; status: CheckoutSessionStatus } | null;
+  // Phase 22 — planogram binding captured at upload (or set afterwards).
+  planogramRackCode?: string | null;
+  rackFrameRegion?: { x: number; y: number; width: number; height: number } | null;
+}
+
+// Phase 22 — Clip Lab: ONE consolidated, shadow-only report for a clip
+// (classified codes, SKUs, normalized numbers; never media or paths).
+export interface ClipLabStepResult {
+  step: 'SCREENING' | 'VALIDATE' | 'DETECTION' | 'FUSION' | 'PRETRAINED';
+  status: 'OK' | 'SKIPPED' | 'FAILED' | 'BLOCKED' | 'NOT_RUN';
+  reasonCode: string | null;
+  ms: number | null;
+}
+
+export interface ClipLabReport {
+  asset: {
+    id: string;
+    name: string;
+    status: string;
+    store: { id: string; name: string; code: string } | null;
+    rackCode: string | null;
+    rackFrameRegion: { x: number; y: number; width: number; height: number } | null;
+    groundTruth: { eventKind: string; sku: string | null; actualTimestampMs: number | null } | null;
+  };
+  steps: ClipLabStepResult[];
+  suggestion: { sku: string | null; action: string; reviewRequired: boolean; notes: string[] } | null;
+  planogram: {
+    configured: boolean;
+    rackCode: string | null;
+    bindingSource: string;
+    cell: string | null;
+    coordinateSource: string;
+    matchStatus: string;
+    expectedSkus: string[];
+    flags: string[];
+  } | null;
+  candidates: { scoped: boolean; excludedProductCount: number; items: { sku: string; score: number }[] };
+  providers: { provider: string; availability: string; reasonCode: string | null; modelId: string | null }[];
+  why: string[];
+  links: { videoAssetPage: string; pretrainedPage: string };
 }
 
 // Quarantine screening preview — the ONE deliberate exception to the

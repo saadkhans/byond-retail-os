@@ -46,6 +46,7 @@ import { JourneyDetailPage, JourneysPage } from './pages/JourneysPage';
 import { LoginPage } from './pages/LoginPage';
 import { OneSkuBootstrapPage } from './pages/OneSkuBootstrapPage';
 import { PretrainedVisionPage } from './pages/PretrainedVisionPage';
+import { ClipLabPage } from './pages/ClipLabPage';
 import { OrderDetailPage, OrdersPage } from './pages/OrdersPage';
 import { PaymentEventsPage } from './pages/PaymentEventsPage';
 import {
@@ -108,6 +109,7 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/vision-events">CV events</NavLink>
         <NavLink to="/inference">Inference jobs</NavLink>
         <NavLink to="/video-assets">Test videos</NavLink>
+        <NavLink to="/clip-lab">Clip Lab</NavLink>
         <NavLink to="/reference-library">Reference library</NavLink>
         <NavLink to="/one-sku-bootstrap">One SKU bootstrap</NavLink>
         <NavLink to="/pickup-validation">Pickup validation</NavLink>
@@ -190,6 +192,7 @@ export function App() {
                       element={<InferenceJobDetailPage />}
                     />
                     <Route path="video-assets" element={<VideoAssetsPage />} />
+                    <Route path="clip-lab" element={<ClipLabPage />} />
                     <Route
                       path="video-assets/:id"
                       element={<VideoAssetDetailPage />}

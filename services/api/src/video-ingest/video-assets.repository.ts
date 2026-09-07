@@ -33,6 +33,8 @@ export const VIDEO_ASSET_SELECT = {
   unitId: true,
   deviceId: true,
   sessionId: true,
+  planogramRackCode: true,
+  rackFrameRegion: true,
   originalFilename: true,
   mimeType: true,
   sizeBytes: true,
@@ -162,6 +164,8 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       unitId?: string;
       deviceId?: string;
       sessionId?: string;
+      planogramRackCode?: string;
+      rackFrameRegion?: Prisma.InputJsonValue;
       originalFilename: string;
       mimeType: string;
       sizeBytes: number;
@@ -346,6 +350,53 @@ export class VideoAssetsRepository extends TenantScopedRepository {
       });
       await this.auditLog.record(buildAuditEntry(created), tx);
       return created;
+    });
+  }
+
+  /**
+   * Phase 22: set/clear the planogram binding of one asset. Tenant-scoped
+   * through the id_tenantId composite key; the caller validated the rack
+   * against the tenant's ACTIVE planogram racks first.
+   */
+  updateBinding(
+    tenantId: string,
+    id: string,
+    data: {
+      locationId?: string;
+      planogramRackCode: string | null;
+      rackFrameRegion: Prisma.InputJsonValue | null;
+    },
+    buildAuditEntry: (before: VideoAssetView, after: VideoAssetView) => AuditEntry,
+  ): Promise<VideoAssetView | null> {
+    const scopedTenantId = this.requireTenantId(tenantId);
+    return this.prisma.$transaction(async (tx) => {
+      const before = await tx.videoAsset.findFirst({
+        where: { id, tenantId: scopedTenantId, deletedAt: null },
+        select: VIDEO_ASSET_SELECT,
+      });
+      if (!before) {
+        return null;
+      }
+      const after = await tx.videoAsset.update({
+        where: { id_tenantId: { id, tenantId: scopedTenantId } },
+        data: {
+          ...(data.locationId !== undefined ? { locationId: data.locationId } : {}),
+          planogramRackCode: data.planogramRackCode,
+          rackFrameRegion:
+            data.rackFrameRegion === null ? Prisma.JsonNull : data.rackFrameRegion,
+        },
+        select: VIDEO_ASSET_SELECT,
+      });
+      await this.auditLog.record(buildAuditEntry(before, after), tx);
+      return after;
+    });
+  }
+
+  /** Store existence probe for the binding update (same tenant only). */
+  findLocation(tenantId: string, id: string): Promise<{ id: string } | null> {
+    return this.prisma.location.findFirst({
+      where: { id, tenantId: this.requireTenantId(tenantId) },
+      select: { id: true },
     });
   }
 

@@ -114,4 +114,25 @@ export class UploadVideoAssetDto {
   @IsString()
   @MinLength(1)
   sessionId?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Phase 22 — ACTIVE planogram rack code at the bound store that the ' +
+      'clip shows (requires locationId). Validated before any byte is ' +
+      'stored; later stages scope SKU candidates to this rack.',
+  })
+  @IsOptionalNonNull()
+  @IsString()
+  @MinLength(1)
+  planogramRackCode?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Phase 22 — where the rack sits in the frame, as a JSON string ' +
+      '{"x","y","width","height"} in 0..1. Leave out when the rack fills ' +
+      'the frame.',
+  })
+  @IsOptionalNonNull()
+  @IsString()
+  rackFrameRegion?: string;
 }

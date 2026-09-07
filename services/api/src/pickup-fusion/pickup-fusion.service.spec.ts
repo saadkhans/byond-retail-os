@@ -183,6 +183,11 @@ function buildService(options: {
   /** Inventory validator port fake — defaults to PLAUSIBLE for every
    *  requested candidate (the gate FAILS CLOSED on anything else). */
   inventoryValidate?: jest.Mock;
+  /** Phase 22: bind the asset to a store + rack and supply the planogram fake. */
+  planogramRackCode?: string | null;
+  locationId?: string | null;
+  planograms?: { listRacks: jest.Mock };
+  retrievalSignals?: CandidateSignal[];
 }) {
   const createdRuns: { data: { policy: FusionPolicyResult; fusedTopSku: string | null; evidence: FusionEvidence; runScope: FusionRunScope } }[] = [];
   // Behaves like the DB: honors the status filter the service sends.
@@ -231,9 +236,10 @@ function buildService(options: {
     height: 360,
     fps: 30,
     storageKey: 'assets/clip.mp4',
-    locationId: null,
+    locationId: options.locationId ?? null,
     unitId: null,
     deviceId: null,
+    planogramRackCode: options.planogramRackCode ?? null,
   };
   // The MEDIA PORT fake (PICKUP_MEDIA_DECODER) — storage-key based; the
   // service never sees a path or a concrete storage/decoder class.
@@ -299,6 +305,11 @@ function buildService(options: {
   const videoAssets = {
     createCrop: jest.fn(async () => ({ artifact: { id: 'crop-1' } })),
   };
+  const contextProvider = {
+    adapterKey: 'stub-context',
+    version: '1.0.0',
+    contextFor: jest.fn(async () => []),
+  };
   const service = new PickupFusionService(
     prisma as never,
     { findByIdInternal: jest.fn(async () => asset) } as never,
@@ -329,18 +340,14 @@ function buildService(options: {
       embeddingModelKey: 'stub-embedding',
       embeddingModelVersion: '1',
       ensureIndex: jest.fn(async () => ({ indexed: 0, total: 0 })),
-      retrieve: jest.fn(async () => []),
+      retrieve: jest.fn(async () => options.retrievalSignals ?? []),
     } as never,
     {
       adapterKey: 'stub-classical',
       version: '1.0.0',
       match: jest.fn(async () => options.classicalSignals),
     } as never,
-    {
-      adapterKey: 'stub-context',
-      version: '1.0.0',
-      contextFor: jest.fn(async () => []),
-    } as never,
+    contextProvider as never,
     new WeightedCandidateFusion(),
     // The SELECTED verifier port (PICKUP_VLM_VERIFIER token) — fakes are
     // injected through the port; the service never sees a concrete vendor.
@@ -379,8 +386,9 @@ function buildService(options: {
     // Tx-scoped retriever factory (module-provided in production).
     (() => ({})) as never,
     { get: (key: string) => options.config?.[key] } as unknown as ConfigService,
+    options.planograms as never,
   );
-  return { service, productFindMany, createdRuns, decoder, detector, videoAssets, prisma, ocrRecognize };
+  return { service, productFindMany, createdRuns, decoder, detector, videoAssets, prisma, ocrRecognize, contextProvider };
 }
 
 describe('fusion catalog is constrained to ACTIVE products', () => {
@@ -1665,5 +1673,112 @@ describe('LIVE frames are screened before any VLM invocation (Codex P1)', () => 
     // No per-crop screening passes on the asset path — the single
     // evidence OCR is the only recognize call (behavior byte-identical).
     expect(ocrRecognize).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Phase 22 — planogram-scoped fusion candidates', () => {
+  const WATER: CatalogFixture = { id: 'p-water', sku: 'WATER-500', name: 'Water', status: ProductStatus.ACTIVE, barcode: '6281000000010' };
+  const CAN: CatalogFixture = { id: 'p-can', sku: 'CAN-250', name: 'Can', status: ProductStatus.ACTIVE, barcode: '6281000000011' };
+  const CHIPS: CatalogFixture = { id: 'p-chips', sku: 'CHIPS-150', name: 'Chips', status: ProductStatus.ACTIVE, barcode: '6281000000012' };
+  const JUICE: CatalogFixture = { id: 'p-juice', sku: 'JUICE-1L', name: 'Juice', status: ProductStatus.ACTIVE, barcode: '6281000000013' };
+  const rack = {
+    rackId: 'rack-1',
+    locationId: 'store-1',
+    rackCode: 'SHELF-2X2',
+    version: 2,
+    cells: [
+      { productId: WATER.id, sku: WATER.sku },
+      { productId: CAN.id, sku: CAN.sku },
+    ],
+  };
+  const noisyRetrieval = [
+    { productId: CHIPS.id, sku: CHIPS.sku, score: 0.9 },
+    { productId: JUICE.id, sku: JUICE.sku, score: 0.85 },
+    { productId: WATER.id, sku: WATER.sku, score: 0.4 },
+  ];
+
+  it('a bound clip ranks only rack SKUs (plus the classical top-1), records the excluded count, and limits the VLM to them', async () => {
+    const vlmVerify = jest.fn(async () => ({ status: 'UNAVAILABLE' }));
+    const listRacks = jest.fn(async () => [rack]);
+    const { service, createdRuns, contextProvider } = buildService({
+      catalog: [WATER, CAN, CHIPS, JUICE],
+      barcodeSeen: 'no-such-barcode',
+      // Classical top-1 is a NON-rack product: it must survive the scope
+      // (a misplaced product can still surface, flagged downstream).
+      classicalSignals: [
+        { productId: JUICE.id, sku: JUICE.sku, score: 0.5 },
+        { productId: CHIPS.id, sku: CHIPS.sku, score: 0.45 },
+        { productId: WATER.id, sku: WATER.sku, score: 0.3 },
+      ],
+      retrievalSignals: noisyRetrieval,
+      locationId: 'store-1',
+      planogramRackCode: 'SHELF-2X2',
+      planograms: { listRacks },
+      vlmVerify,
+      config: { PICKUP_VLM_MODE: 'VALIDATION_ALWAYS' },
+    });
+    await service.run('tenant-1', 'asset-1');
+    expect(listRacks).toHaveBeenCalledWith('tenant-1', 'store-1');
+    const { data } = createdRuns[0];
+    const skus = data.evidence.fused.map((row) => row.sku);
+    expect(skus).toEqual(expect.arrayContaining([WATER.sku, JUICE.sku]));
+    expect(skus).not.toContain(CHIPS.sku);
+    expect(data.evidence.planogramScope).toEqual({
+      rackCode: 'SHELF-2X2',
+      rackVersion: 2,
+      scopedProductCount: 3,
+      excludedProductCount: 1,
+    });
+    expect(data.evidence.notes).toContain('PLANOGRAM_SCOPED_CANDIDATES');
+    // The context provider learns the rack so it can apply the soft prior.
+    expect(contextProvider.contextFor).toHaveBeenCalledWith(
+      'tenant-1',
+      expect.objectContaining({
+        planogramRackCode: 'SHELF-2X2',
+        planogramProductIds: expect.arrayContaining([WATER.id, CAN.id]),
+      }),
+      expect.not.arrayContaining([CHIPS.id]),
+    );
+    // Whatever reached the VLM came from the scoped ranking only.
+    for (const call of vlmVerify.mock.calls as unknown as [{ candidates?: { sku: string }[] }][]) {
+      const candidateSkus = (call[0]?.candidates ?? []).map((row) => row.sku);
+      expect(candidateSkus).not.toContain(CHIPS.sku);
+    }
+  });
+
+  it('an unbound clip is byte-for-byte unscoped: full ranking, no scope evidence', async () => {
+    const listRacks = jest.fn(async () => [rack]);
+    const { service, createdRuns } = buildService({
+      catalog: [WATER, CAN, CHIPS, JUICE],
+      barcodeSeen: 'no-such-barcode',
+      classicalSignals: [{ productId: JUICE.id, sku: JUICE.sku, score: 0.5 }],
+      retrievalSignals: noisyRetrieval,
+      locationId: 'store-1',
+      planogramRackCode: null,
+      planograms: { listRacks },
+    });
+    await service.run('tenant-1', 'asset-1');
+    expect(listRacks).not.toHaveBeenCalled();
+    const { data } = createdRuns[0];
+    expect(data.evidence.fused.map((row) => row.sku)).toEqual(
+      expect.arrayContaining([CHIPS.sku, JUICE.sku, WATER.sku]),
+    );
+    expect(data.evidence.planogramScope).toBeNull();
+    expect(data.evidence.notes ?? []).not.toContain('PLANOGRAM_SCOPED_CANDIDATES');
+  });
+
+  it('a bound rack that no longer exists (deactivated) degrades to unscoped', async () => {
+    const { service, createdRuns } = buildService({
+      catalog: [WATER, CHIPS],
+      barcodeSeen: 'no-such-barcode',
+      classicalSignals: [{ productId: CHIPS.id, sku: CHIPS.sku, score: 0.5 }],
+      retrievalSignals: [{ productId: CHIPS.id, sku: CHIPS.sku, score: 0.9 }],
+      locationId: 'store-1',
+      planogramRackCode: 'GONE',
+      planograms: { listRacks: jest.fn(async () => [rack]) },
+    });
+    await service.run('tenant-1', 'asset-1');
+    expect(createdRuns[0].data.evidence.planogramScope).toBeNull();
+    expect(createdRuns[0].data.evidence.fused.map((row) => row.sku)).toContain(CHIPS.sku);
   });
 });

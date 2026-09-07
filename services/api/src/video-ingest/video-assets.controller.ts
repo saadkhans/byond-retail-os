@@ -5,6 +5,7 @@ import {
   Get,
   Headers,
   Param,
+  Patch,
   Post,
   Query,
   Res,
@@ -41,6 +42,7 @@ import { ExtractFramesDto } from './dto/extract-frames.dto';
 import { QueryVideoAssetsDto } from './dto/query-video-assets.dto';
 import { ScreenVideoAssetDto } from './dto/screen-video-asset.dto';
 import { UploadVideoAssetDto } from './dto/upload-video-asset.dto';
+import { UpdateVideoAssetBindingDto } from './dto/update-video-asset-binding.dto';
 import {
   TestMediaGateGuard,
   UPLOAD_ATTESTATION_HEADERS,
@@ -216,6 +218,26 @@ export class VideoAssetsController {
     @Param('id') id: string,
   ): Promise<VideoAssetView> {
     return this.assetsService.findById(tenantId, id);
+  }
+
+  @Patch(':id/binding')
+  @RequirePermissions('vision:review')
+  @ApiOperation({
+    summary:
+      'Phase 22 — set or change the planogram binding (store, ACTIVE rack ' +
+      'code, rack region in frame) of an uploaded clip. Later stages read ' +
+      'it instead of asking again. Audited; no media is touched.',
+  })
+  updateBinding(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Body() dto: UpdateVideoAssetBindingDto,
+    @CurrentUser() actor: RequestContext,
+  ): Promise<VideoAssetView> {
+    return this.assetsService.updateBinding(tenantId, id, dto, {
+      id: actor.userId,
+      email: actor.email,
+    });
   }
 
   @Get(':id/artifacts')

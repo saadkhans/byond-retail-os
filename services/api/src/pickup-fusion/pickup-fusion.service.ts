@@ -6,8 +6,10 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { PlanogramService } from '../planogram/planogram.service';
 import {
   EvidenceSourceType,
   FusionPolicyResult,
@@ -390,6 +392,13 @@ type TimedFn = <T>(
 ) => Promise<T>;
 
 /** Safe-descriptor evidence (JSON column) — NEVER pixels or paths. */
+/** Phase 22 — resolved candidate scope of a run bound to a planogram rack. */
+export interface PlanogramScope {
+  rackCode: string;
+  rackVersion: number;
+  productIds: Set<string>;
+}
+
 export interface FusionEvidence {
   pipelineVersion: string;
   stages: StageTiming[];
@@ -478,6 +487,17 @@ export interface FusionEvidence {
   /** Phase 13 — set on LIVE_WINDOW runs: the live session whose sampled
    *  frames this run analyzed (no video asset exists for live runs). */
   liveSessionId?: string;
+  /** Phase 22 — set when the asset is bound to an ACTIVE planogram rack:
+   *  the candidate set was SCOPED to that rack's SKUs (plus any product a
+   *  barcode/OCR hit or the classical top-1 named). Counts only. */
+  planogramScope?: {
+    rackCode: string;
+    rackVersion: number;
+    scopedProductCount: number;
+    excludedProductCount: number;
+  } | null;
+  /** Classified evidence notes (UPPER_SNAKE codes only). */
+  notes?: string[];
 }
 
 @Injectable()
@@ -531,6 +551,10 @@ export class PickupFusionService {
     @Inject(PICKUP_TX_RETRIEVER_FACTORY)
     private readonly txRetrieverFactory: TxScopedRetrieverFactory,
     config: ConfigService,
+    // Phase 22: READ-ONLY planogram lookup for candidate scoping (its own
+    // module guard pins writes). Optional so unit harnesses without a
+    // planogram behave byte-for-byte as before.
+    @Optional() private readonly planograms?: PlanogramService,
   ) {
     const num = (key: string, fallback: number) => {
       const value = Number(config.get<string>(key));
@@ -840,6 +864,33 @@ export class PickupFusionService {
       },
       policy: { result: FusionPolicyResult.FAILED, reason: 'not-run' },
       shadow: { classicalV1: null, groundTruth: null, v1Verdict: null, v2Verdict: null },
+      planogramScope: null,
+      notes: [],
+    };
+  }
+
+  /**
+   * Phase 22: the clip's bound ACTIVE planogram rack, if any — the SKUs
+   * assigned to it become the candidate scope of this run. Read-only;
+   * an unbound clip (or no planogram service) returns null and the run
+   * behaves exactly as before.
+   */
+  private async resolvePlanogramScope(
+    tenantId: string,
+    asset: { locationId: string | null; planogramRackCode: string | null },
+  ): Promise<PlanogramScope | null> {
+    if (!this.planograms || !asset.planogramRackCode || !asset.locationId) {
+      return null;
+    }
+    const racks = await this.planograms.listRacks(tenantId, asset.locationId);
+    const rack = racks.find((row) => row.rackCode === asset.planogramRackCode);
+    if (!rack) {
+      return null;
+    }
+    return {
+      rackCode: rack.rackCode,
+      rackVersion: rack.version,
+      productIds: new Set(rack.cells.map((cell) => cell.productId)),
     };
   }
 
@@ -1100,6 +1151,10 @@ export class PickupFusionService {
           unitId: internal.unitId,
           deviceId: internal.deviceId,
         },
+        planogramScope: await this.resolvePlanogramScope(tenantId, {
+          locationId: internal.locationId,
+          planogramRackCode: internal.planogramRackCode ?? null,
+        }),
       });
       return this.persist(tenantId, { videoAssetId }, evidence, startedAt);
     } catch (error) {
@@ -1138,6 +1193,8 @@ export class PickupFusionService {
         unitId: string | null;
         deviceId: string | null;
       };
+      /** Phase 22 candidate scope (null = unscoped, unchanged behaviour). */
+      planogramScope: PlanogramScope | null;
     },
   ): Promise<void> {
       // ---- catalog snapshot -------------------------------------------
@@ -1277,10 +1334,42 @@ export class PickupFusionService {
         score: signal.score,
       }));
 
+      // ---- Phase 22 planogram scope --------------------------------
+      // A clip bound to an ACTIVE rack ranks ONLY the rack's SKUs plus any
+      // product a barcode or OCR hit named and the classical top-1 (so a
+      // misplaced product can still surface, flagged by the planogram
+      // stage). Everything else is excluded before fusion and therefore
+      // never reaches the VLM. Unbound clips: unchanged.
+      let retrievalForFusion = retrievalSignals;
+      let classicalForFusion = classicalSignals;
+      let ocrForFusion = ocrSignals;
+      if (ctx.planogramScope) {
+        const allowed = new Set<string>(ctx.planogramScope.productIds);
+        for (const signal of barcodeSignals) allowed.add(signal.productId);
+        for (const signal of ocrSignals) allowed.add(signal.productId);
+        if (classicalSignals[0]) allowed.add(classicalSignals[0].productId);
+        const seen = new Set(
+          [...barcodeSignals, ...retrievalSignals, ...classicalSignals, ...ocrSignals].map(
+            (signal) => signal.productId,
+          ),
+        );
+        const excluded = [...seen].filter((productId) => !allowed.has(productId)).length;
+        retrievalForFusion = retrievalSignals.filter((signal) => allowed.has(signal.productId));
+        classicalForFusion = classicalSignals.filter((signal) => allowed.has(signal.productId));
+        ocrForFusion = ocrSignals.filter((signal) => allowed.has(signal.productId));
+        ctx.evidence.planogramScope = {
+          rackCode: ctx.planogramScope.rackCode,
+          rackVersion: ctx.planogramScope.rackVersion,
+          scopedProductCount: allowed.size,
+          excludedProductCount: excluded,
+        };
+        ctx.evidence.notes = [...(ctx.evidence.notes ?? []), 'PLANOGRAM_SCOPED_CANDIDATES'];
+      }
+
       // ---- context (req 9) --------------------------------------------
       const candidateIds = [
         ...new Set(
-          [...barcodeSignals, ...retrievalSignals, ...classicalSignals, ...ocrSignals].map(
+          [...barcodeSignals, ...retrievalForFusion, ...classicalForFusion, ...ocrForFusion].map(
             (signal) => signal.productId,
           ),
         ),
@@ -1293,6 +1382,12 @@ export class PickupFusionService {
             unitId: ctx.store.unitId,
             deviceId: ctx.store.deviceId,
             shelfZoneId: ctx.shelfZoneId,
+            ...(ctx.planogramScope
+              ? {
+                  planogramRackCode: ctx.planogramScope.rackCode,
+                  planogramProductIds: [...ctx.planogramScope.productIds],
+                }
+              : {}),
           },
           candidateIds,
         ),
@@ -1306,10 +1401,10 @@ export class PickupFusionService {
       // ---- fusion (req 10) --------------------------------------------
       const fused = this.fusion.fuse(
         {
-          classical: classicalSignals,
-          retrieval: retrievalSignals,
+          classical: classicalForFusion,
+          retrieval: retrievalForFusion,
           barcode: barcodeSignals,
-          ocr: ocrSignals,
+          ocr: ocrForFusion,
           context: contextSignals,
         },
         productMeta,
@@ -1691,6 +1786,7 @@ export class PickupFusionService {
           unitId: input.unitId,
           deviceId: null,
         },
+        planogramScope: null,
       });
       return this.persist(
         tenantId,

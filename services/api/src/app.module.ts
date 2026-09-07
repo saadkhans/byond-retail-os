@@ -18,6 +18,7 @@ import { LocationsModule } from './locations/locations.module';
 import { OneSkuBootstrapModule } from './one-sku-bootstrap/one-sku-bootstrap.module';
 import { PlanogramModule } from './planogram/planogram.module';
 import { PretrainedVisionModule } from './pretrained-vision/pretrained-vision.module';
+import { ClipLabModule } from './clip-lab/clip-lab.module';
 import { OrdersModule } from './orders/orders.module';
 import { PaymentsModule } from './payments/payments.module';
 import { PilotEvaluationModule } from './pilot-evaluation/pilot-evaluation.module';
@@ -62,6 +63,7 @@ import { VisionModule } from './vision/vision.module';
     OneSkuBootstrapModule,
     PlanogramModule,
     PretrainedVisionModule,
+    ClipLabModule,
   ],
 })
 export class AppModule implements NestModule {
