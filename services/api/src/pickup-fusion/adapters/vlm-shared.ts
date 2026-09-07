@@ -350,11 +350,17 @@ export function maxImagesForContext(
 
 /** Reads and bounds PICKUP_VLM_REFERENCES_PER_CANDIDATE; throws on an
  *  out-of-range value so a misconfiguration fails at boot, not per call. */
-export function referencesPerCandidateFromConfig(value: string | undefined): number {
-  if (value === undefined || value.trim().length === 0) {
+export function referencesPerCandidateFromConfig(
+  value: string | number | undefined,
+): number {
+  // env.validation declares the key @IsInt, so ConfigService hands back a
+  // NUMBER once the key is set (a string only when it is absent from the
+  // validated class); accept both — a `.trim()` on a number crashed boot.
+  const text = value === undefined ? '' : String(value).trim();
+  if (text.length === 0) {
     return DEFAULT_REFERENCES_PER_CANDIDATE;
   }
-  const parsed = Number(value);
+  const parsed = Number(text);
   if (
     !Number.isInteger(parsed) ||
     parsed < 1 ||
