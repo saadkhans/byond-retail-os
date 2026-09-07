@@ -73,8 +73,11 @@ export class PretrainedVisionController {
       '(READY / DISABLED / UNAVAILABLE) — the classical fallback is ' +
       'always registered and always READY',
   })
-  providers() {
-    return { providers: this.vision.providerStatuses() };
+  async providers() {
+    // providerStatuses() is async (real runtimes probe); Nest awaits only
+    // the top-level return, so the array must be awaited HERE - a nested
+    // promise would serialize as {} and break the admin page.
+    return { providers: await this.vision.providerStatuses() };
   }
 
   @Post('videos/:videoAssetId/evaluate')

@@ -139,6 +139,21 @@ describe('PythonYoloWorkerRunner — failure classification', () => {
     });
   });
 
+  it('nulls a malformed or missing class digest (the runtime then fails closed)', async () => {
+    for (const classDigest of [undefined, '', 'ABCDEF0123456789ABCDEF0123456789', '0123', 42, 'g'.repeat(32)]) {
+      const { run } = runnerReturning(
+        Buffer.from(
+          JSON.stringify({ protocol: 1, status: 'OK', mode: 'probe', classCount: 3, classDigest }),
+        ),
+      );
+      const outcome = await new PythonYoloWorkerRunner(configWith(), run).probe(probeJob);
+      expect(outcome.ok).toBe(true);
+      if (outcome.ok) {
+        expect(outcome.classDigest).toBeNull();
+      }
+    }
+  });
+
   it('rejects a probe document without a positive class count', async () => {
     const { run } = runnerReturning(
       Buffer.from(JSON.stringify({ protocol: 1, status: 'OK', mode: 'probe', classCount: 0 })),
@@ -160,6 +175,7 @@ describe('PythonYoloWorkerRunner — invocation shape', () => {
           status: 'OK',
           mode: 'probe',
           classCount: 80,
+          classDigest: '0123456789abcdef0123456789abcdef',
           device: 'cpu',
           runtimeVersion: '8.3.40',
           elapsedMs: 900.4,
@@ -171,6 +187,7 @@ describe('PythonYoloWorkerRunner — invocation shape', () => {
     expect(outcome).toEqual({
       ok: true,
       classCount: 80,
+      classDigest: '0123456789abcdef0123456789abcdef',
       device: 'CPU',
       runtimeVersion: '8.3.40',
       elapsedMs: 900,

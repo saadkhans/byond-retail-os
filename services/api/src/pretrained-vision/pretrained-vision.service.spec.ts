@@ -179,6 +179,7 @@ const MODEL: LocalModelDescriptor = {
   version: '1',
   inputSize: 640,
   classCount: 3,
+  classDigest: '0123456789abcdef0123456789abcdef',
   roleClassCounts: { PRODUCT: 1, HAND: 1, PERSON: 1, OBJECT: 0 },
 };
 
@@ -917,6 +918,90 @@ describe('PretrainedVisionService — real local detector runtime (Phase 20)', (
     expect(classical?.status).toBe('COMPLETED');
     expect(classical?.evidence.synthetic).toBe(false);
     expect(report.embeddingCandidates).toEqual([]);
+  });
+
+  it('report-level hand signal falls back to the detector when no dedicated hand provider ran (Codex P2)', async () => {
+    const runtime = fakeRuntime({});
+    const { service } = buildHarness({ provider: 'yolo_local', detectorRuntime: runtime });
+    const report = await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
+    expect(report.runs.find((run) => run.provider === 'HAND_SIGNAL_LOCAL')).toBeUndefined();
+    expect(report.handSignal).toMatchObject({
+      handPresent: true,
+      contactStartMs: 1000,
+      contactEndMs: 1500,
+      contactDurationMs: 500,
+    });
+    // Detector detections never carry the classical crop quality.
+    const yolo = report.runs.find((run) => run.provider === 'YOLO_LOCAL');
+    expect(yolo?.evidence.detections.every((row) => row.quality === null)).toBe(true);
+  });
+
+  it('a one-frame grab still counts as hand contact (positive duration, HAND_CONTACT_OBSERVED)', async () => {
+    const base = pickupResult();
+    const runtime = fakeRuntime({
+      detect: {
+        ...base,
+        frames: [
+          base.frames[0],
+          base.frames[1],
+          base.frames[2], // the ONLY frame with product + hand overlap
+          { frameIndex: 3, timestampMs: 1500, detections: [base.frames[5].detections[0]] },
+          base.frames[4].frameIndex === 4 ? { frameIndex: 4, timestampMs: 2000, detections: [] } : base.frames[4],
+          { frameIndex: 5, timestampMs: 2500, detections: [] },
+        ],
+      },
+    });
+    const { service } = buildHarness({ provider: 'yolo_local', detectorRuntime: runtime });
+    const report = await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
+    const yolo = report.runs.find((run) => run.provider === 'YOLO_LOCAL');
+    expect(yolo?.evidence.handSignal).toMatchObject({
+      contactStartMs: 1000,
+      contactEndMs: 1000,
+      contactDurationMs: 500,
+    });
+    expect(yolo?.evidence.features?.actionCandidate).toBe('PICKUP');
+    expect(report.improvementNotes).toContain('HAND_CONTACT_OBSERVED');
+  });
+
+  it('PRODUCT_DETECTED requires a product label — hand-only evidence never claims a product (Codex P2)', async () => {
+    const base = pickupResult();
+    const hand = base.frames[2].detections[1];
+    const runtime = fakeRuntime({
+      detect: {
+        ...base,
+        frames: [
+          { frameIndex: 0, timestampMs: 0, detections: [hand] },
+          { frameIndex: 1, timestampMs: 500, detections: [hand] },
+          { frameIndex: 2, timestampMs: 1000, detections: [] },
+        ],
+      },
+    });
+    const { service } = buildHarness({ provider: 'yolo_local', detectorRuntime: runtime });
+    const report = await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
+    const yolo = report.runs.find((run) => run.provider === 'YOLO_LOCAL');
+    expect(yolo?.evidence.detections.map((row) => row.label)).toEqual(['HAND', 'HAND']);
+    expect(yolo?.evidence.notes).toContain('NO_PRODUCT_FRAME');
+    expect(report.improvementNotes).not.toContain('PRODUCT_DETECTED');
+    expect(report.improvementNotes).not.toContain('DETECTION_COVERAGE_IMPROVED');
+  });
+
+  it('a busy runtime (RUNTIME_BUSY) degrades to PROVIDER_UNAVAILABLE with the classified code', async () => {
+    const runtime = fakeRuntime({
+      detect: {
+        ...pickupResult(),
+        status: 'UNAVAILABLE',
+        reasonCode: 'RUNTIME_BUSY',
+        frames: [],
+      },
+    });
+    const { service, storedRuns } = buildHarness({ provider: 'yolo_local', detectorRuntime: runtime });
+    const report = await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
+    const yoloRow = storedRuns.find((row) => row.provider === 'YOLO_LOCAL') as Row;
+    expect(yoloRow.status).toBe('PROVIDER_UNAVAILABLE');
+    const yolo = report.runs.find((run) => run.provider === 'YOLO_LOCAL');
+    expect(yolo?.evidence.availability).toBe('UNAVAILABLE');
+    expect(yolo?.evidence.reasonCode).toBe('RUNTIME_BUSY');
+    expect(report.classical).toMatchObject({ topSku: 'SKU-A' });
   });
 
   it('never leaks runtime internals even when the runtime result carries junk fields', async () => {

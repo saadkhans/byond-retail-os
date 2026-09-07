@@ -1,8 +1,13 @@
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ConfigService } from '@nestjs/config';
-import { LocalModelRegistry, parseManifest } from './local-model-registry';
+import {
+  LocalModelRegistry,
+  classListDigest,
+  parseManifest,
+} from './local-model-registry';
 
 function configWith(values: Record<string, string | undefined>): ConfigService {
   return { get: (key: string) => values[key] } as unknown as ConfigService;
@@ -230,8 +235,10 @@ describe('LocalModelRegistry', () => {
       version: '1.0.0',
       inputSize: 640,
       classCount: 5,
+      classDigest: classListDigest(['person', 'hand', 'bottle', 'cup', 'shelf']),
       roleClassCounts: { PRODUCT: 2, HAND: 1, PERSON: 1, OBJECT: 0 },
     });
+    expect(resolution.descriptor.classDigest).toMatch(/^[0-9a-f]{32}$/);
     expect(resolution.classRoles).toEqual([
       'PERSON',
       'HAND',
@@ -287,5 +294,22 @@ describe('LocalModelRegistry', () => {
     // answer inside the TTL (a probe TTL, not a per-call stat).
     await rm(join(root, 'yolo-retail-v1', 'model.pt'));
     expect((await registry.resolve()).ok).toBe(true);
+  });
+});
+
+describe('classListDigest (ordered class identity)', () => {
+  it('is 32 lowercase hex chars, order-sensitive, and matches the worker formula', () => {
+    const digest = classListDigest(['person', 'bottle', 'cup']);
+    expect(digest).toMatch(/^[0-9a-f]{32}$/);
+    // sha256("person\nbottle\ncup") — the Python worker computes the same.
+    expect(digest).toBe(
+      createHash('sha256')
+        .update(['person', 'bottle', 'cup'].join(String.fromCharCode(10)))
+        .digest('hex')
+        .slice(0, 32),
+    );
+    expect(classListDigest(['bottle', 'person', 'cup'])).not.toBe(digest);
+    expect(classListDigest(['person', 'bottle'])).not.toBe(digest);
+    expect(classListDigest(['person', 'bottle', 'cup'])).toBe(digest);
   });
 });

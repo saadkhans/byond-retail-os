@@ -347,13 +347,16 @@ export class YoloVisionAdapter extends OptionalLocalAdapter {
         ],
       });
     }
+    // The classical crop's quality numbers are the BASELINE-level crop
+    // quality of the interaction features only; detector detections
+    // never carry them (no per-frame measurement exists for the detector).
     const crop = ctx.classical?.selectedCrop ?? null;
     const cropQuality = {
       sharpness: crop?.sharpness ?? null,
       occlusion: crop?.occlusion ?? null,
       brightness: crop?.brightness ?? null,
     };
-    const normalized = normalizeDetectorResult(result, cropQuality);
+    const normalized = normalizeDetectorResult(result);
     const features = buildInteractionFeatures({
       detections: normalized.detections,
       handSignal: normalized.handSignal,

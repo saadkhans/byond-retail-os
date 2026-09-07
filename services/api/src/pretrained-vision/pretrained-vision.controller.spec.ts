@@ -5,6 +5,7 @@ import {
   TENANT_ONLY_KEY,
 } from '../auth/decorators/access-policy.decorators';
 import { PretrainedVisionController } from './pretrained-vision.module';
+import { PretrainedVisionService } from './pretrained-vision.service';
 
 /**
  * Access-policy pin for the Phase 19 pretrained-vision surface:
@@ -34,5 +35,29 @@ describe('PretrainedVisionController access policy', () => {
         PretrainedVisionController.prototype[handler],
       ),
     ).toEqual(expected);
+  });
+});
+
+describe('PretrainedVisionController.providers (Codex P1)', () => {
+  it('awaits the async status list so the response carries an ARRAY, never a nested promise', async () => {
+    const statuses = [
+      {
+        provider: 'CLASSICAL',
+        kind: 'CLASSICAL',
+        availability: 'READY',
+        reasonCode: null,
+        stubMode: false,
+        runtime: null,
+      },
+    ];
+    const service = {
+      providerStatuses: jest.fn(async () => statuses),
+    } as unknown as PretrainedVisionService;
+    const controller = new PretrainedVisionController(service);
+    const response = await controller.providers();
+    expect(Array.isArray(response.providers)).toBe(true);
+    expect(response.providers).toEqual(statuses);
+    // What Express would serialize: the array, not "{}".
+    expect(JSON.parse(JSON.stringify(response))).toEqual({ providers: statuses });
   });
 });

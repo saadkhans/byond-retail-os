@@ -37,6 +37,7 @@ export type LocalRuntimeReasonCode =
   | 'INFERENCE_TIMEOUT'
   | 'RUNTIME_OUTPUT_INVALID'
   | 'RUNTIME_OUTPUT_TOO_LARGE'
+  | 'RUNTIME_BUSY'
   | 'CLIP_NOT_FOUND'
   | 'CLIP_NOT_DECODABLE'
   | 'NO_FRAMES_DECODED';
@@ -53,6 +54,11 @@ export interface LocalModelDescriptor {
   version: string;
   inputSize: number;
   classCount: number;
+  /** sha256 (first 32 hex chars) over the manifest's ordered class list
+   *  joined by a newline. The readiness probe must report the same digest for
+   *  the loaded weights — class COUNT alone cannot tell a reordered or
+   *  swapped model apart, and every role mapping is index-based. */
+  classDigest: string;
   /** How many model classes map onto each role (0 = role unsupported —
    *  e.g. a COCO model has no HAND class, so a hand signal must come
    *  from another provider). */

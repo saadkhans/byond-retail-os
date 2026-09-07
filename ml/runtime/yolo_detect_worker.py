@@ -24,6 +24,7 @@ alone. Weights are external artifacts; nothing here fetches anything.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -340,12 +341,28 @@ def build_detect_response(
     }
 
 
-def build_probe_response(class_count: int, device: str, version: str, elapsed_ms: int) -> Dict[str, Any]:
+def class_list_digest(names: Any) -> str:
+    """sha256 (first 32 hex) over the model's class names in INDEX order,
+    joined by newlines — identical to the Node registry's digest over the
+    manifest class list, so a reordered or swapped model is rejected even
+    when the class COUNT matches. Names never leave the worker; only the
+    digest does."""
+    if isinstance(names, dict):
+        ordered = [str(names[key]) for key in sorted(names, key=lambda k: int(k))]
+    else:
+        ordered = [str(name) for name in list(names)]
+    return hashlib.sha256(chr(10).join(ordered).encode("utf-8")).hexdigest()[:32]
+
+
+def build_probe_response(
+    class_count: int, class_digest: str, device: str, version: str, elapsed_ms: int
+) -> Dict[str, Any]:
     return {
         "protocol": PROTOCOL,
         "status": "OK",
         "mode": "probe",
         "classCount": int(class_count),
+        "classDigest": str(class_digest),
         "device": device,
         "runtimeVersion": version,
         "elapsedMs": int(elapsed_ms),
@@ -384,9 +401,14 @@ def run_probe(header: Dict[str, Any], np, ultralytics_module, YOLO) -> Dict[str,
         class_count = 0
     if class_count <= 0:
         raise WorkerExit(EXIT_PROBE_FAILED)
+    try:
+        class_digest = class_list_digest(names)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise WorkerExit(EXIT_PROBE_FAILED) from exc
     elapsed_ms = int((time.monotonic() - started) * 1000)
     return build_probe_response(
         class_count,
+        class_digest,
         report_device(model, header["device"]),
         runtime_version(ultralytics_module),
         elapsed_ms,
