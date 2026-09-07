@@ -122,14 +122,14 @@ function GroundTruthForm({
     }
   }
 
-  const fieldErrorStyle = { color: '#c0392b', fontSize: '0.85em' };
+  const fieldErrorStyle = { color: 'var(--critical)', fontSize: '0.85em' };
 
   return (
     <div style={{ margin: '0.75rem 0' }}>
       <h3 style={{ marginBottom: '0.25rem' }}>Ground truth (what really happens)</h3>
       {apiError ? <div className="error">{apiError}</div> : null}
       {savedNotice ? (
-        <p className="muted" style={{ color: '#1e7e34' }}>
+        <p className="muted" style={{ color: 'var(--good)' }}>
           ✓ {savedNotice}
         </p>
       ) : null}
@@ -459,7 +459,7 @@ export function PickupDetectionPanel({
               style={{
                 position: 'relative',
                 height: 14,
-                background: 'var(--border, #d8d8e0)',
+                background: 'var(--rule)',
                 borderRadius: 7,
                 margin: '0.4rem 0',
                 cursor: 'pointer',
@@ -481,7 +481,7 @@ export function PickupDetectionPanel({
                   )}%`,
                   top: 0,
                   bottom: 0,
-                  background: 'rgba(90, 120, 255, 0.35)',
+                  background: 'color-mix(in srgb, var(--accent) 35%, transparent)',
                   borderRadius: 7,
                 }}
               />
@@ -493,7 +493,7 @@ export function PickupDetectionPanel({
                   width: 4,
                   top: -3,
                   bottom: -3,
-                  background: '#e0483c',
+                  background: 'var(--critical)',
                   borderRadius: 2,
                 }}
               />
@@ -513,7 +513,7 @@ export function PickupDetectionPanel({
             display: 'flex',
             gap: '1rem',
             alignItems: 'flex-start',
-            border: '1px solid var(--border, #d8d8e0)',
+            border: '1px solid var(--rule)',
             borderRadius: 6,
             padding: '0.75rem',
             maxWidth: '40rem',

@@ -10,7 +10,7 @@ import {
   VideoArtifact,
   VideoAsset,
 } from '../api';
-import { formatDate, Page, StatusBadge, useLoad } from '../components';
+import { Disclosure, formatDate, Notice, Page, Pagination, StatusBadge, useLoad } from '../components';
 import { FusionEvidencePanel } from './FusionEvidencePanel';
 import { PickupDetectionPanel } from './PickupDetectionPanel';
 
@@ -226,7 +226,17 @@ export function VideoAssetsPage() {
   }
 
   return (
-    <Page title="Test videos" error={error} loading={loading}>
+    <Page
+      title="Test videos"
+      description="Every uploaded test clip with its artifacts, crops, detection and fusion evidence."
+      error={error}
+      loading={loading}
+    >
+      <Notice tone="info">
+        To upload a clip bound to a store and rack and run the whole
+        analysis in one click, use <Link to="/clip-lab">Clip Lab</Link>.
+      </Notice>
+      <Disclosure summary="Upload without rack binding (advanced)">
       <form className="toolbar" onSubmit={(e) => void upload(e)}>
         <input
           ref={fileInput}
@@ -298,6 +308,7 @@ export function VideoAssetsPage() {
         that nothing is there.
       </p>
       {uploadError ? <div className="error">{uploadError}</div> : null}
+      </Disclosure>
       <div className="toolbar">
         <select
           value={status}
@@ -358,20 +369,7 @@ export function VideoAssetsPage() {
           ))}
         </tbody>
       </table>
-      <div className="pagination">
-        <button
-          disabled={skip === 0}
-          onClick={() => setSkip(Math.max(0, skip - take))}
-        >
-          Previous
-        </button>
-        <button
-          disabled={!data || skip + take >= data.total}
-          onClick={() => setSkip(skip + take)}
-        >
-          Next
-        </button>
-      </div>
+      <Pagination skip={skip} take={take} total={data?.total} onChange={setSkip} />
     </Page>
   );
 }
@@ -679,7 +677,7 @@ export function VideoAssetDetailPage() {
                           maxWidth: '14rem',
                           height: 'auto',
                           display: 'block',
-                          border: '1px solid var(--border, #ccc)',
+                          border: '1px solid var(--rule)',
                           borderRadius: '4px',
                         }}
                       />

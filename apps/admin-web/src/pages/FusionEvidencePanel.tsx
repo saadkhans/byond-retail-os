@@ -199,7 +199,7 @@ export function FusionEvidencePanel({
       ) : null}
 
       {data && evidence ? (
-        <div style={{ border: '1px solid var(--border, #d8d8e0)', borderRadius: 6, padding: '0.75rem' }}>
+        <div style={{ border: '1px solid var(--rule)', borderRadius: 6, padding: '0.75rem' }}>
           <p style={{ marginTop: 0 }}>
             <strong>
               {data.fusedTopSku

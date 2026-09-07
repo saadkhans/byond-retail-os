@@ -1,3 +1,4 @@
+import { Link } from 'react-router-dom';
 import { FormEvent, useState } from 'react';
 import {
   Paginated,
@@ -10,7 +11,7 @@ import {
   api,
   pretrainedEvaluatePath,
 } from '../api';
-import { Page, useLoad } from '../components';
+import { Disclosure, Page, useLoad } from '../components';
 
 /**
  * Phase 19 — Pretrained Vision Evaluation (shadow-only lab surface).
@@ -323,7 +324,12 @@ export function PretrainedVisionPage() {
       <section>
         <h3>Evaluate a clip</h3>
         {errorText ? <div className="error">{errorText}</div> : null}
-        <div className="toolbar" style={{ flexWrap: 'wrap' }}>
+        <p className="muted">
+          Uses the store, rack, and rack region bound to the clip at upload.
+          For upload, screening, and one-click analysis go to{' '}
+          <Link to="/clip-lab">Clip Lab</Link>.
+        </p>
+        <div className="toolbar">
           <select
             value={selectedAssetId}
             onChange={(e) => setSelectedAssetId(e.target.value)}
@@ -337,6 +343,21 @@ export function PretrainedVisionPage() {
                 </option>
               ))}
           </select>
+          <button
+            className="primary"
+            disabled={busy || !selectedAssetId}
+            onClick={() => void evaluate()}
+          >
+            {busy ? 'Evaluating…' : "Evaluate with the clip's binding"}
+          </button>
+          <Link to="/clip-lab">Full analysis in Clip Lab</Link>
+        </div>
+        <Disclosure summary="Advanced overrides (store, rack, position, rack region)">
+          <p className="muted">
+            Overrides replace the clip's binding for this evaluation only.
+            Leave blank to use the binding.
+          </p>
+          <div className="toolbar" style={{ flexWrap: 'wrap' }}>
           <select value={locationId} onChange={(e) => setLocationId(e.target.value)}>
             <option value="">— store (for planogram) —</option>
             {(stores.data?.items ?? []).map((store) => (
@@ -403,14 +424,8 @@ export function PretrainedVisionPage() {
             value={regionH}
             onChange={(e) => setRegionH(e.target.value)}
           />
-          <button
-            className="primary"
-            disabled={busy || !selectedAssetId}
-            onClick={() => void evaluate()}
-          >
-            {busy ? 'Evaluating…' : 'Run side-by-side evaluation'}
-          </button>
-        </div>
+          </div>
+        </Disclosure>
       </section>
 
       {report ? (

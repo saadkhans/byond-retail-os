@@ -46,8 +46,8 @@ function errorMessage(err: unknown): string {
   return err instanceof ApiError ? err.message : 'Unexpected error';
 }
 
-const fieldErrorStyle = { color: '#c0392b', fontSize: '0.85em' };
-const border = '1px solid var(--border, #d8d8e0)';
+const fieldErrorStyle = { color: 'var(--critical)', fontSize: '0.85em' };
+const border = '1px solid var(--rule)';
 const stepCard: CSSProperties = {
   border,
   borderRadius: 8,
@@ -67,8 +67,8 @@ function StepHeading({ n, title }: { n: number; title: string }) {
           width: '1.7rem',
           height: '1.7rem',
           borderRadius: '50%',
-          background: 'var(--accent, #4c6ef5)',
-          color: '#fff',
+          background: 'var(--accent)',
+          color: 'var(--accent-ink)',
           fontSize: '0.95rem',
         }}
       >
@@ -100,7 +100,7 @@ function WarningBadges({ warnings }: { warnings: string[] }) {
  *  dataset-ready, not a smoke test. */
 function SopPanel() {
   return (
-    <aside style={{ ...stepCard, background: 'var(--panel, rgba(76,110,245,0.06))' }}>
+    <aside style={{ ...stepCard, background: 'var(--accent-soft)' }}>
       <strong>First SKU SOP</strong>
       <ol style={{ margin: '0.4rem 0 0 1.2rem', lineHeight: 1.7 }}>
         <li>Upload 8–12 reference images (all angles below)</li>
@@ -809,8 +809,8 @@ function ManualCropTool({
               style={{
                 position: 'absolute',
                 ...overlay,
-                border: '2px solid #e74c3c',
-                boxShadow: '0 0 0 9999px rgba(0,0,0,0.25)',
+                border: '2px solid var(--critical)',
+                boxShadow: '0 0 0 9999px var(--overlay)',
                 pointerEvents: 'none',
               }}
             />
@@ -1151,7 +1151,7 @@ export function OneSkuBootstrapPage() {
               style={{
                 ...stepCard,
                 margin: '0.5rem 0',
-                borderLeft: '4px solid var(--accent, #4c6ef5)',
+                borderLeft: '4px solid var(--accent)',
               }}
             >
               <strong>Next:</strong> {action.label}

@@ -38,7 +38,12 @@ export function DashboardPage() {
   ];
 
   return (
-    <Page title="Dashboard" error={error} loading={loading}>
+    <Page
+      title="Dashboard"
+      description="Counts across the tenant. Each tile opens its list."
+      error={error}
+      loading={loading}
+    >
       <div className="cards">
         {tiles.map((tile) => (
           <Link key={tile.label} to={tile.to} className="card">

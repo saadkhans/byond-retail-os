@@ -15,7 +15,9 @@ containers, conservative size limit), validate/extract-frames/manual-crop
 actions, an artifacts view, and per-crop inference-job creation linking into
 the Phase 9 queue — metadata only: no video preview, no download URLs, and
 no storage paths exist in the API by design.
-Deliberately unpolished — the scope is visibility, not UI product work.
+Phase 23 gave it a grouped sidebar, a top bar with a three-state theme
+switch (system / light / dark), a shared UI kit under `src/ui/`, and merged
+the overlapping list pages — see `docs/development/admin-web-ui.md`.
 
 ## Run locally
 
