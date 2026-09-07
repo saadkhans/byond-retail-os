@@ -401,6 +401,10 @@ export function buildInteractionFeatures(input: {
    *  when given, never on "first product box vs last product box" of a
    *  multi-product shelf. */
   eventTrack?: NormalizedBox[];
+  /** Contact PROXY for models that cannot see hands: a person was seen
+   *  while the product count changed. Only ever raises a candidate that
+   *  stays review-required downstream — never a decision. */
+  contactProxy?: boolean;
 }): InteractionFeatures {
   const productBoxes = input.detections.filter(
     (row) => row.label === 'PRODUCT' || row.label === 'PRODUCT_IN_HAND',
@@ -442,11 +446,12 @@ export function buildInteractionFeatures(input: {
     }
     handProximity = Math.round(Math.max(0, 1 - nearest) * 1000) / 1000;
   }
-  const handContact =
+  const observedContact =
     input.handSignal?.contactDurationMs !== null &&
     input.handSignal?.contactDurationMs !== undefined
       ? input.handSignal.contactDurationMs > 0
       : (handProximity ?? 0) > 0.7;
+  const handContact = observedContact || input.contactProxy === true;
   return {
     preCropQuality: input.cropQuality.pre,
     peakCropQuality: input.cropQuality.peak,

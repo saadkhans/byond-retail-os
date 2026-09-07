@@ -72,6 +72,10 @@ export interface DetectorNormalizationOutput {
   /** That product's box in every sampled frame it was seen in, in time
    *  order (empty when there is no event box). */
   eventTrack: NormalizedBox[];
+  /** True when the model has no HAND role but a person was seen while
+   *  the product count changed — the only contact evidence such a model
+   *  can give. Feeds buildInteractionFeatures.contactProxy. */
+  contactProxy: boolean;
   notes: string[];
 }
 
@@ -479,6 +483,13 @@ export function normalizeDetectorFrames(
   if (localized.eventBox) {
     notes.push('EVENT_PRODUCT_LOCALIZED');
   }
+  const contactProxy =
+    !input.handRoleSupported &&
+    personSeen &&
+    (presence.countDecreased || presence.countIncreased);
+  if (contactProxy) {
+    notes.push('PERSON_PRESENCE_CONTACT_PROXY');
+  }
 
   const bounded = boundDetectionsAcrossTimeline(detections, MAX_EVIDENCE_DETECTIONS);
   if (bounded.length < detections.length) {
@@ -492,6 +503,7 @@ export function normalizeDetectorFrames(
     objectAppeared: presence.objectAppeared,
     eventBox: localized.eventBox,
     eventTrack: localized.eventTrack,
+    contactProxy,
     notes,
   };
 }

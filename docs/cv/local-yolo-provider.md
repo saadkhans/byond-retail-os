@@ -270,6 +270,9 @@ works on **counts and localization**:
   `DETECTOR_ONLY_EVENT`. The Phase 20 review gate still applies: every
   real pretrained contribution stays `reviewRequired`.
 
+**Models without a HAND role (e.g. COCO):** hand contact cannot be observed, so when a person was seen while the product count changed, the normalization raises a *contact proxy* (note `PERSON_PRESENCE_CONTACT_PROXY`). It only lets the count change become a PICKUP / RETURN *candidate*; the Phase 20 review gate still forces human review.
+
+
 ### Detector-supplied planogram coordinates
 
 Cell narrowing needs a point on the rack. Precedence:

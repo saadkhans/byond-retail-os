@@ -362,6 +362,7 @@ export class YoloVisionAdapter extends OptionalLocalAdapter {
     const features = buildInteractionFeatures({
       detections: normalized.detections,
       handSignal: normalized.handSignal,
+      contactProxy: normalized.contactProxy,
       cropQuality: {
         pre: null,
         peak: crop !== null && crop.qualityKnown ? 1 : null,

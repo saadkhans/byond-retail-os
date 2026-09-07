@@ -563,3 +563,43 @@ describe('normalizeDetectorFrames — multi-product shelf (Phase 21)', () => {
     expect(out.notes).not.toContain('EVENT_PRODUCT_LOCALIZED');
   });
 });
+
+describe('normalizeDetectorFrames — person-presence contact proxy (models without a HAND role)', () => {
+  it('4 → 3 bottles with a person seen: contact proxy raised and the action becomes a PICKUP candidate', () => {
+    const out = normalizeDetectorFrames({
+      frames: fridgePickupFrames(),
+      handRoleSupported: false,
+    });
+    expect(out.contactProxy).toBe(true);
+    expect(out.notes).toContain('PERSON_PRESENCE_CONTACT_PROXY');
+    const features = buildInteractionFeatures({
+      detections: out.detections,
+      handSignal: out.handSignal,
+      cropQuality: NO_QUALITY,
+      objectDisappeared: out.objectDisappeared,
+      objectAppeared: out.objectAppeared,
+      topSkuCandidates: [],
+      eventBox: out.eventBox,
+      eventTrack: out.eventTrack,
+      contactProxy: out.contactProxy,
+    });
+    expect(features.actionCandidate).toBe('PICKUP');
+  });
+
+  it('is never raised when the model can see hands (real contact evidence rules)', () => {
+    const out = normalizeDetectorFrames({
+      frames: fridgePickupFrames(),
+      handRoleSupported: true,
+    });
+    expect(out.contactProxy).toBe(false);
+    expect(out.notes).not.toContain('PERSON_PRESENCE_CONTACT_PROXY');
+  });
+
+  it('is never raised without a count change, even with a person in frame', () => {
+    const all = [SHELF.topLeft, SHELF.topRight, SHELF.midLeft, SHELF.midRight];
+    const person = det('PERSON', 0.7, { x: 0.05, y: 0.4, width: 0.3, height: 0.5 });
+    const frames = [0, 1, 2, 3, 4, 5].map((i) => shelfFrame(i * 500, all, i === 3 ? [person] : []));
+    const out = normalizeDetectorFrames({ frames, handRoleSupported: false });
+    expect(out.contactProxy).toBe(false);
+  });
+});

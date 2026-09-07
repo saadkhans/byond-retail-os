@@ -53,6 +53,7 @@ const NOTE_LABELS: Record<string, string> = {
   PRODUCT_COUNT_DECREASED: 'Product count decreased on shelf',
   PRODUCT_COUNT_INCREASED: 'Product count increased on shelf',
   EVENT_PRODUCT_LOCALIZED: 'Event product localized',
+  PERSON_PRESENCE_CONTACT_PROXY: 'Person presence used as contact proxy (model cannot see hands)',
   DETECTOR_ONLY_EVENT: 'Event proposed by detector only (classical found none)',
   EVENT_OUTSIDE_RACK_REGION: 'Event outside the rack region',
 };
