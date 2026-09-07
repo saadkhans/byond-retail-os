@@ -11,8 +11,10 @@ import {
   Product,
   ScreeningPreview,
   Store,
+  Unit,
   VideoAsset,
 } from '../api';
+import { frameCoverageLabel, marginLabel, percentLabel } from '../clip-lab-utils';
 import { Page, useLoad } from '../components';
 import { UPLOAD_ATTESTATIONS } from './VideoAssetsPage';
 
@@ -89,7 +91,41 @@ export const WHY_LABELS: Record<string, string> = {
   PLANOGRAM_SCOPED_CANDIDATES: 'Candidates scoped to the bound planogram',
   SCREENING_SCREENING_APPROVAL_REQUIRED: 'Screening approval required before analysis',
   DETECTION_NO_MOTION_EVENT: 'Classical v1 found no motion event (fusion v2 fallback used)',
+  DETECTION_MISSING_UNIT_BINDING: 'Classical detection skipped — no unit bound to this clip',
+  DETECTION_MISSING_LOCATION_CONTEXT: 'Classical detection needs a store and a unit bound to the clip',
 };
+
+const DETECTION_STATUS_LABELS: Record<string, string> = {
+  OK: 'classical event found',
+  FAILED: 'classical detection failed',
+  SKIPPED: 'skipped (no unit bound)',
+  NOT_RUN: 'not run yet',
+};
+
+const VLM_VERDICT_LABELS: Record<string, string> = {
+  MATCH: 'match',
+  MISMATCH: 'mismatch',
+  UNKNOWN: 'unknown',
+  AMBIGUOUS: 'ambiguous',
+};
+
+const VLM_SUPPORT_LABELS: Record<string, string> = {
+  STRONG: 'strong visual support',
+  WEAK: 'weak visual support',
+  NONE: 'no visual support',
+  CONTRADICTS: 'visual evidence contradicts',
+};
+
+/** Units of one store — "GET /units?locationId=…" (paginated). */
+function useStoreUnits(locationId: string) {
+  return useLoad<Paginated<Unit>>(
+    () =>
+      locationId
+        ? api(`/units?locationId=${encodeURIComponent(locationId)}&take=100`)
+        : Promise.resolve({ items: [], total: 0, skip: 0, take: 0 } as Paginated<Unit>),
+    [locationId],
+  );
+}
 
 function labelFor(code: string, labels: Record<string, string>): string {
   return labels[code] ?? code;
@@ -123,6 +159,7 @@ function UploadSection({ onUploaded }: { onUploaded: (asset: VideoAsset) => void
   const fileInput = useRef<HTMLInputElement>(null);
   const [fileName, setFileName] = useState('');
   const [locationId, setLocationId] = useState('');
+  const [unitId, setUnitId] = useState('');
   const [rackCode, setRackCode] = useState('');
   const [region, setRegion] = useState({ rx: '', ry: '', rw: '', rh: '' });
   const [attested, setAttested] = useState<Record<string, boolean>>({});
@@ -139,13 +176,26 @@ function UploadSection({ onUploaded }: { onUploaded: (asset: VideoAsset) => void
   const rackList: PlanogramRackView[] = Array.isArray(racks.data)
     ? racks.data
     : (racks.data?.racks ?? []);
+  const units = useStoreUnits(locationId);
+  const unitList = units.data?.items ?? [];
   const allAttested = UPLOAD_ATTESTATIONS.every(({ field }) => attested[field]);
   const regionParsed = parseRegion(region);
-  const ready = Boolean(fileName && locationId && rackCode && allAttested && !regionParsed.error);
+  const ready = Boolean(
+    fileName && locationId && unitId && rackCode && allAttested && !regionParsed.error,
+  );
 
   useEffect(() => {
     setRackCode('');
+    setUnitId('');
   }, [locationId]);
+
+  // A store with exactly one unit needs no choice — pre-select it.
+  useEffect(() => {
+    if (!unitId && unitList.length === 1) {
+      setUnitId(unitList[0].id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unitList.length]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -164,6 +214,7 @@ function UploadSection({ onUploaded }: { onUploaded: (asset: VideoAsset) => void
         headers[header] = 'true';
       }
       formData.append('locationId', locationId);
+      formData.append('unitId', unitId);
       formData.append('planogramRackCode', rackCode);
       if (regionParsed.region) {
         formData.append('rackFrameRegion', JSON.stringify(regionParsed.region));
@@ -209,6 +260,17 @@ function UploadSection({ onUploaded }: { onUploaded: (asset: VideoAsset) => void
             </select>
           </label>
           <label>
+            Unit *{' '}
+            <select value={unitId} onChange={(e) => setUnitId(e.target.value)} disabled={!locationId}>
+              <option value="">{locationId ? '— unit —' : 'pick a store first'}</option>
+              {unitList.map((unit) => (
+                <option key={unit.id} value={unit.id}>
+                  {unit.name} ({unit.code})
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
             Rack *{' '}
             <select
               value={rackCode}
@@ -228,6 +290,12 @@ function UploadSection({ onUploaded }: { onUploaded: (asset: VideoAsset) => void
           <p className="error">
             No ACTIVE planogram rack at this store. Publish one on the{' '}
             <Link to="/pretrained-vision">Pretrained vision</Link> page first.
+          </p>
+        ) : null}
+        {locationId && !units.loading && unitList.length === 0 ? (
+          <p className="error">
+            This store has no retail unit. Add one on the <Link to="/units">Units</Link> page —
+            classical detection records its pickup event on a unit.
           </p>
         ) : null}
         <div className="toolbar">
@@ -435,11 +503,98 @@ function ResultSection({ report }: { report: ClipLabReport }) {
           ))}
         </dd>
       </dl>
+      <ConfidenceSummary report={report} />
       <p className="muted">
         Details: <Link to={report.links.videoAssetPage}>clip page</Link> ·{' '}
         <Link to={report.links.pretrainedPage}>pretrained vision</Link>
       </p>
     </section>
+  );
+}
+
+/**
+ * Confidence summary — one row per stage, each stage's own 0..1 signal
+ * shown as a percentage for readability. Percentages come ONLY from the
+ * pure helper (never inline arithmetic here); they are uncalibrated
+ * ranking signals and the footnote says so. Overall is the review gate.
+ */
+function ConfidenceSummary({ report }: { report: ClipLabReport }) {
+  const c = report.confidence;
+  const detectionStep = report.steps.find((step) => step.step === 'DETECTION');
+  const detectionNote = detectionStep?.reasonCode
+    ? labelFor(`DETECTION_${detectionStep.reasonCode}`, WHY_LABELS)
+    : labelFor(c.detection.status, DETECTION_STATUS_LABELS);
+  const vlmText = c.vlm
+    ? [
+        c.vlm.verdict ? labelFor(c.vlm.verdict, VLM_VERDICT_LABELS) : null,
+        c.vlm.sku ? `→ ${c.vlm.sku}` : null,
+        c.vlm.support ? labelFor(c.vlm.support, VLM_SUPPORT_LABELS) : null,
+      ]
+        .filter(Boolean)
+        .join(' · ')
+    : null;
+  const rows: { signal: string; confidence: string; note: string | JSX.Element }[] = [
+    {
+      signal: 'Classical detection',
+      confidence: percentLabel(c.detection.score),
+      note: detectionNote,
+    },
+    {
+      signal: c.detector.provider ? `Local detector (${c.detector.provider})` : 'Local detector',
+      confidence: percentLabel(c.detector.topDetection),
+      note: frameCoverageLabel(c.detector.productFrames, c.detector.sampledFrames),
+    },
+    {
+      signal: 'Fused top candidate',
+      confidence: percentLabel(c.fusionTop?.score ?? null),
+      note: c.fusionTop ? `${c.fusionTop.sku} · margin ${marginLabel(c.fusionTop.margin)}` : '—',
+    },
+    {
+      signal: 'Planogram cell',
+      confidence: percentLabel(c.planogramCell?.confidence ?? null),
+      note: c.planogramCell
+        ? `${c.planogramCell.cell} · ${labelFor(report.planogram?.matchStatus ?? '', MATCH_LABELS)}`
+        : '—',
+    },
+    {
+      signal: 'VLM verifier',
+      confidence: '—',
+      note: vlmText || (c.vlm?.status ? c.vlm.status : 'not invoked'),
+    },
+    {
+      signal: 'Overall',
+      confidence: '—',
+      note: <span className="badge warn">Still needs review</span>,
+    },
+  ];
+  return (
+    <div className="confidence-summary">
+      <h4>Confidence summary</h4>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Signal</th>
+              <th className="num">Confidence</th>
+              <th>Note</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row.signal}>
+                <td>{row.signal}</td>
+                <td className="num">{row.confidence}</td>
+                <td>{row.note}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="muted">
+        Percentages are uncalibrated ranking signals until calibration lands; they are{' '}
+        <strong>not probabilities</strong>.
+      </p>
+    </div>
   );
 }
 
@@ -461,6 +616,23 @@ export function ClipLabPage() {
     [],
   );
   const selected = (assets.data?.items ?? []).find((asset) => asset.id === selectedId) ?? null;
+  const [bindUnitId, setBindUnitId] = useState('');
+  const [bindNotice, setBindNotice] = useState<string | null>(null);
+  const selectedStoreUnits = useStoreUnits(selected && !selected.unitId ? (selected.locationId ?? '') : '');
+  const selectedUnitList = selectedStoreUnits.data?.items ?? [];
+
+  async function bindUnit() {
+    if (!selectedId || !bindUnitId) return;
+    setBindNotice(null);
+    try {
+      await api(`/video-assets/${selectedId}/binding`, { method: 'PATCH', body: { unitId: bindUnitId } });
+      setBindNotice('Unit bound.');
+      setBindUnitId('');
+      setRefresh((n) => n + 1);
+    } catch (err) {
+      setBindNotice(errorText(err));
+    }
+  }
 
   useEffect(() => {
     setReport(null);
@@ -546,6 +718,32 @@ export function ClipLabPage() {
             This clip has no rack bound — candidates will use the full catalog. Re-upload it
             through Clip Lab or bind it on the clip page.
           </p>
+        ) : null}
+        {selected && !selected.unitId ? (
+          <div className="notice warn">
+            <p>This clip has no unit bound — classical detection is skipped.</p>
+            {selected.locationId ? (
+              <div className="toolbar">
+                <label>
+                  Unit{' '}
+                  <select value={bindUnitId} onChange={(e) => setBindUnitId(e.target.value)}>
+                    <option value="">— unit —</option>
+                    {selectedUnitList.map((unit) => (
+                      <option key={unit.id} value={unit.id}>
+                        {unit.name} ({unit.code})
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button type="button" onClick={() => void bindUnit()} disabled={!bindUnitId}>
+                  Bind unit
+                </button>
+                {bindNotice ? <span className="muted">{bindNotice}</span> : null}
+              </div>
+            ) : (
+              <p className="muted">Bind a store on the clip page first.</p>
+            )}
+          </div>
         ) : null}
         {selected?.status === 'QUARANTINED' ? (
           <p className="muted">Approve screening below first.</p>

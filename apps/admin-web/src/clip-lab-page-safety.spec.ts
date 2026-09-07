@@ -27,8 +27,13 @@ describe('Clip Lab page safety', () => {
     expect(pageSource.includes(needle)).toBe(false);
   });
 
-  it('never renders ranking scores as percentages', () => {
-    expect(/score \* 100|similarity \* 100|fusedScore \* 100/.test(pageSource)).toBe(false);
+  it('never computes a percentage of a ranking score inline (the labeled helper is the only door)', () => {
+    expect(/score \* 100|similarity \* 100|fusedScore \* 100|confidence \* 100/.test(pageSource)).toBe(false);
+    // The confidence summary exists, formats through the pure helper, and
+    // tells the operator these are not probabilities.
+    expect(pageSource).toContain('Confidence summary');
+    expect(pageSource).toContain('percentLabel(');
+    expect(pageSource).toContain('not probabilities');
   });
 
   it('uses only the Clip Lab, upload, screening, planogram, and ground-truth surfaces', () => {
@@ -38,7 +43,7 @@ describe('Clip Lab page safety', () => {
   });
 
   it('marks the mandatory fields and keeps the human screening decision explicit', () => {
-    for (const label of ['Clip file *', 'Store *', 'Rack *', 'Clip *', 'Approve screening *', 'Operator attestations *']) {
+    for (const label of ['Clip file *', 'Store *', 'Unit *', 'Rack *', 'Clip *', 'Approve screening *', 'Operator attestations *']) {
       expect(pageSource.includes(label)).toBe(true);
     }
     expect(pageSource).toContain('leave blank if the rack fills the frame');
@@ -46,8 +51,9 @@ describe('Clip Lab page safety', () => {
     expect(pageSource).toContain('scoped to planogram');
   });
 
-  it('binds the store and rack at upload', () => {
+  it('binds the store, unit, and rack at upload', () => {
     expect(pageSource).toContain("formData.append('planogramRackCode'");
     expect(pageSource).toContain("formData.append('locationId'");
+    expect(pageSource).toContain("formData.append('unitId'");
   });
 });

@@ -12,6 +12,8 @@ type Row = Record<string, unknown>;
 function buildHarness(options: {
   status?: string;
   rackCode?: string | null;
+  unitId?: string | null;
+  detectorDetections?: Row[];
   detection?: Row;
   detectionThrows?: Error;
   fusionThrows?: Error;
@@ -25,13 +27,16 @@ function buildHarness(options: {
     status: options.status ?? 'VALIDATED',
     location: { id: 'store-1', name: 'Pickup Lab', code: 'PICKUP-LAB' },
     locationId: 'store-1',
-    unitId: null,
+    unitId: options.unitId === undefined ? 'unit-1' : options.unitId,
     deviceId: null,
     sessionId: null,
     planogramRackCode: options.rackCode === undefined ? 'SHELF-2X2' : options.rackCode,
     rackFrameRegion: { x: 0, y: 0, width: 1, height: 1 },
   };
   const prisma = {
+    retailUnit: {
+      findFirst: jest.fn(async () => ({ id: 'unit-1', name: 'Fridge 1' })),
+    },
     videoGroundTruth: {
       findFirst: jest.fn(async () => ({
         eventKind: 'PICKUP',
@@ -48,6 +53,14 @@ function buildHarness(options: {
             { sku: 'SKU-LIME-GREEN', fusedScore: 0.2178 },
           ],
           planogramScope: { rackCode: 'SHELF-2X2', rackVersion: 1, scopedProductCount: 2, excludedProductCount: 8 },
+          vlm: {
+            status: 'VERDICT',
+            verdict: 'UNKNOWN',
+            selectedSku: null,
+            visualSupport: 'NONE',
+            // Junk a hand-edited row could carry — must never reach the report.
+            rawPreview: 'C:\\models\\x.pt Traceback',
+          },
           // Junk a hand-edited row could carry — must never reach the report.
           storageKey: 'tenant/x/original.mp4',
           stderr: 'Traceback (most recent call last)',
@@ -70,7 +83,14 @@ function buildHarness(options: {
         }
       );
     }),
-    getState: jest.fn(async () => options.detection ?? { enabled: true, job: { status: 'SUCCEEDED', errorCode: null }, detection: {} }),
+    getState: jest.fn(
+      async () =>
+        options.detection ?? {
+          enabled: true,
+          job: { status: 'SUCCEEDED', errorCode: null },
+          detection: { confidence: 0.3247 },
+        },
+    ),
   };
   const fusion = {
     run: jest.fn(async () => {
@@ -91,7 +111,16 @@ function buildHarness(options: {
         status: 'COMPLETED',
         synthetic: false,
         createdAt: new Date(),
-        evidence: { availability: 'READY', notes: ['PRODUCT_COUNT_DECREASED', 'EVENT_PRODUCT_LOCALIZED'] },
+        evidence: {
+          availability: 'READY',
+          notes: ['PRODUCT_COUNT_DECREASED', 'EVENT_PRODUCT_LOCALIZED'],
+          detections: options.detectorDetections ?? [
+            { label: 'PRODUCT', timestampMs: 0, confidence: 0.85 },
+            { label: 'PRODUCT', timestampMs: 500, confidence: 0.8 },
+            { label: 'HAND', timestampMs: 1000, confidence: 0.6 },
+            { label: 'PRODUCT_IN_HAND', timestampMs: 1500, confidence: 0.7 },
+          ],
+        },
       },
     ],
     embeddingCandidates: [],
@@ -264,5 +293,78 @@ describe('ClipLabService.report (Phase 22, read-only)', () => {
       ['PRETRAINED', 'OK'],
     ]);
     expect(report.candidates.scoped).toBe(true);
+  });
+});
+
+describe('ClipLabService — unit binding and confidence summary (Phase 22b)', () => {
+  it('a clip without a unit SKIPS classical detection (MISSING_UNIT_BINDING) and the run continues', async () => {
+    const { service, detection, fusion, pretrained } = buildHarness({ unitId: null });
+    const report = await service.run('t-1', 'va-1', ACTOR, VIEWER);
+    const step = report.steps.find((row) => row.step === 'DETECTION');
+    expect(step).toEqual({ step: 'DETECTION', status: 'SKIPPED', reasonCode: 'MISSING_UNIT_BINDING', ms: null });
+    expect(detection.detectForAsset).not.toHaveBeenCalled();
+    expect(fusion.run).toHaveBeenCalled();
+    expect(pretrained.evaluate).toHaveBeenCalled();
+    expect(report.asset.unit).toBeNull();
+    expect(report.confidence.detection).toEqual({ status: 'SKIPPED', score: null });
+    expect(report.why).toContain('DETECTION_MISSING_UNIT_BINDING');
+  });
+
+  it('a bound unit is reported by name and classical detection runs', async () => {
+    const { service, detection, prisma } = buildHarness();
+    const report = await service.run('t-1', 'va-1', ACTOR, VIEWER);
+    expect(detection.detectForAsset).toHaveBeenCalled();
+    expect(prisma.retailUnit.findFirst).toHaveBeenCalledWith({
+      where: { id: 'unit-1', tenantId: 't-1' },
+      select: { id: true, name: true },
+    });
+    expect(report.asset.unit).toEqual({ id: 'unit-1', name: 'Fridge 1' });
+  });
+
+  it('the confidence summary carries each stage signal as produced, with the fused margin', async () => {
+    const { service } = buildHarness();
+    const report = await service.run('t-1', 'va-1', ACTOR, VIEWER);
+    expect(report.confidence).toEqual({
+      detection: { status: 'OK', score: 0.325 },
+      detector: { provider: 'YOLO_LOCAL', topDetection: 0.85, productFrames: 3, sampledFrames: 4 },
+      fusionTop: { sku: 'WATER-BOTTLE-500ML', score: 0.239, margin: 0.021 },
+      planogramCell: { cell: 'B1', confidence: 0.61 },
+      vlm: { status: 'VERDICT', verdict: 'UNKNOWN', sku: null, support: 'NONE' },
+      overall: { reviewRequired: true, gate: 'REVIEW_REQUIRED' },
+    });
+    // Junk in the VLM block never reaches the summary.
+    expect(JSON.stringify(report.confidence)).not.toContain('Traceback');
+    expect(JSON.stringify(report.confidence)).not.toContain('.pt');
+  });
+
+  it('missing pieces are null, never invented (no fusion candidates, no detector run, single candidate margin 0)', async () => {
+    const single = buildHarness({
+      fusionEvidence: { fused: [{ sku: 'WATER-BOTTLE-500ML', fusedScore: 0.5 }], vlm: null },
+      detectorDetections: [],
+    });
+    const report = await single.service.run('t-1', 'va-1', ACTOR, VIEWER);
+    expect(report.confidence.fusionTop).toEqual({ sku: 'WATER-BOTTLE-500ML', score: 0.5, margin: 0 });
+    expect(report.confidence.detector).toEqual({ provider: 'YOLO_LOCAL', topDetection: null, productFrames: 0, sampledFrames: 0 });
+    expect(report.confidence.vlm).toBeNull();
+
+    const empty = buildHarness({ fusionEvidence: { fused: [], vlm: { status: 'not a code!', verdict: 42 } } });
+    const report2 = await empty.service.run('t-1', 'va-1', ACTOR, VIEWER);
+    expect(report2.confidence.fusionTop).toBeNull();
+    expect(report2.confidence.vlm).toBeNull();
+    expect(report2.confidence.overall).toEqual({ reviewRequired: true, gate: 'REVIEW_REQUIRED' });
+  });
+
+  it('report() marks detection SKIPPED for a unit-less clip with no job', async () => {
+    const { service } = buildHarness({
+      unitId: null,
+      detection: { enabled: true, job: null, detection: null },
+    });
+    const report = await service.report('t-1', 'va-1', VIEWER);
+    expect(report.steps.find((row) => row.step === 'DETECTION')).toEqual({
+      step: 'DETECTION',
+      status: 'SKIPPED',
+      reasonCode: 'MISSING_UNIT_BINDING',
+      ms: null,
+    });
   });
 });
