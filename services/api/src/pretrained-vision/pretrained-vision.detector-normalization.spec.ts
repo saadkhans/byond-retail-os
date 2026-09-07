@@ -3,6 +3,8 @@ import type {
   DetectorFrameResult,
 } from '../local-vision-runtime/local-vision-runtime.port';
 import {
+  deriveTrackChange,
+  trackFor,
   MAX_EVIDENCE_DETECTIONS,
   boundDetectionsAcrossTimeline,
   boxesOverlap,
@@ -601,5 +603,90 @@ describe('normalizeDetectorFrames — person-presence contact proxy (models with
     const frames = [0, 1, 2, 3, 4, 5].map((i) => shelfFrame(i * 500, all, i === 3 ? [person] : []));
     const out = normalizeDetectorFrames({ frames, handRoleSupported: false });
     expect(out.contactProxy).toBe(false);
+  });
+});
+
+/** Clip-2 pattern (tight 2x2 framing): two confident bottles (top-left,
+ *  bottom-left); the bottom-left one is taken while a person is in frame;
+ *  afterwards a borderline detection elsewhere keeps the raw count at 2. */
+function twoShelfPickupFrames(lateExtraConfidence: number): DetectorFrameResult[] {
+  const top = { x: 0.1, y: 0.15, width: 0.15, height: 0.25 };
+  const bottom = { x: 0.1, y: 0.6, width: 0.15, height: 0.25 };
+  const canSpot = { x: 0.7, y: 0.6, width: 0.1, height: 0.25 };
+  const person = det('PERSON', 0.5, { x: 0, y: 0.5, width: 0.4, height: 0.5 });
+  const frames: DetectorFrameResult[] = [];
+  for (let i = 0; i < 15; i += 1) {
+    const ts = i * 500;
+    if (i < 6) {
+      frames.push(frame(ts, [det('PRODUCT', 0.85, top), det('PRODUCT', 0.8, bottom)]));
+    } else if (i < 9) {
+      frames.push(frame(ts, [det('PRODUCT', 0.7, top), person]));
+    } else {
+      frames.push(
+        frame(ts, [det('PRODUCT', 0.7, top), det('PRODUCT', lateExtraConfidence, canSpot)]),
+      );
+    }
+  }
+  return frames;
+}
+
+describe('deriveTrackChange / track-based disappearance (flat count shelves)', () => {
+  it('a borderline late detection is not counted, so the COUNT rule still fires', () => {
+    const out = normalizeDetectorFrames({
+      frames: twoShelfPickupFrames(0.3),
+      handRoleSupported: false,
+    });
+    expect(out.objectDisappeared).toBe(true);
+    expect(out.notes).toContain('PRODUCT_COUNT_DECREASED');
+    expect(out.notes).not.toContain('PRODUCT_TRACK_LOST');
+  });
+
+  it('a counted late detection elsewhere keeps the count flat: the TRACK rule finds the vanished bottle', () => {
+    const frames = twoShelfPickupFrames(0.45);
+    const track = deriveTrackChange(frames);
+    expect(track.disappearedBox).toEqual({ x: 0.1, y: 0.6, width: 0.15, height: 0.25 });
+    expect(track.appearedBox).toBeNull(); // 0.45 is below the stable-product confidence
+    const out = normalizeDetectorFrames({ frames, handRoleSupported: false });
+    expect(out.objectDisappeared).toBe(true);
+    expect(out.objectAppeared).toBe(false);
+    expect(out.notes).toContain('PRODUCT_TRACK_LOST');
+    expect(out.notes).not.toContain('PRODUCT_COUNT_DECREASED');
+    expect(out.eventBox).toEqual({ x: 0.1, y: 0.6, width: 0.15, height: 0.25 });
+    expect(out.eventTrack.length).toBe(6);
+    expect(out.contactProxy).toBe(true);
+    const features = buildInteractionFeatures({
+      detections: out.detections,
+      handSignal: out.handSignal,
+      cropQuality: NO_QUALITY,
+      objectDisappeared: out.objectDisappeared,
+      objectAppeared: out.objectAppeared,
+      topSkuCandidates: [],
+      eventBox: out.eventBox,
+      eventTrack: out.eventTrack,
+      contactProxy: out.contactProxy,
+    });
+    expect(features.actionCandidate).toBe('PICKUP');
+  });
+
+  it('a confident product at a NEW position while another vanished is a relocation, not a take', () => {
+    const frames = twoShelfPickupFrames(0.8);
+    const track = deriveTrackChange(frames);
+    expect(track.disappearedBox).not.toBeNull();
+    expect(track.appearedBox).toEqual({ x: 0.7, y: 0.6, width: 0.1, height: 0.25 });
+    const out = normalizeDetectorFrames({ frames, handRoleSupported: false });
+    expect(out.notes).toContain('PRODUCT_RELOCATED');
+    expect(out.objectDisappeared).toBe(false);
+    expect(out.objectAppeared).toBe(false);
+    expect(out.contactProxy).toBe(false);
+  });
+
+  it('a stable shelf with nothing taken yields no track event', () => {
+    const top = { x: 0.1, y: 0.15, width: 0.15, height: 0.25 };
+    const bottom = { x: 0.1, y: 0.6, width: 0.15, height: 0.25 };
+    const frames = [0, 1, 2, 3, 4, 5, 6, 7, 8].map((i) =>
+      frame(i * 500, [det('PRODUCT', 0.8, top), det('PRODUCT', 0.75, bottom)]),
+    );
+    expect(deriveTrackChange(frames)).toEqual({ disappearedBox: null, appearedBox: null });
+    expect(trackFor(frames, bottom).length).toBe(9);
   });
 });

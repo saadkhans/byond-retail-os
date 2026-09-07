@@ -53,6 +53,13 @@ export const MAX_EVIDENCE_DETECTIONS = 64;
  *  along the event product's track). Products on a shelf barely move
  *  until they are taken, so a generous floor is enough. */
 const SAME_PRODUCT_MIN_IOU = 0.3;
+/** Products counted for the shelf-level count change: borderline hits
+ *  (an empty slot read as a bottle at 0.27, a can read as a cup at 0.3)
+ *  otherwise keep the count flat across a real pickup. */
+const COUNT_CONFIDENCE_MIN = 0.4;
+/** An early/late product must be seen this confidently to be declared
+ *  vanished/appeared by the TRACK rule (deriveTrackChange). */
+const TRACK_EVENT_CONFIDENCE_MIN = 0.5;
 
 export interface DetectorNormalizationInput {
   frames: DetectorFrameResult[];
@@ -298,6 +305,101 @@ export function localizeEventProduct(
   return { eventBox: event.box, eventTrack };
 }
 
+function productDetections(frame: DetectorFrameResult): DetectorDetection[] {
+  return frame.detections.filter((row) => row.role === 'PRODUCT').sort(byConfidenceDesc);
+}
+
+/** Best-IoU product box per frame for one product (its track). */
+export function trackFor(frames: DetectorFrameResult[], box: NormalizedBox): NormalizedBox[] {
+  const track: NormalizedBox[] = [];
+  for (const frame of frames) {
+    let best: { iou: number; box: NormalizedBox } | null = null;
+    for (const product of productDetections(frame)) {
+      const iou = intersectionOverUnion(product.box, box);
+      if (iou >= SAME_PRODUCT_MIN_IOU && (best === null || iou > best.iou)) {
+        best = { iou, box: product.box };
+      }
+    }
+    if (best) {
+      track.push(best.box);
+    }
+  }
+  return track;
+}
+
+/** Products seen confidently in at least half of the given frames,
+ *  clustered by IoU (greedy, confidence order). */
+function stableProducts(frames: DetectorFrameResult[]): NormalizedBox[] {
+  const clusters: { box: NormalizedBox; confidence: number; frames: number }[] = [];
+  for (const frame of frames) {
+    const seen = new Set<number>();
+    for (const product of productDetections(frame)) {
+      if (product.confidence < TRACK_EVENT_CONFIDENCE_MIN) {
+        continue;
+      }
+      let index = clusters.findIndex(
+        (cluster, i) =>
+          !seen.has(i) &&
+          intersectionOverUnion(cluster.box, product.box) >= SAME_PRODUCT_MIN_IOU,
+      );
+      if (index === -1) {
+        clusters.push({ box: product.box, confidence: product.confidence, frames: 0 });
+        index = clusters.length - 1;
+      } else if (product.confidence > clusters[index].confidence) {
+        clusters[index] = { ...clusters[index], box: product.box, confidence: product.confidence };
+      }
+      seen.add(index);
+      clusters[index].frames += 1;
+    }
+  }
+  const needed = Math.max(2, Math.ceil(frames.length / 2));
+  return clusters.filter((cluster) => cluster.frames >= needed).map((cluster) => cluster.box);
+}
+
+/** Fraction of frames in which SOME product overlaps the box. */
+function presenceFraction(frames: DetectorFrameResult[], box: NormalizedBox): number {
+  if (frames.length === 0) {
+    return 0;
+  }
+  let hits = 0;
+  for (const frame of frames) {
+    if (
+      productDetections(frame).some(
+        (product) => intersectionOverUnion(product.box, box) >= SAME_PRODUCT_MIN_IOU,
+      )
+    ) {
+      hits += 1;
+    }
+  }
+  return hits / frames.length;
+}
+
+/**
+ * TRACK rule for shelves where the product COUNT stays flat across a real
+ * event (a borderline detection elsewhere replaces the taken product in
+ * the count): a product seen confidently in most early frames that no
+ * product overlaps in most late frames has VANISHED; the mirror image has
+ * APPEARED. Both at once means a product was relocated - no event.
+ * Exported for tests.
+ */
+export function deriveTrackChange(frames: DetectorFrameResult[]): {
+  disappearedBox: NormalizedBox | null;
+  appearedBox: NormalizedBox | null;
+} {
+  const total = frames.length;
+  if (total < 3) {
+    return { disappearedBox: null, appearedBox: null };
+  }
+  const third = Math.floor(total / 3);
+  const earlyFrames = frames.slice(0, third);
+  const lateFrames = frames.slice(total - third);
+  const disappearedBox =
+    stableProducts(earlyFrames).find((box) => presenceFraction(lateFrames, box) < 0.5) ?? null;
+  const appearedBox =
+    stableProducts(lateFrames).find((box) => presenceFraction(earlyFrames, box) < 0.5) ?? null;
+  return { disappearedBox, appearedBox };
+}
+
 /** Smallest positive gap between consecutive sampled timestamps; 1 ms
  *  when the sample has no such gap (single frame). Exported for tests. */
 export function samplingIntervalMs(timestamps: number[]): number {
@@ -391,7 +493,9 @@ export function normalizeDetectorFrames(
     personSeen = personSeen || selected.personSeen;
     productPresentByFrame.push(selected.products.length > 0);
     productCountByFrame.push(
-      frame.detections.filter((row) => row.role === 'PRODUCT').length,
+      frame.detections.filter(
+        (row) => row.role === 'PRODUCT' && row.confidence >= COUNT_CONFIDENCE_MIN,
+      ).length,
     );
     const hands = input.handRoleSupported ? selected.hands : [];
     if (hands.length) {
@@ -429,12 +533,37 @@ export function normalizeDetectorFrames(
   }
 
   const presence = deriveObjectCountChange(productCountByFrame);
-  const localized =
+  let localized =
     presence.objectDisappeared === true
       ? localizeEventProduct(frames, 'DISAPPEARED')
       : presence.objectAppeared === true
         ? localizeEventProduct(frames, 'APPEARED')
         : { eventBox: null, eventTrack: [] };
+  let trackLost = false;
+  let trackAppeared = false;
+  let relocated = false;
+  if (presence.objectDisappeared !== true && presence.objectAppeared !== true) {
+    const track = deriveTrackChange(frames);
+    if (track.disappearedBox && track.appearedBox) {
+      relocated = true;
+    } else if (track.disappearedBox) {
+      trackLost = true;
+      presence.objectDisappeared = true;
+      presence.objectAppeared = false;
+      localized = {
+        eventBox: track.disappearedBox,
+        eventTrack: trackFor(frames, track.disappearedBox),
+      };
+    } else if (track.appearedBox) {
+      trackAppeared = true;
+      presence.objectDisappeared = false;
+      presence.objectAppeared = true;
+      localized = {
+        eventBox: track.appearedBox,
+        eventTrack: trackFor(frames, track.appearedBox),
+      };
+    }
+  }
 
   // Hand signal ONLY when the model can see hands. There is no shelf
   // zone geometry yet, so "near shelf zone" means hand-product contact
@@ -480,13 +609,22 @@ export function normalizeDetectorFrames(
   if (presence.countIncreased) {
     notes.push('PRODUCT_COUNT_INCREASED');
   }
+  if (trackLost) {
+    notes.push('PRODUCT_TRACK_LOST');
+  }
+  if (trackAppeared) {
+    notes.push('PRODUCT_TRACK_APPEARED');
+  }
+  if (relocated) {
+    notes.push('PRODUCT_RELOCATED');
+  }
   if (localized.eventBox) {
     notes.push('EVENT_PRODUCT_LOCALIZED');
   }
   const contactProxy =
     !input.handRoleSupported &&
     personSeen &&
-    (presence.countDecreased || presence.countIncreased);
+    (presence.countDecreased || presence.countIncreased || trackLost || trackAppeared);
   if (contactProxy) {
     notes.push('PERSON_PRESENCE_CONTACT_PROXY');
   }
