@@ -6,14 +6,16 @@ import {
   MAX_EVIDENCE_DETECTIONS,
   boundDetectionsAcrossTimeline,
   boxesOverlap,
+  deriveObjectCountChange,
   deriveObjectPresenceChange,
+  localizeEventProduct,
   normalizeDetectorFrames,
   normalizeDetectorResult,
   sampledContactDurationMs,
   samplingIntervalMs,
   selectFrameDetections,
 } from './pretrained-vision.detector-normalization';
-import { sanitizeProviderEvidence } from './pretrained-vision.types';
+import { buildInteractionFeatures, sanitizeProviderEvidence } from './pretrained-vision.types';
 
 function det(
   role: DetectorDetection['role'],
@@ -147,6 +149,9 @@ describe('normalizeDetectorFrames', () => {
       'PRODUCT_IN_HAND_DETECTED',
       'HAND_DETECTED_BY_DETECTOR',
       'PERSON_DETECTED',
+      // Single product 1 → 0 is a count decrease, and it was localized.
+      'PRODUCT_COUNT_DECREASED',
+      'EVENT_PRODUCT_LOCALIZED',
     ]);
   });
 
@@ -325,5 +330,236 @@ describe('normalizeDetectorResult', () => {
       ).handSignal,
     ).toBeNull();
     expect(normalizeDetectorResult({ frames, model: null }).handSignal).toBeNull();
+  });
+});
+
+// --------------------------------------------- Phase 21: shelf counts
+
+/** A 2x2 fridge shelf: four bottles at fixed positions; the hand takes
+ *  the middle-left one. */
+const SHELF = {
+  topLeft: { x: 0.1, y: 0.2, width: 0.15, height: 0.2 },
+  topRight: { x: 0.7, y: 0.2, width: 0.15, height: 0.2 },
+  midLeft: { x: 0.12, y: 0.55, width: 0.15, height: 0.2 },
+  midRight: { x: 0.72, y: 0.55, width: 0.15, height: 0.2 },
+};
+
+const NO_QUALITY = {
+  pre: null,
+  peak: null,
+  post: null,
+  occlusion: null,
+  sharpness: null,
+  brightness: null,
+};
+
+function shelfFrame(
+  timestampMs: number,
+  boxes: { x: number; y: number; width: number; height: number }[],
+  extra: DetectorDetection[] = [],
+): DetectorFrameResult {
+  return frame(timestampMs, [
+    ...boxes.map((box, index) => det('PRODUCT', 0.85 - index * 0.03, box)),
+    ...extra,
+  ]);
+}
+
+/** 15 frames: 4 bottles for 5 frames, a person for 4 frames while the
+ *  mid-left bottle goes, then 3 bottles for 6 frames. */
+function fridgePickupFrames(): DetectorFrameResult[] {
+  const all = [SHELF.topLeft, SHELF.topRight, SHELF.midLeft, SHELF.midRight];
+  const three = [SHELF.topLeft, SHELF.topRight, SHELF.midRight];
+  const person = det('PERSON', 0.7, { x: 0, y: 0.4, width: 0.4, height: 0.6 });
+  const frames: DetectorFrameResult[] = [];
+  for (let i = 0; i < 5; i += 1) frames.push(shelfFrame(i * 500, all));
+  for (let i = 5; i < 9; i += 1) frames.push(shelfFrame(i * 500, three, [person]));
+  for (let i = 9; i < 15; i += 1) frames.push(shelfFrame(i * 500, three));
+  return frames;
+}
+
+describe('deriveObjectCountChange (multi-product shelves)', () => {
+  it('a lower late median count is a disappearance even though products stay present', () => {
+    expect(deriveObjectCountChange([4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3])).toEqual({
+      objectDisappeared: true,
+      objectAppeared: false,
+      countDecreased: true,
+      countIncreased: false,
+    });
+  });
+
+  it('a higher late median count is an appearance (return-shaped)', () => {
+    expect(deriveObjectCountChange([3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4])).toEqual({
+      objectDisappeared: false,
+      objectAppeared: true,
+      countDecreased: false,
+      countIncreased: true,
+    });
+  });
+
+  it('one flickering frame does not move the median', () => {
+    // 4 bottles throughout, one early frame misses one, one late frame
+    // doubles one — the medians stay 4 and 4: present throughout.
+    expect(deriveObjectCountChange([4, 3, 4, 4, 4, 4, 4, 4, 4, 5, 4, 4])).toEqual({
+      objectDisappeared: false,
+      objectAppeared: false,
+      countDecreased: false,
+      countIncreased: false,
+    });
+  });
+
+  it('a single product that vanishes still reads as a disappearance', () => {
+    expect(deriveObjectCountChange([1, 1, 1, 1, 0, 0])).toMatchObject({
+      objectDisappeared: true,
+      objectAppeared: false,
+      countDecreased: true,
+    });
+  });
+
+  it('no product anywhere or too few frames is inconclusive', () => {
+    expect(deriveObjectCountChange([0, 0, 0, 0, 0, 0])).toMatchObject({
+      objectDisappeared: null,
+      objectAppeared: null,
+    });
+    expect(deriveObjectCountChange([2, 1])).toMatchObject({
+      objectDisappeared: null,
+      objectAppeared: null,
+    });
+  });
+});
+
+describe('localizeEventProduct', () => {
+  it('finds the bottle that vanished on a 4 → 3 shelf and tracks it through the early frames', () => {
+    const { eventBox, eventTrack } = localizeEventProduct(fridgePickupFrames(), 'DISAPPEARED');
+    expect(eventBox).toEqual(SHELF.midLeft);
+    // Seen in the first 5 frames only (it is gone afterwards).
+    expect(eventTrack).toHaveLength(5);
+    expect(eventTrack[0]).toEqual(SHELF.midLeft);
+  });
+
+  it('finds the bottle that appeared on a 3 → 4 shelf', () => {
+    const three = [SHELF.topLeft, SHELF.topRight, SHELF.midRight];
+    const all = [SHELF.topLeft, SHELF.topRight, SHELF.midLeft, SHELF.midRight];
+    const frames = [
+      ...[0, 1, 2, 3].map((i) => shelfFrame(i * 500, three)),
+      ...[4, 5, 6, 7, 8].map((i) => shelfFrame(i * 500, all)),
+    ];
+    expect(localizeEventProduct(frames, 'APPEARED').eventBox).toEqual(SHELF.midLeft);
+  });
+
+  it('returns null when every early product matches a late one', () => {
+    const all = [SHELF.topLeft, SHELF.topRight, SHELF.midLeft, SHELF.midRight];
+    const frames = [0, 1, 2, 3, 4, 5].map((i) => shelfFrame(i * 500, all));
+    expect(localizeEventProduct(frames, 'DISAPPEARED')).toEqual({
+      eventBox: null,
+      eventTrack: [],
+    });
+  });
+});
+
+describe('normalizeDetectorFrames — multi-product shelf (Phase 21)', () => {
+  it('4 → 3 bottles with a person mid-clip: disappeared, event box = the vanished bottle, movement on its track', () => {
+    const out = normalizeDetectorFrames({
+      frames: fridgePickupFrames(),
+      handRoleSupported: false,
+    });
+    expect(out.objectDisappeared).toBe(true);
+    expect(out.objectAppeared).toBe(false);
+    expect(out.eventBox).toEqual(SHELF.midLeft);
+    expect(out.eventTrack).toHaveLength(5);
+    expect(out.notes).toEqual(
+      expect.arrayContaining([
+        'PRODUCT_DETECTED',
+        'PERSON_DETECTED',
+        'PRODUCT_COUNT_DECREASED',
+        'EVENT_PRODUCT_LOCALIZED',
+      ]),
+    );
+    expect(out.notes).not.toContain('PRODUCT_COUNT_INCREASED');
+    // The count signal saw all four bottles even though the evidence
+    // rows keep only the two strongest per frame.
+    const firstFrameRows = out.detections.filter((row) => row.timestampMs === 0);
+    expect(firstFrameRows).toHaveLength(2);
+
+    // Feature layer: movement is measured on the vanished bottle's own
+    // track (a still bottle → 0), never on "first box vs last box" of
+    // different products (which would be ~0.6 here).
+    const features = buildInteractionFeatures({
+      detections: out.detections,
+      handSignal: null,
+      cropQuality: NO_QUALITY,
+      objectDisappeared: out.objectDisappeared,
+      objectAppeared: out.objectAppeared,
+      topSkuCandidates: [],
+      eventBox: out.eventBox,
+      eventTrack: out.eventTrack,
+    });
+    expect(features.eventBox).toEqual(SHELF.midLeft);
+    expect(features.bboxMovement).toBe(0);
+    expect(features.objectDisappeared).toBe(true);
+    // Sanitizer keeps the event box.
+    const evidence = sanitizeProviderEvidence({
+      provider: 'YOLO_LOCAL',
+      availability: 'READY',
+      synthetic: false,
+      detections: out.detections,
+      features,
+    });
+    expect(evidence.features?.eventBox).toEqual(SHELF.midLeft);
+  });
+
+  it('3 → 4 bottles: appeared with the new bottle as the event box', () => {
+    const three = [SHELF.topLeft, SHELF.topRight, SHELF.midRight];
+    const all = [SHELF.topLeft, SHELF.topRight, SHELF.midLeft, SHELF.midRight];
+    const out = normalizeDetectorFrames({
+      frames: [
+        ...[0, 1, 2, 3].map((i) => shelfFrame(i * 500, three)),
+        ...[4, 5, 6, 7, 8, 9].map((i) => shelfFrame(i * 500, all)),
+      ],
+      handRoleSupported: false,
+    });
+    expect(out.objectAppeared).toBe(true);
+    expect(out.objectDisappeared).toBe(false);
+    expect(out.eventBox).toEqual(SHELF.midLeft);
+    expect(out.notes).toContain('PRODUCT_COUNT_INCREASED');
+  });
+
+  it('a hand-capable model: proximity is measured to the EVENT product, and contact yields PICKUP', () => {
+    const all = [SHELF.topLeft, SHELF.topRight, SHELF.midLeft, SHELF.midRight];
+    const three = [SHELF.topLeft, SHELF.topRight, SHELF.midRight];
+    const hand = det('HAND', 0.8, { x: 0.14, y: 0.6, width: 0.1, height: 0.1 }, 1);
+    const frames = [
+      ...[0, 1, 2, 3].map((i) => shelfFrame(i * 500, all)),
+      shelfFrame(2000, all, [hand]),
+      shelfFrame(2500, all, [hand]),
+      ...[6, 7, 8, 9, 10, 11].map((i) => shelfFrame(i * 500, three)),
+    ];
+    const out = normalizeDetectorFrames({ frames, handRoleSupported: true });
+    expect(out.eventBox).toEqual(SHELF.midLeft);
+    const features = buildInteractionFeatures({
+      detections: out.detections,
+      handSignal: out.handSignal,
+      cropQuality: NO_QUALITY,
+      objectDisappeared: out.objectDisappeared,
+      objectAppeared: out.objectAppeared,
+      topSkuCandidates: [],
+      eventBox: out.eventBox,
+      eventTrack: out.eventTrack,
+    });
+    expect(features.handProximity).toBeGreaterThan(0.9);
+    expect(features.actionCandidate).toBe('PICKUP');
+  });
+
+  it('no products at all: nulls, no event box, no count notes', () => {
+    const person = det('PERSON', 0.7, { x: 0, y: 0.4, width: 0.4, height: 0.6 });
+    const out = normalizeDetectorFrames({
+      frames: [0, 500, 1000, 1500].map((ts) => frame(ts, [person])),
+      handRoleSupported: false,
+    });
+    expect(out.objectDisappeared).toBeNull();
+    expect(out.objectAppeared).toBeNull();
+    expect(out.eventBox).toBeNull();
+    expect(out.eventTrack).toEqual([]);
+    expect(out.notes).not.toContain('PRODUCT_COUNT_DECREASED');
+    expect(out.notes).not.toContain('EVENT_PRODUCT_LOCALIZED');
   });
 });

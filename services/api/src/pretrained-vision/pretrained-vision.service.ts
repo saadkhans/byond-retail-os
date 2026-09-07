@@ -36,6 +36,7 @@ import {
   ActionCandidate,
   EmbeddingCandidate,
   HandSignalSummary,
+  NormalizedBox,
   ProviderEvidence,
   ProviderStatus,
   sanitizeProviderEvidence,
@@ -74,6 +75,14 @@ export interface PlanogramSection {
   } | null;
   normalizedRackX: number | null;
   normalizedRackY: number | null;
+  /** WHO supplied the rack coordinates the cell was resolved from:
+   *  OPERATOR = typed in with the request; DETECTOR = the center of the
+   *  event product a READY, non-synthetic detector localized, mapped
+   *  through `rackFrameRegion`; NONE = no coordinates (rack fallback). */
+  coordinateSource: PlanogramCoordinateSource;
+  /** Where the rack sits in the ANALYSIS frame (normalized), used for the
+   *  DETECTOR mapping; null when the whole frame is the rack. */
+  rackFrameRegion: RackFrameRegion | null;
   cellAssignmentConfidence: number | null;
   planogramCandidateSkus: string[];
   adjacentCellCandidateSkus: string[];
@@ -118,11 +127,111 @@ export interface PretrainedComparisonReport {
   improvementNotes: string[];
 }
 
+export type PlanogramCoordinateSource = 'OPERATOR' | 'DETECTOR' | 'NONE';
+
+/** Normalized rectangle (0..1, top-left origin) of the ANALYSIS frame
+ *  that the planogram rack occupies. Frame the rack tightly and leave it
+ *  out (= whole frame). */
+export interface RackFrameRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export const WHOLE_FRAME_REGION: RackFrameRegion = {
+  x: 0,
+  y: 0,
+  width: 1,
+  height: 1,
+};
+
 export interface PlanogramContextInput {
   locationId?: string | null;
   rackCode?: string | null;
   normalizedRackX?: number | null;
   normalizedRackY?: number | null;
+  rackFrameRegion?: RackFrameRegion | null;
+}
+
+/** Rack coordinates actually used for cell resolution, with provenance. */
+export interface ResolvedRackCoordinates {
+  normalizedRackX: number | null;
+  normalizedRackY: number | null;
+  source: PlanogramCoordinateSource;
+  rackFrameRegion: RackFrameRegion | null;
+  flags: string[];
+}
+
+const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
+
+/** Allowlist rebuild of a rack frame region: finite 0..1 numbers with a
+ *  positive extent, or null (whole frame). Exported for tests. */
+export function sanitizeRackFrameRegion(raw: unknown): RackFrameRegion | null {
+  const region = raw as Partial<RackFrameRegion> | null | undefined;
+  if (!region || typeof region !== 'object') {
+    return null;
+  }
+  const values = [region.x, region.y, region.width, region.height];
+  if (
+    !values.every((value) => typeof value === 'number' && Number.isFinite(value))
+  ) {
+    return null;
+  }
+  const x = clamp01(region.x as number);
+  const y = clamp01(region.y as number);
+  const width = clamp01(region.width as number);
+  const height = clamp01(region.height as number);
+  return width > 0 && height > 0 ? { x, y, width, height } : null;
+}
+
+/**
+ * Map the CENTER of an event product box (analysis-frame normalized)
+ * onto rack-normalized coordinates through the rack frame region:
+ * rx = (cx - region.x) / region.width (same for y). A center outside the
+ * region is NOT coerced onto the rack — null. Exported for tests.
+ */
+export function mapEventBoxToRack(
+  eventBox: NormalizedBox,
+  region: RackFrameRegion | null,
+): { normalizedRackX: number; normalizedRackY: number } | null {
+  const rect = region ?? WHOLE_FRAME_REGION;
+  const cx = eventBox.x + eventBox.width / 2;
+  const cy = eventBox.y + eventBox.height / 2;
+  if (
+    cx < rect.x ||
+    cx > rect.x + rect.width ||
+    cy < rect.y ||
+    cy > rect.y + rect.height
+  ) {
+    return null;
+  }
+  return {
+    normalizedRackX: Math.round(clamp01((cx - rect.x) / rect.width) * 1000) / 1000,
+    normalizedRackY: Math.round(clamp01((cy - rect.y) / rect.height) * 1000) / 1000,
+  };
+}
+
+/**
+ * The event product box a report may derive rack coordinates from: the
+ * first READY, NON-synthetic, non-classical run whose features carry an
+ * eventBox (the detector's localized vanished / appeared product). Lab
+ * stubs and the classical baseline never steer the planogram cell.
+ */
+export function detectorEventBox(
+  runs: { provider: string; evidence: ProviderEvidence }[],
+): NormalizedBox | null {
+  for (const run of runs) {
+    if (
+      run.provider !== 'CLASSICAL' &&
+      run.evidence.availability === 'READY' &&
+      run.evidence.synthetic === false &&
+      run.evidence.features?.eventBox
+    ) {
+      return run.evidence.features.eventBox;
+    }
+  }
+  return null;
 }
 
 @Injectable()
@@ -263,6 +372,7 @@ export class PretrainedVisionService {
     tenantId: string,
     asset: { locationId: string | null },
     input: PlanogramContextInput,
+    coordinates?: { normalizedRackX: number | null; normalizedRackY: number | null },
   ) {
     const locationId = await this.resolvePlanogramLocation(
       tenantId,
@@ -272,12 +382,60 @@ export class PretrainedVisionService {
     if (!locationId || !input.rackCode) {
       return null;
     }
+    const point = coordinates ?? {
+      normalizedRackX: input.normalizedRackX ?? null,
+      normalizedRackY: input.normalizedRackY ?? null,
+    };
     return this.planograms.narrowCandidates(tenantId, {
       locationId,
       rackCode: input.rackCode,
-      normalizedRackX: input.normalizedRackX ?? null,
-      normalizedRackY: input.normalizedRackY ?? null,
+      normalizedRackX: point.normalizedRackX,
+      normalizedRackY: point.normalizedRackY,
     });
+  }
+
+  /** Operator coordinates as given (source OPERATOR when any was typed). */
+  private operatorCoordinates(input: PlanogramContextInput): ResolvedRackCoordinates {
+    const x = input.normalizedRackX ?? null;
+    const y = input.normalizedRackY ?? null;
+    return {
+      normalizedRackX: x,
+      normalizedRackY: y,
+      source: x !== null || y !== null ? 'OPERATOR' : 'NONE',
+      rackFrameRegion: sanitizeRackFrameRegion(input.rackFrameRegion),
+      flags: [],
+    };
+  }
+
+  /**
+   * Detector-supplied rack coordinates (Phase 21): only when the operator
+   * typed none, a planogram context exists, and a READY non-synthetic
+   * detector localized the event product. Its center maps through the
+   * rack frame region (default: the whole frame); a center outside the
+   * region yields NO coordinates and the EVENT_OUTSIDE_RACK_REGION flag.
+   */
+  private detectorCoordinates(
+    operator: ResolvedRackCoordinates,
+    runs: { provider: string; evidence: ProviderEvidence }[],
+  ): ResolvedRackCoordinates | null {
+    if (operator.source === 'OPERATOR') {
+      return null;
+    }
+    const eventBox = detectorEventBox(runs);
+    if (!eventBox) {
+      return null;
+    }
+    const mapped = mapEventBoxToRack(eventBox, operator.rackFrameRegion);
+    if (!mapped) {
+      return { ...operator, flags: ['EVENT_OUTSIDE_RACK_REGION'] };
+    }
+    return {
+      normalizedRackX: mapped.normalizedRackX,
+      normalizedRackY: mapped.normalizedRackY,
+      source: 'DETECTOR',
+      rackFrameRegion: operator.rackFrameRegion,
+      flags: [],
+    };
   }
 
   /**
@@ -348,7 +506,7 @@ export class PretrainedVisionService {
           version: number;
         })
       | null,
-    input: PlanogramContextInput,
+    coordinates: ResolvedRackCoordinates,
     visualCandidates: { sku: string; score: number }[],
     source: PlanogramSection['source'],
   ): PlanogramSection {
@@ -372,14 +530,16 @@ export class PretrainedVisionService {
             confidence: narrowed.cell.confidence,
           }
         : null,
-      normalizedRackX: input.normalizedRackX ?? null,
-      normalizedRackY: input.normalizedRackY ?? null,
+      normalizedRackX: coordinates.normalizedRackX,
+      normalizedRackY: coordinates.normalizedRackY,
+      coordinateSource: narrowed === null ? 'NONE' : coordinates.source,
+      rackFrameRegion: coordinates.rackFrameRegion,
       cellAssignmentConfidence: narrowed?.cell?.confidence ?? null,
       planogramCandidateSkus: narrowed?.cellSkus ?? [],
       adjacentCellCandidateSkus: narrowed?.adjacentSkus ?? [],
       rackCandidateSkus: narrowed?.rackSkus ?? [],
       planogramMatchStatus: prior.matchStatus,
-      flags: prior.flags,
+      flags: [...new Set([...prior.flags, ...coordinates.flags])],
       reviewRequired: prior.reviewRequired,
       candidates: prior.candidates.slice(0, 10),
     };
@@ -430,6 +590,12 @@ export class PretrainedVisionService {
           : null,
       normalizedRackX: num01(section.normalizedRackX),
       normalizedRackY: num01(section.normalizedRackY),
+      coordinateSource:
+        section.coordinateSource === 'OPERATOR' ||
+        section.coordinateSource === 'DETECTOR'
+          ? section.coordinateSource
+          : 'NONE',
+      rackFrameRegion: sanitizeRackFrameRegion(section.rackFrameRegion),
       cellAssignmentConfidence: num01(section.cellAssignmentConfidence),
       planogramCandidateSkus: skuList(section.planogramCandidateSkus),
       adjacentCellCandidateSkus: skuList(section.adjacentCellCandidateSkus),
@@ -525,6 +691,19 @@ export class PretrainedVisionService {
     ) {
       reviewRequired = true;
       suggestionNotes.push('DETECTOR_CLASSICAL_ACTION_DISAGREEMENT');
+    }
+    // The classical stage found no event (or never ran) and a READY,
+    // non-synthetic detector proposes one: the suggestion carries the
+    // detector's action, labeled as detector-only — still review-gated.
+    if (
+      classicalAction === 'UNKNOWN' &&
+      detectorAction &&
+      detectorAction !== 'UNKNOWN' &&
+      detectorRun?.evidence.availability === 'READY' &&
+      detectorRun.evidence.synthetic === false
+    ) {
+      reviewRequired = true;
+      suggestionNotes.push('DETECTOR_ONLY_EVENT');
     }
     // HARD GATE (Phase 20): real (non-synthetic) pretrained evidence is
     // advisory until confidence thresholds and gates are explicitly
@@ -732,16 +911,31 @@ export class PretrainedVisionService {
       }
     }
 
-    const visual = this.visualCandidates(
-      ctx.classical,
-      evidences.map((evidence) => ({
-        provider: evidence.provider,
-        evidence,
-      })),
-    );
+    const runsForVisual = evidences.map((evidence) => ({
+      provider: evidence.provider,
+      evidence,
+    }));
+    const visual = this.visualCandidates(ctx.classical, runsForVisual);
+    // Detector-supplied rack coordinates: when the operator typed none
+    // and a READY non-synthetic detector localized the event product,
+    // narrowing is RE-RUN with its mapped center before persisting (the
+    // adapters' reference scope above deliberately used the rack-level
+    // narrowing — it only orders candidates, never excludes any).
+    let coordinates = this.operatorCoordinates(input);
+    let scoredNarrowing = narrowed;
+    const fromDetector = this.detectorCoordinates(coordinates, runsForVisual);
+    if (fromDetector) {
+      coordinates = fromDetector;
+      if (fromDetector.source === 'DETECTOR' && narrowed !== null) {
+        scoredNarrowing = await this.resolveNarrowing(tenantId, ctx.asset, input, {
+          normalizedRackX: fromDetector.normalizedRackX,
+          normalizedRackY: fromDetector.normalizedRackY,
+        });
+      }
+    }
     const section = this.buildPlanogramSection(
-      narrowed,
-      input,
+      scoredNarrowing,
+      coordinates,
       visual,
       'SCORED_AT_EVALUATION',
     );
@@ -845,14 +1039,27 @@ export class PretrainedVisionService {
     const storedSection = storedSnapshotRow
       ? this.sanitizeStoredPlanogramSection(storedSnapshotRow.planogramEvidence)
       : null;
-    const section =
-      storedSection ??
-      this.buildPlanogramSection(
-        await this.resolveNarrowing(tenantId, ctx.asset, input),
-        input,
+    let section = storedSection;
+    if (!section) {
+      let coordinates = this.operatorCoordinates(input);
+      let narrowed = await this.resolveNarrowing(tenantId, ctx.asset, input);
+      const fromDetector = this.detectorCoordinates(coordinates, runs);
+      if (fromDetector) {
+        coordinates = fromDetector;
+        if (fromDetector.source === 'DETECTOR' && narrowed !== null) {
+          narrowed = await this.resolveNarrowing(tenantId, ctx.asset, input, {
+            normalizedRackX: fromDetector.normalizedRackX,
+            normalizedRackY: fromDetector.normalizedRackY,
+          });
+        }
+      }
+      section = this.buildPlanogramSection(
+        narrowed,
+        coordinates,
         visual,
         'CURRENT_ACTIVE',
       );
+    }
     return this.assembleReport({
       videoAssetId,
       classical: ctx.classical,

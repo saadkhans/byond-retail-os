@@ -13,7 +13,11 @@ import type {
 import { PlanogramService } from '../planogram/planogram.service';
 import { PlatformModulesService } from '../platform-modules/platform-modules.service';
 import { PrismaService } from '../prisma/prisma.service';
-import { PretrainedVisionService } from './pretrained-vision.service';
+import {
+  PretrainedVisionService,
+  mapEventBoxToRack,
+  sanitizeRackFrameRegion,
+} from './pretrained-vision.service';
 
 const TENANT = 'tenant-1';
 const OTHER_TENANT = 'tenant-2';
@@ -1164,5 +1168,286 @@ describe('PretrainedVisionService — real local detector runtime (Phase 20)', (
     expect(report.fusionSuggestion.reviewRequired).toBe(true);
     expect(report.fusionSuggestion.notes).toContain('PRETRAINED_GATE_NOT_APPROVED');
     expect(runtime.detect).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------- Phase 21: detector-supplied cell
+
+describe('mapEventBoxToRack / sanitizeRackFrameRegion (pure)', () => {
+  it('maps a box center through the rack region (whole frame by default)', () => {
+    expect(
+      mapEventBoxToRack({ x: 0.1, y: 0.5, width: 0.2, height: 0.2 }, null),
+    ).toEqual({ normalizedRackX: 0.2, normalizedRackY: 0.6 });
+    // Rack occupies the right half, top 80% of the frame.
+    expect(
+      mapEventBoxToRack(
+        { x: 0.7, y: 0.3, width: 0.1, height: 0.1 },
+        { x: 0.5, y: 0, width: 0.5, height: 0.8 },
+      ),
+    ).toMatchObject({ normalizedRackX: 0.5 });
+    expect(
+      mapEventBoxToRack(
+        { x: 0.7, y: 0.3, width: 0.1, height: 0.1 },
+        { x: 0.5, y: 0, width: 0.5, height: 0.8 },
+      )?.normalizedRackY,
+    ).toBeCloseTo(0.4375, 2);
+  });
+
+  it('a center outside the region is NOT coerced onto the rack', () => {
+    expect(
+      mapEventBoxToRack(
+        { x: 0.1, y: 0.1, width: 0.1, height: 0.1 },
+        { x: 0.5, y: 0, width: 0.5, height: 1 },
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects malformed regions (non-numbers, zero extent) and clamps the rest', () => {
+    expect(sanitizeRackFrameRegion(null)).toBeNull();
+    expect(sanitizeRackFrameRegion({ x: 0, y: 0, width: 0, height: 1 })).toBeNull();
+    expect(sanitizeRackFrameRegion({ x: 'a', y: 0, width: 1, height: 1 })).toBeNull();
+    expect(sanitizeRackFrameRegion({ x: -1, y: 2, width: 3, height: 0.5 })).toEqual({
+      x: 0,
+      y: 1,
+      width: 1,
+      height: 0.5,
+    });
+  });
+});
+
+describe('PretrainedVisionService — detector-supplied planogram cell (Phase 21)', () => {
+  const narrowedRack = {
+    rackId: 'rack-1',
+    rackCode: 'SHELF-2X2',
+    version: 1,
+    cell: null,
+    matchableCell: false,
+    cellSkus: [],
+    adjacentSkus: [],
+    rackSkus: ['SKU-A', 'SKU-B'],
+    usedRackFallback: true,
+  };
+  const narrowedCell = {
+    ...narrowedRack,
+    cell: { rowIndex: 1, columnIndex: 0, cellCode: 'B1', confidence: 1 },
+    matchableCell: true,
+    cellSkus: ['SKU-A'],
+    adjacentSkus: ['SKU-B'],
+    usedRackFallback: false,
+  };
+  /** Classical baseline with NO event (the fridge clip: NO_MOTION_EVENT). */
+  const noEventFusion = {
+    id: 'fusion-2',
+    createdAt: new Date('2026-09-07T09:00:00Z'),
+    policy: 'UNKNOWN_PRODUCT',
+    evidence: fusionEvidence({
+      detector: { yoloReady: false, events: [], warnings: ['NO_MOTION_EVENT'] },
+      crops: [],
+      fused: [],
+    }),
+  };
+  const SHELF_BOX = { x: 0.1, y: 0.6, width: 0.15, height: 0.2 }; // center (0.175, 0.7)
+
+  /** A 4 → 3 bottle shelf timeline (no hand class): the mid-left bottle goes. */
+  function shelfResult(): LocalDetectorResult {
+    const box = (x: number, y: number) => ({ x, y, width: 0.15, height: 0.2 });
+    const product = (b: { x: number; y: number; width: number; height: number }, c: number) => ({
+      role: 'PRODUCT' as const,
+      classIndex: 0,
+      confidence: c,
+      box: b,
+    });
+    const all = [product(box(0.1, 0.2), 0.9), product(box(0.7, 0.2), 0.88), product(SHELF_BOX, 0.85), product(box(0.7, 0.6), 0.8)];
+    const three = [all[0], all[1], all[3]];
+    const frames = [];
+    for (let i = 0; i < 4; i += 1) frames.push({ frameIndex: i, timestampMs: i * 500, detections: all });
+    for (let i = 4; i < 10; i += 1) frames.push({ frameIndex: i, timestampMs: i * 500, detections: three });
+    return {
+      ...pickupResult(),
+      model: { ...MODEL, roleClassCounts: { PRODUCT: 1, HAND: 0, PERSON: 1, OBJECT: 0 } },
+      frames,
+    };
+  }
+
+  function narrowingFake() {
+    return jest.fn(
+      async (_tenant: string, input: { normalizedRackX?: number | null }): Promise<Row | null> =>
+        typeof input.normalizedRackX === 'number' ? narrowedCell : narrowedRack,
+    ) as unknown as jest.Mock<Promise<Row | null>, []>;
+  }
+
+  it('with x/y blank, the detector event product supplies the cell: narrowing re-runs, source DETECTOR, snapshot persisted', async () => {
+    const runtime = fakeRuntime({ detect: shelfResult() });
+    const { service, planograms, storedRuns } = buildHarness({
+      provider: 'yolo_local',
+      detectorRuntime: runtime,
+      fusionRun: noEventFusion,
+    });
+    planograms.narrowCandidates = narrowingFake();
+    const report = await service.evaluate(
+      TENANT,
+      'va-1',
+      { locationId: 'store-1', rackCode: 'SHELF-2X2' },
+      'user-1',
+      VIEWER,
+    );
+    // First call: rack-level (no coordinates); second: the mapped center.
+    expect(planograms.narrowCandidates).toHaveBeenCalledTimes(2);
+    expect(planograms.narrowCandidates).toHaveBeenLastCalledWith(
+      TENANT,
+      expect.objectContaining({
+        rackCode: 'SHELF-2X2',
+        normalizedRackX: 0.175,
+        normalizedRackY: 0.7,
+      }),
+    );
+    expect(report.planogram.coordinateSource).toBe('DETECTOR');
+    expect(report.planogram.cell?.cellCode).toBe('B1');
+    expect(report.planogram.normalizedRackX).toBe(0.175);
+    expect(report.planogram.normalizedRackY).toBe(0.7);
+    expect(report.planogram.rackFrameRegion).toBeNull();
+    expect(report.planogram.planogramCandidateSkus).toEqual(['SKU-A']);
+    // The persisted snapshot carries the provenance.
+    const yoloRow = storedRuns.find((row) => row.provider === 'YOLO_LOCAL') as Row;
+    expect(yoloRow.planogramEvidence).toMatchObject({
+      coordinateSource: 'DETECTOR',
+      normalizedRackX: 0.175,
+      normalizedRackY: 0.7,
+    });
+    // Evidence carries the event product and the shelf-count notes.
+    const yolo = report.runs.find((run) => run.provider === 'YOLO_LOCAL');
+    expect(yolo?.evidence.features?.eventBox).toEqual(SHELF_BOX);
+    expect(yolo?.evidence.features?.objectDisappeared).toBe(true);
+    expect(yolo?.evidence.notes).toEqual(
+      expect.arrayContaining(['PRODUCT_COUNT_DECREASED', 'EVENT_PRODUCT_LOCALIZED']),
+    );
+    // Classical baseline still present (no event) and never replaced.
+    expect(report.classical).toMatchObject({ action: 'UNKNOWN' });
+    expect(report.runs.find((run) => run.provider === 'CLASSICAL')?.status).toBe('COMPLETED');
+  });
+
+  it('operator x/y win over the detector (source OPERATOR, single narrowing call)', async () => {
+    const runtime = fakeRuntime({ detect: shelfResult() });
+    const { service, planograms, storedRuns } = buildHarness({
+      provider: 'yolo_local',
+      detectorRuntime: runtime,
+      fusionRun: noEventFusion,
+    });
+    planograms.narrowCandidates = narrowingFake();
+    const report = await service.evaluate(
+      TENANT,
+      'va-1',
+      { locationId: 'store-1', rackCode: 'SHELF-2X2', normalizedRackX: 0.75, normalizedRackY: 0.25 },
+      'user-1',
+      VIEWER,
+    );
+    expect(planograms.narrowCandidates).toHaveBeenCalledTimes(1);
+    expect(report.planogram.coordinateSource).toBe('OPERATOR');
+    expect(report.planogram.normalizedRackX).toBe(0.75);
+    expect(report.planogram.normalizedRackY).toBe(0.25);
+    expect(
+      (storedRuns.find((row) => row.provider === 'YOLO_LOCAL') as Row).planogramEvidence,
+    ).toMatchObject({ coordinateSource: 'OPERATOR' });
+  });
+
+  it('maps through an explicit rack frame region, and flags an event outside it', async () => {
+    const runtime = fakeRuntime({ detect: shelfResult() });
+    const { service, planograms } = buildHarness({
+      provider: 'yolo_local',
+      detectorRuntime: runtime,
+      fusionRun: noEventFusion,
+    });
+    planograms.narrowCandidates = narrowingFake();
+    // Rack = left 40% x, lower 80% of the frame: center (0.175, 0.7) → (0.4375, 0.625).
+    const inside = await service.evaluate(
+      TENANT,
+      'va-1',
+      {
+        locationId: 'store-1',
+        rackCode: 'SHELF-2X2',
+        rackFrameRegion: { x: 0, y: 0.2, width: 0.4, height: 0.8 },
+      },
+      'user-1',
+      VIEWER,
+    );
+    expect(inside.planogram.coordinateSource).toBe('DETECTOR');
+    expect(inside.planogram.normalizedRackX).toBeCloseTo(0.4375, 2);
+    expect(inside.planogram.normalizedRackY).toBe(0.625);
+    expect(inside.planogram.rackFrameRegion).toEqual({ x: 0, y: 0.2, width: 0.4, height: 0.8 });
+    expect(inside.planogram.flags).not.toContain('EVENT_OUTSIDE_RACK_REGION');
+
+    // Rack = right half only: the vanished bottle sits outside it.
+    const outside = await service.evaluate(
+      TENANT,
+      'va-1',
+      {
+        locationId: 'store-1',
+        rackCode: 'SHELF-2X2',
+        rackFrameRegion: { x: 0.5, y: 0, width: 0.5, height: 1 },
+      },
+      'user-1',
+      VIEWER,
+    );
+    expect(outside.planogram.coordinateSource).toBe('NONE');
+    expect(outside.planogram.normalizedRackX).toBeNull();
+    expect(outside.planogram.flags).toContain('EVENT_OUTSIDE_RACK_REGION');
+    expect(outside.planogram.cell).toBeNull();
+  });
+
+  it('a detector-only event: classical found none, detector proposes PICKUP → DETECTOR_ONLY_EVENT, still review-required', async () => {
+    // Hand-capable model + contact so the action resolves to PICKUP.
+    const runtime = fakeRuntime({ detect: pickupResult() });
+    const { service } = buildHarness({
+      provider: 'yolo_local',
+      detectorRuntime: runtime,
+      fusionRun: noEventFusion,
+    });
+    const report = await service.evaluate(TENANT, 'va-1', {}, 'user-1', VIEWER);
+    expect(report.classical?.action).toBe('UNKNOWN');
+    expect(report.fusionSuggestion.action).toBe('PICKUP');
+    expect(report.fusionSuggestion.reviewRequired).toBe(true);
+    expect(report.fusionSuggestion.notes).toEqual(
+      expect.arrayContaining(['DETECTOR_ONLY_EVENT', 'PRETRAINED_GATE_NOT_APPROVED', 'STILL_NEEDS_REVIEW']),
+    );
+    expect(report.fusionSuggestion.notes).not.toContain('DETECTOR_CLASSICAL_ACTION_DISAGREEMENT');
+  });
+
+  it('a lab stub never steers the planogram cell (source stays NONE)', async () => {
+    const { service, planograms } = buildHarness({
+      provider: 'yolo_local',
+      stubMode: true,
+      fusionRun: noEventFusion,
+    });
+    planograms.narrowCandidates = narrowingFake();
+    const report = await service.evaluate(
+      TENANT,
+      'va-1',
+      { locationId: 'store-1', rackCode: 'SHELF-2X2' },
+      'user-1',
+      VIEWER,
+    );
+    expect(planograms.narrowCandidates).toHaveBeenCalledTimes(1);
+    expect(report.planogram.coordinateSource).toBe('NONE');
+  });
+
+  it('report() shows the stored DETECTOR snapshot and re-sanitizes its provenance', async () => {
+    const runtime = fakeRuntime({ detect: shelfResult() });
+    const { service, planograms, storedRuns } = buildHarness({
+      provider: 'yolo_local',
+      detectorRuntime: runtime,
+      fusionRun: noEventFusion,
+    });
+    planograms.narrowCandidates = narrowingFake();
+    await service.evaluate(TENANT, 'va-1', { locationId: 'store-1', rackCode: 'SHELF-2X2' }, 'user-1', VIEWER);
+    // Tamper with the stored snapshot: an unknown source must not leak through.
+    for (const row of storedRuns) {
+      (row.planogramEvidence as Row).coordinateSource = 'C:/evil/path';
+      (row.planogramEvidence as Row).rackFrameRegion = { x: 'nope' };
+    }
+    const report = await service.report(TENANT, 'va-1', {}, VIEWER);
+    expect(report.planogram.source).toBe('SCORED_AT_EVALUATION');
+    expect(report.planogram.coordinateSource).toBe('NONE');
+    expect(report.planogram.rackFrameRegion).toBeNull();
+    expect(JSON.stringify(report)).not.toContain('C:/evil');
   });
 });

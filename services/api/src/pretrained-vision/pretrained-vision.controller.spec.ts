@@ -4,7 +4,13 @@ import {
   REQUIRED_PERMISSIONS_KEY,
   TENANT_ONLY_KEY,
 } from '../auth/decorators/access-policy.decorators';
-import { PretrainedVisionController } from './pretrained-vision.module';
+import { validate } from 'class-validator';
+import { plainToInstance } from 'class-transformer';
+import {
+  EvaluateClipDto,
+  PretrainedVisionController,
+  parseRackFrameRegionQuery,
+} from './pretrained-vision.module';
 import { PretrainedVisionService } from './pretrained-vision.service';
 
 /**
@@ -59,5 +65,46 @@ describe('PretrainedVisionController.providers (Codex P1)', () => {
     expect(response.providers).toEqual(statuses);
     // What Express would serialize: the array, not "{}".
     expect(JSON.parse(JSON.stringify(response))).toEqual({ providers: statuses });
+  });
+});
+
+describe('EvaluateClipDto.rackFrameRegion (Phase 21)', () => {
+  const errorsFor = async (body: Record<string, unknown>) =>
+    validate(plainToInstance(EvaluateClipDto, body));
+
+  it('accepts a normalized region with a positive extent', async () => {
+    expect(
+      await errorsFor({ rackFrameRegion: { x: 0.1, y: 0.2, width: 0.8, height: 0.5 } }),
+    ).toHaveLength(0);
+  });
+
+  it('is optional', async () => {
+    expect(await errorsFor({ rackCode: 'R1' })).toHaveLength(0);
+  });
+
+  it.each([
+    ['x above 1', { x: 1.2, y: 0, width: 0.5, height: 0.5 }],
+    ['negative y', { x: 0, y: -0.1, width: 0.5, height: 0.5 }],
+    ['zero width', { x: 0, y: 0, width: 0, height: 0.5 }],
+    ['non-numeric height', { x: 0, y: 0, width: 0.5, height: 'tall' }],
+    ['missing fields', { x: 0.2 }],
+  ])('rejects %s', async (_label, region) => {
+    const errors = await errorsFor({ rackFrameRegion: region });
+    expect(errors.length).toBeGreaterThan(0);
+  });
+});
+
+describe('parseRackFrameRegionQuery (report query)', () => {
+  it('needs all four numbers in 0..1 with a positive extent', () => {
+    expect(parseRackFrameRegionQuery({ rx: '0.1', ry: '0.2', rw: '0.8', rh: '0.5' })).toEqual({
+      x: 0.1,
+      y: 0.2,
+      width: 0.8,
+      height: 0.5,
+    });
+    expect(parseRackFrameRegionQuery({ rx: '0.1', ry: '0.2', rw: '0.8' })).toBeNull();
+    expect(parseRackFrameRegionQuery({ rx: '0.1', ry: '0.2', rw: '0', rh: '0.5' })).toBeNull();
+    expect(parseRackFrameRegionQuery({ rx: '2', ry: '0.2', rw: '0.8', rh: '0.5' })).toBeNull();
+    expect(parseRackFrameRegionQuery({})).toBeNull();
   });
 });

@@ -30,6 +30,12 @@ import {
  * that subsampling. Detector detections carry NO quality block: no
  * per-frame sharpness/occlusion/brightness is measured for them, and
  * the classical crop's numbers belong to the classical baseline only.
+ * Multi-product shelves: appearance / disappearance is decided on the
+ * per-frame PRODUCT COUNT (median of the first third vs the last third -
+ * "4 bottles, then 3" is a pickup-shaped change even though products
+ * stay present throughout), and the product that vanished / appeared is
+ * localized by IoU-matching early boxes to late boxes; its box becomes
+ * `eventBox` and its per-frame track drives movement / hand proximity.
  * Nothing here decides anything
  * downstream: the action candidate stays a CANDIDATE and the service
  * forces review for every real pretrained contribution.
@@ -43,6 +49,10 @@ const HANDS_PER_FRAME = 1;
 const IN_HAND_MIN_IOU = 0.05;
 /** Same ceiling as sanitizeProviderEvidence - kept in sync by a test. */
 export const MAX_EVIDENCE_DETECTIONS = 64;
+/** Minimum IoU for "the same product" across early and late frames (and
+ *  along the event product's track). Products on a shelf barely move
+ *  until they are taken, so a generous floor is enough. */
+const SAME_PRODUCT_MIN_IOU = 0.3;
 
 export interface DetectorNormalizationInput {
   frames: DetectorFrameResult[];
@@ -56,6 +66,12 @@ export interface DetectorNormalizationOutput {
   handSignal: HandSignalSummary | null;
   objectDisappeared: boolean | null;
   objectAppeared: boolean | null;
+  /** The product that vanished / appeared (multi-product shelves), or
+   *  null when no single product could be localized. */
+  eventBox: NormalizedBox | null;
+  /** That product's box in every sampled frame it was seen in, in time
+   *  order (empty when there is no event box). */
+  eventTrack: NormalizedBox[];
   notes: string[];
 }
 
@@ -146,6 +162,138 @@ export function deriveObjectPresenceChange(productPresentByFrame: boolean[]): {
   return { objectDisappeared: null, objectAppeared: null };
 }
 
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1
+    ? sorted[mid]
+    : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/**
+ * Count-based appearance / disappearance for MULTI-PRODUCT shelves: the
+ * MEDIAN product count of the first third of frames against the last
+ * third (a median shrugs off one flickering frame). A lower late count
+ * is pickup-shaped (`objectDisappeared`), a higher one return-shaped
+ * (`objectAppeared`). Equal counts fall back to the any-present rule of
+ * deriveObjectPresenceChange, so a single product that vanished still
+ * reads as a disappearance and "present throughout" as no change. No
+ * product anywhere is inconclusive (nulls). Exported for tests.
+ */
+export function deriveObjectCountChange(productCountByFrame: number[]): {
+  objectDisappeared: boolean | null;
+  objectAppeared: boolean | null;
+  countDecreased: boolean;
+  countIncreased: boolean;
+} {
+  const total = productCountByFrame.length;
+  const none = {
+    objectDisappeared: null,
+    objectAppeared: null,
+    countDecreased: false,
+    countIncreased: false,
+  };
+  if (total < 3 || !productCountByFrame.some((count) => count > 0)) {
+    return none;
+  }
+  const third = Math.floor(total / 3);
+  const early = median(productCountByFrame.slice(0, third));
+  const late = median(productCountByFrame.slice(total - third));
+  if (late < early) {
+    return {
+      objectDisappeared: true,
+      objectAppeared: false,
+      countDecreased: true,
+      countIncreased: false,
+    };
+  }
+  if (late > early) {
+    return {
+      objectDisappeared: false,
+      objectAppeared: true,
+      countDecreased: false,
+      countIncreased: true,
+    };
+  }
+  const presence = deriveObjectPresenceChange(
+    productCountByFrame.map((count) => count > 0),
+  );
+  return { ...presence, countDecreased: false, countIncreased: false };
+}
+
+/**
+ * Localize the product an event is ABOUT. Early = first third of frames,
+ * late = last third; the representative frame of each side is the first
+ * frame whose product count equals that side's median (a frame the
+ * median describes, never a flicker). Early boxes are greedily matched to
+ * late boxes by IoU (best pairs first, floor SAME_PRODUCT_MIN_IOU); for a
+ * disappearance the event product is the highest-confidence UNMATCHED
+ * early box, for an appearance the highest-confidence unmatched LATE box.
+ * Its track is its best-IoU product box in every frame where one
+ * overlaps it. Exported for tests.
+ */
+export function localizeEventProduct(
+  frames: DetectorFrameResult[],
+  kind: 'DISAPPEARED' | 'APPEARED',
+): { eventBox: NormalizedBox | null; eventTrack: NormalizedBox[] } {
+  const total = frames.length;
+  if (total < 3) {
+    return { eventBox: null, eventTrack: [] };
+  }
+  const productsOf = (frame: DetectorFrameResult) =>
+    frame.detections.filter((row) => row.role === 'PRODUCT').sort(byConfidenceDesc);
+  const third = Math.floor(total / 3);
+  const earlyFrames = frames.slice(0, third);
+  const lateFrames = frames.slice(total - third);
+  const representative = (side: DetectorFrameResult[]) => {
+    const target = median(side.map((frame) => productsOf(frame).length));
+    return side.find((frame) => productsOf(frame).length === target) ?? side[0];
+  };
+  const earlyBoxes = productsOf(representative(earlyFrames));
+  const lateBoxes = productsOf(representative(lateFrames));
+
+  const pairs: { early: number; late: number; iou: number }[] = [];
+  earlyBoxes.forEach((early, earlyIndex) => {
+    lateBoxes.forEach((late, lateIndex) => {
+      const iou = intersectionOverUnion(early.box, late.box);
+      if (iou >= SAME_PRODUCT_MIN_IOU) {
+        pairs.push({ early: earlyIndex, late: lateIndex, iou });
+      }
+    });
+  });
+  pairs.sort((a, b) => b.iou - a.iou);
+  const matchedEarly = new Set<number>();
+  const matchedLate = new Set<number>();
+  for (const pair of pairs) {
+    if (!matchedEarly.has(pair.early) && !matchedLate.has(pair.late)) {
+      matchedEarly.add(pair.early);
+      matchedLate.add(pair.late);
+    }
+  }
+  const unmatched =
+    kind === 'DISAPPEARED'
+      ? earlyBoxes.filter((_row, index) => !matchedEarly.has(index))
+      : lateBoxes.filter((_row, index) => !matchedLate.has(index));
+  const event = unmatched[0]; // already confidence-sorted
+  if (!event) {
+    return { eventBox: null, eventTrack: [] };
+  }
+  const eventTrack: NormalizedBox[] = [];
+  for (const frame of frames) {
+    let best: { iou: number; box: NormalizedBox } | null = null;
+    for (const product of productsOf(frame)) {
+      const iou = intersectionOverUnion(product.box, event.box);
+      if (iou >= SAME_PRODUCT_MIN_IOU && (best === null || iou > best.iou)) {
+        best = { iou, box: product.box };
+      }
+    }
+    if (best) {
+      eventTrack.push(best.box);
+    }
+  }
+  return { eventBox: event.box, eventTrack };
+}
+
 /** Smallest positive gap between consecutive sampled timestamps; 1 ms
  *  when the sample has no such gap (single frame). Exported for tests. */
 export function samplingIntervalMs(timestamps: number[]): number {
@@ -222,6 +370,10 @@ export function normalizeDetectorFrames(
   const frames = [...input.frames].sort((a, b) => a.timestampMs - b.timestampMs);
   const detections: NormalizedDetection[] = [];
   const productPresentByFrame: boolean[] = [];
+  // Product COUNT per frame from ALL detections (before per-frame caps):
+  // the shelf-level change signal must see every product, not the two
+  // strongest rows the evidence keeps.
+  const productCountByFrame: number[] = [];
   let personSeen = false;
   let handSeen = false;
   let inHandSeen = false;
@@ -234,6 +386,9 @@ export function normalizeDetectorFrames(
     const selected = selectFrameDetections(frame);
     personSeen = personSeen || selected.personSeen;
     productPresentByFrame.push(selected.products.length > 0);
+    productCountByFrame.push(
+      frame.detections.filter((row) => row.role === 'PRODUCT').length,
+    );
     const hands = input.handRoleSupported ? selected.hands : [];
     if (hands.length) {
       handSeen = true;
@@ -269,7 +424,13 @@ export function normalizeDetectorFrames(
     }
   }
 
-  const presence = deriveObjectPresenceChange(productPresentByFrame);
+  const presence = deriveObjectCountChange(productCountByFrame);
+  const localized =
+    presence.objectDisappeared === true
+      ? localizeEventProduct(frames, 'DISAPPEARED')
+      : presence.objectAppeared === true
+        ? localizeEventProduct(frames, 'APPEARED')
+        : { eventBox: null, eventTrack: [] };
 
   // Hand signal ONLY when the model can see hands. There is no shelf
   // zone geometry yet, so "near shelf zone" means hand-product contact
@@ -309,6 +470,15 @@ export function normalizeDetectorFrames(
   if (personSeen) {
     notes.push('PERSON_DETECTED');
   }
+  if (presence.countDecreased) {
+    notes.push('PRODUCT_COUNT_DECREASED');
+  }
+  if (presence.countIncreased) {
+    notes.push('PRODUCT_COUNT_INCREASED');
+  }
+  if (localized.eventBox) {
+    notes.push('EVENT_PRODUCT_LOCALIZED');
+  }
 
   const bounded = boundDetectionsAcrossTimeline(detections, MAX_EVIDENCE_DETECTIONS);
   if (bounded.length < detections.length) {
@@ -320,6 +490,8 @@ export function normalizeDetectorFrames(
     handSignal,
     objectDisappeared: presence.objectDisappeared,
     objectAppeared: presence.objectAppeared,
+    eventBox: localized.eventBox,
+    eventTrack: localized.eventTrack,
     notes,
   };
 }
