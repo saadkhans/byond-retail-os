@@ -272,6 +272,9 @@ works on **counts and localization**:
 
 **Models without a HAND role (e.g. COCO):** hand contact cannot be observed, so when a person was seen while the product count changed, the normalization raises a *contact proxy* (note `PERSON_PRESENCE_CONTACT_PROXY`). It only lets the count change become a PICKUP / RETURN *candidate*; the Phase 20 review gate still forces human review.
 
+**Flat-count shelves (track rule):** products are counted only at confidence >= 0.4, and when the count still does not change across a real take (a borderline detection elsewhere replaces the taken product in the count), a product seen confidently (>= 0.5) in most early frames that no product overlaps in most late frames is treated as vanished (`PRODUCT_TRACK_LOST`); the mirror case is `PRODUCT_TRACK_APPEARED`; both at once is a relocation (`PRODUCT_RELOCATED`, no event).
+
+
 
 ### Detector-supplied planogram coordinates
 
