@@ -91,7 +91,13 @@ export interface PlanogramSection {
   flags: string[];
   reviewRequired: boolean;
   candidates: { sku: string; score: number; planogramBoost: number }[];
+  /** Phase 22 — where the rack context came from: REQUEST = typed with
+   *  this call; ASSET = the clip's stored planogram binding (set at
+   *  upload); NONE = no rack context. */
+  bindingSource: PlanogramBindingSource;
 }
+
+export type PlanogramBindingSource = 'REQUEST' | 'ASSET' | 'NONE';
 
 export interface PretrainedComparisonReport {
   videoAssetId: string;
@@ -295,10 +301,38 @@ export class PretrainedVisionService {
     }
   }
 
+  /**
+   * Phase 22: a clip bound to a planogram rack at upload supplies the
+   * rack context itself. Explicit request values win (the operator can
+   * always override); the stored binding fills what the request omits.
+   */
+  private applyAssetBinding(
+    input: PlanogramContextInput,
+    asset: { planogramRackCode: string | null; rackFrameRegion: unknown },
+  ): { input: PlanogramContextInput; bindingSource: PlanogramBindingSource } {
+    const requestRack = input.rackCode ?? null;
+    const assetRack = asset.planogramRackCode ?? null;
+    const rackCode = requestRack ?? assetRack;
+    const rackFrameRegion =
+      input.rackFrameRegion ??
+      (requestRack === null ? sanitizeRackFrameRegion(asset.rackFrameRegion) : null);
+    return {
+      input: { ...input, rackCode, rackFrameRegion },
+      bindingSource: requestRack ? 'REQUEST' : assetRack ? 'ASSET' : 'NONE',
+    };
+  }
+
   private async loadClipContext(tenantId: string, videoAssetId: string) {
     const asset = await this.prisma.videoAsset.findFirst({
       where: { tenantId, id: videoAssetId, deletedAt: null },
-      select: { id: true, width: true, height: true, locationId: true },
+      select: {
+        id: true,
+        width: true,
+        height: true,
+        locationId: true,
+        planogramRackCode: true,
+        rackFrameRegion: true,
+      },
     });
     if (!asset) {
       throw new NotFoundException('video asset not found');
@@ -509,6 +543,7 @@ export class PretrainedVisionService {
     coordinates: ResolvedRackCoordinates,
     visualCandidates: { sku: string; score: number }[],
     source: PlanogramSection['source'],
+    bindingSource: PlanogramBindingSource = 'NONE',
   ): PlanogramSection {
     const prior: PlanogramPriorResult = applyPlanogramPrior(
       visualCandidates,
@@ -542,6 +577,7 @@ export class PretrainedVisionService {
       flags: [...new Set([...prior.flags, ...coordinates.flags])],
       reviewRequired: prior.reviewRequired,
       candidates: prior.candidates.slice(0, 10),
+      bindingSource: narrowed === null ? 'NONE' : bindingSource,
     };
   }
 
@@ -596,6 +632,10 @@ export class PretrainedVisionService {
           ? section.coordinateSource
           : 'NONE',
       rackFrameRegion: sanitizeRackFrameRegion(section.rackFrameRegion),
+      bindingSource:
+        section.bindingSource === 'REQUEST' || section.bindingSource === 'ASSET'
+          ? section.bindingSource
+          : 'NONE',
       cellAssignmentConfidence: num01(section.cellAssignmentConfidence),
       planogramCandidateSkus: skuList(section.planogramCandidateSkus),
       adjacentCellCandidateSkus: skuList(section.adjacentCellCandidateSkus),
@@ -863,7 +903,7 @@ export class PretrainedVisionService {
   async evaluate(
     tenantId: string,
     videoAssetId: string,
-    input: PlanogramContextInput,
+    rawInput: PlanogramContextInput,
     actorId: string | undefined,
     viewer: { hasVideoAssetReadPermission?: boolean },
   ): Promise<PretrainedComparisonReport> {
@@ -875,6 +915,8 @@ export class PretrainedVisionService {
           'against the classical baseline',
       );
     }
+    const bound = this.applyAssetBinding(rawInput, ctx.asset);
+    const input = bound.input;
     // Planogram narrowing FIRST: it validates the store binding (a
     // mismatched location rejects BEFORE anything runs or persists) and
     // its tiers seed the embedding candidate scope.
@@ -938,6 +980,7 @@ export class PretrainedVisionService {
       coordinates,
       visual,
       'SCORED_AT_EVALUATION',
+      bound.bindingSource,
     );
 
     const persisted: {
@@ -995,11 +1038,13 @@ export class PretrainedVisionService {
   async report(
     tenantId: string,
     videoAssetId: string,
-    input: PlanogramContextInput,
+    rawInput: PlanogramContextInput,
     viewer: { hasVideoAssetReadPermission?: boolean },
   ): Promise<PretrainedComparisonReport> {
     await this.requireVideoBoundary(tenantId, viewer);
     const ctx = await this.loadClipContext(tenantId, videoAssetId);
+    const bound = this.applyAssetBinding(rawInput, ctx.asset);
+    const input = bound.input;
     const rows = await this.prisma.pretrainedVisionRun.findMany({
       where: { tenantId, videoAssetId },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
@@ -1058,6 +1103,7 @@ export class PretrainedVisionService {
         coordinates,
         visual,
         'CURRENT_ACTIVE',
+        bound.bindingSource,
       );
     }
     return this.assembleReport({

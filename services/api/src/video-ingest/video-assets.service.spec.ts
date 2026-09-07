@@ -232,6 +232,8 @@ function buildService(overrides: {
   // completely in every environment.
   allowUnscreenedUploads?: string;
   nodeEnv?: string;
+  /** Phase 22 planogram-binding validator fake (absent = not wired). */
+  bindingValidator?: Record<string, unknown>;
 } = {}) {
   const repository = {
     createAsset: jest.fn(async (_t: string, data: unknown, build: (a: unknown) => unknown) => {
@@ -617,6 +619,7 @@ function buildService(overrides: {
     modules as never,
     auditLog as never,
     config,
+    overrides.bindingValidator as never,
   );
   return {
     service,
@@ -7073,5 +7076,122 @@ describe('VideoAssetsService.getMediaStream', () => {
       service.getMediaStream(TENANT, 'asset-1'),
     ).rejects.toBeInstanceOf(NotFoundException);
     expect(storage.createReadStream).not.toHaveBeenCalled();
+  });
+});
+
+describe('Phase 22 — planogram binding at upload and afterwards', () => {
+  it('a rack code is validated BEFORE any byte is stored; a rejection stores nothing', async () => {
+    const { service, repository, storage } = buildService({
+      bindingValidator: {
+        resolve: jest.fn(async () => {
+          throw new BadRequestException('No ACTIVE planogram rack "R9" at the selected store');
+        }),
+      },
+    });
+    await expect(
+      service.upload(TENANT, uploadFile(), {
+        ...ATTEST,
+        locationId: 'store-1',
+        planogramRackCode: 'R9',
+      }),
+    ).rejects.toThrow(BadRequestException);
+    expect(storage.put).not.toHaveBeenCalled();
+    expect(repository.createAsset).not.toHaveBeenCalled();
+  });
+
+  it('a rack code without the validator wired fails closed (never stored unvalidated)', async () => {
+    const { service, repository } = buildService();
+    await expect(
+      service.upload(TENANT, uploadFile(), {
+        ...ATTEST,
+        locationId: 'store-1',
+        planogramRackCode: 'SHELF-2X2',
+      }),
+    ).rejects.toThrow(BadRequestException);
+    expect(repository.createAsset).not.toHaveBeenCalled();
+  });
+
+  it('persists the validated rack code and region with the asset', async () => {
+    const resolve = jest.fn(async () => ({
+      planogramRackCode: 'SHELF-2X2',
+      rackFrameRegion: { x: 0, y: 0.15, width: 1, height: 0.57 },
+    }));
+    const { service, repository } = buildService({ bindingValidator: { resolve } });
+    await service.upload(TENANT, uploadFile(), {
+      ...ATTEST,
+      locationId: 'store-1',
+      planogramRackCode: 'shelf-2x2',
+      rackFrameRegion: '{"x":0,"y":0.15,"width":1,"height":0.57}',
+    });
+    expect(resolve).toHaveBeenCalledWith(TENANT, {
+      locationId: 'store-1',
+      planogramRackCode: 'shelf-2x2',
+      rackFrameRegion: '{"x":0,"y":0.15,"width":1,"height":0.57}',
+    });
+    const [, data] = repository.createAsset.mock.calls[0] as unknown as [
+      string,
+      { planogramRackCode?: string; rackFrameRegion?: unknown },
+    ];
+    expect(data.planogramRackCode).toBe('SHELF-2X2');
+    expect(data.rackFrameRegion).toEqual({ x: 0, y: 0.15, width: 1, height: 0.57 });
+  });
+
+  it('an upload without a rack code is byte-for-byte the pre-Phase-22 upload', async () => {
+    const resolve = jest.fn();
+    const { service, repository } = buildService({ bindingValidator: { resolve } });
+    await service.upload(TENANT, uploadFile(), { ...ATTEST });
+    expect(resolve).not.toHaveBeenCalled();
+    const [, data] = repository.createAsset.mock.calls[0] as unknown as [
+      string,
+      { planogramRackCode?: string; rackFrameRegion?: unknown },
+    ];
+    expect(data.planogramRackCode).toBeUndefined();
+    expect(data.rackFrameRegion).toBeUndefined();
+  });
+
+  it('updateBinding validates against the effective store and writes tenant-scoped', async () => {
+    const resolve = jest.fn(async () => ({
+      planogramRackCode: 'R1',
+      rackFrameRegion: null,
+    }));
+    const updateBinding = jest.fn(async (_t: string, _id: string, data: unknown) => assetRow({ ...(data as object) }));
+    const { service } = buildService({
+      bindingValidator: { resolve },
+      repository: {
+        findById: jest.fn(async () => assetRow({ locationId: 'store-1' })),
+        updateBinding,
+      },
+    });
+    await service.updateBinding(TENANT, 'asset-1', { planogramRackCode: 'r1' }, { id: 'u1', email: 'u@x.io' });
+    expect(resolve).toHaveBeenCalledWith(TENANT, {
+      locationId: 'store-1',
+      planogramRackCode: 'r1',
+      rackFrameRegion: null,
+    });
+    expect(updateBinding).toHaveBeenCalledWith(
+      TENANT,
+      'asset-1',
+      { planogramRackCode: 'R1', rackFrameRegion: null },
+      expect.any(Function),
+    );
+  });
+
+  it('updateBinding refuses to move a unit-bound clip to another store and 404s on a missing asset', async () => {
+    const { service } = buildService({
+      bindingValidator: { resolve: jest.fn() },
+      repository: {
+        findById: jest.fn(async () => assetRow({ locationId: 'store-1', unitId: 'unit-1' })),
+      },
+    });
+    await expect(
+      service.updateBinding(TENANT, 'asset-1', { locationId: 'store-2' }),
+    ).rejects.toThrow(BadRequestException);
+    const missing = buildService({
+      bindingValidator: { resolve: jest.fn() },
+      repository: { findById: jest.fn(async () => null) },
+    });
+    await expect(
+      missing.service.updateBinding(TENANT, 'asset-x', { planogramRackCode: 'R1' }),
+    ).rejects.toThrow(NotFoundException);
   });
 });

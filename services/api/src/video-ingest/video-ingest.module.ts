@@ -18,6 +18,7 @@ import { VideoAssetsController } from './video-assets.controller';
 import { VideoAssetsRepository } from './video-assets.repository';
 import { VideoAssetsService } from './video-assets.service';
 import { VideoCropsController } from './video-crops.controller';
+import { VideoAssetBindingValidator } from './video-asset-binding';
 
 /**
  * Phase 10 — video ingestion & crop extraction MVP. Controlled TEST videos
@@ -65,6 +66,9 @@ import { VideoCropsController } from './video-crops.controller';
   providers: [
     VideoAssetsService,
     VideoAssetsRepository,
+    // Phase 22: read-only planogram-binding validator (rack code must name
+    // an ACTIVE rack at the bound store before any byte is stored).
+    VideoAssetBindingValidator,
     // The PRE-BUFFER upload gate. Nest instantiates route-level guards
     // through the declaring module's injector, so it must be a provider
     // here to receive ConfigService + the extractor/recognizer ports it
@@ -134,6 +138,7 @@ import { VideoCropsController } from './video-crops.controller';
   exports: [
     VideoAssetsService,
     VideoAssetsRepository,
+    VideoAssetBindingValidator,
     VideoStoragePort,
     LocalVideoStorageAdapter,
     FrameTextRecognizerPort,

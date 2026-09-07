@@ -1451,3 +1451,67 @@ describe('PretrainedVisionService — detector-supplied planogram cell (Phase 21
     expect(JSON.stringify(report)).not.toContain('C:/evil');
   });
 });
+
+describe('PretrainedVisionService — asset planogram binding defaults (Phase 22)', () => {
+  const boundAsset = {
+    id: 'va-1',
+    width: 1920,
+    height: 1080,
+    locationId: 'store-1',
+    planogramRackCode: 'SHELF-2X2',
+    rackFrameRegion: { x: 0, y: 0.15, width: 1, height: 0.57 },
+  };
+  const narrowed = {
+    rackId: 'rack-1',
+    rackCode: 'SHELF-2X2',
+    version: 2,
+    cell: null,
+    cellSkus: [],
+    adjacentSkus: [],
+    rackSkus: ['SKU-A', 'SKU-B'],
+    matchStatus: 'UNKNOWN_CELL',
+    flags: [],
+    reviewRequired: false,
+    candidates: [],
+  };
+
+  it('evaluate with an EMPTY request reads the rack and region from the asset (bindingSource ASSET)', async () => {
+    const { service, planograms } = buildHarness({ asset: boundAsset, narrowed });
+    const report = await service.evaluate(TENANT, 'va-1', {}, 'u-1', VIEWER);
+    expect(planograms.narrowCandidates).toHaveBeenCalledWith(
+      TENANT,
+      expect.objectContaining({ locationId: 'store-1', rackCode: 'SHELF-2X2' }),
+    );
+    expect(report.planogram.configured).toBe(true);
+    expect(report.planogram.bindingSource).toBe('ASSET');
+    expect(report.planogram.rackFrameRegion).toEqual({ x: 0, y: 0.15, width: 1, height: 0.57 });
+  });
+
+  it('an explicit request rack wins over the asset binding (bindingSource REQUEST)', async () => {
+    const { service, planograms } = buildHarness({ asset: boundAsset, narrowed: { ...narrowed, rackCode: 'R7' } });
+    const report = await service.evaluate(TENANT, 'va-1', { rackCode: 'R7' }, 'u-1', VIEWER);
+    expect(planograms.narrowCandidates).toHaveBeenCalledWith(
+      TENANT,
+      expect.objectContaining({ rackCode: 'R7' }),
+    );
+    expect(report.planogram.bindingSource).toBe('REQUEST');
+    // The asset's region belongs to ITS rack — never applied to another one.
+    expect(report.planogram.rackFrameRegion).toBeNull();
+  });
+
+  it('no request rack and no asset binding stays NOT_CONFIGURED with bindingSource NONE', async () => {
+    const { service, planograms } = buildHarness();
+    const report = await service.evaluate(TENANT, 'va-1', {}, 'u-1', VIEWER);
+    expect(planograms.narrowCandidates).not.toHaveBeenCalled();
+    expect(report.planogram.configured).toBe(false);
+    expect(report.planogram.bindingSource).toBe('NONE');
+  });
+
+  it('the stored scored snapshot keeps its binding source on the way out', async () => {
+    const { service } = buildHarness({ asset: boundAsset, narrowed });
+    await service.evaluate(TENANT, 'va-1', {}, 'u-1', VIEWER);
+    const report = await service.report(TENANT, 'va-1', {}, VIEWER);
+    expect(report.planogram.source).toBe('SCORED_AT_EVALUATION');
+    expect(report.planogram.bindingSource).toBe('ASSET');
+  });
+});

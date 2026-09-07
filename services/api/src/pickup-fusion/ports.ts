@@ -211,6 +211,11 @@ export interface ContextInput {
   unitId: string | null;
   deviceId: string | null;
   shelfZoneId: string | null;
+  /** Phase 22 — the clip's bound planogram rack (ACTIVE) and the products
+   *  assigned to it. A rack SKU receives a prior equal to the in-stock
+   *  boost (never more); unset = no planogram data (unchanged). */
+  planogramRackCode?: string | null;
+  planogramProductIds?: string[];
 }
 
 /** Store/planogram/availability priors per candidate product. */

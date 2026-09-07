@@ -7,6 +7,7 @@ import {
 } from '../auth/decorators/access-policy.decorators';
 import { CurrentTenantId } from '../auth/decorators/request-context.decorators';
 import { PickupDetectionModule } from '../pickup-detection/pickup-detection.module';
+import { PlanogramModule } from '../planogram/planogram.module';
 import { PlatformModulesModule } from '../platform-modules/platform-modules.module';
 import { VideoIngestModule } from '../video-ingest/video-ingest.module';
 import {
@@ -131,7 +132,8 @@ export class FusionOpsController {
  * an evidence trail.
  */
 @Module({
-  imports: [VideoIngestModule, PickupDetectionModule, PlatformModulesModule],
+  // PlanogramModule: READ-ONLY rack lookup for Phase 22 candidate scoping.
+  imports: [VideoIngestModule, PickupDetectionModule, PlatformModulesModule, PlanogramModule],
   controllers: [PickupFusionController, FusionOpsController],
   providers: [
     MotionObjectDetector,
