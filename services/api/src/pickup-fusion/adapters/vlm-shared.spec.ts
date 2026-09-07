@@ -70,9 +70,13 @@ describe('referencesPerCandidateFromConfig', () => {
 
 describe('maxImagesForContext', () => {
   it('derives an image cap from num_ctx and never drops below 2', () => {
-    expect(maxImagesForContext(8192)).toBe(9);
-    expect(maxImagesForContext(4096)).toBe(4);
+    // 1100 measured tokens per image (qwen2.5-vl under Ollama) + 1024 text.
+    expect(maxImagesForContext(8192)).toBe(6);
+    expect(maxImagesForContext(16384)).toBe(13);
+    expect(maxImagesForContext(4096)).toBe(2);
     expect(maxImagesForContext(512)).toBe(2);
+    // A cheaper vision encoder can be declared per deployment.
+    expect(maxImagesForContext(8192, 768)).toBe(9);
   });
 });
 

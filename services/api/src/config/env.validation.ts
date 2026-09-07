@@ -368,6 +368,15 @@ class EnvironmentVariables {
   @Max(131_072)
   PICKUP_VLM_NUM_CTX?: number;
 
+  // Prompt-budget cost of ONE image for the local VLM, in tokens. Measured
+  // 1089 for qwen2.5-vl under Ollama; the planner drops references before
+  // the request can exceed PICKUP_VLM_NUM_CTX. Range 256..4096.
+  @IsOptional()
+  @IsInt()
+  @Min(256)
+  @Max(4096)
+  PICKUP_VLM_TOKENS_PER_IMAGE?: number;
+
   // Reference photos shown to the VLM PER candidate (default 3). The
   // adapter reduces it to fit PICKUP_VLM_NUM_CTX before dropping frames.
   @IsOptional()
