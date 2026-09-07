@@ -21,27 +21,54 @@ import {
   PickupEventProposal,
 } from '../ports';
 import { connectedRegions, shelfZoneFor } from '../primitives';
+import { cellBox, localizedMotionTimeline } from './localized-motion';
 
 /** Camera-motion guard: endpoint backgrounds disagreeing over more than
  *  this fraction of the frame is a moved camera, not a picked product. */
 const CAMERA_MOTION_COVERAGE = 0.45;
 const PIXEL_THRESHOLD = 40;
 const MIN_REGION_PIXELS = 12;
+/** Relaxed per-channel change threshold used ONLY inside the localized
+ *  motion cell when the strict frame-wide search found no durable change:
+ *  a transparent bottle on a white shelf changes the background subtly. */
+const LOCALIZED_PIXEL_THRESHOLD = 20;
+
+const MOTION_WINDOW_OPTIONS = {
+  activationFraction: 0.12,
+  removalPixelThreshold: PIXEL_THRESHOLD,
+  backgroundFrames: 3,
+  minRemovalPixels: MIN_REGION_PIXELS,
+  minPeakToBaselineRatio: 3,
+};
 
 function changedMask(
   before: Buffer,
   after: Buffer,
   geometry: AnalysisGeometry,
+  threshold: number = PIXEL_THRESHOLD,
+  within: BoundingBox | null = null,
 ): Uint8Array {
   const mask = new Uint8Array(geometry.width * geometry.height);
   for (let index = 0; index < mask.length; index += 1) {
+    if (within !== null) {
+      const x = index % geometry.width;
+      const y = Math.floor(index / geometry.width);
+      if (
+        x < within.x ||
+        y < within.y ||
+        x >= within.x + within.width ||
+        y >= within.y + within.height
+      ) {
+        continue;
+      }
+    }
     const off = index * 3;
     const delta = Math.max(
       Math.abs(before[off] - after[off]),
       Math.abs(before[off + 1] - after[off + 1]),
       Math.abs(before[off + 2] - after[off + 2]),
     );
-    mask[index] = delta > PIXEL_THRESHOLD ? 1 : 0;
+    mask[index] = delta > threshold ? 1 : 0;
   }
   return mask;
 }
@@ -99,6 +126,15 @@ function regionSurroundContrast(
   ) as [number, number, number];
   return Math.sqrt(
     (inner[0] - ring[0]) ** 2 + (inner[1] - ring[1]) ** 2 + (inner[2] - ring[2]) ** 2,
+  );
+}
+
+function intersects(a: BoundingBox, b: BoundingBox): boolean {
+  return (
+    a.x < b.x + b.width &&
+    b.x < a.x + a.width &&
+    a.y < b.y + b.height &&
+    b.y < a.y + a.height
   );
 }
 
@@ -232,19 +268,27 @@ export class ClassicalMotionEventDetector implements PickupEventDetector {
         meanAbsoluteDifference(frames[index - 1].rgb, frames[index].rgb),
       );
     }
-    const window: PickupWindow | null = findMotionWindow(
+    let window: PickupWindow | null = findMotionWindow(
       motionTimeline,
       frames,
-      {
-        activationFraction: 0.12,
-        removalPixelThreshold: PIXEL_THRESHOLD,
-        backgroundFrames: 3,
-        minRemovalPixels: MIN_REGION_PIXELS,
-        minPeakToBaselineRatio: 3,
-      },
+      MOTION_WINDOW_OPTIONS,
     );
+    // The localized search area for a durable change — set only when the
+    // fallback located the event, so the strict global path is unchanged.
+    let localizedArea: BoundingBox | null = null;
     if (window === null) {
-      return { events: [], tracks: [], warnings: ['NO_MOTION_EVENT'] };
+      // FALLBACK: frame-wide nuisance motion (handheld shake, an animated
+      // display in shot, glass reflections) inflates the global baseline
+      // so a small hand never reaches the required peak ratio. The
+      // per-cell, baseline-subtracted timeline isolates the one cell the
+      // hand actually moves through (see localized-motion.ts).
+      const localized = localizedMotionTimeline(frames, geometry);
+      window = findMotionWindow(localized.timeline, frames, MOTION_WINDOW_OPTIONS);
+      if (window === null) {
+        return { events: [], tracks: [], warnings: ['NO_MOTION_EVENT'] };
+      }
+      warnings.push('LOCALIZED_MOTION_FALLBACK');
+      localizedArea = cellBox(localized.peakCells[window.peakIndex], geometry);
     }
     const { before, after } = backgroundWindows(frames, window, 3);
     const preBackground = medianBackground(before);
@@ -256,15 +300,46 @@ export class ClassicalMotionEventDetector implements PickupEventDetector {
       return {
         events: [],
         tracks: await this.buildTracks(frames, preBackground, geometry),
-        warnings: ['CAMERA_MOTION_SUSPECTED'],
+        warnings: [...warnings, 'CAMERA_MOTION_SUSPECTED'],
       };
     }
-    const regions = connectedRegions(mask, geometry, MIN_REGION_PIXELS);
+    let regions = connectedRegions(mask, geometry, MIN_REGION_PIXELS);
     const tracks = await this.buildTracks(frames, preBackground, geometry);
+    if (regions.length > 1 && localizedArea !== null) {
+      // Fallback mode only: the same nuisance motion that hid the event
+      // (an animated display, reflections) also litters the endpoint
+      // difference with unrelated regions. Keep the ones near where the
+      // hand actually moved when any exist; otherwise keep them all.
+      const area = localizedArea;
+      const near = regions.filter((box) => intersects(box, area));
+      if (near.length > 0 && near.length < regions.length) {
+        regions = near;
+        warnings.push('LOCALIZED_REGION_FILTERED');
+      }
+    }
+    if (regions.length === 0 && localizedArea !== null) {
+      // The fallback knows WHERE the hand moved: look for a subtler
+      // durable change confined to that cell neighbourhood (a transparent
+      // bottle on a bright shelf leaves a low-contrast footprint).
+      regions = connectedRegions(
+        changedMask(
+          preBackground,
+          postBackground,
+          geometry,
+          LOCALIZED_PIXEL_THRESHOLD,
+          localizedArea,
+        ),
+        geometry,
+        MIN_REGION_PIXELS,
+      );
+      if (regions.length > 0) {
+        warnings.push('LOCALIZED_REGION_RELAXED');
+      }
+    }
     if (regions.length === 0) {
       // Motion happened, nothing changed durably — a sweep over an empty
       // shelf (or a pickup immediately returned).
-      return { events: [], tracks, warnings: ['NO_DURABLE_CHANGE'] };
+      return { events: [], tracks, warnings: [...warnings, 'NO_DURABLE_CHANGE'] };
     }
     const events: PickupEventProposal[] = regions.slice(0, 4).map((box) => {
       // Removal makes the region's stand-out contrast against its

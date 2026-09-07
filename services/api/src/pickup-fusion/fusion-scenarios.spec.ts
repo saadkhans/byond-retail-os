@@ -299,6 +299,52 @@ describe('fusion-v2 scenarios', () => {
     expect(detection.warnings).toContain('NO_DURABLE_CHANGE');
   });
 
+  // 10b -------------------------------------------------------------
+  it('localized fallback: frame-wide noise hides the hand from the global timeline, the per-cell residual still finds the pickup', async () => {
+    // Same removeA scenario as the strict path, plus an animated display
+    // band across the bottom of every frame (period-3 flicker, like an ad
+    // screen in shot): it inflates the global motion median so the small
+    // hand never reaches the 3x ratio, yet both endpoint background
+    // models see the same median band value, so it is not a durable change.
+    const FLICKER = [60, 140, 60];
+    const frames = clip({ removeA: true }).map((frame) => {
+      const rgb = Buffer.from(frame.rgb);
+      paint(rgb, { x: 0, y: 28, width: GEOMETRY.width, height: 8 }, [
+        FLICKER[frame.index % 3],
+        FLICKER[frame.index % 3],
+        FLICKER[frame.index % 3],
+      ]);
+      return { ...frame, rgb };
+    });
+    const detection = await buildDetector().detect(frames, GEOMETRY, SOURCE);
+    expect(detection.warnings).toContain('LOCALIZED_MOTION_FALLBACK');
+    expect(detection.events.length).toBeGreaterThanOrEqual(1);
+    const near = detection.events.find(
+      (event) =>
+        event.box.x < BOX_A.x + BOX_A.width &&
+        BOX_A.x < event.box.x + event.box.width &&
+        event.box.y < BOX_A.y + BOX_A.height &&
+        BOX_A.y < event.box.y + event.box.height,
+    );
+    expect(near).toBeDefined();
+    expect(near!.kind).toBe('PICKUP');
+    expect(near!.peakMs).toBeGreaterThanOrEqual(6 * 400);
+    expect(near!.peakMs).toBeLessThanOrEqual(10 * 400);
+  });
+
+  // 10c -------------------------------------------------------------
+  it('localized fallback never engages when the global timeline already finds the event', async () => {
+    const detection = await buildDetector().detect(
+      clip({ removeA: true }),
+      GEOMETRY,
+      SOURCE,
+    );
+    expect(detection.warnings).toEqual([]);
+    expect(detection.events).toHaveLength(1);
+    expect(detection.events[0].kind).toBe('PICKUP');
+    expect(detection.events[0].shelfZoneId).toBe('zone-r2c1');
+  });
+
   // 11 --------------------------------------------------------------
   it('VLM timeout: a stalling endpoint yields TIMEOUT, never a thrown store failure', async () => {
     const server: Server = createServer(() => {
