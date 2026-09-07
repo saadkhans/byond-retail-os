@@ -9,6 +9,12 @@ import {
   InventoryValidation,
   InventoryValidator,
 } from '../ports';
+import {
+  FusionInputs,
+  FusionSignalClass,
+  availableSignalClasses,
+  effectiveWeights,
+} from '../fusion-weighting';
 
 /**
  * Contextual priors (requirement 9): store inventory presence and
@@ -61,7 +67,6 @@ export class PrismaContextSignalProvider implements ContextSignalProvider {
       : ([null, []] as const);
     const stockByProduct = new Map(stock.map((row) => [row.productId, row.quantity]));
     const storeHasInventory = storeProbe !== null;
-    const rackProducts = new Set(context.planogramProductIds ?? []);
     const rackCode = context.planogramRackCode ?? null;
     return products.map((product) => {
       let score = 0.5; // neutral prior
@@ -87,13 +92,9 @@ export class PrismaContextSignalProvider implements ContextSignalProvider {
       if (context.unitId) {
         details.push(`unit:${context.unitId.slice(0, 8)}`);
       }
-      if (rackCode && rackProducts.has(product.id) && product.status === 'ACTIVE') {
-        // Phase 22 planogram prior: a SKU assigned to the clip's bound rack
-        // is at least as plausible as an in-stock product — never more,
-        // so the planogram stays a SOFT prior (see planogram.logic.ts).
-        score = Math.max(score, 0.8);
-        details.push(`planogram:rack(${rackCode})`);
-      }
+      // The planogram is its OWN fusion signal class now (see
+      // fusion-weighting.ts); the context signal is inventory only so a
+      // rack SKU is never counted twice.
       if (context.shelfZoneId) {
         // Planogram slot hook: with a bound rack the candidate set was
         // scoped to its layout; without one the zone is recorded as
@@ -112,20 +113,7 @@ export class PrismaContextSignalProvider implements ContextSignalProvider {
   }
 }
 
-/**
- * Fusion weights — configuration, not calibration. Chosen so the SIGNAL
- * CLASSES can reach the default auto threshold (0.42) in the combinations
- * the policy intends: a catalog-matched barcode plus any support clears
- * it; STRONG agreement of both visual signals with a plausible context
- * clears it narrowly; any single mediocre signal cannot.
- */
-export const FUSION_WEIGHTS = {
-  barcode: 0.35,
-  classical: 0.22,
-  retrieval: 0.22,
-  ocr: 0.13,
-  context: 0.08,
-} as const;
+export { FUSION_WEIGHTS } from '../fusion-weighting';
 
 /**
  * Weighted-sum candidate fusion (requirement 10): every individual signal
@@ -143,33 +131,31 @@ export class WeightedCandidateFusion implements CandidateFusion {
   }
 
   fuse(
-    inputs: {
-      classical: CandidateSignal[];
-      retrieval: CandidateSignal[];
-      barcode: CandidateSignal[];
-      ocr: CandidateSignal[];
-      context: CandidateSignal[];
-    },
+    inputs: FusionInputs,
     products: Map<string, { sku: string; name: string }>,
   ): FusedCandidate[] {
-    const bySource: [keyof typeof FUSION_WEIGHTS, CandidateSignal[]][] = [
+    // Available-signal renormalization + coverage factor: see
+    // fusion-weighting.ts for the math and the rationale.
+    const weighting = effectiveWeights(availableSignalClasses(inputs));
+    const bySource: [FusionSignalClass, CandidateSignal[]][] = [
       ['barcode', inputs.barcode],
       ['classical', inputs.classical],
       ['retrieval', inputs.retrieval],
       ['ocr', inputs.ocr],
       ['context', inputs.context],
+      ['planogram', inputs.planogram ?? []],
     ];
     const accumulator = new Map<
       string,
       {
-        bestBySource: Map<keyof typeof FUSION_WEIGHTS, number>;
+        bestBySource: Map<FusionSignalClass, number>;
         signals: FusedCandidate['signals'];
       }
     >();
     for (const [source, signals] of bySource) {
       for (const signal of signals) {
         const entry = accumulator.get(signal.productId) ?? {
-          bestBySource: new Map<keyof typeof FUSION_WEIGHTS, number>(),
+          bestBySource: new Map<FusionSignalClass, number>(),
           signals: [] as FusedCandidate['signals'],
         };
         // Each source counts ONCE per candidate: duplicate rows from the
@@ -192,13 +178,13 @@ export class WeightedCandidateFusion implements CandidateFusion {
       .map(([productId, entry]) => {
         let weighted = 0;
         for (const [source, score] of entry.bestBySource) {
-          weighted += FUSION_WEIGHTS[source] * score;
+          weighted += weighting.weights[source] * score;
         }
         return {
           productId,
           sku: products.get(productId)?.sku ?? productId,
           productName: products.get(productId)?.name ?? productId,
-          fusedScore: Math.round(weighted * 10_000) / 10_000,
+          fusedScore: Math.round(weighted * weighting.coverage * 10_000) / 10_000,
           signals: entry.signals,
         };
       })

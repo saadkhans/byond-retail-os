@@ -1,12 +1,12 @@
 import { PrismaContextSignalProvider } from './context-fusion-inventory';
 
 /**
- * Phase 22 — the planogram prior is a SOFT prior: a SKU assigned to the
- * clip's bound rack is scored like an in-stock product (0.8), never
- * higher, and only when the product is ACTIVE. Without a rack the
- * provider is byte-for-byte the pre-Phase-22 provider.
+ * Phase 22/23 — the planogram is its OWN fusion signal class
+ * (fusion-weighting.ts). The context provider is inventory only: a rack
+ * SKU is never boosted here (that would count the planogram twice), and
+ * the zone detail records whether the candidate set was planogram-scoped.
  */
-describe('PrismaContextSignalProvider — planogram rack prior (Phase 22)', () => {
+describe('PrismaContextSignalProvider — planogram is not a context prior (Phase 23)', () => {
   const products = [
     { id: 'p-water', sku: 'WATER', categoryId: null, status: 'ACTIVE' },
     { id: 'p-can', sku: 'CAN', categoryId: null, status: 'ACTIVE' },
@@ -23,7 +23,7 @@ describe('PrismaContextSignalProvider — planogram rack prior (Phase 22)', () =
     return new PrismaContextSignalProvider(prisma as never);
   }
 
-  it('rack SKUs get the in-stock-equivalent prior and a rack detail; others are unchanged', async () => {
+  it('a bound rack changes only the zone detail — rack SKUs keep the inventory score', async () => {
     const provider = build(false);
     const signals = await provider.contextFor(
       'tenant-1',
@@ -38,17 +38,14 @@ describe('PrismaContextSignalProvider — planogram rack prior (Phase 22)', () =
       ['p-water', 'p-can', 'p-retired'],
     );
     const bySku = new Map(signals.map((row) => [row.sku, row]));
-    expect(bySku.get('WATER')?.score).toBe(0.8);
-    expect(bySku.get('WATER')?.detail).toContain('planogram:rack(SHELF-2X2)');
+    expect(bySku.get('WATER')?.score).toBe(0.5);
+    expect(bySku.get('WATER')?.detail).not.toContain('planogram:rack');
     expect(bySku.get('WATER')?.detail).toContain('zone:zone-r2c1(planogram-scoped)');
     expect(bySku.get('CAN')?.score).toBe(0.5);
-    expect(bySku.get('CAN')?.detail).not.toContain('planogram:rack');
-    // Inactive products never gain from the planogram.
     expect(bySku.get('OLD')?.score).toBe(0.1);
-    expect(bySku.get('OLD')?.detail).not.toContain('planogram:rack');
   });
 
-  it('never exceeds the in-stock boost when the product is also in stock', async () => {
+  it('in-stock products still get the inventory boost regardless of the rack', async () => {
     const provider = build(true, [{ productId: 'p-water', quantity: 4 }]);
     const [water] = await provider.contextFor(
       'tenant-1',
@@ -63,6 +60,7 @@ describe('PrismaContextSignalProvider — planogram rack prior (Phase 22)', () =
       ['p-water'],
     );
     expect(water.score).toBe(0.8);
+    expect(water.detail).toContain('in-stock(4)');
   });
 
   it('without a bound rack the zone hook still reads no-planogram-data (unchanged)', async () => {

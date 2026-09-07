@@ -1722,9 +1722,11 @@ describe('Phase 22 — planogram-scoped fusion candidates', () => {
     locationId: 'store-1',
     rackCode: 'SHELF-2X2',
     version: 2,
+    rows: 2,
+    columns: 2,
     cells: [
-      { productId: WATER.id, sku: WATER.sku },
-      { productId: CAN.id, sku: CAN.sku },
+      { productId: WATER.id, sku: WATER.sku, rowIndex: 0, columnIndex: 0, cellCode: 'A1' },
+      { productId: CAN.id, sku: CAN.sku, rowIndex: 0, columnIndex: 1, cellCode: 'A2' },
     ],
   };
   const noisyRetrieval = [
@@ -1766,7 +1768,20 @@ describe('Phase 22 — planogram-scoped fusion candidates', () => {
       excludedProductCount: 1,
     });
     expect(data.evidence.notes).toContain('PLANOGRAM_SCOPED_CANDIDATES');
-    // The context provider learns the rack so it can apply the soft prior.
+    // Phase 23: the planogram is its own fusion signal class — every rack
+    // candidate carries a planogram signal, and the weighting records the
+    // classes that were (un)available for this event.
+    expect(data.evidence.planogram?.rackCode).toBe('SHELF-2X2');
+    const water = data.evidence.fused.find((row) => row.sku === WATER.sku);
+    expect(water?.signals.some((row) => row.source === 'planogram')).toBe(true);
+    expect(data.evidence.fusion?.weighting.available).toEqual(
+      expect.arrayContaining(['classical', 'retrieval', 'context', 'planogram']),
+    );
+    expect(data.evidence.fusion?.weighting.unavailable).toEqual(
+      expect.arrayContaining(['barcode', 'ocr']),
+    );
+    expect(data.evidence.notes).toContain('AVAILABLE_SIGNAL_RENORMALIZED');
+    // The context provider still learns the rack (zone detail only).
     expect(contextProvider.contextFor).toHaveBeenCalledWith(
       'tenant-1',
       expect.objectContaining({

@@ -211,9 +211,9 @@ export interface ContextInput {
   unitId: string | null;
   deviceId: string | null;
   shelfZoneId: string | null;
-  /** Phase 22 — the clip's bound planogram rack (ACTIVE) and the products
-   *  assigned to it. A rack SKU receives a prior equal to the in-stock
-   *  boost (never more); unset = no planogram data (unchanged). */
+  /** Phase 22 — the clip's bound planogram rack (ACTIVE). Recorded in the
+   *  zone detail only; the planogram contributes its OWN fusion signal
+   *  class (fusion-weighting.ts), never a context prior. */
   planogramRackCode?: string | null;
   planogramProductIds?: string[];
 }
@@ -249,6 +249,9 @@ export interface CandidateFusion extends VersionedAdapter {
     barcode: CandidateSignal[];
     ocr: CandidateSignal[];
     context: CandidateSignal[];
+    /** Planogram signal (fusion-weighting.ts); null/undefined = no rack
+     *  bound, the class is unavailable for this event. */
+    planogram?: CandidateSignal[] | null;
   }, products: Map<string, { sku: string; name: string }>): FusedCandidate[];
 }
 
