@@ -200,3 +200,13 @@ describe('buildPromptParts', () => {
     expect(parts.images.filter((image) => image.label.startsWith('Reference image'))).toHaveLength(3);
   });
 });
+
+describe('referencesPerCandidateFromConfig — validated numeric form', () => {
+  it('accepts the validated numeric form (env.validation converts the key to a number)', () => {
+    expect(referencesPerCandidateFromConfig(2)).toBe(2);
+    expect(referencesPerCandidateFromConfig('2')).toBe(2);
+    expect(referencesPerCandidateFromConfig(undefined)).toBe(3);
+    expect(referencesPerCandidateFromConfig('')).toBe(3);
+    expect(() => referencesPerCandidateFromConfig(9)).toThrow(/safe range/);
+  });
+});
