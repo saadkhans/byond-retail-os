@@ -65,9 +65,9 @@ describe('parseClipFilename', () => {
 
   it.each([
     ['notes.txt', 'NOT_VIDEO'],
-    ['r1_a1_water_pickup_01.mp4', 'WRONG_TOKEN_COUNT'],
+    ['r1_a1_pickup_01.mp4', 'WRONG_TOKEN_COUNT'],
     ['r1_c3_water_pickup_room_01.mp4', 'UNKNOWN_CELL'],
-    ['r1_a1_water_grab_room_01.mp4', 'UNKNOWN_TYPE'],
+    ['r1_a1_water_dance_room_01.mp4', 'UNKNOWN_TYPE'],
     ['r1_a1_water_pickup_dark_01.mp4', 'UNKNOWN_LIGHT'],
     ['r1_a1_water_pickup_room_xx.mp4', 'BAD_INDEX'],
   ])('rejects %s with %s', (name, reason) => {
@@ -203,5 +203,37 @@ describe('truthAgreement', () => {
     expect(truthAgreement(report({ eventKind: 'NONE', sku: null, actualTimestampMs: null }, suggest(null, 'UNKNOWN')))).toBe('MATCH');
     expect(truthAgreement(report({ eventKind: 'NONE', sku: null, actualTimestampMs: null }, suggest('WATER-BOTTLE-500ML', 'PICKUP')))).toBe('ACTION_MISMATCH');
     expect(countAgreements(['MATCH', 'MATCH', 'NO_TRUTH']).MATCH).toBe(2);
+  });
+});
+
+describe('parseClipFilename — lenient names (batch 1 as filmed)', () => {
+  it('accepts five tokens with no light token', () => {
+    const parse = parseClipFilename('r1_a1_water_pickup_02.mov');
+    expect(parse.ok).toBe(true);
+    if (parse.ok) {
+      expect(parse.parsed).toMatchObject({ cell: 'a1', skuToken: 'water', type: 'pickup', light: 'unspecified', index: 2 });
+    }
+  });
+  it('maps type synonyms such as falsetouch, wrong and none', () => {
+    const cases: [string, string][] = [
+      ['r1_a2_nescafe_falsetouch_01.mov', 'touch'],
+      ['r1_a2_water_wrongcell_01.mov', 'wrongcell'],
+      ['r1_b2_nescafe_wrong_01.mov', 'wrongcell'],
+      ['r1_rack_none_none_01.mov', 'nothing'],
+      ['r1_a1_water_two_01.mov', 'double'],
+    ];
+    for (const [name, type] of cases) {
+      const parse = parseClipFilename(name);
+      expect(parse.ok).toBe(true);
+      if (parse.ok) expect(parse.parsed.type).toBe(type);
+    }
+  });
+  it('still validates the light token when six tokens are given', () => {
+    expect(parseClipFilename('r1_a1_water_pickup_dark_01.mov')).toEqual({ ok: false, reason: 'UNKNOWN_LIGHT' });
+    expect(parseClipFilename('r1_a1_water_pickup_fridge_01.mov').ok).toBe(true);
+  });
+  it('rejects four or seven tokens', () => {
+    expect(parseClipFilename('r1_a1_pickup_01.mov')).toEqual({ ok: false, reason: 'WRONG_TOKEN_COUNT' });
+    expect(parseClipFilename('r1_a1_water_pickup_room_x_01.mov')).toEqual({ ok: false, reason: 'WRONG_TOKEN_COUNT' });
   });
 });

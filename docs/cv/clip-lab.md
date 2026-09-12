@@ -112,3 +112,7 @@ Resume: after a refresh, pick the store and press "Check already uploaded" — c
 the store are matched by file name and skipped by Upload all; re-pick the folder only for the
 files still queued. If the session expires mid-batch the runner pauses and an inline sign-in
 resumes it in place.
+
+### Lenient file names (batch 1 as filmed)
+
+The light token is optional: `r1_<cell>_<sku>_<type>_<n>.mov` parses with light `unspecified`. Type synonyms are accepted and mapped: `falsetouch`/`false`/`nudge` → touch; `pick`/`grab`/`take` → pickup; `put`/`putback` → return; `wrong`/`misplaced` → wrongcell; `two`/`second` → double; `none`/`empty`/`idle` → nothing. Tokens may be separated by `_`, `-` or spaces; case does not matter. A name is only "not understood" when it has fewer than 5 or more than 6 tokens, an unknown cell, an unknown type word, or (with 6 tokens) a light other than room/fridge.

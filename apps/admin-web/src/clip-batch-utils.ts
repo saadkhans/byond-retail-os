@@ -19,7 +19,18 @@ import type {
 
 export const CLIP_NAME_CELLS = ['a1', 'a2', 'b1', 'b2', 'rack'] as const;
 export const CLIP_NAME_TYPES = ['pickup', 'return', 'touch', 'wrongcell', 'double', 'nothing'] as const;
-export const CLIP_NAME_LIGHTS = ['room', 'fridge'] as const;
+export const CLIP_NAME_LIGHTS = ['room', 'fridge', 'unspecified'] as const;
+/** Spellings people actually use for the type token → canonical type. The
+ *  first batch arrived as `falsetouch` with no light token, so the parser
+ *  is lenient: 5 tokens (no light) or 6 (with light), synonyms accepted. */
+export const CLIP_NAME_TYPE_SYNONYMS: Record<string, ClipNameType> = {
+  pickup: 'pickup', pick: 'pickup', grab: 'pickup', take: 'pickup', taken: 'pickup',
+  return: 'return', put: 'return', putback: 'return', returned: 'return',
+  touch: 'touch', falsetouch: 'touch', false: 'touch', nudge: 'touch', notake: 'touch',
+  wrongcell: 'wrongcell', wrong: 'wrongcell', misplaced: 'wrongcell', swap: 'wrongcell',
+  double: 'double', two: 'double', second: 'double', multi: 'double',
+  nothing: 'nothing', none: 'nothing', empty: 'nothing', idle: 'nothing', still: 'nothing',
+};
 export const VIDEO_EXTENSIONS = ['.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi', '.mpeg', '.mpg'];
 
 export type ClipNameCell = (typeof CLIP_NAME_CELLS)[number];
@@ -50,10 +61,10 @@ export type ClipNameParse =
 
 export const PARSE_REASON_LABELS: Record<ClipNameParseReason, string> = {
   NOT_VIDEO: 'not a video file',
-  WRONG_TOKEN_COUNT: 'expected r1_cell_sku_type_light_nn',
+  WRONG_TOKEN_COUNT: 'expected r1_cell_sku_type_nn or r1_cell_sku_type_light_nn',
   UNKNOWN_CELL: 'cell must be a1, a2, b1, b2 or rack',
   UNKNOWN_TYPE: 'type must be pickup, return, touch, wrongcell, double or nothing',
-  UNKNOWN_LIGHT: 'light must be room or fridge',
+  UNKNOWN_LIGHT: 'light must be room or fridge (or leave it out)',
   BAD_INDEX: 'last token must be a number',
 };
 
@@ -92,15 +103,18 @@ export function parseClipFilename(name: string): ClipNameParse {
   }
   const extension = extensionOf(base);
   const stem = base.slice(0, base.length - extension.length).toLowerCase();
-  const tokens = stem.split(/[_-]/).filter((token) => token.length > 0);
-  if (tokens.length !== 6) {
+  const tokens = stem.split(/[_\-\s]+/).filter((token) => token.length > 0);
+  if (tokens.length !== 5 && tokens.length !== 6) {
     return { ok: false, reason: 'WRONG_TOKEN_COUNT' };
   }
-  const [run, cell, skuToken, type, light, index] = tokens;
+  const [run, cell, skuToken, rawType] = tokens;
+  const light = tokens.length === 6 ? tokens[4] : 'unspecified';
+  const index = tokens[tokens.length - 1];
   if (!(CLIP_NAME_CELLS as readonly string[]).includes(cell)) {
     return { ok: false, reason: 'UNKNOWN_CELL' };
   }
-  if (!(CLIP_NAME_TYPES as readonly string[]).includes(type)) {
+  const type = CLIP_NAME_TYPE_SYNONYMS[rawType];
+  if (!type) {
     return { ok: false, reason: 'UNKNOWN_TYPE' };
   }
   if (!(CLIP_NAME_LIGHTS as readonly string[]).includes(light)) {
@@ -115,7 +129,7 @@ export function parseClipFilename(name: string): ClipNameParse {
       run,
       cell: cell as ClipNameCell,
       skuToken,
-      type: type as ClipNameType,
+      type,
       light: light as ClipNameLight,
       index: Number(index),
       extension,
