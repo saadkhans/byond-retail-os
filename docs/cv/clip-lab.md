@@ -78,3 +78,37 @@ explicit request values still win (`REQUEST`).
 - Screening remains a separate, audited human decision by design.
 - The rack region is stored per clip; camera calibration zones are not
   consulted yet.
+
+## Batch upload (a folder of named clips)
+
+The **Batch upload** tab uploads a whole folder with the one-time inputs entered once:
+store, unit, rack (optional rack region) and the four operator attestations. Every server
+gate is unchanged — the batch is a client-side, one-at-a-time loop over the same single-file
+upload, the attestations are recorded with every clip, each clip still needs a human
+screening decision on real frames, and ground truth is saved only when you save it.
+
+Name files as `r1_<cell>_<sku>_<type>_<light>_<n>.mp4`:
+
+| token | values |
+| --- | --- |
+| cell | `a1`, `a2`, `b1`, `b2`, `rack` |
+| sku | a catalog token (`water`, `nescafe`) or `none` — mapped to a product in the aliases panel |
+| type | `pickup`, `return`, `touch`, `wrongcell`, `double`, `nothing` |
+| light | `room`, `fridge` |
+| n | `01`, `02`, … |
+
+Ground truth is pre-filled from the name (pickup → PICKUP / PICKUP_SINGLE; return → RETURN /
+RETURN_SINGLE; touch → NONE / FALSE_TOUCH; wrongcell and double → PICKUP / PICKUP_SINGLE with
+a note; nothing → NONE), timestamp 4500 ms by default, note `cell=… light=… type=… sku=…`.
+Names that do not parse still upload and are flagged "name not understood".
+
+Flow: settings → pick folder/files or drop them → Upload all (pause, resume, cancel, per-file
+retry) → Screening review grid (Load frames for all, Approve / Reject per card, "Approve all
+previewed" only for cards whose frames were shown; previews older than 25 minutes are shown
+again first) → Ground truth table (confirm, Save all) → Run all (sequential lab-runs) → summary
+with agreement per clip (match, wrong SKU, wrong action, no suggestion, no ground truth).
+
+Resume: after a refresh, pick the store and press "Check already uploaded" — clips already at
+the store are matched by file name and skipped by Upload all; re-pick the folder only for the
+files still queued. If the session expires mid-batch the runner pauses and an inline sign-in
+resumes it in place.
