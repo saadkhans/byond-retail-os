@@ -2,7 +2,6 @@ import { FormEvent, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   api,
-  ApiError,
   apiUpload,
   ClipLabReport,
   GroundTruthEventKind,
@@ -11,11 +10,12 @@ import {
   Product,
   ScreeningPreview,
   Store,
-  Unit,
   VideoAsset,
 } from '../api';
-import { frameCoverageLabel, marginLabel, percentLabel } from '../clip-lab-utils';
-import { Page, useLoad } from '../components';
+import { frameCoverageLabel, marginLabel, parseRegion, percentLabel } from '../clip-lab-utils';
+import { Page, Tabs, useLoad } from '../components';
+import { ClipLabBatchSection } from './ClipLabBatchSection';
+import { errorText, labelFor, MATCH_LABELS, STEP_BADGE, STEP_LABELS, useStoreUnits } from './clip-lab-shared';
 import { UPLOAD_ATTESTATIONS } from './VideoAssetsPage';
 
 /**
@@ -25,31 +25,6 @@ import { UPLOAD_ATTESTATIONS } from './VideoAssetsPage';
  * with one click, and read one consolidated, review-required result.
  * Nothing here touches checkout, orders, inventory, or payments.
  */
-
-const STEP_LABELS: Record<string, string> = {
-  SCREENING: 'Screened',
-  VALIDATE: 'Validated',
-  DETECTION: 'Detection',
-  FUSION: 'Fusion',
-  PRETRAINED: 'Pretrained',
-};
-
-const STEP_BADGE: Record<string, string> = {
-  OK: 'ok',
-  SKIPPED: '',
-  NOT_RUN: '',
-  FAILED: 'warn',
-  BLOCKED: 'warn',
-};
-
-const MATCH_LABELS: Record<string, string> = {
-  MATCH: 'Expected in this cell',
-  ADJACENT_MATCH: 'Found in neighboring cell',
-  RACK_MATCH: 'Expected on this rack',
-  OUT_OF_PLANOGRAM: 'Possible misplaced product',
-  UNKNOWN_CELL: 'Cell mapping uncertain',
-  PLANOGRAM_NOT_CONFIGURED: 'Planogram not configured',
-};
 
 const COORDINATE_SOURCE_LABELS: Record<string, string> = {
   OPERATOR: 'operator supplied',
@@ -115,43 +90,6 @@ const VLM_SUPPORT_LABELS: Record<string, string> = {
   NONE: 'no visual support',
   CONTRADICTS: 'visual evidence contradicts',
 };
-
-/** Units of one store — "GET /units?locationId=…" (paginated). */
-function useStoreUnits(locationId: string) {
-  return useLoad<Paginated<Unit>>(
-    () =>
-      locationId
-        ? api(`/units?locationId=${encodeURIComponent(locationId)}&take=100`)
-        : Promise.resolve({ items: [], total: 0, skip: 0, take: 0 } as Paginated<Unit>),
-    [locationId],
-  );
-}
-
-function labelFor(code: string, labels: Record<string, string>): string {
-  return labels[code] ?? code;
-}
-
-function errorText(error: unknown): string {
-  return error instanceof ApiError ? error.message : 'Request failed';
-}
-
-function parseRegion(values: { rx: string; ry: string; rw: string; rh: string }) {
-  const all = [values.rx, values.ry, values.rw, values.rh].map((v) => v.trim());
-  if (all.every((v) => v === '')) {
-    return { region: null, error: null };
-  }
-  if (all.some((v) => v === '')) {
-    return { region: null, error: 'Rack region needs all four values (or leave all blank).' };
-  }
-  const [x, y, width, height] = all.map(Number);
-  if ([x, y, width, height].some((n) => !Number.isFinite(n) || n < 0 || n > 1)) {
-    return { region: null, error: 'Rack region values must be numbers between 0 and 1.' };
-  }
-  if (width < 0.01 || height < 0.01 || x + width > 1.0005 || y + height > 1.0005) {
-    return { region: null, error: 'Rack region must be a rectangle inside the frame.' };
-  }
-  return { region: { x, y, width, height }, error: null };
-}
 
 // ------------------------------------------------------------ upload
 
@@ -601,6 +539,7 @@ function ConfidenceSummary({ report }: { report: ClipLabReport }) {
 // ------------------------------------------------------------- page
 
 export function ClipLabPage() {
+  const [tab, setTab] = useState('single');
   const [selectedId, setSelectedId] = useState('');
   const [refresh, setRefresh] = useState(0);
   const [report, setReport] = useState<ClipLabReport | null>(null);
@@ -683,6 +622,17 @@ export function ClipLabPage() {
         approve screening, run the full shadow analysis, read one result. Everything is advisory
         and review-required — nothing here touches checkout, orders, or inventory.
       </p>
+      <Tabs
+        tabs={[
+          { id: 'single', label: 'Single clip' },
+          { id: 'batch', label: 'Batch upload' },
+        ]}
+        value={tab}
+        onChange={setTab}
+      />
+      {tab === 'batch' ? <ClipLabBatchSection /> : null}
+      {tab === 'batch' ? null : (
+      <>
       <UploadSection
         onUploaded={(asset) => {
           setSelectedId(asset.id);
@@ -780,6 +730,8 @@ export function ClipLabPage() {
         <ScreeningSection asset={selected} onChanged={() => setRefresh((n) => n + 1)} />
       ) : null}
       {report ? <ResultSection report={report} /> : null}
+      </>
+      )}
     </Page>
   );
 }

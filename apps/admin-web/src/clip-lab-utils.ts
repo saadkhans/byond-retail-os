@@ -34,3 +34,25 @@ export function frameCoverageLabel(
   }
   return `product in ${productFrames} of ${sampledFrames} sampled frames`;
 }
+
+/** Normalized rack region in the frame from four text inputs; all blank = none. */
+export function parseRegion(values: { rx: string; ry: string; rw: string; rh: string }): {
+  region: { x: number; y: number; width: number; height: number } | null;
+  error: string | null;
+} {
+  const all = [values.rx, values.ry, values.rw, values.rh].map((v) => v.trim());
+  if (all.every((v) => v === '')) {
+    return { region: null, error: null };
+  }
+  if (all.some((v) => v === '')) {
+    return { region: null, error: 'Rack region needs all four values (or leave all blank).' };
+  }
+  const [x, y, width, height] = all.map(Number);
+  if ([x, y, width, height].some((n) => !Number.isFinite(n) || n < 0 || n > 1)) {
+    return { region: null, error: 'Rack region values must be numbers between 0 and 1.' };
+  }
+  if (width < 0.01 || height < 0.01 || x + width > 1.0005 || y + height > 1.0005) {
+    return { region: null, error: 'Rack region must be a rectangle inside the frame.' };
+  }
+  return { region: { x, y, width, height }, error: null };
+}

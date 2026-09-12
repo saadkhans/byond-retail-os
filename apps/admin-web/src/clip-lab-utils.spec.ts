@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { frameCoverageLabel, marginLabel, percentLabel } from './clip-lab-utils';
+import { frameCoverageLabel, marginLabel, parseRegion, percentLabel } from './clip-lab-utils';
 
 describe('Clip Lab confidence formatting', () => {
   it('renders 0..1 signals as whole percentages and clamps', () => {
@@ -27,5 +27,21 @@ describe('Clip Lab confidence formatting', () => {
   it('describes detector frame coverage', () => {
     expect(frameCoverageLabel(9, 15)).toBe('product in 9 of 15 sampled frames');
     expect(frameCoverageLabel(null, 15)).toBe('—');
+  });
+});
+
+describe('parseRegion', () => {
+  it('accepts all-blank as no region and a valid rectangle', () => {
+    expect(parseRegion({ rx: '', ry: '', rw: '', rh: '' })).toEqual({ region: null, error: null });
+    expect(parseRegion({ rx: '0', ry: '0.15', rw: '1', rh: '0.57' })).toEqual({
+      region: { x: 0, y: 0.15, width: 1, height: 0.57 },
+      error: null,
+    });
+  });
+
+  it('rejects partial, out-of-range and overflowing rectangles', () => {
+    expect(parseRegion({ rx: '0', ry: '', rw: '1', rh: '1' }).error).toMatch(/all four/);
+    expect(parseRegion({ rx: '2', ry: '0', rw: '1', rh: '1' }).error).toMatch(/between 0 and 1/);
+    expect(parseRegion({ rx: '0.5', ry: '0', rw: '0.9', rh: '1' }).error).toMatch(/inside the frame/);
   });
 });

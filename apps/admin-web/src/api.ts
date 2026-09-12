@@ -680,6 +680,8 @@ export interface VideoAsset {
   location?: { id: string; name: string; code: string } | null;
   unit?: { id: string; name: string; code: string } | null;
   session?: { id: string; status: CheckoutSessionStatus } | null;
+  /** When an operator last inspected screening frames (approval must follow within 30 min). */
+  screeningInspectedAt?: string | null;
   // Phase 22 — planogram binding captured at upload (or set afterwards).
   planogramRackCode?: string | null;
   rackFrameRegion?: { x: number; y: number; width: number; height: number } | null;
