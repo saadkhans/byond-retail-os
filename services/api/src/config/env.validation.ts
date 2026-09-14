@@ -204,6 +204,24 @@ class EnvironmentVariables {
   @Max(300_000)
   VIDEO_SCREENING_TIMEOUT_MS?: number;
 
+  // Bounded PARALLELISM of the recognizer (OCR) calls inside the mandatory
+  // pre-storage frame screen: how many decoded frames may be in
+  // recognition at once. The screen still inspects EVERY unique source
+  // frame — this changes only how many run side by side, never which
+  // frames are looked at. It exists because the recognizer is an external
+  // process that costs ~0.4 s per 1080p frame on a laptop-class CPU, so a
+  // 60 fps recorder clip (530 frames for 9 s) needs ~220 s sequentially
+  // against the 120 s enforceable deadline; at 6 the same clip screens in
+  // ~40 s. Each in-flight call holds one PNG frame (≤ the per-frame byte
+  // budget) and one child process, so size it to roughly cores / 3.
+  // Default 1 (sequential, the previous behaviour); bounds 1..16 so a
+  // deployment typo fails at boot instead of fork-bombing the host.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(16)
+  VIDEO_SCREENING_OCR_CONCURRENCY?: number;
+
   // ── Pickup detection / fusion (Phase 10 CV) ─────────────────────────
   // Every PICKUP_* key read through ConfigService is declared here so the
   // env contract is explicit and a deployment typo fails at boot. Note

@@ -618,6 +618,21 @@ function boundaryCarry(buffer: Buffer, boundary: number): BoundaryCarry {
  * state — bounded streaming state, overflow → reject, never unbounded
  * buffering.
  *
+ * CONTAINER SCOPE: for ISO BMFF files (mp4/m4v/mov — "ftyp" at offset 4)
+ * the screen reads every top-level atom EXCEPT `mdat`, the compressed
+ * codec payload (see `payloadScanBytes`). Text-bearing metadata — ftyp,
+ * moov (udta/meta/ilst, track names), free/skip padding, uuid/XMP — is
+ * all outside mdat, while mdat is entropy-coded frame data no consumer
+ * ever decodes as text. Scanning it was pure false-positive surface, and
+ * MEASURED, not estimated: on the first real lab batch (30 iPhone clips of
+ * 16-35 MiB) 2 of 3 sampled files carried a chance fused-label hit in the
+ * frame bytes ("cVc3", "cVn3y" — case-insensitive 3-letter label + digit
+ * is ~1e-7 per byte, i.e. a couple of expected hits per 20 MiB view, two
+ * orders of magnitude above the earlier estimate). Containers this module
+ * cannot walk (EBML/webm/mkv, RIFF/avi, MPEG-PS) and any ISO BMFF whose
+ * atom tree is malformed keep the FULL-buffer scan — fail toward scanning
+ * more, never less.
+ *
  * SCOPE (documented limitation): this screens TEXT-ENCODED bytes. Sensitive
  * content that is only VISIBLE IN THE VIDEO FRAMES (a card filmed on
  * camera) is not decodable without real CV, which Phase 10 explicitly
@@ -626,6 +641,15 @@ function boundaryCarry(buffer: Buffer, boundary: number): BoundaryCarry {
  * and never served, and later CV phases add frame-content review.
  */
 export function bufferCarriesSensitiveText(buffer: Buffer): boolean {
+  return scannedBytesCarrySensitiveText(payloadScanBytes(buffer));
+}
+
+/**
+ * The chunked text screen proper, over bytes already narrowed to the
+ * container's text-bearing regions by `payloadScanBytes` (or the whole
+ * buffer for containers this module cannot walk).
+ */
+function scannedBytesCarrySensitiveText(buffer: Buffer): boolean {
   for (
     let offset = 0;
     offset < buffer.length;
@@ -689,6 +713,160 @@ export function bufferCarriesSensitiveText(buffer: Buffer): boolean {
     }
   }
   return false;
+}
+
+// ------------------------------------------------------------- ISO BMFF
+
+/** ISO base media / QuickTime container: "ftyp" at offset 4 (mp4/m4v/mov). */
+export function isIsoBmff(buffer: Buffer): boolean {
+  return hasBytes(buffer, 4, [0x66, 0x74, 0x79, 0x70]);
+}
+
+export interface IsoBmffAtom {
+  /** Four-character atom type, latin1 ("ftyp", "moov", "mdat", ...). */
+  readonly type: string;
+  /** Byte offset of the atom header. */
+  readonly start: number;
+  /** Byte offset one past the atom's last payload byte. */
+  readonly end: number;
+}
+
+/** The compressed codec payload atom — never text, never scanned. */
+const MEDIA_DATA_ATOM = 'mdat';
+
+/**
+ * Top-level atom walk (ISO/IEC 14496-12 §4.2): 32-bit big-endian size +
+ * 4-char type; size 1 means a 64-bit "largesize" follows the type; size 0
+ * means the atom runs to the end of the file. Returns null for a
+ * non-ISO-BMFF buffer or a MALFORMED tree (a size smaller than its own
+ * header, or reaching past the buffer, or a trailing partial header):
+ * callers then treat the whole buffer as scannable — malformation fails
+ * toward scanning MORE, never toward skipping bytes.
+ */
+export function isoBmffTopLevelAtoms(buffer: Buffer): IsoBmffAtom[] | null {
+  if (!isIsoBmff(buffer)) {
+    return null;
+  }
+  const atoms: IsoBmffAtom[] = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    if (offset + 8 > buffer.length) {
+      return null;
+    }
+    let size = buffer.readUInt32BE(offset);
+    let headerBytes = 8;
+    if (size === 1) {
+      if (offset + 16 > buffer.length) {
+        return null;
+      }
+      const largesize = buffer.readBigUInt64BE(offset + 8);
+      if (largesize > BigInt(Number.MAX_SAFE_INTEGER)) {
+        return null;
+      }
+      size = Number(largesize);
+      headerBytes = 16;
+    } else if (size === 0) {
+      size = buffer.length - offset;
+    }
+    if (size < headerBytes || offset + size > buffer.length) {
+      return null;
+    }
+    atoms.push({
+      type: buffer.toString('latin1', offset + 4, offset + 8),
+      start: offset,
+      end: offset + size,
+    });
+    offset += size;
+  }
+  return atoms;
+}
+
+/**
+ * The bytes the payload text screen reads (see the CONTAINER SCOPE note on
+ * the screen): for a well-formed ISO BMFF buffer, every top-level atom
+ * except `mdat`, concatenated in file order; otherwise the buffer itself.
+ * The concatenation can only JOIN bytes that mdat used to separate — a
+ * chain straddling the seam is over-detection, the safe direction.
+ * Cost: one copy of the non-mdat bytes (moov is typically tens to
+ * hundreds of KiB; the multi-MiB mdat is what is skipped).
+ */
+export function payloadScanBytes(buffer: Buffer): Buffer {
+  const atoms = isoBmffTopLevelAtoms(buffer);
+  if (atoms === null) {
+    return buffer;
+  }
+  const kept = atoms.filter((atom) => atom.type !== MEDIA_DATA_ATOM);
+  if (kept.length === atoms.length) {
+    return buffer;
+  }
+  return Buffer.concat(
+    kept.map((atom) => buffer.subarray(atom.start, atom.end)),
+  );
+}
+
+// ISO 6709 Annex H point-location string, the form QuickTime recorders
+// write into `com.apple.quicktime.location.ISO6709` (and legacy `©xyz`):
+// ±LAT±LON[±ALT][CRSxxx]/ — e.g. "+21.5630+039.1182+006.893/". Latitude
+// integer part DD/DDMM/DDMMSS (2-6 digits), longitude DDD/DDDMM/DDDMMSS
+// (3-7), each with an optional decimal fraction, an optional signed
+// altitude, an optional CRS suffix, and the MANDATORY trailing solidus. A
+// mandatory leading sign, decimal points, and the closing "/" make a
+// chance hit inside binary tables (stco/stsz/...) vanishingly unlikely:
+// the shortest match is 11 specific printable bytes in a fixed grammar.
+const ISO_6709_LOCATION =
+  /[+-]\d{2,6}(?:\.\d{1,8})?[+-]\d{3,7}(?:\.\d{1,8})?(?:[+-]\d{1,6}(?:\.\d{1,8})?)?(?:CRS[A-Za-z0-9_:.-]{1,32})?\//g;
+
+/**
+ * Blanks (overwrites with ASCII spaces, IN PLACE, same length) every ISO
+ * 6709 location string found in the text-bearing atoms of an ISO BMFF
+ * buffer, and returns how many were blanked. Non-ISO-BMFF or malformed
+ * buffers are left untouched (0).
+ *
+ * WHY BLANK, NOT EXEMPT: the recording device's GPS position is personal
+ * data of the OPERATOR filming the clip, has no CV use, and must not
+ * reach durable storage at all — so the fix is to remove it from the
+ * bytes before the checksum and the put, not to teach the screen to
+ * tolerate it. It also closes the screen's largest measured false reject
+ * without touching the governing policy: a coordinate string joins to
+ * ~19 digits, so roughly one recorder position in ten contains a
+ * Luhn-valid 13-19-digit window ("+21.5630+039.1182+006.893/" does — the
+ * whole first lab batch was rejected on it), and the policy that NO digit
+ * shape rescues a Luhn-valid window stands. The remedy that policy names
+ * — "strip metadata" — is applied by the server instead of demanded of
+ * every operator. A PAN deliberately WRITTEN in coordinate shape is
+ * blanked too, i.e. never stored, which is the outcome the screen exists
+ * to guarantee; a PAN in any other shape in the same atom still rejects.
+ *
+ * Same-length space fill keeps every atom size and every chunk/sample
+ * offset table valid; the `data` atom's UTF-8 type indicator stays
+ * truthful (spaces are UTF-8). Byte offsets map 1:1 to latin1 string
+ * indexes, so the regex index is the byte index.
+ */
+export function redactLocationMetadata(buffer: Buffer): number {
+  const atoms = isoBmffTopLevelAtoms(buffer);
+  if (atoms === null) {
+    return 0;
+  }
+  let redacted = 0;
+  for (const atom of atoms) {
+    if (atom.type === MEDIA_DATA_ATOM) {
+      continue;
+    }
+    const text = buffer.toString('latin1', atom.start, atom.end);
+    for (const match of text.matchAll(ISO_6709_LOCATION)) {
+      const index = match.index;
+      if (index === undefined) {
+        continue;
+      }
+      buffer.fill(
+        0x20,
+        atom.start + index,
+        atom.start + index + match[0].length,
+      );
+      redacted += 1;
+    }
+  }
+  return redacted;
 }
 
 function hasBytes(buffer: Buffer, offset: number, expected: number[]): boolean {
