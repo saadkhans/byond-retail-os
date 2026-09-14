@@ -12,7 +12,8 @@
     "start:dev": "nest start --watch",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "db:seed": "prisma db seed"
+    "db:seed": "prisma db seed",
+    "fusion:replay": "ts-node -T scripts/replay-fusion.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.0",

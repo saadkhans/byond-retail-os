@@ -316,6 +316,29 @@ class EnvironmentVariables {
   @Max(600_000)
   PICKUP_VLM_TIMEOUT_MS?: number;
 
+  // Phase 25 — VLM EVENT VERIFICATION: before the identity stages run,
+  // the local VLM counts the product units in the touched shelf cell
+  // BEFORE and AFTER the hand motion. NONE (units unchanged, HIGH
+  // confidence) is a touch — no pickup is proposed and no identity work
+  // runs; REMOVED/ADDED fixes the event kind. Motion with no durable
+  // pixel change is also checked, so a clear bottle that left the shelf
+  // without tripping the pixel threshold can still become an event.
+  // Opt-in (strict true/false, default false); needs PICKUP_VLM_ENABLED
+  // with the local provider.
+  @IsOptional()
+  @Matches(/^(true|false)$/i, {
+    message: 'PICKUP_VLM_EVENT_CHECK must be true or false',
+  })
+  PICKUP_VLM_EVENT_CHECK?: string;
+
+  // Deadline for ONE event-count check (two small images). Default 60000;
+  // bounds 5 s .. 3 min so a typo cannot stall a run or abort a warm-up.
+  @IsOptional()
+  @IsInt()
+  @Min(5000)
+  @Max(180_000)
+  PICKUP_VLM_EVENT_CHECK_TIMEOUT_MS?: number;
+
   // Local (Ollama) verifier endpoint — the adapter itself refuses any
   // non-loopback URL, so no host validation is duplicated here.
   @IsOptional()

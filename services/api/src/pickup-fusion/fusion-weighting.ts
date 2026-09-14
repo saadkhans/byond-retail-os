@@ -134,8 +134,17 @@ export interface PlanogramRackLayout {
 
 /** Score in the planogram signal for a product assigned to the event cell. */
 export const PLANOGRAM_CELL_SCORE = 1;
-/** Score for a product assigned elsewhere on the bound rack. */
-export const PLANOGRAM_RACK_SCORE = 0.6;
+/**
+ * Score for a product assigned elsewhere on the bound rack. 0.8, not the
+ * earlier 0.6: the planogram is a SOFT prior and the cell-vs-rack contrast
+ * decides only when the visual signals are close. Offline re-scoring of
+ * the 30 ground-truthed R1 batch-1 clips (2026-09-13) from their stored
+ * per-signal scores: 0.6 ranked 19/22 event clips correctly and flipped
+ * the water-taken-from-A2 wrong-cell test to Nescafe on a 0.035 gap; 0.8
+ * ranks 20/22 with that clip correct; 0.9 and above start flipping real
+ * returns the other way. Cell match stays 1.0, off-rack 0.
+ */
+export const PLANOGRAM_RACK_SCORE = 0.8;
 
 /**
  * Map the event's normalized ANALYSIS-FRAME point through the rack's

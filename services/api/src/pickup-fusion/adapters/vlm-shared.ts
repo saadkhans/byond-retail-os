@@ -298,8 +298,34 @@ export function parseStrictVerdict(
     reasonCodes: reasonCodes.codes,
     contradictions: contradictions.codes,
     requiresHumanReview: record.requiresHumanReview,
+    observedDescription: normalizeObservedDescription(record.observedDescription),
   };
   return { status: 'VERDICT', result, errorDetail: null };
+}
+
+/** Longest description retained from the describe-then-choose step. */
+export const OBSERVED_DESCRIPTION_MAX_CHARS = 120;
+
+/**
+ * The optional free-text description is tolerated, never required: a
+ * non-string becomes null, control characters are dropped, whitespace is
+ * collapsed and the text is cut at OBSERVED_DESCRIPTION_MAX_CHARS. It is
+ * still response-derived text, so the persistence boundary screens it for
+ * sensitive content before it reaches the evidence row.
+ */
+export function normalizeObservedDescription(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const printable = Array.from(value, (char) => {
+    const code = char.charCodeAt(0);
+    return code < 32 || code === 127 ? ' ' : char;
+  }).join('');
+  const cleaned = printable.replace(/\s+/g, ' ').trim();
+  if (cleaned.length === 0) {
+    return null;
+  }
+  return cleaned.slice(0, OBSERVED_DESCRIPTION_MAX_CHARS);
 }
 
 export interface VlmPromptParts {
@@ -434,6 +460,169 @@ export function enlargeCrop(image: RgbImage): RgbImage {
   return resizeRgb(image, image.width * scale, image.height * scale);
 }
 
+// ------------------------------------------------------ event-count check
+
+/**
+ * The before/after unit-count instruction (Phase 25). Validated on the
+ * first 30-clip R1 lab batch at 26/27 agreement with ground truth, with
+ * every false touch answered NONE. The model is asked to COUNT — a
+ * concrete, checkable task — never "was this a pickup", so the answer can
+ * be cross-checked against the counts by the strict parser.
+ */
+export const EVENT_COUNT_INSTRUCTION =
+  'You see two photos of the SAME retail shelf cell: image 1 is BEFORE a ' +
+  "shopper's hand reached in, image 2 is AFTER the hand left. Count the " +
+  'product units (bottles, jars or cans) standing in the cell in each ' +
+  'photo. Ignore hands, shadows and small shifts in position. Answer with ' +
+  'exactly one JSON object: {"before": <integer>, "after": <integer>, ' +
+  '"change": "REMOVED" | "ADDED" | "NONE", "confidence": "HIGH" | "LOW"}';
+
+/** Counts above this are not a shelf cell — the answer is rejected. */
+export const EVENT_COUNT_MAX_UNITS = 20;
+
+export type EventCountParseResult =
+  | {
+      status: 'VERDICT';
+      before: number;
+      after: number;
+      change: 'REMOVED' | 'ADDED' | 'NONE';
+      confidence: 'HIGH' | 'LOW';
+      errorCode: null;
+      errorDetail: null;
+    }
+  | {
+      status: 'FAILED';
+      before: null;
+      after: null;
+      change: null;
+      confidence: null;
+      errorCode: 'MALFORMED_RESPONSE' | 'INVALID_JSON' | 'INVALID_SCHEMA';
+      errorDetail: string;
+    };
+
+function eventCountFail(
+  errorCode: 'MALFORMED_RESPONSE' | 'INVALID_JSON' | 'INVALID_SCHEMA',
+  errorDetail: string,
+): EventCountParseResult {
+  return {
+    status: 'FAILED',
+    before: null,
+    after: null,
+    change: null,
+    confidence: null,
+    errorCode,
+    errorDetail,
+  };
+}
+
+/**
+ * Strict whitelist parse of the event-count answer. Same posture as
+ * parseStrictVerdict: exactly one JSON object, every field validated,
+ * and the change word must AGREE with the counts — a model that says
+ * NONE with 2 → 1 is rejected as INVALID_SCHEMA rather than trusted.
+ */
+export function parseEventCountResult(
+  text: string,
+  options: { stripFences?: boolean } = {},
+): EventCountParseResult {
+  const source = (options.stripFences ? stripCodeFences(text) : text).trim();
+  if (source.length === 0) {
+    return eventCountFail('MALFORMED_RESPONSE', 'empty response text');
+  }
+  let jsonText: string;
+  if (options.stripFences) {
+    const jsonMatch = source.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      return eventCountFail('MALFORMED_RESPONSE', 'no JSON object found in response text');
+    }
+    jsonText = jsonMatch[0];
+  } else {
+    if (!source.startsWith('{') || !source.endsWith('}')) {
+      return eventCountFail(
+        'MALFORMED_RESPONSE',
+        'response must be exactly one bare JSON object (no prose, no fences)',
+      );
+    }
+    jsonText = source;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (error) {
+    return eventCountFail(
+      'INVALID_JSON',
+      `JSON.parse failed (${error instanceof Error ? error.constructor.name : 'unknown'})`,
+    );
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return eventCountFail('INVALID_SCHEMA', 'response is not a JSON object');
+  }
+  const record = parsed as Record<string, unknown>;
+  const count = (key: 'before' | 'after'): number | null => {
+    const value = record[key];
+    return typeof value === 'number' &&
+      Number.isInteger(value) &&
+      value >= 0 &&
+      value <= EVENT_COUNT_MAX_UNITS
+      ? value
+      : null;
+  };
+  const before = count('before');
+  const after = count('after');
+  if (before === null || after === null) {
+    return eventCountFail(
+      'INVALID_SCHEMA',
+      `"before"/"after" must be integers in 0..${EVENT_COUNT_MAX_UNITS}`,
+    );
+  }
+  const change = record.change;
+  if (change !== 'REMOVED' && change !== 'ADDED' && change !== 'NONE') {
+    return eventCountFail('INVALID_SCHEMA', '"change" must be REMOVED, ADDED or NONE');
+  }
+  const expected = after < before ? 'REMOVED' : after > before ? 'ADDED' : 'NONE';
+  if (change !== expected) {
+    return eventCountFail(
+      'INVALID_SCHEMA',
+      `"change" ${change} disagrees with the counts (${before} -> ${after} is ${expected})`,
+    );
+  }
+  const confidence = record.confidence;
+  if (confidence !== 'HIGH' && confidence !== 'LOW') {
+    return eventCountFail('INVALID_SCHEMA', '"confidence" must be HIGH or LOW');
+  }
+  return {
+    status: 'VERDICT',
+    before,
+    after,
+    change,
+    confidence,
+    errorCode: null,
+    errorDetail: null,
+  };
+}
+
+/** Longest side of an event-check image sent to the model. */
+export const EVENT_CHECK_MAX_SIDE = 640;
+
+/**
+ * Downscale so the longest side is at most EVENT_CHECK_MAX_SIDE (never
+ * upsamples) and encode as PNG — the cell crop the count check sees.
+ */
+export function encodeEventCheckImage(image: RgbImage): Buffer {
+  const longest = Math.max(image.width, image.height);
+  if (longest <= EVENT_CHECK_MAX_SIDE || longest <= 0) {
+    return encodeRgbPng(image);
+  }
+  const scale = EVENT_CHECK_MAX_SIDE / longest;
+  return encodeRgbPng(
+    resizeRgb(
+      image,
+      Math.max(1, Math.round(image.width * scale)),
+      Math.max(1, Math.round(image.height * scale)),
+    ),
+  );
+}
+
 export function buildPromptParts(
   evidence: VlmRequestEvidence,
   options: VlmPromptOptions = {},
@@ -485,11 +674,33 @@ export function buildPromptParts(
         `photos (shape, colour, label). Answer with exactly one SKU from the list, or ` +
         `NONE if none matches.`
       : `Which candidate product was picked up?`;
+  // Describe-then-choose: the model must commit to what it SEES (material,
+  // colour, shape, readable text) before it looks at the candidate list,
+  // so a clear plastic bottle is not talked into being a coloured can by a
+  // stronger-looking reference photo. A material or dominant-colour
+  // mismatch is a hard exclusion, and UNKNOWN is the honest answer when
+  // nothing matches the description.
+  const procedure =
+    `Work in two steps. STEP 1: look ONLY at the product crop and the event frames and ` +
+    `write "observedDescription": its material (clear plastic, metal can, glass, paper or ` +
+    `cardboard), its dominant colour, its shape, and any label text you can actually ` +
+    `read (max 120 characters). STEP 2: compare that description against EACH ` +
+    `candidate's reference photos. A candidate whose references show a different ` +
+    `material or a different dominant colour than you described is NOT a match, ` +
+    `whatever its fused score. Choose a SKU only when its references agree with your ` +
+    `description; otherwise answer UNKNOWN. Never pick the best of a bad set. SKU codes ` +
+    `and catalog names are internal identifiers that need not appear on the packaging: ` +
+    `never report a contradiction because the SKU code or catalog name differs from the ` +
+    `printed label. LABEL_MISMATCH means only that text printed on the product ` +
+    `contradicts text printed on the chosen candidate's reference photos.
+`;
   const instruction =
     layout +
+    procedure +
     `${question} Return EXACTLY ONE JSON object ` +
     `and nothing else: no markdown, no code fences, no prose before or after.\n` +
-    `Schema: {"verdict": "MATCH"|"AMBIGUOUS"|"UNKNOWN"|"INVALID_INPUT", ` +
+    `Schema: {"observedDescription": string, ` +
+    `"verdict": "MATCH"|"AMBIGUOUS"|"UNKNOWN"|"INVALID_INPUT", ` +
     `"selectedSku": string|null, ` +
     `"visualSupport": "STRONG"|"MEDIUM"|"WEAK"|"NONE", ` +
     `"ocrSupport": "STRONG"|"MEDIUM"|"WEAK"|"NONE", ` +
@@ -498,6 +709,9 @@ export function buildPromptParts(
     `"requiresHumanReview": boolean}.\n` +
     `Rules: "selectedSku" MUST be null unless "verdict" is "MATCH"; when ` +
     `MATCH it MUST be exactly one of: ${skus.join(', ')}. ` +
+    `"visualSupport" is STRONG only when the crop's material, colour, shape AND label all ` +
+    `agree with the chosen candidate's references; MEDIUM when material and colour agree ` +
+    `but the label is unreadable; WEAK when only the shape agrees. ` +
     `Use UNKNOWN if no candidate matches, AMBIGUOUS if several are ` +
     `indistinguishable, INVALID_INPUT if the images are unusable. ` +
     `"reasonCodes" may ONLY use: ${VLM_REASON_CODES.filter((code) => code !== 'LEGACY_SCHEMA_MAPPED').join(', ')}. ` +

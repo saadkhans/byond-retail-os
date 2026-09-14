@@ -30,7 +30,11 @@ import {
   rackPointFor,
 } from './fusion-weighting';
 import { analysisGeometryFor } from '../pickup-detection/analysis/analysis-frames';
-import { AnalysisFrame, BoundingBox } from '../pickup-detection/analysis/pickup-analyzer';
+import {
+  AnalysisFrame,
+  AnalysisGeometry,
+  BoundingBox,
+} from '../pickup-detection/analysis/pickup-analyzer';
 import { RgbImage, cropRgb } from '../pickup-detection/analysis/product-matcher';
 import { referencesPerCandidateFromConfig } from './adapters/vlm-shared';
 import {
@@ -52,12 +56,21 @@ import {
   OcrReader,
   PickupDetectionOutput,
   PickupEventDetector,
+  PickupEventKind,
+  PickupEventProposal,
   PickupMediaDecoder,
   QualifiedCrop,
   VisualRetriever,
+  VlmEventChange,
+  VlmEventCheckStatus,
+  VlmEventCheckVerdict,
+  VlmEventConfidence,
   VlmStructuredResult,
   VlmVerdict,
+  VlmRequestEvidence,
 } from './ports';
+import { cellFromNormalized } from '../planogram/planogram.logic';
+import { encodeEventCheckImage } from './adapters/vlm-shared';
 import {
   PICKUP_BARCODE_READER,
   PICKUP_CANDIDATE_FUSION,
@@ -78,6 +91,7 @@ import {
   occlusionFraction,
   selectBestCrop,
   sharpness,
+  shelfZoneFor,
   textFieldOverlap,
 } from './primitives';
 
@@ -133,6 +147,68 @@ export function fusionCropIdempotencyKey(
  *  interaction cannot bleed into this window's detection. */
 export const WINDOW_BASELINE_LEAD_IN_MS = 1000;
 
+/**
+ * Phase 25 event-count check instants: the BEFORE crop is taken this far
+ * ahead of the motion start (a settled shelf, no hand yet) and the AFTER
+ * crop this far past the motion end (hand gone, product settled). Both
+ * validated on the R1 lab batch: 26/27 count agreements with ground
+ * truth; the one miss was a return whose jar was still being placed.
+ */
+export const EVENT_CHECK_PRE_LEAD_MS = 800;
+export const EVENT_CHECK_POST_LAG_MS = 1200;
+/**
+ * A "units unchanged" answer is CONFIRMED on a later AFTER frame before it
+ * is allowed to veto the event: a return whose jar is still being set down
+ * at +1.2 s (the one lab miss) reads as unchanged there and as ADDED here.
+ * Only touches pay for the second call.
+ */
+export const EVENT_CHECK_CONFIRM_POST_LAG_MS = 2500;
+export const EVENT_CHECK_CONFIRM_PRE_LEAD_MS = 2500;
+/** The count check decodes its two frames at up to this width so a cell
+ *  crop keeps enough detail to count units (then EVENT_CHECK_MAX_SIDE). */
+export const EVENT_CHECK_DECODE_WIDTH = 1280;
+/** Without a planogram cell the crop is the event box grown by this factor. */
+export const EVENT_CHECK_BOX_GROWTH = 2.5;
+/** Warning codes the check adds to the detector warnings. */
+export const TOUCH_ONLY = 'TOUCH_ONLY';
+export const EVENT_FROM_VLM_COUNT = 'EVENT_FROM_VLM_COUNT';
+
+/** Clamp a box to the source frame (at least 1×1). */
+export function clampBoxToSource(
+  box: BoundingBox,
+  source: { width: number; height: number },
+): BoundingBox {
+  const x = Math.max(0, Math.min(box.x, source.width - 1));
+  const y = Math.max(0, Math.min(box.y, source.height - 1));
+  return {
+    x,
+    y,
+    width: Math.max(1, Math.min(box.width, source.width - x)),
+    height: Math.max(1, Math.min(box.height, source.height - y)),
+  };
+}
+
+/** Grow a box about its centre by `factor`, clamped to the source frame. */
+export function growBox(
+  box: BoundingBox,
+  factor: number,
+  source: { width: number; height: number },
+): BoundingBox {
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  const width = box.width * factor;
+  const height = box.height * factor;
+  return clampBoxToSource(
+    {
+      x: Math.floor(cx - width / 2),
+      y: Math.floor(cy - height / 2),
+      width: Math.ceil(width),
+      height: Math.ceil(height),
+    },
+    source,
+  );
+}
+
 /** Bounds on the frame buffer a live window may hand to fusion — enough
  *  for ten minutes at the slowest legal sampling, small enough that a
  *  runaway session cannot flood one run. */
@@ -175,6 +251,13 @@ export const LIVE_FRAME_PIXEL_SCREEN_REQUIRED =
   'LIVE_FRAME_PIXEL_SCREEN_REQUIRED';
 export const BARCODE_VALUE_SUPPRESSED = 'UNMATCHED_SCREENED';
 
+/** Identity-verify statuses retried once with the identical request. */
+export const VLM_RETRYABLE_STATUSES: ReadonlySet<string> = new Set([
+  'INVALID_SCHEMA',
+  'INVALID_JSON',
+  'MALFORMED_RESPONSE',
+]);
+
 /**
  * Shadow verdict rule, extracted for tests and shared by the run-time bake
  * AND the read-time recompute: each pipeline's BEST ANSWER is compared
@@ -198,15 +281,24 @@ export function shadowVerdict(
   return predictedSku === truth.sku ? 'correct' : 'incorrect';
 }
 
-/** v2's best answer: the VLM's MATCHED SKU when present, else fused #1.
+/** v2's best answer: the VLM's MATCHED SKU when present, else fused #1 —
+ *  with ONE exception, the disagreement credit rule: when fusion was
+ *  itself confident (its own decision was AUTO_PROPOSE) and the VLM picked
+ *  a DIFFERENT supplied SKU with less than STRONG visual support, fusion's
+ *  top candidate stays the credited answer (the clip still goes to review;
+ *  see policyFromVlmResult). A lone weakly-supported verifier pick must not
+ *  outvote a confident, separated ranking; a STRONG disagreement still does.
  *  Accepts BOTH evidence generations because shadow verdicts are
  *  recomputed at read time over historical rows: the strict schema
- *  (verdict/selectedSku) and the retired pre-strict shape (choice). */
+ *  (verdict/selectedSku) and the retired pre-strict shape (choice); rows
+ *  written before `fusionDecision` existed behave exactly as before. */
 export function fusionPredictedSku(evidence: {
   vlm: {
     status: string | null;
     verdict?: string | null;
     selectedSku?: string | null;
+    visualSupport?: string | null;
+    fusionDecision?: 'AUTO_PROPOSE' | 'NEEDS_VLM' | null;
     /** Legacy rows only — never written by the strict pipeline. */
     choice?: string | null;
   };
@@ -214,6 +306,17 @@ export function fusionPredictedSku(evidence: {
 }): string | null {
   if (evidence.vlm.status === 'VERDICT') {
     if (evidence.vlm.verdict === 'MATCH' && evidence.vlm.selectedSku) {
+      const top = evidence.fused[0]?.sku ?? null;
+      if (
+        vlmDisagreementYieldsToFusion(
+          evidence.vlm.fusionDecision ?? null,
+          top,
+          evidence.vlm.selectedSku,
+          evidence.vlm.visualSupport ?? null,
+        )
+      ) {
+        return top;
+      }
       return evidence.vlm.selectedSku;
     }
     if (
@@ -229,12 +332,46 @@ export function fusionPredictedSku(evidence: {
 }
 
 /**
+ * The disagreement credit rule (shared by the policy reason and the shadow
+ * credit): true when fusion was confident on its own (AUTO_PROPOSE), the
+ * verifier matched a DIFFERENT supplied SKU, and its visual support is
+ * anything less than STRONG. Such a pick is recorded and sends the clip to
+ * review, but fusion's top candidate remains the credited answer.
+ */
+export function vlmDisagreementYieldsToFusion(
+  fusionDecision: 'AUTO_PROPOSE' | 'NEEDS_VLM' | null,
+  topSku: string | null,
+  selectedSku: string | null,
+  visualSupport: string | null,
+): boolean {
+  return (
+    fusionDecision === 'AUTO_PROPOSE' &&
+    topSku !== null &&
+    selectedSku !== null &&
+    selectedSku !== topSku &&
+    visualSupport !== 'STRONG'
+  );
+}
+
+/**
  * The POLICY decision derived from a validated verifier result — the VLM
  * never sets policy itself; this pure rule (extracted for tests) consumes
  * the structured result and decides. Shadow-phase safety over throughput:
  * every uncertainty signal (AMBIGUOUS, UNKNOWN against confident fusion,
  * INVALID_INPUT, requiresHumanReview, contradictions, disagreement with
- * fusion's top candidate) demotes to human review.
+ * fusion's top candidate) demotes to human review. A disagreement is
+ * credited per `vlmDisagreementYieldsToFusion`: a weakly-supported pick
+ * against a confident ranking leaves fusion's candidate credited.
+ *
+ * ONE contradiction is discounted: a lone LABEL_MISMATCH on a STRONG visual
+ * match that agrees with fusion's top candidate. The local 7B model
+ * compares the text printed on the product against the CATALOG names it is
+ * given ("Drinking Water Bottle 500ml" for a bottle labelled AKOYA,
+ * "Nescafe" for SKU-LIME-GREEN), and reports that difference as a label
+ * contradiction on virtually every clip — an artefact of the prompt inputs,
+ * not evidence about the product. Any other contradiction, a weaker visual
+ * match, a disagreement with fusion or a requiresHumanReview flag keeps the
+ * review behaviour.
  */
 export function policyFromVlmResult(
   result: VlmStructuredResult,
@@ -273,20 +410,39 @@ export function policyFromVlmResult(
       }`,
     };
   }
-  if (result.contradictions.length > 0) {
+  const agreesWithFusion = topSku !== null && result.selectedSku === topSku;
+  const spuriousLabelMismatch =
+    agreesWithFusion &&
+    result.visualSupport === 'STRONG' &&
+    result.contradictions.length === 1 &&
+    result.contradictions[0] === 'LABEL_MISMATCH';
+  if (result.contradictions.length > 0 && !spuriousLabelMismatch) {
     return {
       result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
       reason: `VLM matched ${result.selectedSku} but reported contradictions (${result.contradictions.join(', ')})`,
     };
   }
-  if (topSku !== null && result.selectedSku === topSku) {
+  if (agreesWithFusion) {
     return {
       result: FusionPolicyResult.AUTO_PROPOSE,
-      reason: `VLM confirmed ${result.selectedSku} (visual ${result.visualSupport}, ocr ${result.ocrSupport}, barcode ${result.barcodeSupport})`,
+      reason:
+        `VLM confirmed ${result.selectedSku} (visual ${result.visualSupport}, ocr ` +
+        `${result.ocrSupport}, barcode ${result.barcodeSupport})` +
+        (spuriousLabelMismatch ? '; catalog-name label mismatch ignored' : ''),
     };
   }
   // The VLM chose a DIFFERENT supplied SKU than fusion's top — shadow
   // phase treats disagreement as review, never as an automatic override.
+  if (
+    vlmDisagreementYieldsToFusion(fusionDecision, topSku, result.selectedSku, result.visualSupport)
+  ) {
+    return {
+      result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
+      reason:
+        `VLM chose ${result.selectedSku} (visual ${result.visualSupport}) but fusion ` +
+        `ranked ${topSku} first with confidence — ${topSku} credited, review`,
+    };
+  }
   return {
     result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
     reason: `VLM chose ${result.selectedSku} but fusion ranked ${topSku} first — review`,
@@ -338,9 +494,37 @@ export function applyVlmVerdictToEvidence(
   evidence.vlm.reasonCodes = result.reasonCodes;
   evidence.vlm.contradictions = result.contradictions;
   evidence.vlm.requiresHumanReview = result.requiresHumanReview;
+  evidence.vlm.fusionDecision = fusionDecision;
+  // The description is response-derived free text: it can echo label
+  // text the model read, so the same reject-on-write screen that guards
+  // OCR text replaces anything sensitive with the classified marker.
+  const description = result.observedDescription ?? null;
+  evidence.vlm.observedDescription =
+    description === null
+      ? null
+      : containsSensitiveFreeText(description)
+        ? OCR_TEXT_SUPPRESSED
+        : description;
   // The VLM never sets policy — the pure policy rule decides from the
   // VALIDATED result.
   evidence.policy = policyFromVlmResult(result, fusionDecision, topSku);
+}
+
+/**
+ * Reference photos shown to the identity verifier, most useful first: the
+ * largest file per product (a resolution proxy — placeholder PNGs and tiny
+ * crops sort last), then oldest, then id, so the choice is deterministic
+ * for unchanged data. Exported for tests.
+ */
+export function orderReferenceRows<
+  T extends { id: string; sizeBytes: number; createdAt: Date },
+>(rows: readonly T[]): T[] {
+  return [...rows].sort(
+    (a, b) =>
+      b.sizeBytes - a.sizeBytes ||
+      a.createdAt.getTime() - b.createdAt.getTime() ||
+      (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+  );
 }
 
 export interface PolicyThresholds {
@@ -479,9 +663,19 @@ export interface FusionEvidence {
     reasonCodes: string[];
     contradictions: string[];
     requiresHumanReview: boolean | null;
+    /** Describe-then-choose: what the model said it saw before choosing
+     *  (screened text, at most 120 chars) — diagnostics for a wrong pick. */
+    observedDescription?: string | null;
+    /** Fusion's OWN decision before the verifier ran, kept so the credit
+     *  rule (fusionPredictedSku) can tell a confident ranking from a
+     *  NEEDS_VLM one at read time; absent on rows written before it. */
+    fusionDecision?: 'AUTO_PROPOSE' | 'NEEDS_VLM' | null;
+    /** Identity verify calls repeated after a malformed/invalid-schema
+     *  answer from the local model (0 or 1); the retry reuses the request. */
+    retries?: number;
     /** Which reference images each candidate was shown (deterministic:
-     *  oldest rows first). referenceImageId keeps the first for older
-     *  readers; referenceImageIds lists all of them. */
+     *  largest files first, then oldest). referenceImageId keeps the first
+     *  for older readers; referenceImageIds lists all of them. */
     references?: {
       sku: string;
       referenceImageId: string | null;
@@ -543,6 +737,38 @@ export interface FusionEvidence {
     cellCode: string | null;
     candidates: { sku: string; score: number; detail?: string }[];
   };
+  /** Phase 25 — the VLM before/after unit-count check on the touched cell
+   *  (PICKUP_VLM_EVENT_CHECK). Numbers, codes and boxes only. */
+  eventVerification?: {
+    status: VlmEventCheckStatus;
+    /** Which event the check was run for: the detector's primary event,
+     *  or a motion window that produced no durable change. */
+    source: 'primary' | 'motion-window' | null;
+    before: number | null;
+    after: number | null;
+    change: VlmEventChange | null;
+    confidence: VlmEventConfidence | null;
+    latencyMs: number | null;
+    /** The cell crop sent, in SOURCE pixels. */
+    cropBox: BoundingBox | null;
+    preMs: number | null;
+    postMs: number | null;
+    cellLabel: string | null;
+    /** Set when a HIGH-confidence REMOVED/ADDED replaced the detector's
+     *  contrast-derived kind. */
+    kindOverride: PickupEventKind | null;
+    errorCode?: string | null;
+    /** The confirmation call made on a later AFTER frame when the first
+     *  answer was "unchanged" (null when no confirmation was needed). */
+    confirmation?: {
+      status: VlmEventCheckStatus;
+      change: VlmEventChange | null;
+      confidence: VlmEventConfidence | null;
+      preMs: number;
+      postMs: number;
+      latencyMs: number | null;
+    } | null;
+  };
 }
 
 @Injectable()
@@ -558,6 +784,9 @@ export class PickupFusionService {
   private readonly vlmProvider: 'local' | 'anthropic';
   private readonly vlmMode: 'UNCERTAIN_ONLY' | 'VALIDATION_ALWAYS';
   private readonly liveFastMode: boolean;
+  /** Phase 25 — PICKUP_VLM_EVENT_CHECK: the before/after unit-count check. */
+  private readonly vlmEventCheckEnabled: boolean;
+  private readonly vlmEventCheckTimeoutMs: number;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -660,6 +889,29 @@ export class PickupFusionService {
     this.liveFastMode =
       (config.get<string>('CV_LIVE_FAST_MODE') ?? '').trim().toLowerCase() ===
       'true';
+    this.vlmEventCheckEnabled =
+      (config.get<string>('PICKUP_VLM_EVENT_CHECK') ?? '').trim().toLowerCase() ===
+      'true';
+    this.vlmEventCheckTimeoutMs = bounded(
+      'PICKUP_VLM_EVENT_CHECK_TIMEOUT_MS',
+      60_000,
+      5_000,
+      180_000,
+    );
+  }
+
+  /**
+   * The event-count check runs only when explicitly enabled, the VLM
+   * stage is enabled, the provider is the LOCAL one (cell crops never
+   * leave the machine), and the selected verifier implements it.
+   */
+  private get eventCheckActive(): boolean {
+    return (
+      this.vlmEventCheckEnabled &&
+      this.vlmEnabled &&
+      this.vlmProvider === 'local' &&
+      typeof this.vlm.verifyEvent === 'function'
+    );
   }
 
   /** The configured verifier PORT — LOCAL (Ollama) by default; no paid
@@ -767,6 +1019,10 @@ export class PickupFusionService {
   }): Promise<{
     scopedEvents: PickupDetectionOutput['events'];
     finalWarnings: string[];
+    /** The detector's motion window / searched cell (ANALYSIS geometry),
+     *  reported even when no durable change produced an event. */
+    motionWindow: { startMs: number; peakMs: number; endMs: number } | null;
+    localizedArea: BoundingBox | null;
   }> {
       const leadIn = Math.max(WINDOW_BASELINE_LEAD_IN_MS, ctx.frameMarginMs);
       const framesForDet = ctx.window
@@ -834,7 +1090,12 @@ export class PickupFusionService {
           box: scaleBoxToSource(box.box, ctx.geometry, ctx.source),
         })),
       }));
-      return { scopedEvents, finalWarnings: detection.warnings };
+      return {
+        scopedEvents,
+        finalWarnings: detection.warnings,
+        motionWindow: detection.motionWindow ?? null,
+        localizedArea: detection.localizedArea ?? null,
+      };
   }
 
   /** Per-stage timing wrapper shared by both pipeline entry points. */
@@ -908,6 +1169,9 @@ export class PickupFusionService {
         reasonCodes: [],
         contradictions: [],
         requiresHumanReview: null,
+        observedDescription: null,
+        fusionDecision: null,
+        retries: 0,
         modelKey: null,
         latencyMs: null,
       },
@@ -915,7 +1179,181 @@ export class PickupFusionService {
       shadow: { classicalV1: null, groundTruth: null, v1Verdict: null, v2Verdict: null },
       planogramScope: null,
       notes: [],
+      eventVerification: {
+        status: 'NOT_RUN',
+        source: null,
+        before: null,
+        after: null,
+        change: null,
+        confidence: null,
+        latencyMs: null,
+        cropBox: null,
+        preMs: null,
+        postMs: null,
+        cellLabel: null,
+        kindOverride: null,
+        errorCode: null,
+      },
     };
+  }
+
+  /**
+   * Phase 25 — the planogram cell rectangle (SOURCE pixels, 10% padding)
+   * the event's centre maps to, when the asset is bound to a rack with a
+   * known geometry; null when there is no rack, no cell mapping, or the
+   * point falls outside the rack frame region.
+   */
+  /** The planogram cell an analysis-frame box maps to (null: no rack, or
+   *  the point lies outside the rack frame region). */
+  private planogramCellFor(
+    eventBox: BoundingBox,
+    geometry: AnalysisGeometry,
+    rackRegion: { x: number; y: number; width: number; height: number } | null,
+    scope: PlanogramScope | null,
+  ): { rowIndex: number; columnIndex: number; cellCode: string } | null {
+    if (!scope || scope.rows <= 0 || scope.columns <= 0) {
+      return null;
+    }
+    const framePoint = {
+      x: (eventBox.x + eventBox.width / 2) / geometry.width,
+      y: (eventBox.y + eventBox.height / 2) / geometry.height,
+    };
+    const rackPoint = rackPointFor(framePoint, rackRegion);
+    if (rackPoint === null) {
+      return null;
+    }
+    const cell = cellFromNormalized(scope.rows, scope.columns, rackPoint.x, rackPoint.y);
+    return { rowIndex: cell.rowIndex, columnIndex: cell.columnIndex, cellCode: cell.cellCode };
+  }
+
+  /** One planogram cell's rectangle in SOURCE pixels, padded 10% and
+   *  clamped to the frame — the crop the count check sees. */
+  private planogramCellCrop(
+    cell: { rowIndex: number; columnIndex: number; cellCode: string },
+    source: { width: number; height: number },
+    rackRegion: { x: number; y: number; width: number; height: number } | null,
+    scope: PlanogramScope,
+  ): { box: BoundingBox; cellCode: string } {
+    const area = rackRegion ?? { x: 0, y: 0, width: 1, height: 1 };
+    const cellWidth = area.width / scope.columns;
+    const cellHeight = area.height / scope.rows;
+    const pad = 0.1;
+    const unit = (value: number) => Math.max(0, Math.min(1, value));
+    const x0 = unit(area.x + (cell.columnIndex - pad) * cellWidth);
+    const y0 = unit(area.y + (cell.rowIndex - pad) * cellHeight);
+    const x1 = unit(area.x + (cell.columnIndex + 1 + pad) * cellWidth);
+    const y1 = unit(area.y + (cell.rowIndex + 1 + pad) * cellHeight);
+    return {
+      box: clampBoxToSource(
+        {
+          x: Math.round(x0 * source.width),
+          y: Math.round(y0 * source.height),
+          width: Math.round((x1 - x0) * source.width),
+          height: Math.round((y1 - y0) * source.height),
+        },
+        source,
+      ),
+      cellCode: cell.cellCode,
+    };
+  }
+
+  /**
+   * Phase 25 — run the before/after unit-count check for ONE window over
+   * ONE cell crop and record it on the evidence. Never throws: a verifier
+   * that throws is recorded as FAILED/ADAPTER_THREW and the pipeline
+   * proceeds exactly as if the check had not run.
+   */
+  private async verifyEventCount(ctx: {
+    evidence: FusionEvidence;
+    timed: TimedFn;
+    source: 'primary' | 'motion-window';
+    window: { startMs: number; endMs: number };
+    durationMs: number;
+    cropBox: BoundingBox;
+    cellLabel: string | null;
+    frameAt: (ms: number) => Promise<AnalysisFrame>;
+    frameGeometry: AnalysisGeometry;
+    sourceGeometry: { width: number; height: number };
+    /** Lead of the BEFORE frame ahead of the motion start and lag of the
+     *  AFTER frame past its end (defaults: the primary instants; the
+     *  confirmation pass uses the wider ones). */
+    preLeadMs?: number;
+    postLagMs?: number;
+    /** Record as the confirmation of an earlier answer instead of the
+     *  primary evidence block. */
+    asConfirmation?: boolean;
+  }): Promise<VlmEventCheckVerdict> {
+    const preMs = Math.max(0, ctx.window.startMs - (ctx.preLeadMs ?? EVENT_CHECK_PRE_LEAD_MS));
+    const postMs = Math.max(
+      0,
+      Math.min(
+        ctx.durationMs - 1,
+        ctx.window.endMs + (ctx.postLagMs ?? EVENT_CHECK_POST_LAG_MS),
+      ),
+    );
+    const verdict = await ctx.timed(
+      'event-verification',
+      { adapterKey: `${this.vlm.adapterKey}-count`, version: this.vlm.version },
+      async (): Promise<VlmEventCheckVerdict> => {
+        try {
+          const [pre, post] = await Promise.all([ctx.frameAt(preMs), ctx.frameAt(postMs)]);
+          const boxInFrame = scaleBoxToSource(ctx.cropBox, ctx.sourceGeometry, ctx.frameGeometry);
+          const crop = (frame: AnalysisFrame): Buffer =>
+            encodeEventCheckImage(
+              cropRgb(
+                { width: ctx.frameGeometry.width, height: ctx.frameGeometry.height, rgb: frame.rgb },
+                boxInFrame,
+              ),
+            );
+          return await this.vlm.verifyEvent!(
+            { preFrame: crop(pre), postFrame: crop(post), cellLabel: ctx.cellLabel },
+            this.vlmEventCheckTimeoutMs,
+          );
+        } catch (error) {
+          this.logger.warn(
+            `event-verification failed: ${error instanceof Error ? error.constructor.name : 'unknown'}`,
+          );
+          return {
+            status: 'FAILED',
+            before: null,
+            after: null,
+            change: null,
+            confidence: null,
+            latencyMs: null,
+            errorCode: 'ADAPTER_THREW',
+          };
+        }
+      },
+      ctx.asConfirmation ? `${ctx.source} (confirmation)` : ctx.source,
+    );
+    if (ctx.asConfirmation && ctx.evidence.eventVerification) {
+      ctx.evidence.eventVerification.confirmation = {
+        status: verdict.status,
+        change: verdict.change,
+        confidence: verdict.confidence,
+        preMs,
+        postMs,
+        latencyMs: verdict.latencyMs,
+      };
+      return verdict;
+    }
+    ctx.evidence.eventVerification = {
+      status: verdict.status,
+      source: ctx.source,
+      before: verdict.before,
+      after: verdict.after,
+      change: verdict.change,
+      confidence: verdict.confidence,
+      latencyMs: verdict.latencyMs,
+      cropBox: ctx.cropBox,
+      preMs,
+      postMs,
+      cellLabel: ctx.cellLabel,
+      kindOverride: null,
+      errorCode: verdict.errorCode ?? null,
+      confirmation: null,
+    };
+    return verdict;
   }
 
   /**
@@ -1037,31 +1475,16 @@ export class PickupFusionService {
       if (window) {
         evidence.replayWindow = { ...window };
       }
-      const { scopedEvents, finalWarnings } = await this.detectScopedToWindow({
-        evidence,
-        timed,
-        frames: framesSmall,
-        geometry: geometrySmall,
-        source,
-        window,
-        frameMarginMs: 1000 / this.detectionConfig.analysisFps,
-      });
-
-      if (scopedEvents.length === 0) {
-        const cameraMotion = finalWarnings.includes('CAMERA_MOTION_SUSPECTED');
-        evidence.policy = cameraMotion
-          ? {
-              result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
-              reason: 'camera motion suspected — footage needs human eyes',
-            }
-          : {
-              result: FusionPolicyResult.UNKNOWN_PRODUCT,
-              reason: `no pickup event proposed (${finalWarnings.join(',') || 'quiet clip'})`,
-            };
-        return this.persist(tenantId, { videoAssetId }, evidence, startedAt);
-      }
-
-      const primary = scopedEvents[0];
+      const { scopedEvents, finalWarnings, motionWindow, localizedArea } =
+        await this.detectScopedToWindow({
+          evidence,
+          timed,
+          frames: framesSmall,
+          geometry: geometrySmall,
+          source,
+          window,
+          frameMarginMs: 1000 / this.detectionConfig.analysisFps,
+        });
 
       // ---- multi-frame crop selection (req 4) --------------------------
       // Only the instants the pipeline actually consumes are decoded at
@@ -1087,6 +1510,190 @@ export class PickupFusionService {
         fullFrameCache.set(clamped, frame);
         return frame;
       };
+      // Phase 25: the count check looks at TWO frames only, decoded at a
+      // higher width than the 640 px analysis frames so a cell crop keeps
+      // enough detail to count units.
+      const geometryCheck = analysisGeometryFor(
+        { durationMs: internal.durationMs, width: source.width, height: source.height, fps: internal.fps ?? 30 },
+        Math.min(source.width, EVENT_CHECK_DECODE_WIDTH),
+      );
+      const checkFrameAt = (ms: number): Promise<AnalysisFrame> =>
+        this.media.decodeFrameAt(
+          internal.storageKey,
+          Math.max(0, Math.min(ms, durationMs - 1)),
+          geometryCheck,
+        );
+      const planogramScope = await this.resolvePlanogramScope(tenantId, {
+        locationId: internal.locationId,
+        planogramRackCode: internal.planogramRackCode ?? null,
+      });
+      const rackRegion = sanitizeStoredRackFrameRegion(internal.rackFrameRegion);
+      const eventCheckActive = this.eventCheckActive;
+      if (!eventCheckActive) {
+        stages.push({ stage: 'event-verification', adapterKey: 'not-run', version: '-', ms: 0 });
+      }
+
+      let events: PickupEventProposal[] = scopedEvents;
+      // Phase 25 — MISSED-EVENT RECOVERY: the detector saw the hand move
+      // but no durable pixel change survived (a clear bottle on a bright
+      // shelf). Ask the VLM to count the units in the touched cell before
+      // and after; a confident REMOVED/ADDED becomes the primary event and
+      // the identity path continues exactly as for a detector event.
+      if (
+        events.length === 0 &&
+        eventCheckActive &&
+        motionWindow !== null &&
+        localizedArea !== null &&
+        !finalWarnings.includes('CAMERA_MOTION_SUSPECTED')
+      ) {
+        const areaSource = scaleBoxToSource(localizedArea, geometrySmall, source);
+        // The motion peak only APPROXIMATES the cell — the hand's peak can
+        // sit over the neighbour — so with a rack known the mapped cell is
+        // counted first and then, while nothing changed, each other cell of
+        // the same shelf row (one call per cell, each at full cell
+        // resolution: a whole-row crop shrinks a clear bottle past what
+        // the model can count). Without a rack: the localized area grown.
+        const mapped = this.planogramCellFor(localizedArea, geometrySmall, rackRegion, planogramScope);
+        const crops: { box: BoundingBox; cellCode: string | null }[] =
+          mapped && planogramScope
+            ? [
+                mapped,
+                ...planogramScope.cells
+                  .filter((row) => row.rowIndex === mapped.rowIndex && row.cellCode !== mapped.cellCode)
+                  .sort((a, b) => a.columnIndex - b.columnIndex),
+              ].map((cell) => this.planogramCellCrop(cell, source, rackRegion, planogramScope))
+            : [{ box: growBox(areaSource, EVENT_CHECK_BOX_GROWTH, source), cellCode: null }];
+        let verdict: VlmEventCheckVerdict | null = null;
+        for (const crop of crops) {
+          verdict = await this.verifyEventCount({
+            evidence,
+            timed,
+            source: 'motion-window',
+            window: motionWindow,
+            durationMs,
+            cropBox: crop.box,
+            cellLabel: crop.cellCode,
+            frameAt: checkFrameAt,
+            frameGeometry: geometryCheck,
+            sourceGeometry: source,
+          });
+          if (verdict.status !== 'VERDICT' || verdict.change !== 'NONE') {
+            break;
+          }
+        }
+        if (
+          verdict !== null &&
+          verdict.status === 'VERDICT' &&
+          verdict.confidence === 'HIGH' &&
+          (verdict.change === 'REMOVED' || verdict.change === 'ADDED')
+        ) {
+          const synthesized: PickupEventProposal = {
+            kind: verdict.change === 'REMOVED' ? 'PICKUP' : 'RETURN',
+            startMs: motionWindow.startMs,
+            peakMs: motionWindow.peakMs,
+            endMs: motionWindow.endMs,
+            trackId: 'vlm-count',
+            shelfZoneId: shelfZoneFor(localizedArea, geometrySmall),
+            box: localizedArea,
+          };
+          events = [synthesized];
+          evidence.detector.events = [{ ...synthesized, box: areaSource }];
+          evidence.detector.warnings = [...evidence.detector.warnings, EVENT_FROM_VLM_COUNT];
+          evidence.eventVerification!.kindOverride = synthesized.kind;
+        }
+      }
+
+      if (events.length === 0) {
+        const cameraMotion = finalWarnings.includes('CAMERA_MOTION_SUSPECTED');
+        evidence.policy = cameraMotion
+          ? {
+              result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
+              reason: 'camera motion suspected — footage needs human eyes',
+            }
+          : {
+              result: FusionPolicyResult.UNKNOWN_PRODUCT,
+              reason: `no pickup event proposed (${finalWarnings.join(',') || 'quiet clip'})`,
+            };
+        return this.persist(tenantId, { videoAssetId }, evidence, startedAt);
+      }
+
+      const primary = events[0];
+      // Phase 25 — EVENT VERIFICATION on the detector's primary event: a
+      // confident "units unchanged" is a TOUCH — nothing was taken, so no
+      // identity work runs and no product is proposed. A confident
+      // REMOVED/ADDED replaces the contrast-derived kind. Low confidence
+      // or any failure leaves the pipeline as it was, except that a
+      // low-confidence "unchanged" demotes an auto-proposal to review.
+      let unchangedLowConfidence = false;
+      if (eventCheckActive && evidence.eventVerification?.status === 'NOT_RUN') {
+        const primarySource = scaleBoxToSource(primary.box, geometrySmall, source);
+        const mapped = this.planogramCellFor(primary.box, geometrySmall, rackRegion, planogramScope);
+        const cell =
+          mapped && planogramScope
+            ? this.planogramCellCrop(mapped, source, rackRegion, planogramScope)
+            : null;
+        const checkArgs = {
+          evidence,
+          timed,
+          source: 'primary' as const,
+          window: primary,
+          durationMs,
+          cropBox: cell?.box ?? growBox(primarySource, EVENT_CHECK_BOX_GROWTH, source),
+          cellLabel: cell?.cellCode ?? null,
+          frameAt: checkFrameAt,
+          frameGeometry: geometryCheck,
+          sourceGeometry: source,
+        };
+        let verdict = await this.verifyEventCount(checkArgs);
+        if (
+          verdict.status === 'VERDICT' &&
+          verdict.change === 'NONE' &&
+          verdict.confidence === 'HIGH'
+        ) {
+          // CONFIRM before vetoing: look again with WIDER instants — an
+          // earlier BEFORE (the product may already have been in view, in
+          // the hand, at the first instant) and a later AFTER (it may still
+          // have been in the hand). A confident REMOVED/ADDED there wins;
+          // anything else keeps NONE.
+          const confirmation = await this.verifyEventCount({
+            ...checkArgs,
+            preLeadMs: EVENT_CHECK_CONFIRM_PRE_LEAD_MS,
+            postLagMs: EVENT_CHECK_CONFIRM_POST_LAG_MS,
+            asConfirmation: true,
+          });
+          if (
+            confirmation.status === 'VERDICT' &&
+            confirmation.confidence === 'HIGH' &&
+            (confirmation.change === 'REMOVED' || confirmation.change === 'ADDED')
+          ) {
+            verdict = confirmation;
+            evidence.eventVerification!.change = confirmation.change;
+            evidence.eventVerification!.before = confirmation.before;
+            evidence.eventVerification!.after = confirmation.after;
+          }
+        }
+        if (verdict.status === 'VERDICT' && verdict.change === 'NONE') {
+          if (verdict.confidence === 'HIGH') {
+            evidence.detector.warnings = [...evidence.detector.warnings, TOUCH_ONLY];
+            evidence.policy = {
+              result: FusionPolicyResult.UNKNOWN_PRODUCT,
+              reason: `no pickup event proposed (${TOUCH_ONLY}: units ${verdict.before}->${verdict.after})`,
+            };
+            return this.persist(tenantId, { videoAssetId }, evidence, startedAt);
+          }
+          unchangedLowConfidence = true;
+        } else if (verdict.status === 'VERDICT' && verdict.confidence === 'HIGH') {
+          const kind: PickupEventKind = verdict.change === 'REMOVED' ? 'PICKUP' : 'RETURN';
+          if (primary.kind !== kind) {
+            primary.kind = kind;
+            if (evidence.detector.events[0]) {
+              evidence.detector.events[0].kind = kind;
+            }
+            evidence.eventVerification!.kindOverride = kind;
+          }
+        }
+      }
+
       const fullBox = scaleBoxToSource(primary.box, geometrySmall, {
         width: geometryFull.width,
         height: geometryFull.height,
@@ -1208,10 +1815,7 @@ export class PickupFusionService {
           unitId: internal.unitId,
           deviceId: internal.deviceId,
         },
-        planogramScope: await this.resolvePlanogramScope(tenantId, {
-          locationId: internal.locationId,
-          planogramRackCode: internal.planogramRackCode ?? null,
-        }),
+        planogramScope,
         // The event centre in the analysis frame, mapped through the
         // asset's rack frame region (null = the rack fills the frame).
         planogramPoint: rackPointFor(
@@ -1219,9 +1823,20 @@ export class PickupFusionService {
             x: (primary.box.x + primary.box.width / 2) / geometrySmall.width,
             y: (primary.box.y + primary.box.height / 2) / geometrySmall.height,
           },
-          sanitizeStoredRackFrameRegion(internal.rackFrameRegion),
+          rackRegion,
         ),
       });
+      if (
+        unchangedLowConfidence &&
+        evidence.policy.result === FusionPolicyResult.AUTO_PROPOSE
+      ) {
+        evidence.policy = {
+          result: FusionPolicyResult.NEEDS_HUMAN_REVIEW,
+          reason:
+            'event verification counted no unit change at LOW confidence — ' +
+            'possible touch, routed to review',
+        };
+      }
       return this.persist(tenantId, { videoAssetId }, evidence, startedAt);
     } catch (error) {
       this.logger.error(
@@ -1969,15 +2584,17 @@ export class PickupFusionService {
   ): Promise<VlmVerdict> {
     // Up to N reference images per candidate (PICKUP_VLM_REFERENCES_PER_
     // CANDIDATE, default 3), decoded from managed storage. DETERMINISTIC
-    // selection: oldest rows (createdAt, then id) per product, and the
-    // chosen image ids are recorded on the evidence — re-running against
-    // unchanged data must show the model the same reference photos. The
-    // adapter may still show fewer to fit its context window.
-    const references = await this.prisma.productReferenceImage.findMany({
-      where: { tenantId, productId: { in: top3.map((candidate) => candidate.productId) } },
-      select: { id: true, productId: true, storageKey: true },
-      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-    });
+    // selection: the most useful rows first (largest file, then oldest,
+    // then id — see orderReferenceRows) per product, and the chosen image
+    // ids are recorded on the evidence — re-running against unchanged data
+    // must show the model the same reference photos. The adapter may still
+    // show fewer to fit its context window.
+    const references = orderReferenceRows(
+      await this.prisma.productReferenceImage.findMany({
+        where: { tenantId, productId: { in: top3.map((candidate) => candidate.productId) } },
+        select: { id: true, productId: true, storageKey: true, sizeBytes: true, createdAt: true },
+      }),
+    );
     const referenceImages = new Map<string, RgbImage[]>();
     evidence.vlm.references = [];
     for (const candidate of top3) {
@@ -1999,8 +2616,7 @@ export class PickupFusionService {
       }
       referenceImages.set(candidate.productId, decoded);
     }
-    return this.vlm.verify(
-      {
+    const request: VlmRequestEvidence = {
         // The SELECTED best pre-event crop (sharpest, least occluded) —
         // the same evidence OCR and retrieval ran on — plus peak/post.
         frames: [bestPre, ...crops.filter((crop) => crop.phase !== 'pre')].map(
@@ -2023,9 +2639,19 @@ export class PickupFusionService {
             ? evidence.barcode.results[0].value
             : null,
         shelfContext: evidence.detector.events[0]?.shelfZoneId ?? null,
-      },
-      this.vlmTimeoutMs,
-    );
+      };
+    // A malformed or schema-breaking completion is a sampling accident of
+    // the local model (temperature 0 does not make JSON emission
+    // deterministic across the longer describe-then-choose prompt), so the
+    // IDENTICAL request is retried exactly once under the same timeout; a
+    // second failure keeps the classified-failure → review behaviour.
+    evidence.vlm.retries = 0;
+    let verdict = await this.vlm.verify(request, this.vlmTimeoutMs);
+    if (VLM_RETRYABLE_STATUSES.has(verdict.status)) {
+      evidence.vlm.retries = 1;
+      verdict = await this.vlm.verify(request, this.vlmTimeoutMs);
+    }
+    return verdict;
   }
 
   private async persist(
