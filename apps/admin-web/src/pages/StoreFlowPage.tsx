@@ -31,7 +31,7 @@ import {
   Tabs,
   useLoad,
 } from '../components';
-import { useTabState } from '../ui/primitives';
+import { useTabState } from '@byond/ui';
 
 function errorMessage(err: unknown): string {
   return err instanceof ApiError ? err.message : 'Unexpected error';

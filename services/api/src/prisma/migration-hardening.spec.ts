@@ -1391,10 +1391,10 @@ describe('loyalty & promotions migration hardening', () => {
     expect(sql).toContain(
       'CREATE UNIQUE INDEX "LoyaltyAccount_tenantId_shopperId_key"',
     );
-    // The forward link is a bare column for now: no FK, because Shopper does
-    // not exist on this line of development yet.
+    // Phase 29 landed the forward link as a bare column, because Shopper did
+    // not exist on its line of development. The reservation is the index; the
+    // foreign key arrives in its own migration, asserted below.
     expect(sql).toMatch(/"shopperId" TEXT/);
-    expect(sql).not.toMatch(/REFERENCES "Shopper"/);
   });
 
   it('MAKES A PROMOTION STRICTLY SUBTRACTIVE, at the database level', () => {
@@ -1497,5 +1497,59 @@ describe('loyalty module backfill migration', () => {
 
   it('uses deterministic ids so a re-run cannot race', () => {
     expect(sql).toContain("md5(t.\"id\" || ':loyalty')");
+  });
+});
+
+describe('loyalty account -> shopper foreign key migration', () => {
+  // Phase 26 (Shopper) and Phase 29 (LoyaltyAccount) were built on separate
+  // branches, so the forward link could only be closed once both were in one
+  // tree. This is that one migration.
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260916140000_loyalty_account_shopper_fk',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+  const flat = sql.replace(/\s+/g, ' ');
+  // The prose above the statement explains what this migration deliberately
+  // does NOT do, so the "does nothing else" assertions below read the SQL
+  // with `--` comment lines stripped.
+  const statements = sql
+    .split(/\r?\n/)
+    .filter((line) => !line.trim().startsWith('--'))
+    .join('\n');
+
+  it('closes the forward link with a real foreign key to Shopper', () => {
+    // The inverse of what the Phase 29 migration could assert: the reference
+    // now exists.
+    expect(flat).toMatch(/REFERENCES "Shopper"/);
+  });
+
+  it('proves same-tenant membership, not mere existence', () => {
+    // A single-column FK would let a loyalty account cite another tenant's
+    // shopper. The composite form makes that unrepresentable.
+    expect(flat).toContain(
+      'ADD CONSTRAINT "LoyaltyAccount_shopper_same_tenant_fkey" FOREIGN KEY ("shopperId", "tenantId") REFERENCES "Shopper"("id", "tenantId")',
+    );
+    expect(flat).toContain('ON DELETE RESTRICT ON UPDATE CASCADE');
+  });
+
+  it('renames nothing, backfills nothing, and moves no data', () => {
+    // The Phase 29 author designed the column so that wiring it would be one
+    // ALTER TABLE. Anything else here would be a redesign in a merge.
+    expect(statements).not.toMatch(/RENAME/i);
+    expect(statements).not.toMatch(/\bUPDATE\s+"/i);
+    expect(statements).not.toMatch(/\bINSERT\s+INTO\b/i);
+    expect(statements).not.toMatch(/\bDROP\b/i);
+    // One statement: the constraint.
+    expect(
+      statements.split(';').filter((part) => part.trim().length > 0),
+    ).toHaveLength(1);
   });
 });

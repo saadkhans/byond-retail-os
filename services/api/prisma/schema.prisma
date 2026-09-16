@@ -3452,8 +3452,11 @@ model Shopper {
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   user   User?  @relation("ShopperUser", fields: [userId], references: [id], onDelete: Restrict)
 
-  entryTokens StoreEntryToken[]
-  journeys    CustomerJourney[]
+  entryTokens     StoreEntryToken[]
+  journeys        CustomerJourney[]
+  /// Phase 29 reserves at most one loyalty account per shopper per tenant
+  /// with a partial unique index, so this back-reference is at most one row.
+  loyaltyAccounts LoyaltyAccount[]
 
   @@unique([id, tenantId])
   @@index([tenantId, status, createdAt])
@@ -4201,22 +4204,24 @@ model LoyaltyAccount {
   /// card, or any other credential-shaped value.
   displayName String?
   status      LoyaltyAccountStatus @default(ACTIVE)
-  /// FORWARD LINK to the Phase 26 `Shopper`, which does not exist on this
-  /// branch. Deliberately a bare nullable column with NO Prisma relation and
-  /// NO foreign key yet: when Shopper lands, wiring it is one ALTER TABLE
-  /// adding the composite same-tenant FK plus one relation line here — no
-  /// column rename, no backfill, no data migration. Until then the column is
-  /// never written by the API (there is no DTO field for it), and the partial
-  /// unique index in migration SQL already reserves "at most one loyalty
-  /// account per shopper per tenant".
+  /// FORWARD LINK to the Phase 26 `Shopper`, wired on the integration branch
+  /// where both phases live in one tree. Exactly what Phase 29 specified: one
+  /// composite same-tenant foreign key (migration
+  /// 20260916140000_loyalty_account_shopper_fk) plus the relation line below
+  /// — no column rename, no backfill, no data migration. The partial unique
+  /// index in Phase 29's own migration already reserved "at most one loyalty
+  /// account per shopper per tenant". The API still never writes the column
+  /// (there is no DTO field for it), so every row is NULL and the optional
+  /// composite FK is satisfied automatically.
   shopperId   String?
   enrolledAt  DateTime             @default(now())
   createdById String?
   createdAt   DateTime             @default(now())
   updatedAt   DateTime             @updatedAt
 
-  tenant    Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  createdBy User?  @relation("LoyaltyAccountActor", fields: [createdById], references: [id], onDelete: Restrict)
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  shopper   Shopper? @relation(fields: [shopperId], references: [id], onDelete: Restrict)
+  createdBy User?    @relation("LoyaltyAccountActor", fields: [createdById], references: [id], onDelete: Restrict)
 
   movements        LoyaltyPointMovement[]
   checkoutSessions CheckoutSession[]

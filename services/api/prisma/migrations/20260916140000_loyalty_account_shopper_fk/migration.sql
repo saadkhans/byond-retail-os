@@ -1,0 +1,29 @@
+-- Integration — wire LoyaltyAccount.shopperId to the Phase 26 Shopper.
+--
+-- Phase 29 was built on a line of development where "Shopper" did not exist,
+-- so "LoyaltyAccount"."shopperId" landed as a BARE NULLABLE COLUMN with no
+-- relation and no foreign key, and the phase's own migration deliberately
+-- reserved the link with a partial unique index
+-- ("LoyaltyAccount_tenantId_shopperId_key", WHERE "shopperId" IS NOT NULL)
+-- so that "at most one loyalty account per shopper per tenant" was already
+-- true before anything could reference it.
+--
+-- Both phases now live in one tree, so this closes the forward link exactly
+-- as the Phase 29 author specified: ONE composite same-tenant foreign key.
+-- No column rename, no backfill, no data migration — the column is still
+-- never written by the API (there is no DTO field for it), so every existing
+-- row has "shopperId" IS NULL and the constraint is satisfied on creation
+-- without touching a single row.
+--
+-- Composite (not single-column) for the same reason as every other FK in this
+-- schema: a single-column FK only proves the referenced row EXISTS, while
+-- ("shopperId", "tenantId") -> "Shopper"("id", "tenantId") proves it belongs
+-- to the SAME tenant, so a cross-tenant shopper id can never be stitched into
+-- a loyalty account even if application code slipped. A composite FK with a
+-- NULL column is satisfied automatically, which is what an optional forward
+-- link wants.
+--
+-- RESTRICT on delete, matching every other same-tenant FK here: a shopper who
+-- has a loyalty account cannot be deleted out from under its points ledger.
+ALTER TABLE "LoyaltyAccount" ADD CONSTRAINT "LoyaltyAccount_shopper_same_tenant_fkey"
+  FOREIGN KEY ("shopperId", "tenantId") REFERENCES "Shopper"("id", "tenantId") ON DELETE RESTRICT ON UPDATE CASCADE;
