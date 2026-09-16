@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { InventoryModule } from '../inventory/inventory.module';
+import { LoyaltyModule } from '../loyalty/loyalty.module';
 import { PricingModule } from '../pricing/pricing.module';
 import { CheckoutSessionsController } from './checkout-sessions.controller';
 import { CheckoutSessionsRepository } from './checkout-sessions.repository';
@@ -14,7 +15,11 @@ import { CheckoutSessionsService } from './checkout-sessions.service';
   // snapshots a price onto each basket line. The dependency is one-way and
   // optional: without it (or with the pricing module disabled for the
   // tenant) lines stay unpriced and orders keep null totals.
-  imports: [InventoryModule, PricingModule],
+  // LoyaltyModule provides LINE_PROMOTION_PORT, the SECOND optional resolver.
+  // Two ports rather than one is the point: pricing answers "what does this
+  // cost" and promotions compose on top of that answer, so a discount can
+  // never reach inside price resolution or write a price version.
+  imports: [InventoryModule, PricingModule, LoyaltyModule],
   controllers: [CheckoutSessionsController],
   providers: [CheckoutSessionsService, CheckoutSessionsRepository],
 })

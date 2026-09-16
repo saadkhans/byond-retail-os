@@ -103,6 +103,13 @@ enum AuditAction {
   // draft version is an ordinary CREATE, and editing draft entries an UPDATE.
   PRICE_CHANGE
   ROLLBACK
+  // Phase 29 — loyalty and promotions. PROMOTION_CHANGE marks the activation
+  // of a promotion version (the moment a discount starts or stops applying);
+  // POINTS_MOVEMENT marks an append to a loyalty account's points ledger.
+  // Creating a promotion or a draft version is an ordinary CREATE, editing
+  // draft rules an UPDATE, and a promotion rollback reuses ROLLBACK.
+  PROMOTION_CHANGE
+  POINTS_MOVEMENT
 }
 
 enum ProductStatus {
@@ -277,6 +284,12 @@ model Tenant {
   eslGateways   EslGateway[]
   eslLabels     EslLabel[]
   eslUpdateJobs EslUpdateJob[]
+
+  loyaltyAccounts       LoyaltyAccount[]
+  loyaltyPointMovements LoyaltyPointMovement[]
+  promotions            Promotion[]
+  promotionVersions     PromotionVersion[]
+  promotionRules        PromotionRule[]
 }
 
 model User {
@@ -320,13 +333,19 @@ model User {
   videoAssetsUploaded   VideoAsset[]    @relation("VideoAssetUploader")
   videoArtifactsCreated VideoArtifact[] @relation("VideoArtifactActor")
 
-  priceBooksCreated         PriceBook[]        @relation("PriceBookActor")
-  priceBookVersionsCreated  PriceBookVersion[] @relation("PriceBookVersionActor")
+  priceBooksCreated          PriceBook[]        @relation("PriceBookActor")
+  priceBookVersionsCreated   PriceBookVersion[] @relation("PriceBookVersionActor")
   priceBookVersionsActivated PriceBookVersion[] @relation("PriceBookVersionActivator")
 
   eslGatewaysCreated   EslGateway[]   @relation("EslGatewayActor")
   eslLabelsCreated     EslLabel[]     @relation("EslLabelActor")
   eslUpdateJobsCreated EslUpdateJob[] @relation("EslUpdateJobActor")
+
+  loyaltyAccountsCreated       LoyaltyAccount[]       @relation("LoyaltyAccountActor")
+  loyaltyPointMovementsCreated LoyaltyPointMovement[] @relation("LoyaltyPointMovementActor")
+  promotionsCreated            Promotion[]            @relation("PromotionActor")
+  promotionVersionsCreated     PromotionVersion[]     @relation("PromotionVersionActor")
+  promotionVersionsActivated   PromotionVersion[]     @relation("PromotionVersionActivator")
 
   // Composite FK target for same-tenant creator constraints (id alone is
   // already unique; this adds nothing semantically, only an FK anchor).
@@ -411,22 +430,23 @@ model Location {
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
 
-  inventoryLevels     InventoryLevel[]
-  inventoryMovements  InventoryMovement[]
-  retailUnits         RetailUnit[]
-  checkoutSessions    CheckoutSession[]
-  orders              Order[]
-  visionEvents        VisionEvent[]
-  inferenceJobs       InferenceJob[]
-  videoAssets         VideoAsset[]
-  customerJourneys    CustomerJourney[]
-  cameraSources       CameraSource[]
-  pilotEvaluationRuns PilotEvaluationRun[]
-  cvTestProtocols     CvTestProtocol[]
+  inventoryLevels           InventoryLevel[]
+  inventoryMovements        InventoryMovement[]
+  retailUnits               RetailUnit[]
+  checkoutSessions          CheckoutSession[]
+  orders                    Order[]
+  visionEvents              VisionEvent[]
+  inferenceJobs             InferenceJob[]
+  videoAssets               VideoAsset[]
+  customerJourneys          CustomerJourney[]
+  cameraSources             CameraSource[]
+  pilotEvaluationRuns       PilotEvaluationRun[]
+  cvTestProtocols           CvTestProtocol[]
   cameraCalibrationProfiles CameraCalibrationProfile[]
-  planogramRacks      PlanogramRack[]
-  priceBooks          PriceBook[]
-  eslGateways         EslGateway[]
+  planogramRacks            PlanogramRack[]
+  priceBooks                PriceBook[]
+  eslGateways               EslGateway[]
+  promotions                Promotion[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -569,25 +589,26 @@ model Product {
   category ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: Restrict)
   brand    Brand?           @relation(fields: [brandId], references: [id], onDelete: Restrict)
 
-  barcodes                ProductBarcode[]
-  inventoryLevels         InventoryLevel[]
-  inventoryMovements      InventoryMovement[]
-  checkoutSessionLines    CheckoutSessionLine[]
-  orderLines              OrderLine[]
-  visionEventCandidates   VisionEventCandidate[]
-  visionReviewsApplied    VisionEventReview[]          @relation("VisionReviewAppliedProduct")
-  referenceImages         ProductReferenceImage[]
-  groundTruths            VideoGroundTruth[]
-  referenceEmbeddings     ProductReferenceEmbedding[]
-  journeyEvents           CustomerJourneyEvent[]
-  journeyEventReviews     CustomerJourneyEventReview[] @relation("JourneyReviewCorrectedProduct")
-  pilotReviewExpectations PilotObservationReview[]     @relation("PilotReviewExpectedProduct")
-  bootstrapEvaluationRuns PilotEvaluationRun[]         @relation("PilotRunBootstrapProduct")
-  planogramCellAssignments PlanogramCellAssignment[]
-  cvScenarioExpectations  CvTestProtocolScenario[]     @relation("CvScenarioExpectedProduct")
+  barcodes                    ProductBarcode[]
+  inventoryLevels             InventoryLevel[]
+  inventoryMovements          InventoryMovement[]
+  checkoutSessionLines        CheckoutSessionLine[]
+  orderLines                  OrderLine[]
+  visionEventCandidates       VisionEventCandidate[]
+  visionReviewsApplied        VisionEventReview[]            @relation("VisionReviewAppliedProduct")
+  referenceImages             ProductReferenceImage[]
+  groundTruths                VideoGroundTruth[]
+  referenceEmbeddings         ProductReferenceEmbedding[]
+  journeyEvents               CustomerJourneyEvent[]
+  journeyEventReviews         CustomerJourneyEventReview[]   @relation("JourneyReviewCorrectedProduct")
+  pilotReviewExpectations     PilotObservationReview[]       @relation("PilotReviewExpectedProduct")
+  bootstrapEvaluationRuns     PilotEvaluationRun[]           @relation("PilotRunBootstrapProduct")
+  planogramCellAssignments    PlanogramCellAssignment[]
+  cvScenarioExpectations      CvTestProtocolScenario[]       @relation("CvScenarioExpectedProduct")
   calibrationZoneExpectations CameraCalibrationZoneProduct[] @relation("CameraCalibrationZoneExpectedProduct")
   eslLabels                   EslLabel[]
-  priceBookEntries        PriceBookEntry[]
+  priceBookEntries            PriceBookEntry[]
+  promotionRules              PromotionRule[]
 
   @@unique([tenantId, sku])
   @@unique([id, tenantId])
@@ -972,10 +993,10 @@ model CameraSource {
   createdAt          DateTime           @default(now())
   updatedAt          DateTime           @updatedAt
 
-  tenant           Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location         Location            @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit             RetailUnit?         @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  replayVideoAsset VideoAsset?         @relation("CameraReplayAsset", fields: [replayVideoAssetId], references: [id], onDelete: SetNull)
+  tenant              Tenant                     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location            Location                   @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit                RetailUnit?                @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  replayVideoAsset    VideoAsset?                @relation("CameraReplayAsset", fields: [replayVideoAssetId], references: [id], onDelete: SetNull)
   pilotRuns           CameraPilotRun[]
   liveSessions        LiveCameraSession[]
   cvTestProtocols     CvTestProtocol[]
@@ -1357,6 +1378,12 @@ model CheckoutSession {
   unitId                    String
   // Optional source device reference (no edge runtime in Phase 5).
   deviceId                  String?
+  // Phase 29 — the loyalty account this basket is being shopped under, when
+  // the shopper identified themselves. NULL is the norm and means "no
+  // member": member-only promotions simply do not apply, and no points are
+  // accrued. It is captured when the session OPENS so a promotion decision
+  // made on a line can never be changed by identifying later.
+  loyaltyAccountId          String?
   status                    CheckoutSessionStatus @default(OPEN)
   startedAt                 DateTime              @default(now())
   endedAt                   DateTime?
@@ -1389,6 +1416,7 @@ model CheckoutSession {
   location       Location              @relation(fields: [locationId], references: [id], onDelete: Restrict)
   unit           RetailUnit            @relation(fields: [unitId], references: [id], onDelete: Restrict)
   device         Device?               @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  loyaltyAccount LoyaltyAccount?       @relation(fields: [loyaltyAccountId], references: [id], onDelete: Restrict)
   createdBy      User?                 @relation("CheckoutSessionActor", fields: [createdById], references: [id], onDelete: Restrict)
   lines          CheckoutSessionLine[]
   order          Order?
@@ -1424,11 +1452,23 @@ model CheckoutSessionLine {
   // idempotencyKey reserved (see CheckoutSessionLineStatus above).
   status                    CheckoutSessionLineStatus @default(ACTIVE)
   removedAt                 DateTime?
-  // Pricing placeholders — ALWAYS NULL in Phase 5; future pricing/payment
-  // phases populate them (minor currency units, integer-exact).
+  // Price snapshot, in minor currency units (integer-exact). NULL means
+  // UNPRICED, never free. Since Phase 29 `unitPriceMinor` is the price the
+  // shopper actually pays: the base price from a price book version, minus
+  // at most one promotion. The provenance columns below make that number
+  // explainable without re-deriving it — basePriceMinor is what the price
+  // version said, promotionDiscountMinor is what the promotion took off, and
+  // the two version ids name exactly which rows produced each part.
   unitPriceMinor            Int?
   lineTotalMinor            Int?
   currencyCode              String?
+  // Phase 29 — price/promotion provenance. A promotion NEVER rewrites a
+  // price version: it is recorded here as a separate, subtractive layer on
+  // top of the version named by priceBookVersionId.
+  priceBookVersionId        String?
+  basePriceMinor            Int?
+  promotionVersionId        String?
+  promotionDiscountMinor    Int?
   // Vendor-neutral evidence/source lineage (same set as the session,
   // including the pre-Phase-7 external compatibility refs — see
   // CheckoutSession for the canonical-vs-external split).
@@ -1451,6 +1491,8 @@ model CheckoutSessionLine {
   tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   session            CheckoutSession     @relation(fields: [sessionId], references: [id], onDelete: Restrict)
   product            Product             @relation(fields: [productId], references: [id], onDelete: Restrict)
+  priceBookVersion   PriceBookVersion?   @relation("CheckoutLinePriceVersion", fields: [priceBookVersionId], references: [id], onDelete: Restrict)
+  promotionVersion   PromotionVersion?   @relation("CheckoutLinePromotionVersion", fields: [promotionVersionId], references: [id], onDelete: Restrict)
   createdBy          User?               @relation("CheckoutSessionLineActor", fields: [createdById], references: [id], onDelete: Restrict)
   orderLines         OrderLine[]
   visionEventReviews VisionEventReview[]
@@ -1519,13 +1561,14 @@ model Order {
   createdAt                 DateTime           @default(now())
   updatedAt                 DateTime           @updatedAt
 
-  tenant         Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  session        CheckoutSession @relation(fields: [checkoutSessionId], references: [id], onDelete: Restrict)
-  location       Location        @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit           RetailUnit      @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  createdBy      User?           @relation("OrderActor", fields: [createdById], references: [id], onDelete: Restrict)
-  lines          OrderLine[]
-  paymentIntents PaymentIntent[]
+  tenant                Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  session               CheckoutSession        @relation(fields: [checkoutSessionId], references: [id], onDelete: Restrict)
+  location              Location               @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit                  RetailUnit             @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  createdBy             User?                  @relation("OrderActor", fields: [createdById], references: [id], onDelete: Restrict)
+  lines                 OrderLine[]
+  paymentIntents        PaymentIntent[]
+  loyaltyPointMovements LoyaltyPointMovement[]
 
   @@unique([id, tenantId])
   @@unique([tenantId, orderNumber])
@@ -1550,10 +1593,17 @@ model OrderLine {
   productName               String
   unitOfMeasure             UnitOfMeasure
   quantity                  Int
-  // Pricing placeholders — ALWAYS NULL in Phase 5.
+  // Money snapshot copied verbatim from the basket line at completion. An
+  // order line is never re-priced and never re-promoted: what the shopper
+  // was charged stays readable for the life of the order.
   unitPriceMinor            Int?
   lineTotalMinor            Int?
   currencyCode              String?
+  // Phase 29 — price/promotion provenance, copied from the basket line.
+  priceBookVersionId        String?
+  basePriceMinor            Int?
+  promotionVersionId        String?
+  promotionDiscountMinor    Int?
   // Vendor-neutral evidence/source lineage copied from the session line
   // (canonical Phase 7 refs and pre-Phase-7 external compatibility refs
   // stay separate — see CheckoutSession).
@@ -1570,11 +1620,13 @@ model OrderLine {
   createdById               String?
   createdAt                 DateTime           @default(now())
 
-  tenant      Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  order       Order                @relation(fields: [orderId], references: [id], onDelete: Restrict)
-  product     Product              @relation(fields: [productId], references: [id], onDelete: Restrict)
-  sessionLine CheckoutSessionLine? @relation(fields: [sessionLineId], references: [id], onDelete: Restrict)
-  createdBy   User?                @relation("OrderLineActor", fields: [createdById], references: [id], onDelete: Restrict)
+  tenant           Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  order            Order                @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  product          Product              @relation(fields: [productId], references: [id], onDelete: Restrict)
+  sessionLine      CheckoutSessionLine? @relation(fields: [sessionLineId], references: [id], onDelete: Restrict)
+  priceBookVersion PriceBookVersion?    @relation("OrderLinePriceVersion", fields: [priceBookVersionId], references: [id], onDelete: Restrict)
+  promotionVersion PromotionVersion?    @relation("OrderLinePromotionVersion", fields: [promotionVersionId], references: [id], onDelete: Restrict)
+  createdBy        User?                @relation("OrderLineActor", fields: [createdById], references: [id], onDelete: Restrict)
 
   @@unique([id, tenantId])
   @@index([tenantId, orderId])
@@ -2371,18 +2423,18 @@ model VideoAsset {
   createdAt                DateTime              @default(now())
   updatedAt                DateTime              @updatedAt
 
-  tenant              Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location            Location?                @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit                RetailUnit?              @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  device              Device?                  @relation(fields: [deviceId], references: [id], onDelete: Restrict)
-  session             CheckoutSession?         @relation(fields: [sessionId], references: [id], onDelete: Restrict)
-  uploadedBy          User?                    @relation("VideoAssetUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
-  artifacts           VideoArtifact[]
-  extractionRequests  VideoExtractionRequest[]
-  groundTruth         VideoGroundTruth?
-  fusionRuns          PickupFusionRun[]
-  replayCameraSources CameraSource[]           @relation("CameraReplayAsset")
-  cameraPilotRuns     CameraPilotRun[]
+  tenant               Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location             Location?                @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit                 RetailUnit?              @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  device               Device?                  @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  session              CheckoutSession?         @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  uploadedBy           User?                    @relation("VideoAssetUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
+  artifacts            VideoArtifact[]
+  extractionRequests   VideoExtractionRequest[]
+  groundTruth          VideoGroundTruth?
+  fusionRuns           PickupFusionRun[]
+  replayCameraSources  CameraSource[]           @relation("CameraReplayAsset")
+  cameraPilotRuns      CameraPilotRun[]
   pretrainedVisionRuns PretrainedVisionRun[]
 
   @@unique([id, tenantId])
@@ -2498,12 +2550,12 @@ enum PilotExpectedAction {
 }
 
 model PilotEvaluationRun {
-  id          String                   @id @default(cuid())
-  tenantId    String
-  locationId  String?
-  name        String
-  description String?
-  status      PilotEvaluationRunStatus @default(OPEN)
+  id                 String                   @id @default(cuid())
+  tenantId           String
+  locationId         String?
+  name               String
+  description        String?
+  status             PilotEvaluationRunStatus @default(OPEN)
   // One-SKU bootstrap identity: the product this run bootstraps, set ONLY
   // by the bootstrap workflow's find-or-create (NULL for every other
   // pilot run). A partial unique index (raw SQL in the
@@ -2511,9 +2563,9 @@ model PilotEvaluationRun {
   // WHERE clause) allows at most ONE OPEN run per tenant/product, so
   // concurrent first corrections cannot split reviews across duplicates.
   bootstrapProductId String?
-  createdById String?
-  createdAt   DateTime                 @default(now())
-  completedAt DateTime?
+  createdById        String?
+  createdAt          DateTime                 @default(now())
+  completedAt        DateTime?
 
   tenant                 Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   location               Location?                 @relation(fields: [locationId], references: [id], onDelete: Restrict)
@@ -2550,27 +2602,27 @@ model PilotEvaluationSession {
 // review time — never caller-supplied. The newest review per observation
 // is the one metrics use; older rows remain as audit history.
 model PilotObservationReview {
-  id                 String                  @id @default(cuid())
-  tenantId           String
-  evaluationRunId    String
-  liveSessionId      String?
-  journeyEventId     String?
-  verdict            PilotObservationVerdict
-  expectedAction     PilotExpectedAction
-  expectedProductId  String?
-  expectedSku        String?
-  predictedProductId String?
-  predictedSku       String?
-  predictedAction    PilotExpectedAction?
+  id                     String                  @id @default(cuid())
+  tenantId               String
+  evaluationRunId        String
+  liveSessionId          String?
+  journeyEventId         String?
+  verdict                PilotObservationVerdict
+  expectedAction         PilotExpectedAction
+  expectedProductId      String?
+  expectedSku            String?
+  predictedProductId     String?
+  predictedSku           String?
+  predictedAction        PilotExpectedAction?
   // One-SKU bootstrap: OPAQUE id of the operator-approved manual CROP
   // VideoArtifact that supersedes the fusion run's automatic crop as
   // this observation's evidence. STRUCTURED (never parsed from notes),
   // validated tenant-scoped + same-video at write time, and carried into
   // Phase 18 candidates as evidenceCropArtifactId. Never a path or URL.
   operatorCropArtifactId String?
-  notes              String?
-  reviewedById       String?
-  createdAt          DateTime                @default(now())
+  notes                  String?
+  reviewedById           String?
+  createdAt              DateTime                @default(now())
 
   tenant          Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   evaluationRun   PilotEvaluationRun    @relation(fields: [evaluationRunId], references: [id], onDelete: Restrict)
@@ -2638,7 +2690,7 @@ model CvTestProtocol {
   createdAt        DateTime             @default(now())
   completedAt      DateTime?
 
-  tenant        Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  tenant                 Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   // SAME-TENANT composite location relation (Codex P1): the store join
   // carries the tenant in the FK itself — a malformed row can never
   // resolve another tenant's store name.
@@ -2724,33 +2776,33 @@ enum CameraCalibrationZoneType {
 }
 
 model CameraCalibrationProfile {
-  id                 String                          @id @default(cuid())
+  id                 String                         @id @default(cuid())
   tenantId           String
   cameraSourceId     String
   locationId         String?
   name               String
-  status             CameraCalibrationProfileStatus  @default(DRAFT)
-  calibrationVersion Int                             @default(1)
+  status             CameraCalibrationProfileStatus @default(DRAFT)
+  calibrationVersion Int                            @default(1)
   frameWidth         Int?
   frameHeight        Int?
-  orientation        CameraCalibrationOrientation    @default(UNKNOWN)
-  cameraMount        CameraCalibrationMount          @default(UNKNOWN)
+  orientation        CameraCalibrationOrientation   @default(UNKNOWN)
+  cameraMount        CameraCalibrationMount         @default(UNKNOWN)
   // Screened free text (reject-on-write): never a URL, path, credential,
   // or connection string — same policy as camera connectionNote.
   notes              String?
   createdById        String?
-  createdAt          DateTime                        @default(now())
-  updatedAt          DateTime                        @updatedAt
+  createdAt          DateTime                       @default(now())
+  updatedAt          DateTime                       @updatedAt
   activatedAt        DateTime?
   archivedAt         DateTime?
 
-  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  tenant                 Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   // SAME-TENANT composite relations (Codex P1): the FK itself carries the
   // tenant, so a malformed row can never resolve another tenant's source
   // or store.
-  cameraSource CameraSource @relation(fields: [cameraSourceId, tenantId], references: [id, tenantId], onDelete: Restrict)
-  location     Location?    @relation(fields: [locationId, tenantId], references: [id, tenantId], onDelete: Restrict)
-  zones        CameraCalibrationZone[]
+  cameraSource           CameraSource              @relation(fields: [cameraSourceId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  location               Location?                 @relation(fields: [locationId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  zones                  CameraCalibrationZone[]
   datasetImprovementRuns CvDatasetImprovementRun[]
 
   // At most ONE ACTIVE profile per camera source: partial unique index in
@@ -2777,9 +2829,9 @@ model CameraCalibrationZone {
   createdAt            DateTime                  @default(now())
   updatedAt            DateTime                  @updatedAt
 
-  tenant             Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  calibrationProfile CameraCalibrationProfile @relation(fields: [calibrationProfileId, tenantId], references: [id, tenantId], onDelete: Cascade)
-  cameraSource       CameraSource             @relation(fields: [cameraSourceId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  tenant             Tenant                         @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  calibrationProfile CameraCalibrationProfile       @relation(fields: [calibrationProfileId, tenantId], references: [id, tenantId], onDelete: Cascade)
+  cameraSource       CameraSource                   @relation(fields: [cameraSourceId, tenantId], references: [id, tenantId], onDelete: Restrict)
   expectedProducts   CameraCalibrationZoneProduct[]
 
   @@unique([id, tenantId])
@@ -2860,22 +2912,22 @@ enum CvDatasetEligibility {
 }
 
 model CvDatasetImprovementRun {
-  id                          String                        @id @default(cuid())
-  tenantId                    String
-  sourceEvaluationRunId       String?
-  sourceTestProtocolId        String?
-  sourceCalibrationProfileId  String?
-  name                        String
-  status                      CvDatasetImprovementRunStatus @default(DRAFT)
-  purpose                     CvDatasetPurpose
-  trainSplitPercent           Int
-  validationSplitPercent      Int
-  testSplitPercent            Int
-  minReviewedExamplesPerSku   Int
+  id                           String                        @id @default(cuid())
+  tenantId                     String
+  sourceEvaluationRunId        String?
+  sourceTestProtocolId         String?
+  sourceCalibrationProfileId   String?
+  name                         String
+  status                       CvDatasetImprovementRunStatus @default(DRAFT)
+  purpose                      CvDatasetPurpose
+  trainSplitPercent            Int
+  validationSplitPercent       Int
+  testSplitPercent             Int
+  minReviewedExamplesPerSku    Int
   minReviewedExamplesPerAction Int
   // Screened free text (reject-on-write): never a URL, path, credential,
   // or slot name — same policy as calibration notes.
-  notes                       String?
+  notes                        String?
   // sha256 over SAFE calibration content (profile id/version/orientation/
   // mount/updatedAt + zone counts, sorted zone ids, max zone updatedAt),
   // captured at candidate refresh when the linked profile is stamped on
@@ -2883,14 +2935,14 @@ model CvDatasetImprovementRun {
   // AND zone additions/updates/deletions after the refresh reject the
   // export instead of silently changing the manifest. Null when no
   // profile is linked or nothing is stamped (FILE_REPLAY exemption).
-  calibrationFingerprint      String?
-  createdById                 String?
-  createdAt                   DateTime                      @default(now())
-  updatedAt                   DateTime                      @updatedAt
-  exportedAt                  DateTime?
-  archivedAt                  DateTime?
+  calibrationFingerprint       String?
+  createdById                  String?
+  createdAt                    DateTime                      @default(now())
+  updatedAt                    DateTime                      @updatedAt
+  exportedAt                   DateTime?
+  archivedAt                   DateTime?
 
-  tenant             Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  tenant                   Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   // SAME-TENANT composite relations (Codex P1): the FK itself carries the
   // tenant, so a malformed row can never resolve another tenant's
   // evaluation run, protocol, or calibration profile.
@@ -2913,36 +2965,36 @@ model CvDatasetImprovementRun {
 // calibrationZoneLabel are ALWAYS null in the MVP: no source data exists
 // for them yet, and Phase 18 never fabricates values.
 model CvDatasetCandidate {
-  id                   String                       @id @default(cuid())
-  tenantId             String
-  runId                String
-  sourceType           CvDatasetCandidateSourceType
-  sourceId             String
-  liveSessionId        String?
-  evaluationRunId      String?
-  protocolId           String?
-  calibrationProfileId String?
-  skuId                String?
-  skuCodeSnapshot      String?
-  actionLabel          String
-  correctedActionLabel String?
-  reviewVerdict        String
-  reviewSource         String
-  confidenceBucket     String?
-  lightingBucket       String?
-  occlusionBucket      String?
-  calibrationZoneLabel String?
-  scenarioTypeSnapshot String?
+  id                     String                       @id @default(cuid())
+  tenantId               String
+  runId                  String
+  sourceType             CvDatasetCandidateSourceType
+  sourceId               String
+  liveSessionId          String?
+  evaluationRunId        String?
+  protocolId             String?
+  calibrationProfileId   String?
+  skuId                  String?
+  skuCodeSnapshot        String?
+  actionLabel            String
+  correctedActionLabel   String?
+  reviewVerdict          String
+  reviewSource           String
+  confidenceBucket       String?
+  lightingBucket         String?
+  occlusionBucket        String?
+  calibrationZoneLabel   String?
+  scenarioTypeSnapshot   String?
   // OPAQUE id of the operator-approved crop artifact this candidate's
   // evidence resolves to (copied from the source review's structured
   // operatorCropArtifactId at refresh). Null = the source event's own
   // automatic fusion crop. Reference marker only — never a path/URL.
   evidenceCropArtifactId String?
-  split                CvDatasetSplit?
-  eligibility          CvDatasetEligibility
-  exclusionReason      String?
-  createdAt            DateTime                     @default(now())
-  updatedAt            DateTime                     @updatedAt
+  split                  CvDatasetSplit?
+  eligibility            CvDatasetEligibility
+  exclusionReason        String?
+  createdAt              DateTime                     @default(now())
+  updatedAt              DateTime                     @updatedAt
 
   tenant Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   run    CvDatasetImprovementRun @relation(fields: [runId, tenantId], references: [id, tenantId], onDelete: Cascade)
@@ -3033,20 +3085,22 @@ enum PretrainedVisionRunStatus {
 // paths, raw tensors, raw media, or provider logs. Records the planogram
 // version the run was scored against (version safety).
 model PretrainedVisionRun {
-  id               String                    @id @default(cuid())
-  tenantId         String
-  videoAssetId     String
-  provider         String
-  status           PretrainedVisionRunStatus
-  planogramRackId  String?
-  planogramVersion Int?
-  /** The EXACT sanitized planogram section the run was scored against —
-   *  immutable evidence: publishing a new planogram version can never
-   *  rewrite what an old run's candidates/match status looked like. */
+  id                String                    @id @default(cuid())
+  tenantId          String
+  videoAssetId      String
+  provider          String
+  status            PretrainedVisionRunStatus
+  planogramRackId   String?
+  planogramVersion  Int?
+  /**
+   * The EXACT sanitized planogram section the run was scored against —
+   * immutable evidence: publishing a new planogram version can never
+   * rewrite what an old run's candidates/match status looked like.
+   */
   planogramEvidence Json?
-  evidence         Json
-  createdById      String?
-  createdAt        DateTime                  @default(now())
+  evidence          Json
+  createdById       String?
+  createdAt         DateTime                  @default(now())
 
   tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   videoAsset VideoAsset @relation(fields: [videoAssetId], references: [id], onDelete: Cascade)
@@ -3165,15 +3219,20 @@ model PriceBookVersion {
   createdBy   User?     @relation("PriceBookVersionActor", fields: [createdById], references: [id], onDelete: Restrict)
   activatedBy User?     @relation("PriceBookVersionActivator", fields: [activatedById], references: [id], onDelete: Restrict)
 
-  supersededBy    PriceBookVersion? @relation("PriceBookSupersession", fields: [supersededByVersionId], references: [id], onDelete: Restrict)
-  supersedes      PriceBookVersion? @relation("PriceBookSupersession")
-  rolledBackFrom  PriceBookVersion? @relation("PriceBookRollback", fields: [rolledBackFromVersionId], references: [id], onDelete: Restrict)
-  rollbackCopies  PriceBookVersion[] @relation("PriceBookRollback")
+  supersededBy   PriceBookVersion?  @relation("PriceBookSupersession", fields: [supersededByVersionId], references: [id], onDelete: Restrict)
+  supersedes     PriceBookVersion?  @relation("PriceBookSupersession")
+  rolledBackFrom PriceBookVersion?  @relation("PriceBookRollback", fields: [rolledBackFromVersionId], references: [id], onDelete: Restrict)
+  rollbackCopies PriceBookVersion[] @relation("PriceBookRollback")
 
   entries PriceBookEntry[]
 
   eslRenderedLabels EslLabel[]     @relation("EslLabelRenderedVersion")
   eslUpdateJobs     EslUpdateJob[] @relation("EslJobPriceVersion")
+
+  // Phase 29 — the lines whose base price this version produced. Read-only
+  // back-references: nothing downstream may write a price version.
+  checkoutLines CheckoutSessionLine[] @relation("CheckoutLinePriceVersion")
+  orderLines    OrderLine[]           @relation("OrderLinePriceVersion")
 
   @@unique([id, tenantId])
   @@unique([priceBookId, versionNumber])
@@ -3274,16 +3333,16 @@ enum EslUpdateErrorCode {
 
 /// A vendor gateway serving the labels in one location.
 model EslGateway {
-  id       String @id @default(cuid())
-  tenantId String
+  id            String           @id @default(cuid())
+  tenantId      String
   /// Unique per tenant, normalized to uppercase (like PriceBook.code).
-  code     String
-  name     String
+  code          String
+  name          String
   /// Selects the adapter behind EslVendorPort. 'SIMULATED' always resolves.
-  vendorCode String
+  vendorCode    String
   /// Labels belong to a store; a gateway is always location-bound.
-  locationId String
-  status     EslGatewayStatus @default(PENDING)
+  locationId    String
+  status        EslGatewayStatus @default(PENDING)
   /// OPAQUE configuration key (e.g. 'ACME_STORE_01'). The runtime resolves it
   /// to a credential from the environment. A secret must NEVER be written
   /// here; the service rejects credential-shaped values.
@@ -3293,12 +3352,12 @@ model EslGateway {
   metadata      Json?
   lastSeenAt    DateTime?
   createdById   String?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
 
-  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location  Location  @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  createdBy User?     @relation("EslGatewayActor", fields: [createdById], references: [id], onDelete: Restrict)
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location  Location @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  createdBy User?    @relation("EslGatewayActor", fields: [createdById], references: [id], onDelete: Restrict)
 
   labels     EslLabel[]
   updateJobs EslUpdateJob[]
@@ -3311,33 +3370,33 @@ model EslGateway {
 
 /// One physical label.
 model EslLabel {
-  id        String @id @default(cuid())
-  tenantId  String
-  gatewayId String
+  id                  String         @id @default(cuid())
+  tenantId            String
+  gatewayId           String
   /// The vendor's own identifier for the hardware. Unique per gateway.
-  vendorLabelId String
-  productId     String?
+  vendorLabelId       String
+  productId           String?
   /// Optional planogram placement, so a label can be traced to a shelf cell.
-  cellAssignmentId String?
-  status           EslLabelStatus @default(UNBOUND)
-  batteryPercent   Int?
-  signalPercent    Int?
+  cellAssignmentId    String?
+  status              EslLabelStatus @default(UNBOUND)
+  batteryPercent      Int?
+  signalPercent       Int?
   /// What the label is actually SHOWING — set only when a push succeeded.
   lastRenderedAt      DateTime?
   renderedVersionId   String?
   /// Hash of the rendered content, so reconciliation can tell "already
   /// correct" from "never pushed" without storing the content itself.
   renderedContentHash String?
-  createdById String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  createdById         String?
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
 
-  tenant         Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  gateway        EslGateway               @relation(fields: [gatewayId], references: [id], onDelete: Restrict)
-  product        Product?                 @relation(fields: [productId], references: [id], onDelete: Restrict)
-  cellAssignment PlanogramCellAssignment? @relation(fields: [cellAssignmentId], references: [id], onDelete: Restrict)
-  renderedVersion PriceBookVersion?       @relation("EslLabelRenderedVersion", fields: [renderedVersionId], references: [id], onDelete: Restrict)
-  createdBy      User?                    @relation("EslLabelActor", fields: [createdById], references: [id], onDelete: Restrict)
+  tenant          Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  gateway         EslGateway               @relation(fields: [gatewayId], references: [id], onDelete: Restrict)
+  product         Product?                 @relation(fields: [productId], references: [id], onDelete: Restrict)
+  cellAssignment  PlanogramCellAssignment? @relation(fields: [cellAssignmentId], references: [id], onDelete: Restrict)
+  renderedVersion PriceBookVersion?        @relation("EslLabelRenderedVersion", fields: [renderedVersionId], references: [id], onDelete: Restrict)
+  createdBy       User?                    @relation("EslLabelActor", fields: [createdById], references: [id], onDelete: Restrict)
 
   updateJobs EslUpdateJob[]
 
@@ -3350,37 +3409,37 @@ model EslLabel {
 
 /// A queued push of content to one label.
 model EslUpdateJob {
-  id        String @id @default(cuid())
-  tenantId  String
-  labelId   String
+  id                 String              @id @default(cuid())
+  tenantId           String
+  labelId            String
   /// Denormalized from the label so the processor can batch by gateway
   /// without a join, and so a claim stays a single indexed read.
-  gatewayId String
-  trigger   EslUpdateTrigger
+  gatewayId          String
+  trigger            EslUpdateTrigger
   /// The activation that caused this push, when there was one.
   priceBookVersionId String?
-  status             EslUpdateJobStatus @default(QUEUED)
+  status             EslUpdateJobStatus  @default(QUEUED)
   /// Content fingerprint at enqueue time. A push whose label already shows
   /// this hash is a no-op success, which makes replay free.
-  contentHash String
+  contentHash        String
   /// Tenant-scoped de-duplication. For a price activation this is
   /// "<versionId>:<labelId>", so the same activation can never enqueue twice.
-  idempotencyKey String
-  attempts       Int  @default(0)
+  idempotencyKey     String
+  attempts           Int                 @default(0)
   /// Set on claim; the worker echoes it back as a fencing token so a late
   /// result from a reclaimed attempt cannot commit over the live one.
-  claimedAttempt Int?
-  leaseExpiresAt DateTime?
+  claimedAttempt     Int?
+  leaseExpiresAt     DateTime?
   /// Backoff gate: a QUEUED job is invisible to claims until this instant.
-  nextAttemptAt  DateTime  @default(now())
-  lastErrorCode    EslUpdateErrorCode?
-  lastErrorMessage String?
-  requestedAt DateTime  @default(now())
-  startedAt   DateTime?
-  finishedAt  DateTime?
-  createdById String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  nextAttemptAt      DateTime            @default(now())
+  lastErrorCode      EslUpdateErrorCode?
+  lastErrorMessage   String?
+  requestedAt        DateTime            @default(now())
+  startedAt          DateTime?
+  finishedAt         DateTime?
+  createdById        String?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
 
   tenant           Tenant            @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   label            EslLabel          @relation(fields: [labelId], references: [id], onDelete: Restrict)
@@ -3394,4 +3453,296 @@ model EslUpdateJob {
   @@index([tenantId, labelId, status])
   @@index([tenantId, gatewayId, status])
   @@index([tenantId, priceBookVersionId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 29 — Loyalty and promotions.
+//
+// THE CENTRAL INVARIANT: a promotion must not bypass price versioning.
+// Phase 25 made a price an immutable entry inside a versioned price book;
+// Phase 28 made activation the event that drives shelf labels. Nothing here
+// writes, supersedes, or shadows a price row. A promotion is a SEPARATE,
+// SUBTRACTIVE layer that composes on top of the price version already in
+// force:
+//
+//     paid = resolvePrice(product, at, location)   <- pricing, unchanged
+//            - selectPromotion(...)                <- this module, on top
+//
+// Both halves are recorded on the basket line (priceBookVersionId,
+// basePriceMinor, promotionVersionId, promotionDiscountMinor), so any price a
+// shopper paid can be explained by naming exactly one price version and at
+// most one promotion version. Promotions carry their own version lifecycle —
+// DRAFT -> ACTIVE -> SUPERSEDED with half-open effective windows, and
+// rollback by copying an old version forward — so a discount is as versioned,
+// auditable and reversible as a price is, WITHOUT either one editing the
+// other. A promotion that must appear on a shelf label is not modelled here
+// at all: it is a price book version with reason PROMOTION_BASE, which the
+// ESL pipeline already propagates.
+// ---------------------------------------------------------------------------
+
+enum LoyaltyAccountStatus {
+  ACTIVE
+  /// Operator-held. Accrues nothing, redeems nothing, wins no member-only
+  /// promotion. History is kept intact.
+  SUSPENDED
+  /// Terminal. Never reopened — enrol a new account instead.
+  CLOSED
+}
+
+/// WHY a points movement exists. The ledger is append-only, so a mistake is
+/// corrected by appending a REVERSAL, never by editing or deleting a row.
+enum LoyaltyPointMovementType {
+  ACCRUAL
+  REDEMPTION
+  ADJUSTMENT
+  EXPIRY
+  REVERSAL
+}
+
+enum PromotionStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+enum PromotionVersionStatus {
+  /// Editable. Rules may be replaced; the version discounts nothing.
+  DRAFT
+  /// The current version of its promotion. At most ONE per promotion —
+  /// enforced by a PARTIAL unique index in migration SQL.
+  ACTIVE
+  /// Was active, then replaced. Still applies inside its closed
+  /// [effectiveFrom, effectiveTo) window, which is what makes a historical
+  /// quote ("what did this basket cost last Tuesday?") reproducible.
+  SUPERSEDED
+  /// Withdrawn without ever having been active. Never discounts anything.
+  ARCHIVED
+}
+
+/// Who a promotion is for. LOYALTY_MEMBERS requires an ACTIVE loyalty account
+/// on the basket; ALL_SHOPPERS applies to everyone, member or not.
+enum PromotionAudience {
+  ALL_SHOPPERS
+  LOYALTY_MEMBERS
+}
+
+/// How a rule reduces a base price. All three are strictly subtractive and
+/// integer-exact on minor units — a promotion can only ever lower a price,
+/// never raise it (see loyalty.logic.ts, and the CHECKs in migration SQL).
+enum PromotionRuleKind {
+  /// `value` is basis points off the base price (1..10000 = 0.01%..100%).
+  PERCENT_OFF
+  /// `value` is minor units off the base price.
+  AMOUNT_OFF
+  /// `value` is the promoted unit price in minor units. Ignored (no discount)
+  /// when it is not BELOW the base price.
+  FIXED_UNIT_PRICE
+}
+
+/// Closed vocabulary for why a promotion version exists. Free-form
+/// justification goes in `note`, which is screened for credential- and
+/// payment-bearing text before it is persisted (it also flows into
+/// AuditLog.reason).
+enum PromotionChangeReason {
+  INITIAL
+  RULE_CHANGE
+  CORRECTION
+  ROLLBACK
+}
+
+/// A loyalty membership. Tenant-scoped, identified by a member code the
+/// operator issues.
+model LoyaltyAccount {
+  id          String               @id @default(cuid())
+  tenantId    String
+  /// Unique per tenant, normalized to uppercase (like Product.sku).
+  memberCode  String
+  /// Operator-facing label only. Screened free text — never an email, phone,
+  /// card, or any other credential-shaped value.
+  displayName String?
+  status      LoyaltyAccountStatus @default(ACTIVE)
+  /// FORWARD LINK to the Phase 26 `Shopper`, which does not exist on this
+  /// branch. Deliberately a bare nullable column with NO Prisma relation and
+  /// NO foreign key yet: when Shopper lands, wiring it is one ALTER TABLE
+  /// adding the composite same-tenant FK plus one relation line here — no
+  /// column rename, no backfill, no data migration. Until then the column is
+  /// never written by the API (there is no DTO field for it), and the partial
+  /// unique index in migration SQL already reserves "at most one loyalty
+  /// account per shopper per tenant".
+  shopperId   String?
+  enrolledAt  DateTime             @default(now())
+  createdById String?
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+
+  tenant    Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  createdBy User?  @relation("LoyaltyAccountActor", fields: [createdById], references: [id], onDelete: Restrict)
+
+  movements        LoyaltyPointMovement[]
+  checkoutSessions CheckoutSession[]
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, memberCode])
+  @@index([tenantId, status])
+  @@index([tenantId, shopperId])
+}
+
+/// One append to an account's points ledger.
+///
+/// APPEND-ONLY, at the database level: a trigger in migration SQL rejects
+/// UPDATE, DELETE and TRUNCATE, exactly as it does for InventoryMovement and
+/// AuditLog. The balance is therefore always DERIVED (SUM of `points`) and is
+/// never a mutable counter anywhere in the system. `balanceAfter` is an
+/// immutable stamp of that sum at insert time, kept so the floor can be a
+/// CHECK on the row being written rather than a decision the application is
+/// trusted to have made correctly.
+model LoyaltyPointMovement {
+  id                 String                   @id @default(cuid())
+  tenantId           String
+  accountId          String
+  /// Monotonic per account, starting at 1. The unique index on
+  /// (accountId, sequenceNumber) is what makes a lost update impossible: two
+  /// concurrent redemptions that both read the same tail collide on the
+  /// insert instead of both succeeding.
+  sequenceNumber     Int
+  type               LoyaltyPointMovementType
+  /// Signed: accruals positive, redemptions negative. Never zero (CHECK).
+  points             Int
+  /// Derived balance after this movement. CHECK >= 0 — an overdraw is a
+  /// FAILED WRITE, not a negative balance somebody notices later.
+  balanceAfter       Int
+  /// Uppercase operator vocabulary (PURCHASE, GOODWILL, ...). Screened.
+  reasonCode         String
+  /// Screened free text; also copied into AuditLog.reason.
+  note               String?
+  /// Optional lineage: the order that earned or spent the points.
+  orderId            String?
+  /// Optional lineage: the promotion version that granted them.
+  promotionVersionId String?
+  /// Tenant-scoped replay key. A repeat of the same key returns the original
+  /// movement instead of moving points twice.
+  idempotencyKey     String
+  createdById        String?
+  /// No updatedAt by design — rows are never updated.
+  createdAt          DateTime                 @default(now())
+
+  tenant           Tenant            @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  account          LoyaltyAccount    @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  order            Order?            @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  promotionVersion PromotionVersion? @relation("LoyaltyPointsPromotionVersion", fields: [promotionVersionId], references: [id], onDelete: Restrict)
+  createdBy        User?             @relation("LoyaltyPointMovementActor", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, idempotencyKey])
+  @@unique([accountId, sequenceNumber])
+  @@index([tenantId, accountId, createdAt])
+  @@index([tenantId, orderId])
+}
+
+/// A named discount programme. Its RULES live in versions, never here, for
+/// the same reason a price lives in a price book version and not on Product.
+model Promotion {
+  id          String            @id @default(cuid())
+  tenantId    String
+  /// Unique per tenant, normalized to uppercase.
+  code        String
+  /// Operator-facing. Screened free text.
+  name        String
+  status      PromotionStatus   @default(ACTIVE)
+  audience    PromotionAudience @default(ALL_SHOPPERS)
+  /// NULL = applies tenant-wide. Set = applies only at that location, and
+  /// beats a tenant-wide promotion there (same specificity rule as a price
+  /// book).
+  locationId  String?
+  /// Deterministic tie-break when two promotions offer the SAME discount.
+  /// Higher wins. It is a tie-break only: it can never make a smaller
+  /// discount beat a larger one.
+  priority    Int               @default(0)
+  createdById String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location  Location? @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  createdBy User?     @relation("PromotionActor", fields: [createdById], references: [id], onDelete: Restrict)
+
+  versions PromotionVersion[]
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, code])
+  @@index([tenantId, status])
+  @@index([tenantId, locationId, status])
+}
+
+/// One immutable revision of a promotion. Same lifecycle as
+/// PriceBookVersion, deliberately: an operator who understands how a price
+/// change is made already understands how a discount change is made.
+model PromotionVersion {
+  id            String                 @id @default(cuid())
+  tenantId      String
+  promotionId   String
+  /// Monotonic per promotion, starting at 1. Never reused.
+  versionNumber Int
+  status        PromotionVersionStatus @default(DRAFT)
+  effectiveFrom DateTime
+  /// Exclusive end of the window, written when a newer version activates.
+  effectiveTo   DateTime?
+  reason        PromotionChangeReason
+  note          String?
+
+  createdById             String?
+  activatedById           String?
+  activatedAt             DateTime?
+  supersededByVersionId   String?   @unique
+  rolledBackFromVersionId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant      Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  promotion   Promotion @relation(fields: [promotionId], references: [id], onDelete: Restrict)
+  createdBy   User?     @relation("PromotionVersionActor", fields: [createdById], references: [id], onDelete: Restrict)
+  activatedBy User?     @relation("PromotionVersionActivator", fields: [activatedById], references: [id], onDelete: Restrict)
+
+  supersededBy   PromotionVersion?  @relation("PromotionSupersession", fields: [supersededByVersionId], references: [id], onDelete: Restrict)
+  supersedes     PromotionVersion?  @relation("PromotionSupersession")
+  rolledBackFrom PromotionVersion?  @relation("PromotionRollback", fields: [rolledBackFromVersionId], references: [id], onDelete: Restrict)
+  rollbackCopies PromotionVersion[] @relation("PromotionRollback")
+
+  rules PromotionRule[]
+
+  checkoutLines  CheckoutSessionLine[]  @relation("CheckoutLinePromotionVersion")
+  orderLines     OrderLine[]            @relation("OrderLinePromotionVersion")
+  pointMovements LoyaltyPointMovement[] @relation("LoyaltyPointsPromotionVersion")
+
+  @@unique([id, tenantId])
+  @@unique([promotionId, versionNumber])
+  @@index([tenantId, promotionId, status])
+  @@index([tenantId, promotionId, effectiveFrom])
+  @@index([tenantId, status, effectiveFrom])
+}
+
+/// One rule inside one promotion version. Immutable once its version leaves
+/// DRAFT, for the same reason a price entry is: an order that cited it must
+/// stay explicable forever.
+model PromotionRule {
+  id               String            @id @default(cuid())
+  tenantId         String
+  versionId        String
+  /// NULL = applies to every product the base price covers. Set = applies to
+  /// that product only, and beats the catalog-wide rule of the same version.
+  productId        String?
+  kind             PromotionRuleKind
+  /// Meaning depends on `kind` (see PromotionRuleKind). Always positive.
+  value            Int
+  /// Optional ceiling in minor units, for PERCENT_OFF. NULL = uncapped.
+  maxDiscountMinor Int?
+  createdAt        DateTime          @default(now())
+
+  tenant  Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  version PromotionVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  product Product?         @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@index([tenantId, versionId])
+  @@index([tenantId, productId])
 }

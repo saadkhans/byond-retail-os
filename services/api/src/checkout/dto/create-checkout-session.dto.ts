@@ -26,6 +26,18 @@ export class CreateCheckoutSessionDto extends EvidenceRefsDto {
   deviceId?: string;
 
   @ApiPropertyOptional({
+    description:
+      'Loyalty account (member) this basket is shopped under. Captured when ' +
+      'the session OPENS, so a promotion decision taken on a line can never ' +
+      'be changed by identifying later. Must be an ACTIVE account in this ' +
+      'tenant; omit for a non-member basket.',
+  })
+  @IsOptionalNonNull()
+  @IsString()
+  @MinLength(1)
+  loyaltyAccountId?: string;
+
+  @ApiPropertyOptional({
     maxLength: 100,
     description:
       'Tenant-scoped idempotency key: retrying the same create returns the ' +

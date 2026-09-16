@@ -17,6 +17,7 @@ import { InferenceModule } from './inference/inference.module';
 import { InventoryModule } from './inventory/inventory.module';
 import { JourneyModule } from './journey/journey.module';
 import { LocationsModule } from './locations/locations.module';
+import { LoyaltyModule } from './loyalty/loyalty.module';
 import { OneSkuBootstrapModule } from './one-sku-bootstrap/one-sku-bootstrap.module';
 import { PlanogramModule } from './planogram/planogram.module';
 import { PretrainedVisionModule } from './pretrained-vision/pretrained-vision.module';
@@ -68,6 +69,7 @@ import { VisionModule } from './vision/vision.module';
     PretrainedVisionModule,
     ClipLabModule,
     EslModule,
+    LoyaltyModule,
   ],
 })
 export class AppModule implements NestModule {

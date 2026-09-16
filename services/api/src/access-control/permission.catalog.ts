@@ -62,4 +62,12 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   { code: 'esl-label:manage', module: 'esl', description: 'Register labels, bind them to products and planogram cells, retire them, and request a re-render' },
   { code: 'esl-job:read', module: 'esl', description: 'View label update jobs, their attempts, and their failure reasons' },
   { code: 'esl-job:process', module: 'esl', description: 'Run a label update pass, reclaim expired worker leases, and reconcile labels against the price in force' },
+  { code: 'loyalty-account:read', module: 'loyalty', description: 'View loyalty accounts and their derived points balances' },
+  { code: 'loyalty-account:manage', module: 'loyalty', description: 'Enrol loyalty accounts, rename them, and suspend or close them' },
+  { code: 'loyalty-points:read', module: 'loyalty', description: 'View the append-only points ledger of a loyalty account' },
+  { code: 'loyalty-points:post', module: 'loyalty', description: 'Accrue and redeem points (idempotent; a redemption can never overdraw)' },
+  { code: 'loyalty-points:adjust', module: 'loyalty', description: 'Append a manual adjustment, expiry, or reversal to a points ledger — the only way to correct a mistake, since movements are never edited or deleted' },
+  { code: 'promotion:read', module: 'loyalty', description: 'View promotions, their versions and rules, and the explained price a shopper would be quoted' },
+  { code: 'promotion:manage', module: 'loyalty', description: 'Create promotions and draft versions, set rules, and archive a promotion' },
+  { code: 'promotion:activate', module: 'loyalty', description: 'Activate a promotion version and roll back to an earlier one — the moment a discount starts or stops applying to baskets' },
 ];

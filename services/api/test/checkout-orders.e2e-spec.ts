@@ -436,6 +436,30 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
     );
   }
 
+  /**
+   * Resolves a write predicate the way Prisma does, for BOTH shapes a
+   * destructive write may use: `{ id }` and the tenant-carrying composite
+   * `{ id_tenantId: { id, tenantId } }`. The composite form is matched on
+   * BOTH columns, so this stub models the tenant isolation it is testing
+   * rather than quietly ignoring half the key.
+   */
+  function pickByWritePredicate<T extends { id: string; tenantId?: unknown }>(
+    rows: T[],
+    where: Where,
+  ): T | undefined {
+    const composite = where.id_tenantId as
+      | { id: string; tenantId: string }
+      | undefined;
+    if (composite) {
+      return rows.find(
+        (candidate) =>
+          candidate.id === composite.id &&
+          candidate.tenantId === composite.tenantId,
+      );
+    }
+    return rows.find((candidate) => candidate.id === where.id);
+  }
+
   // Prisma applies column defaults when a create field is undefined; a naive
   // spread would clobber the stub's defaults with undefined instead.
   function stripUndefined(data: Where): Where & { tenantId: string } {
@@ -829,9 +853,7 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
         data: Where;
         include?: Where;
       }) => {
-        const row = store.sessions.find(
-          (candidate) => candidate.id === where.id,
-        )!;
+        const row = pickByWritePredicate(store.sessions, where)!;
         Object.assign(row, stripUndefined(data), { updatedAt: new Date() });
         return sessionView(row, include);
       },
@@ -897,16 +919,12 @@ describe('Checkout sessions & orders (e2e, no live database)', () => {
           ]),
         ) ?? null,
       update: async ({ where, data }: { where: Where; data: Where }) => {
-        const row = store.sessionLines.find(
-          (candidate) => candidate.id === where.id,
-        )!;
+        const row = pickByWritePredicate(store.sessionLines, where)!;
         Object.assign(row, stripUndefined(data), { updatedAt: new Date() });
         return row;
       },
       delete: async ({ where }: { where: Where }) => {
-        const row = store.sessionLines.find(
-          (candidate) => candidate.id === where.id,
-        )!;
+        const row = pickByWritePredicate(store.sessionLines, where)!;
         store.sessionLines = store.sessionLines.filter(
           (candidate) => candidate.id !== row.id,
         );
