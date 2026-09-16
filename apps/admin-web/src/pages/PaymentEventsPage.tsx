@@ -4,21 +4,13 @@ import {
   api,
   ApiError,
   Paginated,
+  PAYMENT_EVENT_TYPE_VALUES,
   PaymentEvent,
   PaymentEventType,
 } from '../api';
 import { formatDate, Page, Pagination, StatusBadge, useLoad } from '../components';
 
-const EVENT_TYPES: PaymentEventType[] = [
-  'AUTHORIZATION_SUCCEEDED',
-  'AUTHORIZATION_FAILED',
-  'CAPTURE_SUCCEEDED',
-  'CAPTURE_FAILED',
-  'PAYMENT_CANCELLED',
-  'PAYMENT_VOIDED',
-  'PAYMENT_EXPIRED',
-  'UNKNOWN',
-];
+const EVENT_TYPES: readonly PaymentEventType[] = PAYMENT_EVENT_TYPE_VALUES;
 
 function errorMessage(err: unknown): string {
   return err instanceof ApiError ? err.message : 'Unexpected error';

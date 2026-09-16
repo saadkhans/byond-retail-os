@@ -1,9 +1,9 @@
 import { useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { api, Order, Paginated } from '../api';
+import { api, Order, ORDER_STATUS_VALUES, Paginated } from '../api';
 import { formatDate, Page, Pagination, StatusBadge, useLoad } from '../components';
 
-const ORDER_STATUSES = ['', 'DRAFT', 'CONFIRMED', 'CANCELLED'];
+const ORDER_STATUSES = ['', ...ORDER_STATUS_VALUES];
 
 export function OrdersPage() {
   const [status, setStatus] = useState('');

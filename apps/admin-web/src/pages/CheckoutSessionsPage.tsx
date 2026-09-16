@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   api,
   ApiError,
+  CHECKOUT_SESSION_STATUS_VALUES,
   CheckoutSession,
   Order,
   Paginated,
@@ -12,15 +13,7 @@ import {
 } from '../api';
 import { formatDate, Page, Pagination, StatusBadge, useLoad } from '../components';
 
-const SESSION_STATUSES = [
-  '',
-  'OPEN',
-  'ACTIVE',
-  'PENDING_REVIEW',
-  'COMPLETED',
-  'CANCELLED',
-  'EXPIRED',
-];
+const SESSION_STATUSES = ['', ...CHECKOUT_SESSION_STATUS_VALUES];
 
 const TERMINAL_STATUSES = ['COMPLETED', 'CANCELLED', 'EXPIRED'];
 

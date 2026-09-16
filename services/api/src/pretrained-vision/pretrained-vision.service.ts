@@ -8,6 +8,7 @@ import {
   Optional,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import type { RackFrameRegion } from '@byond/shared';
 import { FusionRunScope, PretrainedVisionRunStatus } from '@prisma/client';
 import type {
   LocalDetectorRuntimePort,
@@ -141,15 +142,9 @@ export interface PretrainedComparisonReport {
 
 export type PlanogramCoordinateSource = 'OPERATOR' | 'DETECTOR' | 'NONE';
 
-/** Normalized rectangle (0..1, top-left origin) of the ANALYSIS frame
- *  that the planogram rack occupies. Frame the rack tightly and leave it
- *  out (= whole frame). */
-export interface RackFrameRegion {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
+/** Declared in `@byond/shared`: the normalized (0..1, top-left origin)
+ *  rectangle of the ANALYSIS frame the planogram rack occupies. */
+export type { RackFrameRegion } from '@byond/shared';
 
 export const WHOLE_FRAME_REGION: RackFrameRegion = {
   x: 0,

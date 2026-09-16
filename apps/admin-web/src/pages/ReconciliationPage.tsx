@@ -4,19 +4,13 @@ import {
   api,
   ApiError,
   Paginated,
+  RECONCILIATION_STATUS_VALUES,
   ReconciliationRecord,
   ReconciliationStatus,
 } from '../api';
 import { formatDate, Page, Pagination, StatusBadge, useLoad } from '../components';
 
-const RECON_STATUSES: (ReconciliationStatus | '')[] = [
-  '',
-  'PENDING',
-  'MATCHED',
-  'MISMATCH',
-  'RECONCILED',
-  'FAILED',
-];
+const RECON_STATUSES: (ReconciliationStatus | '')[] = ['', ...RECONCILIATION_STATUS_VALUES];
 
 const SETTABLE: ReconciliationStatus[] = [
   'MATCHED',

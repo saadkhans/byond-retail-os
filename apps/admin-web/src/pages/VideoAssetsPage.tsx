@@ -7,6 +7,8 @@ import {
   InferenceJob,
   Paginated,
   ScreeningPreview,
+  VIDEO_ASSET_STATUS_VALUES,
+  VIDEO_CROP_REASON_VALUES,
   VideoArtifact,
   VideoAsset,
 } from '../api';
@@ -14,27 +16,9 @@ import { Disclosure, formatDate, Notice, Page, Pagination, StatusBadge, useLoad 
 import { FusionEvidencePanel } from './FusionEvidencePanel';
 import { PickupDetectionPanel } from './PickupDetectionPanel';
 
-const ASSET_STATUSES = [
-  '',
-  'PENDING_MEDIA',
-  'QUARANTINED',
-  'UPLOADED',
-  'VALIDATED',
-  'REJECTED',
-  'PROCESSING',
-  'READY',
-  'FAILED',
-];
+const ASSET_STATUSES = ['', ...VIDEO_ASSET_STATUS_VALUES];
 
-const CROP_REASONS = [
-  '',
-  'PRODUCT_PICKUP',
-  'PRODUCT_RETURN',
-  'SHELF_AUDIT',
-  'CART_INSERTION',
-  'OCR_REVIEW',
-  'VLM_REVIEW',
-];
+const CROP_REASONS = ['', ...VIDEO_CROP_REASON_VALUES];
 
 export const ACCEPTED_EXTENSIONS = '.mp4,.m4v,.mov,.webm,.mkv,.avi,.mpg,.mpeg';
 

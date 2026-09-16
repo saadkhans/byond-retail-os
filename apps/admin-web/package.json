@@ -7,19 +7,24 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "lint": "eslint src vite.config.ts eslint.config.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@byond/shared": "workspace:*",
+    "@byond/ui": "workspace:*",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.30.0"
   },
   "devDependencies": {
+    "@byond/config": "workspace:*",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^9.20.0",
     "typescript": "^5.7.0",
     "vite": "^6.0.0",
     "vitest": "^4.1.10"

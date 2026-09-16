@@ -1,19 +1,18 @@
 import { FormEvent, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { api, ApiError, InferenceJob, Paginated } from '../api';
+import {
+  api,
+  ApiError,
+  INFERENCE_JOB_STATUS_VALUES,
+  INFERENCE_JOB_TYPE_VALUES,
+  InferenceJob,
+  Paginated,
+} from '../api';
 import { formatDate, Page, Pagination, StatusBadge, useLoad } from '../components';
 
-const JOB_STATUSES = ['', 'QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED'];
+const JOB_STATUSES = ['', ...INFERENCE_JOB_STATUS_VALUES];
 
-const JOB_TYPES = [
-  '',
-  'TRACKING_EVENT',
-  'SHELF_AUDIT',
-  'PRODUCT_RECOGNITION',
-  'OCR_REVIEW',
-  'VLM_REVIEW',
-  'EXIT_RECONCILIATION',
-];
+const JOB_TYPES = ['', ...INFERENCE_JOB_TYPE_VALUES];
 
 const EVENT_TYPES = [
   'PRODUCT_PICKUP',

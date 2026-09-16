@@ -4,24 +4,14 @@ import {
   api,
   ApiError,
   Paginated,
+  PAYMENT_STATUS_VALUES,
   PaymentIntent,
   PaymentStatus,
   ReconciliationRecord,
 } from '../api';
 import { formatDate, Page, Pagination, StatusBadge, useLoad } from '../components';
 
-const INTENT_STATUSES: (PaymentStatus | '')[] = [
-  '',
-  'CREATED',
-  'REQUIRES_AUTHORIZATION',
-  'AUTHORIZED',
-  'CAPTURE_PENDING',
-  'CAPTURED',
-  'FAILED',
-  'CANCELLED',
-  'VOIDED',
-  'EXPIRED',
-];
+const INTENT_STATUSES: (PaymentStatus | '')[] = ['', ...PAYMENT_STATUS_VALUES];
 
 function errorMessage(err: unknown): string {
   return err instanceof ApiError ? err.message : 'Unexpected error';
