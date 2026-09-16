@@ -277,6 +277,139 @@ export interface ResolvedPrice {
 }
 
 /* ---------------------------------------------------------------- */
+/* Loyalty & promotions (Phase 29)                                    */
+/*                                                                    */
+/* A promotion NEVER rewrites a price version. It composes on top of  */
+/* one, and a quote reports both halves so any price a shopper pays   */
+/* names exactly one price version and at most one promotion version. */
+/* ---------------------------------------------------------------- */
+
+export type LoyaltyAccountStatus = 'ACTIVE' | 'SUSPENDED' | 'CLOSED';
+
+export type LoyaltyPointMovementType =
+  | 'ACCRUAL'
+  | 'REDEMPTION'
+  | 'ADJUSTMENT'
+  | 'EXPIRY'
+  | 'REVERSAL';
+
+export interface LoyaltyAccount {
+  id: string;
+  memberCode: string;
+  displayName: string | null;
+  status: LoyaltyAccountStatus;
+  enrolledAt: string;
+  createdAt: string;
+}
+
+/** An account plus its DERIVED balance — there is no balance column. */
+export interface LoyaltyAccountWithBalance {
+  account: LoyaltyAccount;
+  pointsBalance: number;
+  movementCount: number;
+}
+
+export interface LoyaltyPointMovement {
+  id: string;
+  accountId: string;
+  sequenceNumber: number;
+  type: LoyaltyPointMovementType;
+  /** Signed: accruals positive, redemptions negative. */
+  points: number;
+  balanceAfter: number;
+  reasonCode: string;
+  note: string | null;
+  orderId: string | null;
+  createdAt: string;
+}
+
+export interface PointMovementResult {
+  movement: LoyaltyPointMovement;
+  pointsBalance: number;
+  /** True when the idempotency key replayed an earlier append. */
+  replayed: boolean;
+}
+
+export type PromotionStatus = 'ACTIVE' | 'ARCHIVED';
+
+export type PromotionVersionStatus =
+  | 'DRAFT'
+  | 'ACTIVE'
+  | 'SUPERSEDED'
+  | 'ARCHIVED';
+
+export type PromotionAudience = 'ALL_SHOPPERS' | 'LOYALTY_MEMBERS';
+
+export type PromotionRuleKind =
+  | 'PERCENT_OFF'
+  | 'AMOUNT_OFF'
+  | 'FIXED_UNIT_PRICE';
+
+export type PromotionChangeReason =
+  | 'INITIAL'
+  | 'RULE_CHANGE'
+  | 'CORRECTION'
+  | 'ROLLBACK';
+
+export interface PromotionVersion {
+  id: string;
+  promotionId: string;
+  versionNumber: number;
+  status: PromotionVersionStatus;
+  effectiveFrom: string;
+  effectiveTo: string | null;
+  reason: PromotionChangeReason;
+  note: string | null;
+  activatedAt: string | null;
+  supersededByVersionId: string | null;
+  rolledBackFromVersionId: string | null;
+  createdAt: string;
+}
+
+export interface Promotion {
+  id: string;
+  code: string;
+  name: string;
+  status: PromotionStatus;
+  audience: PromotionAudience;
+  locationId: string | null;
+  priority: number;
+  createdAt: string;
+  location?: { id: string; code: string; name: string } | null;
+  versions?: PromotionVersion[];
+}
+
+export interface PromotionRule {
+  id: string;
+  versionId: string;
+  productId: string | null;
+  kind: PromotionRuleKind;
+  value: number;
+  maxDiscountMinor: number | null;
+  product?: { id: string; sku: string; name: string } | null;
+}
+
+export interface PromotionOutcome {
+  promotionId: string;
+  promotionVersionId: string;
+  ruleId: string;
+  kind: PromotionRuleKind;
+  discountMinor: number;
+  finalUnitPriceMinor: number;
+}
+
+/** The explained price: which version, which promotion, what is paid. */
+export interface PriceQuote {
+  productId: string;
+  currencyCode: string;
+  basePriceMinor: number;
+  priceBookId: string;
+  priceBookVersionId: string;
+  promotion: PromotionOutcome | null;
+  unitPriceMinor: number;
+}
+
+/* ---------------------------------------------------------------- */
 /* Electronic shelf labels (Phase 28)                                 */
 /* ---------------------------------------------------------------- */
 

@@ -41,6 +41,7 @@ scripts/         Repo automation scripts
 - [docs/product/store-flow.md](docs/product/store-flow.md) — the autonomous store loop: entry, the observation → basket bridge, exit settlement
 - [docs/product/returns.md](docs/product/returns.md) — the reverse flow: returns, refunds, cycle counts and shrink, all through the ledger
 - [docs/product/esl.md](docs/product/esl.md) — vendor-neutral electronic shelf labels
+- [docs/product/loyalty.md](docs/product/loyalty.md) — loyalty points and promotions that compose on top of a price version
 
 ## Getting started
 
@@ -95,8 +96,13 @@ reconciles the projection against the ledger, and write off a CV-detected loss
 (see [docs/product/returns.md](docs/product/returns.md)). Shelf labels are
 managed under **Shelf labels**, where a gateway is registered against a
 simulated (or real) vendor adapter and its labels follow every price
-activation — see [docs/product/esl.md](docs/product/esl.md). The API's CORS
-allowlist defaults to
+activation — see [docs/product/esl.md](docs/product/esl.md). **Loyalty &
+promotions** covers member accounts with an append-only points ledger and
+versioned promotions that subtract from the price version in force without
+ever rewriting it — the quote panel there names the price version and the
+promotion version behind any price, see
+[docs/product/loyalty.md](docs/product/loyalty.md). The API's CORS allowlist
+defaults to
 `http://localhost:5173` (override with `CORS_ORIGINS`).
 
 ### CV pipeline (http://localhost:3100)

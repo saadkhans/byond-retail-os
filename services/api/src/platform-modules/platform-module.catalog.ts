@@ -214,10 +214,20 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
   },
   {
     code: 'loyalty',
-    name: 'Loyalty',
-    description: 'Loyalty and promotions (later phase).',
-    defaultEnabled: false,
-    isActive: false,
+    name: 'Loyalty & Promotions',
+    description:
+      'Loyalty accounts with an append-only points ledger, and versioned, ' +
+      'reversible promotions that compose on top of the price version in ' +
+      'force without ever rewriting price history.',
+    // Shipped in Phase 29 and DEFAULT-ENABLED for the same reason as
+    // inventory/devices/checkout/pricing/esl (see above): the only enable
+    // endpoint is @TenantOnly(), so leaving this false would strand new
+    // tenants behind 403s. RBAC still gates every route independently.
+    // Tenants that existed BEFORE Phase 29 are covered by the
+    // 20260916130001_loyalty_module_backfill migration — defaultEnabled only
+    // applies at tenant creation time.
+    defaultEnabled: true,
+    isActive: true,
   },
   {
     code: 'reporting',

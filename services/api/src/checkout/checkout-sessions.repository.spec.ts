@@ -1323,7 +1323,9 @@ describe('CheckoutSessionsRepository', () => {
         () => auditEntry('CheckoutSessionLine'),
       );
       expect(lineMocks.update).toHaveBeenCalledWith({
-        where: { id: 'line-1' },
+        // The tenant travels IN the write predicate (Phase 29 hardening),
+        // never only in the lookup that preceded it.
+        where: { id_tenantId: { id: 'line-1', tenantId: 'tenant-a' } },
         data: { status: 'REMOVED', removedAt: expect.any(Date) },
       });
       // Never a hard delete: the tombstone IS the key reservation.

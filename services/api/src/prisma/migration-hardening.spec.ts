@@ -1336,3 +1336,166 @@ describe('returns module backfill migration', () => {
     }
   });
 });
+
+describe('loyalty & promotions migration hardening', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260916130000_phase29_loyalty_promotions',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('makes the points ledger append-only at the database level', () => {
+    expect(sql).toContain(
+      'CREATE FUNCTION prevent_loyalty_point_movement_mutation()',
+    );
+    expect(sql).toContain('BEFORE UPDATE OR DELETE ON "LoyaltyPointMovement"');
+    expect(sql).toContain('BEFORE TRUNCATE ON "LoyaltyPointMovement"');
+  });
+
+  it('puts the balance floor on the row being written', () => {
+    expect(sql).toContain('CHECK ("balanceAfter" >= 0)');
+    expect(sql).toContain('CHECK ("points" <> 0)');
+    // Two concurrent redemptions that read the same tail collide here rather
+    // than both committing.
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "LoyaltyPointMovement_accountId_sequenceNumber_key"',
+    );
+  });
+
+  it('makes a points movement replayable exactly once per tenant', () => {
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "LoyaltyPointMovement_tenantId_idempotencyKey_key"',
+    );
+  });
+
+  it('keeps at most one ACTIVE version per promotion', () => {
+    expect(sql).toContain('CREATE UNIQUE INDEX "PromotionVersion_active_promotion_key"');
+    expect(sql).toContain("WHERE \"status\" = 'ACTIVE'");
+  });
+
+  it('keeps one rule per product and one catalog-wide rule per version', () => {
+    expect(sql).toContain('CREATE UNIQUE INDEX "PromotionRule_version_product_key"');
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "PromotionRule_version_catalog_wide_key"',
+    );
+  });
+
+  it('reserves one loyalty account per shopper, ready for the Shopper model', () => {
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "LoyaltyAccount_tenantId_shopperId_key"',
+    );
+    // The forward link is a bare column for now: no FK, because Shopper does
+    // not exist on this line of development yet.
+    expect(sql).toMatch(/"shopperId" TEXT/);
+    expect(sql).not.toMatch(/REFERENCES "Shopper"/);
+  });
+
+  it('MAKES A PROMOTION STRICTLY SUBTRACTIVE, at the database level', () => {
+    for (const table of ['CheckoutSessionLine', 'OrderLine']) {
+      expect(sql).toContain(`"${table}_promotion_subtractive"`);
+      expect(sql).toContain(`"${table}_promotion_needs_price_version"`);
+    }
+    expect(sql).toContain(
+      '"unitPriceMinor" = "basePriceMinor" - "promotionDiscountMinor"',
+    );
+    expect(sql).toContain('"promotionDiscountMinor" <= "basePriceMinor"');
+  });
+
+  it('NEVER TOUCHES A PRICE TABLE — promotions do not bypass price versioning', () => {
+    // A promotion composes on top of a price version. This migration may
+    // REFERENCE PriceBookVersion (a basket line names the version its base
+    // price came from) but must never alter, drop, or write one.
+    expect(sql).not.toMatch(/ALTER TABLE "PriceBook(Version|Entry)?"/);
+    expect(sql).not.toMatch(/DROP TABLE "PriceBook/);
+    expect(sql).not.toMatch(/UPDATE "PriceBook/);
+    expect(sql).not.toMatch(/INSERT INTO "PriceBook/);
+    expect(sql).not.toMatch(/DELETE FROM "PriceBook/);
+    // The only permitted mention outside a comment is as a foreign-key
+    // target: a basket/order line NAMES the version its base price came from.
+    for (const line of sql.split('\n')) {
+      if (!line.includes('"PriceBookVersion"')) continue;
+      if (line.trimStart().startsWith('--')) continue;
+      expect(line).toMatch(/REFERENCES "PriceBookVersion"/);
+    }
+  });
+
+  it('enforces same-tenant references with composite foreign keys', () => {
+    for (const constraint of [
+      'LoyaltyAccount_createdBy_same_tenant_fkey',
+      'LoyaltyPointMovement_account_same_tenant_fkey',
+      'LoyaltyPointMovement_order_same_tenant_fkey',
+      'LoyaltyPointMovement_promotionVersion_same_tenant_fkey',
+      'Promotion_location_same_tenant_fkey',
+      'Promotion_createdBy_same_tenant_fkey',
+      'PromotionVersion_promotion_same_tenant_fkey',
+      'PromotionVersion_superseded_same_tenant_fkey',
+      'PromotionVersion_rollback_same_tenant_fkey',
+      'PromotionRule_version_same_tenant_fkey',
+      'PromotionRule_product_same_tenant_fkey',
+      'CheckoutSession_loyaltyAccount_same_tenant_fkey',
+      'CheckoutSessionLine_priceVersion_same_tenant_fkey',
+      'CheckoutSessionLine_promotionVersion_same_tenant_fkey',
+      'OrderLine_priceVersion_same_tenant_fkey',
+      'OrderLine_promotionVersion_same_tenant_fkey',
+    ]) {
+      expect(sql).toContain(constraint);
+    }
+  });
+
+  it('cascades only from a promotion version into its own rules', () => {
+    // A rule has no meaning apart from its version, so it cascades. Nothing
+    // else does: no loyalty account, points movement, promotion, basket line
+    // or order line is ever removed by a delete somewhere else.
+    for (const line of sql.split('\n')) {
+      if (!line.includes('ON DELETE CASCADE')) continue;
+      expect(line).toMatch(/REFERENCES "PromotionVersion"/);
+    }
+  });
+
+  it('keeps promotion windows and rule values sane', () => {
+    expect(sql).toContain('"PromotionVersion_effective_window_ordered"');
+    expect(sql).toContain('"PromotionVersion_no_self_supersession"');
+    expect(sql).toContain('"PromotionVersion_no_self_rollback"');
+    expect(sql).toContain('"PromotionRule_value_positive"');
+    expect(sql).toContain('"PromotionRule_percent_off_basis_points"');
+  });
+});
+
+describe('loyalty module backfill migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260916130001_loyalty_module_backfill',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('force-activates the module row a pre-Phase-29 database already has', () => {
+    // `loyalty` shipped for many releases as an INACTIVE catalog name. A
+    // DO NOTHING upsert would leave isActive false and every /loyalty route
+    // would 403 behind ModuleEnabledGuard.
+    expect(sql).toContain('ON CONFLICT ("code") DO UPDATE SET');
+    expect(sql).toMatch(/"isActive" = true/);
+  });
+
+  it('enables it for existing tenants without overwriting an admin choice', () => {
+    expect(sql).toContain('INSERT INTO "TenantModule"');
+    expect(sql).toContain('ON CONFLICT ("tenantId", "moduleId") DO NOTHING');
+  });
+
+  it('uses deterministic ids so a re-run cannot race', () => {
+    expect(sql).toContain("md5(t.\"id\" || ':loyalty')");
+  });
+});

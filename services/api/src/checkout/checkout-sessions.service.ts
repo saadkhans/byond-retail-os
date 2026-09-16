@@ -146,6 +146,7 @@ export class CheckoutSessionsService {
           locationId: dto.locationId,
           unitId: dto.unitId,
           deviceId: dto.deviceId,
+          loyaltyAccountId: dto.loyaltyAccountId,
           idempotencyKey: dto.idempotencyKey,
           createdById: actor?.id,
         },
@@ -195,6 +196,13 @@ export class CheckoutSessionsService {
     if (result === 'device-unit-mismatch') {
       throw new BadRequestException(
         `Device "${dto.deviceId}" is not attached to unit "${dto.unitId}"`,
+      );
+    }
+    if (result === 'loyalty-account-not-found') {
+      // Deliberately one message for "no such account" and "not ACTIVE": a
+      // caller probing member codes learns nothing either way.
+      throw new BadRequestException(
+        'Loyalty account not found, or not ACTIVE, in this tenant',
       );
     }
     this.throwEvidenceRefRejection(result, dto);
