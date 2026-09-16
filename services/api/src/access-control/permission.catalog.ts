@@ -82,6 +82,7 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   { code: 'promotion:read', module: 'loyalty', description: 'View promotions, their versions and rules, and the explained price a shopper would be quoted' },
   { code: 'promotion:manage', module: 'loyalty', description: 'Create promotions and draft versions, set rules, and archive a promotion' },
   { code: 'promotion:activate', module: 'loyalty', description: 'Activate a promotion version and roll back to an earlier one — the moment a discount starts or stops applying to baskets' },
+  { code: 'report:read', module: 'reporting', description: 'Open the reporting surface. Held ALONGSIDE the permission that already guards each report’s rows (order:read, inventory:read, cycle-count:read, shrink:read, vision:read) — reporting never widens what a user can see' },
   { code: 'supplier:read', module: 'procurement', description: 'View suppliers and what each one charges for a product' },
   { code: 'supplier:manage', module: 'procurement', description: 'Create and update suppliers, archive them, and set supplier costs (every cost change appends a history row)' },
   { code: 'purchase-order:read', module: 'procurement', description: 'View purchase orders, their lines, and what has been received against each line' },

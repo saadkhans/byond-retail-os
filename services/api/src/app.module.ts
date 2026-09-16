@@ -30,6 +30,7 @@ import { PlatformModulesModule } from './platform-modules/platform-modules.modul
 import { PickupDetectionModule } from './pickup-detection/pickup-detection.module';
 import { PickupFusionModule } from './pickup-fusion/pickup-fusion.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { ReportingModule } from './reporting/reporting.module';
 import { ReturnsModule } from './returns/returns.module';
 import { ProcurementModule } from './procurement/procurement.module';
 import { TenantsModule } from './tenants/tenants.module';
@@ -76,6 +77,7 @@ import { VisionModule } from './vision/vision.module';
     EslModule,
     LoyaltyModule,
     ProcurementModule,
+    ReportingModule,
   ],
 })
 export class AppModule implements NestModule {

@@ -2767,3 +2767,251 @@ export interface ReceiptMovement {
   quantityAfter: number;
   createdAt: string;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 30 — reporting & analytics.
+//
+// Every shape below is READ-ONLY. There is no request body anywhere in the
+// reporting surface: the page never saves a report definition, a filter preset
+// or a note, so no operator prose from this page can ever reach a persisted
+// column.
+// ---------------------------------------------------------------------------
+
+/** Says when a number was computed, and from what. Never cached. */
+export interface ReportProvenance {
+  generatedAt: string;
+  derivation: 'DERIVED_ON_READ';
+  sourceOfTruth: string[];
+  stale: false;
+}
+
+export interface ReportWindow {
+  from: string;
+  to: string;
+}
+
+export interface SalesMoney {
+  grossSalesMinor: number;
+  promotionDiscountMinor: number;
+  netSalesMinor: number;
+  unitsSold: number;
+  lines: number;
+}
+
+export interface SalesCurrencyTotals extends SalesMoney {
+  currencyCode: string;
+  reconciled: boolean;
+}
+
+export interface SalesProductRow extends SalesMoney {
+  key: string;
+  currencyCode: string;
+  productId: string;
+  sku: string;
+  productName: string;
+}
+
+export interface SalesPromotionRow extends SalesMoney {
+  key: string;
+  currencyCode: string;
+  promotionVersionId: string | null;
+}
+
+export interface SalesPriceVersionRow extends SalesMoney {
+  key: string;
+  currencyCode: string;
+  priceBookVersionId: string | null;
+}
+
+export interface SalesReport {
+  window: ReportWindow;
+  filters: { locationId: string | null; productId: string | null };
+  scope: string;
+  totals: {
+    byCurrency: SalesCurrencyTotals[];
+    byProduct: SalesProductRow[];
+    byPromotionVersion: SalesPromotionRow[];
+    byPriceBookVersion: SalesPriceVersionRow[];
+    unpricedLines: number;
+    unpricedUnits: number;
+    inconsistentPricePoints: number;
+  };
+  crossCheck: {
+    netSalesMinorFromOrderLines: number;
+    unitsFromOrderLines: number;
+    lines: number;
+    reconciled: boolean;
+  };
+  provenance: ReportProvenance;
+}
+
+export interface SalesExplainLine {
+  orderLineId: string;
+  productId: string;
+  sku: string;
+  productName: string;
+  quantity: number;
+  currencyCode: string | null;
+  basePriceMinor: number | null;
+  promotionDiscountMinor: number | null;
+  unitPriceMinor: number | null;
+  lineTotalMinor: number | null;
+  priceBookVersion: {
+    id: string;
+    versionNumber: number;
+    status: string;
+    reason: string;
+    effectiveFrom: string;
+    effectiveTo: string | null;
+    activatedAt: string | null;
+    priceBookId: string;
+    priceBookCode: string;
+    priceBookName: string;
+  } | null;
+  promotionVersion: {
+    id: string;
+    versionNumber: number;
+    status: string;
+    reason: string;
+    effectiveFrom: string;
+    effectiveTo: string | null;
+    activatedAt: string | null;
+    promotionId: string;
+    promotionCode: string;
+    promotionName: string;
+    audience: string;
+  } | null;
+  checks: {
+    unitPriceMatchesBaseMinusDiscount: boolean;
+    lineTotalMatchesUnitTimesQuantity: boolean;
+  };
+}
+
+export interface SalesExplainReport {
+  orderId: string;
+  orderNumber: string;
+  status: string;
+  paymentStatus: string;
+  placedAt: string;
+  locationId: string;
+  lines: SalesExplainLine[];
+  totals: SalesCurrencyTotals[];
+  orderSnapshot: {
+    totalQuantity: number;
+    subtotalMinor: number | null;
+    totalMinor: number | null;
+    currencyCode: string | null;
+  };
+  reconciled: boolean | null;
+  provenance: ReportProvenance;
+}
+
+export interface MovementReport {
+  window: ReportWindow;
+  filters: { locationId: string | null; productId: string | null };
+  movements: {
+    byType: {
+      movementType: string;
+      quantityDelta: number;
+      unitsIn: number;
+      unitsOut: number;
+      movements: number;
+    }[];
+    totals: {
+      quantityDelta: number;
+      unitsIn: number;
+      unitsOut: number;
+      movements: number;
+    };
+  };
+  provenance: ReportProvenance;
+}
+
+export interface BalanceReport {
+  rows: {
+    locationId: string;
+    productId: string;
+    ledgerQuantity: number;
+    movements: number;
+    projectedQuantity: number | null;
+    projectionDriftQuantity: number | null;
+  }[];
+  summary: {
+    pairs: number;
+    ledgerQuantity: number;
+    driftingPairs: number;
+    totalAbsoluteDrift: number;
+    projectionHealthy: boolean;
+  };
+  filters: { locationId: string | null; productId: string | null };
+  page: { skip: number; take: number };
+  balanceSource: string;
+  provenance: ReportProvenance;
+}
+
+export interface CountReconciliationReport {
+  lines: number;
+  variance: { totalQuantity: number; lines: number; meaning: string };
+  projectionDefect: {
+    totalDriftQuantity: number;
+    lines: number;
+    healthy: boolean;
+    meaning: string;
+    severity: 'NONE' | 'PLATFORM_DEFECT';
+  };
+  varianceIncludesDrift: false;
+  window: ReportWindow;
+  filters: { locationId: string | null; productId: string | null };
+  provenance: ReportProvenance;
+}
+
+export interface ShrinkReport {
+  shrink: {
+    units: number;
+    events: number;
+    bySource: { source: string; units: number; events: number }[];
+    byProduct: { productId: string; units: number; events: number }[];
+  };
+  ledgerCheck: {
+    shrinkMovementUnits: number;
+    movements: number;
+    reconciled: boolean;
+  };
+  damagedReturns: {
+    units: number;
+    lines: number;
+    byProduct: { productId: string; units: number; lines: number }[];
+    ledgerMovementsWritten: 0;
+    meaning: string;
+  };
+  window: ReportWindow;
+  filters: { locationId: string | null };
+  provenance: ReportProvenance;
+}
+
+export interface CvAccuracyReport {
+  totals: {
+    reviewedObservations: number;
+    correct: number;
+    incorrect: number;
+    uncertain: number;
+    falseTouch: number;
+    wrongSku: number;
+    wrongAction: number;
+    missedEvents: number;
+    decided: number;
+  };
+  accuracy: {
+    action: number | null;
+    sku: number | null;
+    combined: number | null;
+  };
+  confusion: {
+    action: { predicted: string; expected: string; count: number }[];
+    sku: { predicted: string; expected: string; count: number }[];
+  };
+  definitions: Record<string, string>;
+  evaluationRunId: string;
+  scope: { videoBackedObservationsIncluded: boolean; excluded: string };
+  provenance: ReportProvenance;
+}

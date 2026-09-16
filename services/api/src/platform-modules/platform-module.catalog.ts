@@ -231,10 +231,24 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
   },
   {
     code: 'reporting',
-    name: 'Reporting',
-    description: 'Analytics and reporting (later phase).',
-    defaultEnabled: false,
-    isActive: false,
+    name: 'Reporting & Analytics',
+    description:
+      'Read-only sales, inventory, shrink and CV-accuracy reporting derived ' +
+      'on read from the append-only ledger, the order lines with their ' +
+      'price/promotion provenance, and the evaluation tables.',
+    // Shipped in Phase 30 and DEFAULT-ENABLED for the same reason as
+    // inventory/checkout/pricing (see above): the only enable endpoint is
+    // @TenantOnly(), so leaving this false would strand new tenants behind
+    // 403s on a shipped feature. RBAC still gates every route independently
+    // — each report demands `report:read` AND the permission that already
+    // guards its rows — and enabling this module grants NO new reach: a
+    // report over a module the tenant has disabled is refused. Tenants that
+    // existed BEFORE Phase 30 are covered by the
+    // 20260916150001_reporting_module_backfill migration, which FORCE-upserts
+    // isActive = true: databases seeded earlier already carry an inactive
+    // `reporting` row, and a DO NOTHING there would strand every one of them.
+    defaultEnabled: true,
+    isActive: true,
   },
   {
     code: 'procurement',

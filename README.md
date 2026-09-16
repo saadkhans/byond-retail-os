@@ -43,6 +43,7 @@ scripts/         Repo automation scripts
 - [docs/product/esl.md](docs/product/esl.md) — vendor-neutral electronic shelf labels
 - [docs/product/loyalty.md](docs/product/loyalty.md) — loyalty points and promotions that compose on top of a price version
 - [docs/product/procurement.md](docs/product/procurement.md) — suppliers, purchase orders, and receiving through the inventory ledger
+- [docs/product/reporting.md](docs/product/reporting.md) — read-only sales, inventory, shrink and CV-accuracy reporting derived from the ledger and the evaluation tables
 
 ## Getting started
 
@@ -105,7 +106,14 @@ promotions** covers member accounts with an append-only points ledger and
 versioned promotions that subtract from the price version in force without
 ever rewriting it — the quote panel there names the price version and the
 promotion version behind any price, see
-[docs/product/loyalty.md](docs/product/loyalty.md). The API's CORS allowlist
+[docs/product/loyalty.md](docs/product/loyalty.md). **Reports** is the Phase
+30 read-only surface: sales explained down to the price version and promotion
+behind each line, inventory balances derived from the append-only ledger with
+the stock projection beside them as a cross-check, shrink reconciled against
+its `SHRINK` movements (damaged returns counted separately, because they write
+no movement), and CV accuracy over the evaluation tables as counts, never
+evidence. Every figure is derived on read and says when it was computed — see
+[docs/product/reporting.md](docs/product/reporting.md). The API's CORS allowlist
 defaults to
 `http://localhost:5173` (override with `CORS_ORIGINS`).
 
