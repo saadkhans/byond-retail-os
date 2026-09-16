@@ -59,6 +59,7 @@ import {
   ReconciliationPage,
 } from './pages/ReconciliationPage';
 import { ReferenceLibraryPage } from './pages/ReferenceLibraryPage';
+import { ReturnsPage } from './pages/ReturnsPage';
 import { ReviewQueuePage } from './pages/ReviewQueuePage';
 import { StoreDetailPage, StoresPage } from './pages/StoresPage';
 import { UnitDetailPage, UnitsPage } from './pages/UnitsPage';
@@ -114,6 +115,7 @@ export function App() {
                     />
                     <Route path="pricing" element={<PricingPage />} />
                     <Route path="store-flow" element={<StoreFlowPage />} />
+                    <Route path="returns" element={<ReturnsPage />} />
                     <Route path="orders" element={<OrdersPage />} />
                     <Route path="orders/:id" element={<OrderDetailPage />} />
                     <Route path="payments" element={<PaymentsPage />} />

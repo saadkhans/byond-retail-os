@@ -6,6 +6,7 @@ import {
 import { PaymentStatus } from '@prisma/client';
 import { PaymentsService } from './payments.service';
 import { PaymentsRepository } from './payments.repository';
+import { RefundGateway } from './ports/refund-gateway.port';
 
 // Secret-shaped test strings are BUILT AT RUNTIME so no static secret/PAN is
 // ever committed (Gitleaks-safe). '4111 1111 1111 1111' is Luhn-valid.
@@ -28,6 +29,20 @@ function makeRepo(): jest.Mocked<PaymentsRepository> {
   } as unknown as jest.Mocked<PaymentsRepository>;
 }
 
+/**
+ * Phase 27: PaymentsService now also drives the owned refund-gateway port. A
+ * gateway that is never called by these cases still has to be injectable, so
+ * the harness supplies one that FAILS LOUDLY if any of them reach it.
+ */
+function makeGateway(): jest.Mocked<RefundGateway> {
+  return {
+    name: 'test',
+    execute: jest.fn(() => {
+      throw new Error('the refund gateway must not be reached here');
+    }),
+  } as unknown as jest.Mocked<RefundGateway>;
+}
+
 const actor = { id: 'user-1', email: 'user@tenant.example' };
 const intentDetail = { id: 'pi-1', status: PaymentStatus.CAPTURED } as never;
 
@@ -37,7 +52,7 @@ describe('PaymentsService', () => {
 
   beforeEach(() => {
     repo = makeRepo();
-    service = new PaymentsService(repo);
+    service = new PaymentsService(repo, makeGateway());
   });
 
   const baseCreate = {

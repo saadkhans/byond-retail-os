@@ -28,6 +28,7 @@ import { PlatformModulesModule } from './platform-modules/platform-modules.modul
 import { PickupDetectionModule } from './pickup-detection/pickup-detection.module';
 import { PickupFusionModule } from './pickup-fusion/pickup-fusion.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { ReturnsModule } from './returns/returns.module';
 import { TenantsModule } from './tenants/tenants.module';
 import { UnitsModule } from './units/units.module';
 import { UsersModule } from './users/users.module';
@@ -68,6 +69,7 @@ import { VisionModule } from './vision/vision.module';
     PretrainedVisionModule,
     ClipLabModule,
     StoreFlowModule,
+    ReturnsModule,
   ],
 })
 export class AppModule implements NestModule {

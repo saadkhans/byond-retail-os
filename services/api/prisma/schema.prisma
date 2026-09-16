@@ -151,6 +151,18 @@ enum InventoryMovementType {
   RECEIPT
   CORRECTION_IN
   CORRECTION_OUT
+  // Phase 27 — the reverse flow. RETURN_IN puts goods back on the shelf when
+  // an order is returned or a settled order is cancelled (the mirror of the
+  // SALE that took them off it). SHRINK writes off stock that a camera saw
+  // leave without ever being paid for. Both are ORDINARY ledger movements:
+  // same append-only table, same signed delta, same projection increment —
+  // the reverse flow never edits a stock level.
+  //
+  // Cycle-count variance deliberately does NOT get its own type: a count that
+  // disagrees with the projection is a signed count correction, which is
+  // exactly what CORRECTION_IN / CORRECTION_OUT already mean.
+  RETURN_IN
+  SHRINK
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +291,13 @@ model Tenant {
   storeFlowPolicies       StoreFlowPolicy[]
   storeFlowPolicyVersions StoreFlowPolicyVersion[]
   storeFlowProjections    StoreFlowProjection[]
+
+  paymentRefunds   PaymentRefund[]
+  orderReturns     OrderReturn[]
+  orderReturnLines OrderReturnLine[]
+  cycleCounts      CycleCount[]
+  cycleCountLines  CycleCountLine[]
+  shrinkEvents     ShrinkEvent[]
 }
 
 model User {
@@ -330,6 +349,12 @@ model User {
   storeEntryTokensIssued         StoreEntryToken[]        @relation("StoreEntryTokenIssuer")
   storeFlowPoliciesCreated       StoreFlowPolicy[]        @relation("StoreFlowPolicyActor")
   storeFlowPolicyVersionsCreated StoreFlowPolicyVersion[] @relation("StoreFlowPolicyVersionActor")
+
+  paymentRefundsCreated PaymentRefund[] @relation("PaymentRefundActor")
+  orderReturnsRecorded  OrderReturn[]   @relation("OrderReturnActor")
+  cycleCountsOpened     CycleCount[]    @relation("CycleCountActor")
+  cycleCountsReconciled CycleCount[]    @relation("CycleCountReconciler")
+  shrinkEventsRecorded  ShrinkEvent[]   @relation("ShrinkEventActor")
 
   // Composite FK target for same-tenant creator constraints (id alone is
   // already unique; this adds nothing semantically, only an FK anchor).
@@ -431,6 +456,8 @@ model Location {
   priceBooks                PriceBook[]
   storeEntryTokens          StoreEntryToken[]
   storeFlowPolicies         StoreFlowPolicy[]
+  cycleCounts               CycleCount[]
+  shrinkEvents              ShrinkEvent[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -591,6 +618,9 @@ model Product {
   cvScenarioExpectations      CvTestProtocolScenario[]       @relation("CvScenarioExpectedProduct")
   calibrationZoneExpectations CameraCalibrationZoneProduct[] @relation("CameraCalibrationZoneExpectedProduct")
   priceBookEntries            PriceBookEntry[]
+  orderReturnLines            OrderReturnLine[]
+  cycleCountLines             CycleCountLine[]
+  shrinkEvents                ShrinkEvent[]
 
   @@unique([tenantId, sku])
   @@unique([id, tenantId])
@@ -1302,6 +1332,16 @@ model InventoryMovement {
   product   Product  @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   createdBy User?    @relation("InventoryMovementActor", fields: [createdById], references: [id], onDelete: Restrict, onUpdate: NoAction)
 
+  // Phase 27 — the reverse-flow decision records point AT the movement they
+  // produced. These are back-references only: the ledger row itself stays
+  // immutable (UPDATE/DELETE/TRUNCATE triggers, since Phase 3).
+  orderReturnLines OrderReturnLine[]
+  cycleCountLines  CycleCountLine[]
+  shrinkEvents     ShrinkEvent[]
+
+  // Phase 27: anchors the same-tenant composite FKs those decision records
+  // use, so a return/count/shrink can never cite another tenant's movement.
+  @@unique([id, tenantId])
   @@index([tenantId, locationId, productId, createdAt(sort: Desc)])
   @@index([tenantId, createdAt(sort: Desc)])
   @@index([productId])
@@ -1551,6 +1591,7 @@ model Order {
   unit             RetailUnit       @relation(fields: [unitId], references: [id], onDelete: Restrict)
   createdBy        User?            @relation("OrderActor", fields: [createdById], references: [id], onDelete: Restrict)
   lines            OrderLine[]
+  returns          OrderReturn[]
   paymentIntents   PaymentIntent[]
   // Phase 26 — the store-flow journey this order settled. NULL for orders
   // completed through the manual checkout route.
@@ -1604,6 +1645,7 @@ model OrderLine {
   product     Product              @relation(fields: [productId], references: [id], onDelete: Restrict)
   sessionLine CheckoutSessionLine? @relation(fields: [sessionLineId], references: [id], onDelete: Restrict)
   createdBy   User?                @relation("OrderLineActor", fields: [createdById], references: [id], onDelete: Restrict)
+  returnLines OrderReturnLine[]
 
   @@unique([id, tenantId])
   @@index([tenantId, orderId])
@@ -1724,6 +1766,12 @@ model PaymentIntent {
   currencyCode          String
   // Simulated capture accumulates here; only ever set by the capture path.
   capturedAmountMinor   Int             @default(0)
+  // Phase 27 — money returned against `capturedAmountMinor`. Only ever
+  // incremented by a SUCCEEDED refund settlement, and never past the captured
+  // amount (service ceiling + CHECK constraint in migration SQL). The intent
+  // itself stays CAPTURED: a refund is a separate financial record, not a
+  // resurrection of a terminal intent.
+  refundedAmountMinor   Int             @default(0)
   // OPAQUE provider references — never secrets. Screened for credential- and
   // payment-bearing values before any write.
   providerRef           String?
@@ -1753,6 +1801,7 @@ model PaymentIntent {
   createdBy             User?                         @relation("PaymentIntentActor", fields: [createdById], references: [id], onDelete: Restrict)
   authorizations        PaymentAuthorization[]
   captures              PaymentCapture[]
+  refunds               PaymentRefund[]
   events                PaymentEvent[]
   reconciliationRecords PaymentReconciliationRecord[]
 
@@ -1810,6 +1859,7 @@ model PaymentCapture {
   tenant                Tenant                        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   intent                PaymentIntent                 @relation(fields: [intentId], references: [id], onDelete: Restrict)
   createdBy             User?                         @relation("PaymentCaptureActor", fields: [createdById], references: [id], onDelete: Restrict)
+  refunds               PaymentRefund[]
   reconciliationRecords PaymentReconciliationRecord[]
 
   @@unique([id, tenantId])
@@ -2023,6 +2073,9 @@ model VisionEvent {
   inferenceJobs       InferenceJob[]
   // Phase 26 — the store-flow projection that produced this event, if any.
   storeFlowProjection StoreFlowProjection?
+  // Phase 27 — the shrink write-off recorded against this observation, if
+  // an operator decided the goods left without being paid for. At most one.
+  shrinkEvent         ShrinkEvent?
 
   @@unique([id, tenantId])
   @@unique([tenantId, idempotencyKey])
@@ -3443,4 +3496,322 @@ model StoreFlowProjection {
   @@unique([tenantId, journeyEventId])
   @@index([tenantId, journeyId, createdAt])
   @@index([tenantId, outcome])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 27 — returns, refunds and inventory reconciliation: the reverse flow.
+//
+// Everything below is a DECISION RECORD. None of it is a second source of
+// truth for stock or for money:
+//
+//   * Stock only ever changes through InventoryMovement. A return, a
+//     cancellation, a cycle-count variance and a shrink each APPEND one
+//     movement through the same `InventoryRepository.applyMovement` the sale
+//     path uses, and each row below merely cites the movement it produced
+//     (`movementId`). Nothing here writes an InventoryLevel.
+//   * Money only ever moves through the provider-neutral payment abstraction.
+//     A refund is a PaymentRefund against a CAPTURED intent, bounded by what
+//     that intent actually captured, and settled by the owned refund-gateway
+//     port (SIMULATED only — there is still no live gateway anywhere).
+//
+// SECURITY INVARIANT (AGENTS.md, unchanged): no raw card data. Every operator
+// free-text field here (return reason, count note, discrepancy note, shrink
+// reason) is screened for credential-/payment-bearing content before it is
+// written, because these strings are persisted verbatim AND copied into
+// AuditLog.reason, which audit redaction does not cover.
+// ---------------------------------------------------------------------------
+
+/// A refund's own lifecycle, independent of the intent's. PENDING is written
+/// BEFORE the gateway is called (so a crash mid-flight leaves a visible,
+/// replayable record instead of a silent gap); the gateway's answer settles it
+/// to SUCCEEDED or FAILED exactly once.
+enum PaymentRefundStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+/// Simulated money movement BACK to a shopper, against one captured payment.
+///
+/// Bounded by construction: the sum of PENDING + SUCCEEDED refunds on an
+/// intent can never exceed the intent's `capturedAmountMinor` (checked under
+/// the intent advisory lock, with a CHECK constraint on the intent as the
+/// backstop). Idempotent by construction: (tenantId, idempotencyKey) is
+/// unique, so a replayed refund request re-reads the original row instead of
+/// moving money twice.
+model PaymentRefund {
+  id                String              @id @default(cuid())
+  tenantId          String
+  intentId          String
+  /// The capture this money is coming back out of. Nullable only for the
+  /// (unreachable today) case of a captured intent with no capture row.
+  captureId         String?
+  status            PaymentRefundStatus @default(PENDING)
+  amountMinor       Int
+  currencyCode      String
+  /// Operator-supplied justification. Screened before persistence; also the
+  /// audit reason.
+  reason            String?
+  /// OPAQUE provider references — never secrets, never card data.
+  providerRef       String?
+  providerRefundRef String?
+  failureReason     String?
+  /// Tenant-scoped idempotency for the refund request.
+  idempotencyKey    String?
+  requestedAt       DateTime            @default(now())
+  settledAt         DateTime?
+  createdById       String?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  tenant    Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  intent    PaymentIntent   @relation(fields: [intentId], references: [id], onDelete: Restrict)
+  capture   PaymentCapture? @relation(fields: [captureId], references: [id], onDelete: Restrict)
+  createdBy User?           @relation("PaymentRefundActor", fields: [createdById], references: [id], onDelete: Restrict)
+  returns   OrderReturn[]
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, intentId, createdAt, id])
+  @@index([tenantId, status, createdAt, id])
+}
+
+/// Why goods came back. A CUSTOMER_RETURN takes named lines back; an
+/// ORDER_CANCELLATION reverses the whole remaining order and cancels it.
+enum OrderReturnKind {
+  CUSTOMER_RETURN
+  ORDER_CANCELLATION
+}
+
+/// The return's own lifecycle. RECORDED means the goods are accounted for
+/// (stock reversed) and no money is owed — either nothing was captured or the
+/// operator asked for no refund. The REFUND_* states track the money.
+enum OrderReturnStatus {
+  RECORDED
+  REFUND_PENDING
+  REFUNDED
+  REFUND_FAILED
+}
+
+/// Why a return recorded no refund. A closed vocabulary, never free text, so
+/// the reason a shopper got no money back is always legible.
+enum RefundSkipReason {
+  /// The caller explicitly asked for a stock-only return.
+  NOT_REQUESTED
+  /// No payment intent on this order ever reached CAPTURED — including one
+  /// that ended CANCELLED/FAILED/VOIDED/EXPIRED. There is no money to return.
+  NO_CAPTURED_PAYMENT
+  /// The returned lines carry no price (an order completed before pricing, or
+  /// with an unpriced basket), so no amount can be justified.
+  NO_PRICEABLE_LINES
+  /// Everything this order captured has already been refunded.
+  ALREADY_FULLY_REFUNDED
+}
+
+/// One return or cancellation against one order. Append-only in spirit: the
+/// lines and their movements are written once inside a single transaction, and
+/// afterwards only the refund linkage (`status`, `refundId`,
+/// `refundSkipReason`) is ever set.
+model OrderReturn {
+  id                String            @id @default(cuid())
+  tenantId          String
+  orderId           String
+  kind              OrderReturnKind
+  status            OrderReturnStatus @default(RECORDED)
+  /// Tenant-scoped idempotency reference supplied by the caller: replaying a
+  /// return request returns the original return instead of reversing stock
+  /// twice. Same contract as the goods-receipt (`recordMovement`) path.
+  reference         String
+  /// Operator free text, screened before persistence (also the audit reason).
+  reason            String
+  /// Total units that actually went back on the shelf (sum of the lines'
+  /// restocked quantities). Derived at write time; never a stock figure.
+  restockedQuantity Int               @default(0)
+  /// Money owed back, derived from the returned lines' snapshotted prices.
+  refundAmountMinor Int?
+  currencyCode      String?
+  refundId          String?
+  refundSkipReason  RefundSkipReason?
+  recordedById      String?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  tenant     Tenant            @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  order      Order             @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  refund     PaymentRefund?    @relation(fields: [refundId], references: [id], onDelete: Restrict)
+  recordedBy User?             @relation("OrderReturnActor", fields: [recordedById], references: [id], onDelete: Restrict)
+  lines      OrderReturnLine[]
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, reference])
+  @@index([tenantId, orderId, createdAt, id])
+  @@index([tenantId, status, createdAt, id])
+}
+
+/// One order line coming back. `movementId` cites the RETURN_IN ledger entry
+/// this line produced — NULL when the goods were not restocked (damaged or
+/// unsellable), which is the honest record that stock did not change.
+model OrderReturnLine {
+  id                String   @id @default(cuid())
+  tenantId          String
+  returnId          String
+  orderLineId       String
+  productId         String
+  /// Snapshot of what was returned, so history never rewrites when the
+  /// catalog is edited (same rule as OrderLine).
+  sku               String
+  productName       String
+  quantity          Int
+  /// Whether these units went back on the shelf.
+  restocked         Boolean  @default(true)
+  movementId        String?
+  /// Per-line money, derived from the order line's snapshotted unit price.
+  refundAmountMinor Int?
+  /// Operator note about condition. Screened before persistence.
+  note              String?
+  createdAt         DateTime @default(now())
+
+  tenant    Tenant             @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  return    OrderReturn        @relation(fields: [returnId], references: [id], onDelete: Restrict)
+  orderLine OrderLine          @relation(fields: [orderLineId], references: [id], onDelete: Restrict)
+  product   Product            @relation(fields: [productId], references: [id], onDelete: Restrict)
+  movement  InventoryMovement? @relation(fields: [movementId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@index([tenantId, returnId])
+  @@index([tenantId, orderLineId])
+}
+
+/// A count's lifecycle. OPEN accepts counted quantities; RECONCILED is
+/// terminal and means every line has been compared and any variance has
+/// already become a ledger movement. CANCELLED is an abandoned count — it
+/// never touched stock.
+enum CycleCountStatus {
+  OPEN
+  RECONCILED
+  CANCELLED
+}
+
+/// An operator counting a location — a spot cycle count or a full stocktake.
+///
+/// A count NEVER SETS STOCK. Reconciling compares three numbers (what was
+/// counted, what the projection says, and what the ledger replays to) and
+/// writes a signed CORRECTION_IN / CORRECTION_OUT movement for the
+/// difference. The ledger stays the only history of how stock got where it is.
+model CycleCount {
+  id              String           @id @default(cuid())
+  tenantId        String
+  locationId      String
+  /// Tenant-scoped idempotency/reference the operator can quote.
+  reference       String
+  status          CycleCountStatus @default(OPEN)
+  /// Set when the whole location was counted (a stocktake) rather than a
+  /// sample of products (a cycle count). Recorded for the audit trail only —
+  /// it changes no arithmetic.
+  isFullStocktake Boolean          @default(false)
+  /// Operator free text, screened before persistence.
+  note            String?
+  reconciledAt    DateTime?
+  cancelledAt     DateTime?
+  createdById     String?
+  reconciledById  String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  tenant       Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location     Location         @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  createdBy    User?            @relation("CycleCountActor", fields: [createdById], references: [id], onDelete: Restrict)
+  reconciledBy User?            @relation("CycleCountReconciler", fields: [reconciledById], references: [id], onDelete: Restrict)
+  lines        CycleCountLine[]
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, reference])
+  @@index([tenantId, locationId, status])
+  @@index([tenantId, status, createdAt, id])
+}
+
+/// One product counted at one location.
+///
+/// The three quantities are kept side by side on purpose:
+///   countedQuantity  — what the human found on the shelf.
+///   systemQuantity   — what the InventoryLevel projection said, read under
+///                      the per-product advisory lock at reconcile time.
+///   ledgerQuantity   — what the append-only movement ledger replays to.
+/// `varianceQuantity` = counted − system, and is what becomes a movement.
+/// `ledgerDriftQuantity` = system − ledger and must ALWAYS be zero; a
+/// non-zero value means the projection and its own history disagree, which is
+/// a platform bug, not a stock discrepancy, and is surfaced rather than
+/// silently corrected.
+model CycleCountLine {
+  id                  String   @id @default(cuid())
+  tenantId            String
+  cycleCountId        String
+  productId           String
+  countedQuantity     Int
+  systemQuantity      Int?
+  ledgerQuantity      Int?
+  varianceQuantity    Int?
+  ledgerDriftQuantity Int?
+  /// The CORRECTION_IN / CORRECTION_OUT movement this line's variance
+  /// produced. NULL when there was no variance — the honest record that
+  /// reconciling this line changed nothing.
+  movementId          String?
+  /// Operator discrepancy note. Screened before persistence.
+  note                String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  tenant     Tenant             @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  cycleCount CycleCount         @relation(fields: [cycleCountId], references: [id], onDelete: Restrict)
+  product    Product            @relation(fields: [productId], references: [id], onDelete: Restrict)
+  movement   InventoryMovement? @relation(fields: [movementId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  /// tenantId leads deliberately: it makes the composite key a TENANT-SCOPED
+  /// write predicate, so an upsert can never reach another tenant's line.
+  @@unique([tenantId, cycleCountId, productId])
+  @@index([tenantId, cycleCountId])
+  @@index([tenantId, productId])
+}
+
+/// Where a shrink decision came from. CV_DETECTED is the Phase 27 path: a
+/// vision observation of goods leaving that no order ever accounted for.
+enum ShrinkSource {
+  CV_DETECTED
+  OPERATOR
+}
+
+/// A recorded write-off of stock that left without being paid for.
+///
+/// At most ONE per vision event ((tenantId, visionEventId) is unique), so a
+/// replayed decision can never write off the same loss twice. The SHRINK
+/// ledger movement is the stock change; this row is why it happened.
+model ShrinkEvent {
+  id            String       @id @default(cuid())
+  tenantId      String
+  locationId    String
+  productId     String
+  /// The observation that detected the loss. NULL only for an OPERATOR-source
+  /// write-off, which has no camera evidence behind it.
+  visionEventId String?      @unique
+  source        ShrinkSource @default(CV_DETECTED)
+  quantity      Int
+  /// Operator free text, screened before persistence (also the audit reason).
+  reason        String
+  /// The SHRINK movement this decision produced. NOT NULL: a shrink record
+  /// without its ledger entry would be a stock claim with no history.
+  movementId    String
+  recordedById  String?
+  createdAt     DateTime     @default(now())
+
+  tenant      Tenant            @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location    Location          @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  product     Product           @relation(fields: [productId], references: [id], onDelete: Restrict)
+  visionEvent VisionEvent?      @relation(fields: [visionEventId], references: [id], onDelete: Restrict)
+  movement    InventoryMovement @relation(fields: [movementId], references: [id], onDelete: Restrict)
+  recordedBy  User?             @relation("ShrinkEventActor", fields: [recordedById], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@index([tenantId, locationId, createdAt, id])
+  @@index([tenantId, productId, createdAt, id])
 }

@@ -44,6 +44,15 @@ export const SETTLEMENT_BLOCK_REASON = {
   EMPTY_BASKET: 'EMPTY_BASKET',
   NO_ORDER_TOTAL: 'NO_ORDER_TOTAL',
   SETTLEMENT_DISABLED: 'SETTLEMENT_DISABLED',
+  /**
+   * Phase 27. The order already carries a payment intent that ended in a
+   * TERMINAL non-captured state (CANCELLED / FAILED / VOIDED / EXPIRED).
+   * Nothing about a terminal intent may change again, so re-authorising it is
+   * illegal — and quietly minting a SECOND intent would take money for an
+   * attempt a human deliberately cancelled. The exit therefore stops with the
+   * order created and unpaid, and says why, instead of throwing.
+   */
+  PAYMENT_TERMINAL: 'PAYMENT_TERMINAL',
 } as const;
 
 export type SettlementBlockReason =

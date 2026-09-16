@@ -2524,3 +2524,130 @@ export interface StoreFlowSyncResult {
   projected: StoreFlowProjection[];
   skippedShadow: boolean;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 27 — returns, refunds and inventory reconciliation (the reverse flow).
+//
+// Every shape below is a DECISION RECORD that cites the append-only ledger
+// movement it produced (`movementId`). None of them carries a stock level: the
+// admin UI reads stock from the inventory projection as it always has, and the
+// reverse flow explains how it got there.
+// ---------------------------------------------------------------------------
+
+export type OrderReturnKind = 'CUSTOMER_RETURN' | 'ORDER_CANCELLATION';
+
+export type OrderReturnStatus =
+  | 'RECORDED'
+  | 'REFUND_PENDING'
+  | 'REFUNDED'
+  | 'REFUND_FAILED';
+
+/** Closed vocabulary for WHY a return recorded no refund. Never free text. */
+export type RefundSkipReason =
+  | 'NOT_REQUESTED'
+  | 'NO_CAPTURED_PAYMENT'
+  | 'NO_PRICEABLE_LINES'
+  | 'ALREADY_FULLY_REFUNDED';
+
+export type PaymentRefundStatus = 'PENDING' | 'SUCCEEDED' | 'FAILED';
+
+export interface PaymentRefund {
+  id: string;
+  intentId: string;
+  captureId: string | null;
+  status: PaymentRefundStatus;
+  amountMinor: number;
+  currencyCode: string;
+  reason: string | null;
+  providerRefundRef: string | null;
+  failureReason: string | null;
+  requestedAt: string;
+  settledAt: string | null;
+}
+
+export interface OrderReturnLine {
+  id: string;
+  returnId: string;
+  orderLineId: string;
+  productId: string;
+  sku: string;
+  productName: string;
+  quantity: number;
+  /** False for damaged goods: no ledger movement, and `movementId` is null. */
+  restocked: boolean;
+  /** The RETURN_IN movement this line produced. */
+  movementId: string | null;
+  refundAmountMinor: number | null;
+  note: string | null;
+  createdAt: string;
+}
+
+export interface OrderReturn {
+  id: string;
+  orderId: string;
+  kind: OrderReturnKind;
+  status: OrderReturnStatus;
+  reference: string;
+  reason: string;
+  restockedQuantity: number;
+  refundAmountMinor: number | null;
+  currencyCode: string | null;
+  refundId: string | null;
+  refundSkipReason: RefundSkipReason | null;
+  createdAt: string;
+  lines?: OrderReturnLine[];
+  order?: {
+    id: string;
+    orderNumber: string;
+    status: OrderStatus;
+    paymentStatus: OrderPaymentStatus;
+  };
+  refund?: PaymentRefund | null;
+}
+
+export type CycleCountStatus = 'OPEN' | 'RECONCILED' | 'CANCELLED';
+
+export interface CycleCountLine {
+  id: string;
+  cycleCountId: string;
+  productId: string;
+  /** What the operator found on the shelf. */
+  countedQuantity: number;
+  /** What the stock projection said at reconcile time. */
+  systemQuantity: number | null;
+  /** What the append-only ledger replays to. */
+  ledgerQuantity: number | null;
+  /** counted - projection: what became a correction movement. */
+  varianceQuantity: number | null;
+  /** projection - ledger. MUST be zero; anything else is a platform bug. */
+  ledgerDriftQuantity: number | null;
+  movementId: string | null;
+  note: string | null;
+}
+
+export interface CycleCount {
+  id: string;
+  locationId: string;
+  reference: string;
+  status: CycleCountStatus;
+  isFullStocktake: boolean;
+  note: string | null;
+  reconciledAt: string | null;
+  cancelledAt: string | null;
+  createdAt: string;
+  lines?: CycleCountLine[];
+  location?: { id: string; name: string; code: string };
+}
+
+export interface ShrinkEvent {
+  id: string;
+  locationId: string;
+  productId: string;
+  visionEventId: string | null;
+  source: 'CV_DETECTED' | 'OPERATOR';
+  quantity: number;
+  reason: string;
+  /** The SHRINK movement. Never null: a write-off always has its ledger row. */
+  movementId: string;
+  createdAt: string;
+}
