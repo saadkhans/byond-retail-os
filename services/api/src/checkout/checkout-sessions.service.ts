@@ -478,6 +478,12 @@ export class CheckoutSessionsService {
           'reduce line quantities before completing. No order was created',
       );
     }
+    if (result === 'total-amount-overflow') {
+      throw new ConflictException(
+        'The basket total amount exceeds the maximum an order can hold. ' +
+          'No order was created',
+      );
+    }
     if (typeof result === 'object' && 'stockFailure' in result) {
       if (result.stockFailure === 'insufficient-stock') {
         throw new ConflictException(

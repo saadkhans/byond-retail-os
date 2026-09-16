@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import {
   CheckoutSession,
   CheckoutSessionLine,
@@ -34,6 +34,12 @@ import {
 } from '../inventory/inventory.repository';
 import { PrismaService } from '../prisma/prisma.service';
 import { TenantScopedRepository } from '../prisma/tenant-scoped.repository';
+import { computeBasketTotals } from '../pricing/pricing.logic';
+import {
+  LINE_PRICING_PORT,
+  LinePricingPort,
+  ResolvedLinePrice,
+} from './line-pricing.port';
 
 /** Read shape for session list responses (no lines — keep pages light). */
 export const SESSION_INCLUDE = {
@@ -170,7 +176,12 @@ export type CompletionRejection =
   | 'already-completed'
   | 'empty-session'
   | 'idempotency-key-conflict'
-  | 'total-quantity-overflow';
+  | 'total-quantity-overflow'
+  // The summed line totals exceed the INTEGER backing Order.subtotalMinor.
+  // Rejected BEFORE any write, like the quantity overflow above, so an
+  // implausibly large basket is a controlled 409 rather than a raw Prisma
+  // out-of-range 500.
+  | 'total-amount-overflow';
 
 /** A per-line inventory decrement failure that aborted the whole completion. */
 export interface CompletionStockFailure {
@@ -230,8 +241,45 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
     prisma: PrismaService,
     private readonly auditLog: AuditLogService,
     private readonly inventoryRepository: InventoryRepository,
+    /**
+     * Optional on purpose. A deployment without the pricing module — and
+     * every unit test written before Phase 25 — constructs this repository
+     * with three arguments and gets exactly the old behaviour: lines carry
+     * no price and orders carry no total. Pricing adds money to the basket;
+     * it never becomes a precondition for having one.
+     */
+    @Optional()
+    @Inject(LINE_PRICING_PORT)
+    private readonly linePricing?: LinePricingPort,
   ) {
     super(prisma);
+  }
+
+  /**
+   * Snapshots the price of a product onto a basket line, inside the caller's
+   * transaction.
+   *
+   * Snapshot, not reference: what the shopper was shown is what they pay,
+   * even if a new price version activates while the basket is open. A null
+   * result (pricing absent, disabled, or no book covering the product) means
+   * UNPRICED — never free. Completion then leaves the order total null, which
+   * is the pre-Phase-25 behaviour.
+   */
+  private async resolveLinePrice(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    productId: string,
+    locationId: string,
+  ): Promise<ResolvedLinePrice | null> {
+    if (!this.linePricing) {
+      return null;
+    }
+    return this.linePricing.resolveForLine(tx, {
+      tenantId,
+      productId,
+      locationId,
+      at: new Date(),
+    });
   }
 
   /**
@@ -609,6 +657,14 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
           return claimRejection;
         }
       }
+      // Resolved under the product lock taken above, so the price cannot move
+      // between the read and the insert.
+      const price = await this.resolveLinePrice(
+        tx,
+        scopedTenantId,
+        product.id,
+        session.locationId,
+      );
       const line = await tx.checkoutSessionLine.create({
         data: {
           tenantId: scopedTenantId,
@@ -620,6 +676,12 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
           productName: product.name,
           unitOfMeasure: product.unitOfMeasure,
           quantity: data.quantity,
+          // Price snapshot — null when the tenant has no pricing, which is
+          // exactly the pre-Phase-25 shape.
+          unitPriceMinor: price?.unitPriceMinor ?? null,
+          lineTotalMinor:
+            price === null ? null : price.unitPriceMinor * data.quantity,
+          currencyCode: price?.currencyCode ?? null,
           sourceType: data.sourceType,
           sourceId: data.sourceId,
           evidenceBundleId: data.evidenceBundleId,
@@ -714,10 +776,19 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
           return claimRejection;
         }
       }
+      // A quantity change re-multiplies the SNAPSHOTTED unit price; it never
+      // re-resolves. Re-pricing an open basket because a new version
+      // activated mid-shop is exactly what the snapshot exists to prevent.
+      const quantityAfter = data.quantity ?? before.quantity;
+      const lineTotalMinor =
+        before.unitPriceMinor === null
+          ? null
+          : before.unitPriceMinor * quantityAfter;
       const after = await tx.checkoutSessionLine.update({
         where: { id: before.id },
         data: {
           quantity: data.quantity,
+          lineTotalMinor,
           sourceType: data.sourceType,
           sourceId: data.sourceId,
           evidenceBundleId: data.evidenceBundleId,
@@ -924,6 +995,16 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
           return 'total-quantity-overflow' as const;
         }
 
+        // Money totals are derived from the price each line SNAPSHOTTED when
+        // it was added, never re-resolved at completion. All-or-nothing: a
+        // basket with any unpriced line, or with mixed currencies, completes
+        // with null totals exactly as it did before pricing existed, rather
+        // than with a total that quietly omits lines.
+        const totals = computeBasketTotals(session.lines);
+        if (totals && totals.subtotalMinor > PG_INT_MAX) {
+          return 'total-amount-overflow' as const;
+        }
+
         // The order row is created first so SALE movements can carry its id
         // as their referenceType/referenceId cause. CONFIRMED means
         // "inventory consumed" — it carries NO paid/captured semantics
@@ -939,6 +1020,9 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
             confirmedAt: now,
             placedAt: now,
             totalQuantity,
+            subtotalMinor: totals?.subtotalMinor ?? null,
+            totalMinor: totals?.totalMinor ?? null,
+            currencyCode: totals?.currencyCode ?? null,
             sourceType: session.sourceType,
             sourceId: session.sourceId,
             evidenceBundleId: session.evidenceBundleId,
@@ -1012,6 +1096,11 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
               productName: line.productName,
               unitOfMeasure: line.unitOfMeasure,
               quantity: line.quantity,
+              // Copied from the basket line, not re-resolved: an order line
+              // must always explain the amount the shopper was charged.
+              unitPriceMinor: line.unitPriceMinor,
+              lineTotalMinor: line.lineTotalMinor,
+              currencyCode: line.currencyCode,
               sourceType: line.sourceType,
               sourceId: line.sourceId,
               evidenceBundleId: line.evidenceBundleId,

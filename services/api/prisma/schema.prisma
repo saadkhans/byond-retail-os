@@ -97,6 +97,12 @@ enum AuditAction {
   VOID
   FAIL
   RECONCILE
+  // Phase 25 — pricing. PRICE_CHANGE marks the activation of a price book
+  // version (the moment prices actually change for shoppers); ROLLBACK marks
+  // a version created by copying an earlier one forward. Creating a book or a
+  // draft version is an ordinary CREATE, and editing draft entries an UPDATE.
+  PRICE_CHANGE
+  ROLLBACK
 }
 
 enum ProductStatus {
@@ -263,6 +269,10 @@ model Tenant {
   planogramRacks                 PlanogramRack[]
   planogramCellAssignments       PlanogramCellAssignment[]
   pretrainedVisionRuns           PretrainedVisionRun[]
+
+  priceBooks        PriceBook[]
+  priceBookVersions PriceBookVersion[]
+  priceBookEntries  PriceBookEntry[]
 }
 
 model User {
@@ -305,6 +315,10 @@ model User {
 
   videoAssetsUploaded   VideoAsset[]    @relation("VideoAssetUploader")
   videoArtifactsCreated VideoArtifact[] @relation("VideoArtifactActor")
+
+  priceBooksCreated         PriceBook[]        @relation("PriceBookActor")
+  priceBookVersionsCreated  PriceBookVersion[] @relation("PriceBookVersionActor")
+  priceBookVersionsActivated PriceBookVersion[] @relation("PriceBookVersionActivator")
 
   // Composite FK target for same-tenant creator constraints (id alone is
   // already unique; this adds nothing semantically, only an FK anchor).
@@ -403,6 +417,7 @@ model Location {
   cvTestProtocols     CvTestProtocol[]
   cameraCalibrationProfiles CameraCalibrationProfile[]
   planogramRacks      PlanogramRack[]
+  priceBooks          PriceBook[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -562,6 +577,7 @@ model Product {
   planogramCellAssignments PlanogramCellAssignment[]
   cvScenarioExpectations  CvTestProtocolScenario[]     @relation("CvScenarioExpectedProduct")
   calibrationZoneExpectations CameraCalibrationZoneProduct[] @relation("CameraCalibrationZoneExpectedProduct")
+  priceBookEntries        PriceBookEntry[]
 
   @@unique([tenantId, sku])
   @@unique([id, tenantId])
@@ -3025,4 +3041,153 @@ model PretrainedVisionRun {
 
   @@unique([id, tenantId])
   @@index([tenantId, videoAssetId, createdAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 25 — Pricing.
+//
+// AGENTS.md hard rule: "Pricing changes must be versioned, auditable, and
+// reversible." The model below makes that structural rather than procedural:
+// a price is never a mutable column on Product. It lives in an immutable
+// PriceBookEntry belonging to a PriceBookVersion, and the only way to change
+// a price is to create a NEW version. Activation supersedes the previous
+// version (closing its effective window) and rollback copies an earlier
+// version forward — history is appended to, never rewritten or deleted.
+// ---------------------------------------------------------------------------
+
+enum PriceBookStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+enum PriceBookVersionStatus {
+  // Editable. Entries may be set/replaced; the version resolves no prices.
+  DRAFT
+  // The current version of its book. At most ONE per book — enforced by a
+  // PARTIAL unique index in migration SQL (Prisma cannot express it).
+  ACTIVE
+  // Was active, then replaced by a newer version. Still resolves prices for
+  // instants inside its closed [effectiveFrom, effectiveTo) window, which is
+  // what makes historical price lookups correct.
+  SUPERSEDED
+  // Withdrawn without ever having been active (a discarded draft). Never
+  // resolves a price. Rows are kept, never deleted.
+  ARCHIVED
+}
+
+/// Closed vocabulary for WHY a price version exists. Free-form justification
+/// goes in `note`, which is screened for credential/payment-bearing text
+/// before it is persisted (it also flows into AuditLog.reason).
+enum PriceChangeReason {
+  INITIAL
+  PRICE_CHANGE
+  PROMOTION_BASE
+  CORRECTION
+  ROLLBACK
+}
+
+/// A named, currency-homogeneous set of prices. A book scoped to a location
+/// overrides the tenant-wide book for that location; the resolution rule is
+/// "most specific applicable book wins" (see pricing/pricing.logic.ts).
+model PriceBook {
+  id           String          @id @default(cuid())
+  tenantId     String
+  /// Unique per tenant, normalized to uppercase (like Product.sku).
+  code         String
+  name         String
+  /// ISO-4217 alphabetic code. Every entry in every version of this book is
+  /// denominated in it; a book never mixes currencies.
+  currencyCode String
+  /// NULL = tenant-wide default book. Set = applies only at that location.
+  locationId   String?
+  status       PriceBookStatus @default(ACTIVE)
+  createdById  String?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  tenant    Tenant             @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location  Location?          @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  createdBy User?              @relation("PriceBookActor", fields: [createdById], references: [id], onDelete: Restrict)
+  versions  PriceBookVersion[]
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, code])
+  @@index([tenantId, status])
+  @@index([tenantId, locationId, status])
+}
+
+/// One immutable revision of a price book. Append-only in spirit: after
+/// activation the only columns that ever change are the supersession links
+/// (`status`, `effectiveTo`, `supersededByVersionId`), written exactly once
+/// when a newer version takes over.
+model PriceBookVersion {
+  id            String                 @id @default(cuid())
+  tenantId      String
+  priceBookId   String
+  /// Monotonic per book, starting at 1. Never reused, even after archiving.
+  versionNumber Int
+  status        PriceBookVersionStatus @default(DRAFT)
+  /// Instant the version starts applying. Set at activation (or scheduled
+  /// ahead of time); a DRAFT carries its intended start.
+  effectiveFrom DateTime
+  /// Exclusive end of the window, written when a newer version activates.
+  /// NULL while this version is the current one.
+  effectiveTo   DateTime?
+  reason        PriceChangeReason
+  note          String?
+
+  createdById             String?
+  activatedById           String?
+  activatedAt             DateTime?
+  /// The version that replaced this one (set on the OLD row at activation).
+  supersededByVersionId   String?   @unique
+  /// For ROLLBACK versions: the historical version whose entries were copied
+  /// forward. The source row itself is never resurrected or edited.
+  rolledBackFromVersionId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant      Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  priceBook   PriceBook @relation(fields: [priceBookId], references: [id], onDelete: Restrict)
+  createdBy   User?     @relation("PriceBookVersionActor", fields: [createdById], references: [id], onDelete: Restrict)
+  activatedBy User?     @relation("PriceBookVersionActivator", fields: [activatedById], references: [id], onDelete: Restrict)
+
+  supersededBy    PriceBookVersion? @relation("PriceBookSupersession", fields: [supersededByVersionId], references: [id], onDelete: Restrict)
+  supersedes      PriceBookVersion? @relation("PriceBookSupersession")
+  rolledBackFrom  PriceBookVersion? @relation("PriceBookRollback", fields: [rolledBackFromVersionId], references: [id], onDelete: Restrict)
+  rollbackCopies  PriceBookVersion[] @relation("PriceBookRollback")
+
+  entries PriceBookEntry[]
+
+  @@unique([id, tenantId])
+  @@unique([priceBookId, versionNumber])
+  @@index([tenantId, priceBookId, status])
+  @@index([tenantId, priceBookId, effectiveFrom])
+}
+
+/// One product's price inside one version. Immutable once its version leaves
+/// DRAFT — the service refuses to touch entries of a non-DRAFT version, and
+/// a price change is expressed as a new version instead.
+model PriceBookEntry {
+  id             String   @id @default(cuid())
+  tenantId       String
+  versionId      String
+  productId      String
+  /// Minor currency units (integer-exact; 1099 = 10.99). Never negative —
+  /// a CHECK constraint in migration SQL backstops the DTO and the service.
+  unitPriceMinor Int
+  /// Denormalized snapshot of the owning book's currency, so a resolved
+  /// price is self-describing without a join.
+  currencyCode   String
+  createdAt      DateTime @default(now())
+
+  tenant  Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  version PriceBookVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  product Product          @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@unique([versionId, productId])
+  @@index([tenantId, productId])
+  @@index([tenantId, versionId])
 }

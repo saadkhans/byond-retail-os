@@ -97,7 +97,13 @@ export type CreateIntentInput = IntentReferenceInput & {
 export type CreateIntentRejection =
   | 'order-not-found'
   | 'session-not-found'
-  | 'order-session-mismatch';
+  | 'order-session-mismatch'
+  // Phase 25: the linked order carries a derived total, and the intent asks
+  // to charge something else. A payment must never be for an amount the
+  // order cannot justify, so the mismatch is rejected rather than reconciled
+  // later. Orders with no total (no pricing) keep the pre-Phase-25
+  // client-supplied-amount behaviour.
+  | 'order-amount-mismatch';
 
 export type TransitionRejection =
   | 'terminal-blocked'
@@ -210,14 +216,37 @@ export class PaymentsRepository extends TenantScopedRepository {
           return { intent: existing, replayed: true };
         }
       }
-      let order: { id: string; checkoutSessionId: string } | null = null;
+      let order: {
+        id: string;
+        checkoutSessionId: string;
+        totalMinor: number | null;
+        currencyCode: string | null;
+      } | null = null;
       if (data.orderId) {
         order = await tx.order.findFirst({
           where: { id: data.orderId, tenantId: scopedTenantId },
-          select: { id: true, checkoutSessionId: true },
+          select: {
+            id: true,
+            checkoutSessionId: true,
+            totalMinor: true,
+            currencyCode: true,
+          },
         });
         if (!order) {
           return 'order-not-found' as const;
+        }
+        // A priced order is the authority on what may be charged.
+        // `!= null` on purpose: an order that predates pricing, or a read
+        // shape that simply does not carry the column, is UNPRICED and keeps
+        // the client-supplied amount. Only an order that actually states a
+        // total gets to veto one.
+        if (
+          order.totalMinor != null &&
+          (data.amountMinor !== order.totalMinor ||
+            (order.currencyCode != null &&
+              data.currencyCode !== order.currencyCode))
+        ) {
+          return 'order-amount-mismatch' as const;
         }
       }
       if (data.checkoutSessionId) {

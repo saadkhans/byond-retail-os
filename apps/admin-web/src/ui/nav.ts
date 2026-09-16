@@ -51,6 +51,7 @@ export const NAV_GROUPS: NavGroup[] = [
     label: 'Commerce',
     icon: 'commerce',
     items: [
+      { to: '/pricing', label: 'Pricing' },
       { to: '/checkout-sessions', label: 'Checkout sessions' },
       { to: '/orders', label: 'Orders' },
       { to: '/payments', label: 'Payments' },

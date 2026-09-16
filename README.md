@@ -32,6 +32,7 @@ scripts/         Repo automation scripts
 - [CONTRIBUTING.md](CONTRIBUTING.md) — branch, PR, and review workflow
 - [SECURITY.md](SECURITY.md) — security requirements and tooling
 - [TESTING.md](TESTING.md) — required test categories
+- [docs/product/pricing.md](docs/product/pricing.md) — versioned pricing model and rules
 
 ## Getting started
 
@@ -70,9 +71,11 @@ pnpm run dev
 
 The admin web signs in via `POST /auth/login` (or a pasted access token) and
 provides read-only visibility over stores, units, devices, catalog, and
-inventory, plus a manual checkout test flow: create a checkout session, manage
-basket lines, and complete it into an order (no payment capture — pricing and
-payments arrive in a later phase). The API's CORS allowlist defaults to
+inventory; versioned price books (create a draft, set prices, activate, roll
+back — see [docs/product/pricing.md](docs/product/pricing.md)); and a manual
+checkout test flow: create a checkout session, manage basket lines, and
+complete it into an order, which now carries a total derived from the price
+each line was added at. The API's CORS allowlist defaults to
 `http://localhost:5173` (override with `CORS_ORIGINS`).
 
 ### ML pipeline (Phase 8)
