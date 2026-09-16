@@ -42,6 +42,7 @@ scripts/         Repo automation scripts
 - [docs/product/returns.md](docs/product/returns.md) — the reverse flow: returns, refunds, cycle counts and shrink, all through the ledger
 - [docs/product/esl.md](docs/product/esl.md) — vendor-neutral electronic shelf labels
 - [docs/product/loyalty.md](docs/product/loyalty.md) — loyalty points and promotions that compose on top of a price version
+- [docs/product/procurement.md](docs/product/procurement.md) — suppliers, purchase orders, and receiving through the inventory ledger
 
 ## Getting started
 
@@ -81,7 +82,10 @@ pnpm run dev
 The admin web signs in via `POST /auth/login` (or a pasted access token) and
 provides read-only visibility over stores, units, devices, catalog, and
 inventory; versioned price books (create a draft, set prices, activate, roll
-back — see [docs/product/pricing.md](docs/product/pricing.md)); and a manual
+back — see [docs/product/pricing.md](docs/product/pricing.md)); procurement
+(suppliers and their costs, purchase orders, and receiving a delivery, which
+admits stock through the append-only inventory ledger — see
+[docs/product/procurement.md](docs/product/procurement.md)); and a manual
 checkout test flow: create a checkout session, manage basket lines, and
 complete it into an order, which now carries a total derived from the price
 each line was added at. The Store flow page drives the Phase 26 loop end to end

@@ -239,9 +239,19 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
   {
     code: 'procurement',
     name: 'Procurement',
-    description: 'Supplier ordering and receiving (later phase).',
-    defaultEnabled: false,
-    isActive: false,
+    description:
+      'Suppliers, the supplier catalog and its audited cost history, ' +
+      'purchase orders, and goods receipts that admit stock through the ' +
+      'append-only inventory ledger.',
+    // Shipped in Phase 31 and DEFAULT-ENABLED for the same reason as
+    // inventory/checkout (see above): the only enable endpoint is
+    // @TenantOnly(), so leaving this false would strand new tenants behind
+    // 403s on a shipped feature. RBAC still gates every route independently.
+    // Tenants that existed BEFORE Phase 31 are covered by the
+    // 20260916120001_procurement_module_backfill migration — defaultEnabled
+    // only applies at tenant creation time.
+    defaultEnabled: true,
+    isActive: true,
   },
 ];
 

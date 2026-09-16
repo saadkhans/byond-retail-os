@@ -45,6 +45,7 @@ export const NAV_GROUPS: NavGroup[] = [
       { to: '/catalog', label: 'Catalog' },
       { to: '/inventory', label: 'Inventory' },
       { to: '/esl', label: 'Shelf labels' },
+      { to: '/procurement', label: 'Procurement' },
     ],
   },
   {

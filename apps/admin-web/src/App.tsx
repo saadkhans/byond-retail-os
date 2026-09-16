@@ -56,6 +56,7 @@ import { EslPage } from './pages/EslPage';
 import { LoyaltyPage } from './pages/LoyaltyPage';
 import { PricingPage } from './pages/PricingPage';
 import { StoreFlowPage } from './pages/StoreFlowPage';
+import { ProcurementPage } from './pages/ProcurementPage';
 import {
   ReconciliationDetailPage,
   ReconciliationPage,
@@ -120,6 +121,7 @@ export function App() {
                     <Route path="returns" element={<ReturnsPage />} />
                     <Route path="esl" element={<EslPage />} />
                     <Route path="loyalty" element={<LoyaltyPage />} />
+                    <Route path="procurement" element={<ProcurementPage />} />
                     <Route path="orders" element={<OrdersPage />} />
                     <Route path="orders/:id" element={<OrderDetailPage />} />
                     <Route path="payments" element={<PaymentsPage />} />

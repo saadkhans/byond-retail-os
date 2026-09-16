@@ -48,10 +48,10 @@ describe('platform module catalog', () => {
     // inventory (Phase 3), devices (Phase 4), pricing (Phase 25),
     // checkout (Phase 5), payments (Phase 6), cv (Phase 7),
     // inference (Phase 9), video-ingest (Phase 10), store-flow (Phase 26),
-    // returns (Phase 27), esl (Phase 28) and loyalty (Phase 29) are
-    // default-enabled so their routes are reachable for every new tenant (the
-    // only enable endpoint is tenant-scoped and needs a module:manage tenant
-    // user, which a brand-new tenant does not yet have).
+    // returns (Phase 27), esl (Phase 28), loyalty (Phase 29) and procurement
+    // (Phase 31) are default-enabled so their routes are reachable for every
+    // new tenant (the only enable endpoint is tenant-scoped and needs a
+    // module:manage tenant user, which a brand-new tenant does not yet have).
     // store-flow being enabled changes nothing on its own: its autonomy
     // policy defaults to SHADOW. Nor does returns: it has no background jobs,
     // so nothing happens until an operator records a return, a count or a
@@ -70,6 +70,7 @@ describe('platform module catalog', () => {
       'returns',
       'esl',
       'loyalty',
+      'procurement',
     ]);
   });
 
@@ -98,8 +99,9 @@ describe('platform module catalog', () => {
     // esl (vendor-neutral shelf labels behind an adapter port, driven by
     // price activation): Phase 28; loyalty (accounts, append-only points
     // ledger, versioned promotions composing on top of the price version in
-    // force): Phase 29.
-    // reporting and procurement remain catalog names only.
+    // force): Phase 29; procurement (suppliers, purchase orders, and goods
+    // receipts that admit stock through the ledger): Phase 31.
+    // reporting remains a catalog name only.
     expect(active).toEqual([
       'core',
       'inventory',
@@ -114,6 +116,7 @@ describe('platform module catalog', () => {
       'returns',
       'esl',
       'loyalty',
+      'procurement',
     ]);
   });
 
