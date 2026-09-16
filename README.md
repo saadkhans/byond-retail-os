@@ -31,6 +31,7 @@ scripts/         Repo automation scripts
 ## Key documents
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system principles and design invariants
+- [docs/architecture/edge-runtime.md](docs/architecture/edge-runtime.md) — the in-store data plane: the file-backed store, the local ledger, sync and the hardware abstraction layer
 - [AGENTS.md](AGENTS.md) — AI agent roles and hard rules
 - [CONTRIBUTING.md](CONTRIBUTING.md) — branch, PR, and review workflow
 - [SECURITY.md](SECURITY.md) — security requirements and tooling
@@ -45,6 +46,8 @@ scripts/         Repo automation scripts
 - [docs/product/procurement.md](docs/product/procurement.md) — suppliers, purchase orders, and receiving through the inventory ledger
 - [docs/product/reporting.md](docs/product/reporting.md) — read-only sales, inventory, shrink and CV-accuracy reporting derived from the ledger and the evaluation tables
 - [docs/product/shopper-app.md](docs/product/shopper-app.md) — the shopper application: the journey-scoped credential, the four screens, and what makes a public API surface safe
+- [docs/product/release-notes.md](docs/product/release-notes.md) — what shipped, phase by phase
+- [docs/product/release-pr.md](docs/product/release-pr.md) — the `dev` → `main` release pull request, including what is NOT proven
 
 ## Getting started
 
@@ -56,6 +59,11 @@ pnpm run typecheck
 pnpm run test
 pnpm run build
 ```
+
+`pnpm run test` fans out to every package at once. On a developer machine prefer
+per-package runs with a worker cap — `pnpm --filter @byond/api run test --ci
+--maxWorkers=4` — because the recursive form spawns a Jest worker pool per
+package and will exhaust a 16 GB machine.
 
 ## Running locally
 
@@ -136,6 +144,27 @@ abstraction (see
 SHADOW policy the basket stays empty on purpose, and the app says so. Add its
 origin to the API's allowlist when running both:
 `CORS_ORIGINS=http://localhost:5173,http://localhost:5174`.
+
+### Edge runtime
+
+```bash
+cd services/edge-runtime
+cp .env.example .env        # EDGE_TENANT_ID, EDGE_LOCATION_ID, EDGE_DEVICE_ID,
+                            # EDGE_STORE_ROOT and the control-plane URL + token
+pnpm run start
+```
+
+The in-store data plane. It has no database: its durable state is a directory of
+files under `EDGE_STORE_ROOT`, split into replaceable records the cloud pushes
+down and append-only logs of facts the store observed. It keeps trading while
+the cloud link is down — local ledger, local decisioning, a local review queue
+an operator can clear offline — and reconciles through an at-least-once ordered
+outbox when the link returns. Every hardware kind ships a simulated driver, so
+the whole thing runs with no cameras, no scales and no labels. The store is
+sealed on first open to one tenant, location and device and refuses to start
+against a directory sealed to anything else. `GET /health` and `GET /metrics`
+bind to loopback unless deliberately widened. See
+[docs/architecture/edge-runtime.md](docs/architecture/edge-runtime.md).
 
 ### CV pipeline (http://localhost:3100)
 

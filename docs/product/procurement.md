@@ -152,8 +152,10 @@ produced.
 
 ## Known limitations
 
-- **No returns to supplier.** Sending stock back is a different movement and
-  arrives with the returns and refunds phase.
+- **No returns to supplier.** Sending stock back is a different movement.
+  Phase 27's returns and refunds work covers CUSTOMER returns, cancellations,
+  cycle counts and shrink — it does **not** implement supplier returns, so this
+  remains open.
 - **No partial-line receipt splitting.** A line appears at most once per receipt;
   two deliveries of the same line are two receipts.
 - **No landed cost.** Freight, duty and handling are not apportioned onto unit

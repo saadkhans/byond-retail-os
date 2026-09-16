@@ -124,14 +124,20 @@ All are tenant-scoped and gated on the `pricing` module.
 
 ## Known limitations
 
-- **No tax, discounts or promotions.** `totalMinor` equals `subtotalMinor`.
-  Promotions arrive with the loyalty phase and will participate in resolution
-  rather than bypassing versioning.
+- **No tax.** `totalMinor` equals `subtotalMinor`. Tax is not modelled
+  anywhere in the platform.
+- ~~**No discounts or promotions.**~~ **Shipped in Phase 29.** Promotions
+  compose on top of a resolved price version rather than bypassing versioning,
+  exactly as this document anticipated — see
+  [loyalty.md](loyalty.md). A promoted line records both the price version and
+  the promotion version.
 - **No customer- or channel-specific books.** Scope is tenant-wide or per store.
 - **No scheduled-activation worker.** A future `effectiveFrom` is accepted and
   resolves correctly from the moment it arrives, but activation itself is an
   explicit operator action; nothing activates a draft on a timer.
 - **No price import or export.** Entries are set through the API or the admin
   page one book at a time.
-- **No electronic shelf label propagation.** Activating a version changes what
-  checkout charges; pushing it to a label is the ESL phase.
+- ~~**No electronic shelf label propagation.**~~ **Shipped in Phase 28.**
+  Activating or rolling back a version now queues a push to every bound label
+  showing that product, best-effort so that an unreachable label can never fail
+  a price change — see [esl.md](esl.md).

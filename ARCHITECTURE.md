@@ -5,7 +5,13 @@ BYOND is a retail operating system built on the following principles. These are 
 ## Core principles
 
 ### Edge-first
-Stores keep operating when the cloud is unreachable. The edge runtime (`services/edge-runtime/`) handles in-store decisions locally — CV event processing, checkout, ESL updates — and syncs with the cloud when connectivity allows.
+Stores keep operating when the cloud is unreachable. The edge runtime (`services/edge-runtime/`) is a real NestJS service and is what makes this true rather than aspirational. It has **no database**: its durable state is a directory of files, split into replaceable *records* the cloud pushes down (units, devices, the catalog snapshot, the planogram, resolved prices) and append-only *logs* of facts (the local inventory ledger, the outbox, the inbox, conflicts, dead letters, and CV proposals as observed). Stock levels and outbox progress are projections over those logs, so a silent overwrite is structurally impossible on the edge exactly as it is in the cloud.
+
+What it does today: local CV-proposal ingestion and offline decisioning with a local review queue, an append-only local ledger, at-least-once ordered sync through an outbox with stable idempotency keys, a hardware abstraction layer with a simulated driver for every kind (cameras, scales, shelf labels, gates, POS peripherals), and a loopback-bound `GET /health` + `GET /metrics` ops surface.
+
+What it does **not** do yet, and what an earlier version of this document wrongly claimed it did: it does not run checkout locally, and it does not drive ESL updates. Those are cloud-side today (`services/api/src/checkout`, `services/api/src/esl`). The edge runtime has the extension points — a local checkout projection alongside the ledger, and an `EslDriver` port whose only implementation is simulated — but the loop through them is not closed. Treat "edge-first" as a proven property of the ledger, sync and decisioning layers, and as a stated direction for checkout and labels.
+
+A node is sealed on first open to one `EDGE_TENANT_ID` / `EDGE_LOCATION_ID` / `EDGE_DEVICE_ID` and refuses to start against a store sealed to anything else, which is how the multitenancy rule below is enforced on a box that serves exactly one retailer. See [docs/architecture/edge-runtime.md](docs/architecture/edge-runtime.md).
 
 ### Cloud-managed
 Configuration, fleet management, model distribution, tenant administration, and analytics live in the cloud (`services/api/`). The cloud is the control plane; the edge is the data plane.
@@ -41,6 +47,33 @@ Phase 10 is the first controlled on-ramp for REAL test footage into the tier 1�
 Storage is a LOCAL/DEV adapter behind a `VideoStoragePort` (gitignored root, root-confined keys, no public or signed URLs, no cloud credentials — object storage arrives later behind the same port). Extraction runs behind a `VideoFrameExtractorPort` with two adapters: a deterministic SIMULATED extractor (the default — dev/test/CI need no media tooling) and an OPTIONAL local system-binary adapter (ffmpeg/ffprobe from PATH, opt-in via `VIDEO_FFMPEG_ENABLED=true`, argument vectors only, no shell, controlled errors that never echo paths or stderr; never an npm dependency). Upload safety is layered: container allowlist (extension + declared MIME + magic bytes), conservative configurable size limit, filename traversal rejection, credential/payment screening, tenant isolation with same-tenant composite FKs, RBAC (`video-asset:read/manage/process/delete`), module gating (`video-ingest`), and full audit logging. Raw media NEVER enters the app database; artifact rows are internal references (no download URLs in Phase 10).
 
 **Explicitly NOT in Phase 10:** production camera/streaming runtime, GStreamer/DeepStream/Triton, broker-backed queues, real model execution, VLM integration, cloud/object media storage, public or signed media URLs, and committed media of any kind (uploads, frames, crops live only under the gitignored local storage root).
+
+### The retail domain (Phases 25–35)
+
+The event flow above is the CV half. The commercial half now exists in the cloud API and follows one shape: **versioned, append-only, derived on read.** Nothing in it mutates a figure in place.
+
+- **Pricing** (`services/api/src/pricing/`, `/price-books`, `/prices`) — a price is a row in a version of a price book, never a field on a product. Changing a price publishes a new version; rollback copies an earlier version forward rather than rewriting history. A basket line locks its price when it is added, so an activation mid-shop cannot re-price an open basket, and a priced order becomes the authority on what may be charged.
+- **The store loop** (`services/api/src/store-flow/`, `/store-flow`) — entry credential → observations → basket → exit → order → payment, with a versioned per-tenant/per-store autonomy policy. The default is `SHADOW`: observe only, change nothing. Every step is idempotent, and a journey with anything still awaiting review will not settle.
+- **Returns, refunds and reconciliation** (`services/api/src/returns/`, `/returns`, `/cycle-counts`, `/shrink-events`) — the reverse flow. Goods return through the ledger; money returns through the payments abstraction, capped at what was captured. Stocktake variance (a real operator finding) and ledger drift (a platform defect) are kept in separate blocks so they can never be averaged together.
+- **Electronic shelf labels** (`services/api/src/esl/`, `/esl`) — activating a price version queues a push to every bound label. Vendor-neutral behind an adapter port; the only shipped adapter is simulated. Delivery is best-effort by design: an unreachable label must never fail a price change.
+- **Loyalty and promotions** (`services/api/src/loyalty/`, `/loyalty`) — promotions compose *on top of* a resolved price version and never inside it, so the price book stays the single explanation of base price. Points are an append-only ledger. Promotions do not stack: exactly one applies, the largest discount.
+- **Reporting** (`services/api/src/reporting/`, `/reports`) — read-only and derived on read. No roll-up tables, no cache, no scheduled job, and no new Prisma model, so reporting can never become a second set of books. Every response says when it was computed and which tables it came from. `read-only.spec.ts` pins that the module contains no destructive Prisma call.
+- **Procurement** (`services/api/src/procurement/`, `/suppliers`, `/supplier-products`, `/purchase-orders`, `/goods-receipts`) — stock arrives through a purchase order and a goods receipt that writes the same append-only ledger a sale does, instead of through a manual adjustment. Purchase cost and retail price are deliberately separate.
+- **The shopper application** (`services/api/src/shopper/`, `/shopper`) — see below.
+
+### The public API surface
+
+Until Phase 35 every route in this repository required an authenticated user or a device token. The shopper application introduces the first routes intended to be reached from an untrusted device on a hostile network: `POST /shopper/session`, `GET /shopper/basket`, `POST /shopper/exit`.
+
+The design invariant is that the *principal* changes, not the guard. A shopper presents `Authorization: Shopper <secret>` — the single-use store entry credential the door already issued — and it authorizes exactly one journey in exactly one tenant and nothing else. The app never names a tenant, store, journey or shopper; every identifier is read off the credential server-side, so there is no parameter a shopper could tamper with to reach someone else's data. The three routes are `@Public()` by exception and are kept in one file so the surface stays countable; `services/api/src/shopper/boundary.spec.ts` pins that count, and `apps/mobile-app/src/app-safety.spec.ts` pins that the client makes no other call. The app contains no payment form, field or handler of any kind.
+
+This is the highest-risk surface in the repository and the one most deserving of a human security review before it reaches production.
+
+### Tenant isolation at the write predicate
+
+Multitenancy (above) is enforced at the data-access layer by `TenantScopedRepository`. A repo-wide sweep hardened every destructive write — `delete`, `deleteMany`, `update`, `updateMany` — to carry `tenantId` in its predicate rather than addressing a row by `id` alone, and `services/api/src/prisma/tenant-write-predicate.spec.ts` walks the whole API source tree to keep it that way, with an allowlist whose every entry must explain itself.
+
+Its limit is worth stating plainly: **the guard is textual.** It proves the token `tenantId` appears in the predicate of a destructive write. It cannot prove that the value bound to it is the caller's tenant. Closing that gap properly means a Prisma client extension that refuses a tenant-scoped write with no tenant filter at the driver, where the value is knowable.
 
 ## Swappability
 

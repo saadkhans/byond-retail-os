@@ -194,15 +194,17 @@ pricing still knows about neither.
 
 ## The Shopper link
 
-Phase 26 introduces a `Shopper` model on a sibling line of development that has
-not merged here. `LoyaltyAccount.shopperId` is deliberately a **bare nullable
-column with no Prisma relation and no foreign key**: the API never writes it
-(there is no DTO field), and a partial unique index already reserves "at most
-one loyalty account per shopper per tenant".
+Phase 26's `Shopper` model arrived on a sibling line of development, so when
+this module was written `LoyaltyAccount.shopperId` was deliberately a bare
+nullable column with no Prisma relation and no foreign key, guarded only by a
+partial unique index reserving "at most one loyalty account per shopper per
+tenant".
 
-Wiring it when Shopper lands is one `ALTER TABLE` adding the composite
-same-tenant FK plus one relation line in `schema.prisma`. No column rename, no
-backfill, no data migration.
+**Both have now merged.** The composite same-tenant foreign key and the relation
+line were added in `20260916140000_loyalty_account_shopper_fk`, exactly the one
+`ALTER TABLE` this section predicted — no column rename, no backfill, no data
+migration. The API still never writes `shopperId` (there is no DTO field);
+linking an account to a shopper remains open work.
 
 ## Surface
 

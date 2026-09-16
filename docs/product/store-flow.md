@@ -135,8 +135,10 @@ job and its live-session ownership rules still apply.
   simulated and a manual provider. Settlement drives the real state machine, but
   no gateway is contacted and no card data exists anywhere in the path. A real
   provider arrives as an adapter behind the same contract.
-- **No refunds or returns after settlement.** Cancelling a settled order does not
-  yet reverse stock or money; that is the returns and refunds phase.
+- ~~**No refunds or returns after settlement.**~~ **Shipped in Phase 27.**
+  Returns put goods back through the ledger and money back through the payments
+  abstraction, capped at what was captured; cancelling a settled order now has a
+  supported path — see [returns.md](returns.md).
 - **An unpriced basket produces an unpaid order.** If pricing cannot value every
   line, the order is created with no total and is payable by hand rather than
   automatically.
@@ -146,7 +148,11 @@ job and its live-session ownership rules still apply.
 - **The confidence floor is compared against an uncalibrated ranking score**, not
   a probability. Until the calibration work lands, treat the number as a
   threshold that was tuned on your own clips, not as a percentage.
-- **Anonymous shoppers only.** A shopper row exists so journeys, baskets and
-  orders have a stable subject. There is no shopper-facing application, no
-  stored payment instrument, and no identity beyond an optional link to a
-  platform user.
+- **Anonymous shoppers only — but there IS a shopper application now.**
+  A shopper row still carries no identity beyond an optional link to a platform
+  user, and no stored payment instrument. What changed in Phase 35 is that the
+  shopper can drive their own visit: the entry credential issued here doubles as
+  a journey-scoped credential for three public routes
+  (`POST /shopper/session`, `GET /shopper/basket`, `POST /shopper/exit`), which
+  is the repository's first public API surface — see
+  [shopper-app.md](shopper-app.md).

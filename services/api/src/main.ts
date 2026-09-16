@@ -48,9 +48,14 @@ async function bootstrap(): Promise<void> {
       .setDescription(
         'Core platform — auth, tenants, users, RBAC, stores, modules, ' +
           'product catalog, inventory, retail units, devices, checkout ' +
-          'sessions, orders, and payments. Phase 6 adds a PROVIDER-NEUTRAL ' +
-          'payment abstraction: there is NO live payment gateway, NO provider ' +
-          'SDK, and NO raw card data — authorization and capture are ' +
+          'sessions, orders, and payments; versioned pricing, the ' +
+          'autonomous store loop, returns/refunds/reconciliation, ' +
+          'electronic shelf labels, loyalty and promotions, procurement, ' +
+          'read-only reporting, the CV inference and video-ingest ' +
+          'foundations, and the public shopper surface. ' +
+          'Payments remain PROVIDER-NEUTRAL: there is NO live payment ' +
+          'gateway, NO provider ' +
+          'SDK, and NO raw card data — authorization, capture and refund are ' +
           'SIMULATED through an internal state machine, provider references ' +
           'are opaque, and an order is marked PAID only when its payment ' +
           'intent reaches the CAPTURED state. Real gateway adapters and ' +
@@ -61,10 +66,14 @@ async function bootstrap(): Promise<void> {
           'authenticate a SHOPPER instead of a user: the single-use store ' +
           'entry credential, presented as Authorization: Shopper <secret>, ' +
           'which authorizes exactly one journey in exactly one tenant and ' +
-          'nothing else. ' +
+          'nothing else. It is the ONLY public surface in this API that ' +
+          'returns tenant data, it names no tenant, store, journey or ' +
+          'shopper in any request (every identifier is read off the ' +
+          'credential server-side), and it accepts NO payment data of any ' +
+          'kind. ' +
           'Errors use the standard Nest shape: { statusCode, message, error }.',
       )
-      .setVersion('0.6.0')
+      .setVersion('1.0.0')
       .addTag(
         'stores',
         'Tenant stores/branches/sites (the Location entity): name, code, ' +
@@ -100,16 +109,24 @@ async function bootstrap(): Promise<void> {
           'lifecycle. Completion atomically creates a CONFIRMED order and ' +
           'consumes inventory via SALE ledger movements (idempotent by ' +
           'key). Evidence/source fields (sourceType, visionEventId, ' +
-          'vlmReviewId, ...) are vendor-neutral placeholders for future ' +
-          'CV/VLM adapters — no vision code runs in Phase 5.',
+          'vlmReviewId, ...) are vendor-neutral and are now populated for ' +
+          'real by the store loop, which bridges approved vision events ' +
+          'onto basket lines. A line locks the price resolved when it was ' +
+          'added, so a price activation mid-shop never re-prices an open ' +
+          'basket.',
       )
       .addTag(
         'orders',
         'Orders generated from completed checkout sessions: per-tenant ' +
           'order numbers, immutable product snapshot lines with full ' +
           'session → line → movement lineage. CONFIRMED means inventory ' +
-          'was consumed — NOT paid/captured; payment capture is a later ' +
-          'phase, and pricing fields are null placeholders.',
+          'was consumed — NOT paid/captured; an order is PAID only when a ' +
+          'linked payment intent reaches CAPTURED. Pricing fields are no ' +
+          'longer placeholders: where a price book resolves every line, the ' +
+          'order carries a total derived from the price each line was added ' +
+          'at, and that total is the authority on what may be charged. An ' +
+          'order whose lines cannot all be priced is created with a null ' +
+          'total and is payable by hand.',
       )
       .addTag(
         'payments',
@@ -152,8 +169,97 @@ async function bootstrap(): Promise<void> {
         'edge-registration',
         'Safe device/edge registration foundation: an admin issues a ' +
           'one-time, expiring, serial-bound token (only its SHA-256 hash ' +
-          'is stored); the edge device redeems it at /edge/register. ' +
-          'Prepares for the Phase 7 edge runtime.',
+          'is stored); the edge device redeems it at /edge/register. This ' +
+          'is how a real node in services/edge-runtime is provisioned: it ' +
+          'seals itself to the tenant, location and device the redeemed ' +
+          'token names and refuses to start against any other.',
+      )
+      .addTag(
+        'pricing',
+        'Versioned price books and their entries (/price-books) plus ' +
+          'resolution (/prices/resolve). A price is a row in a VERSION, ' +
+          'never a field on a product: changing a price publishes a new ' +
+          'version and rollback copies an earlier version forward, so ' +
+          'history is never rewritten. Store-scoped books beat tenant-wide ' +
+          'ones. No tax, no scheduled activation worker, no import/export.',
+      )
+      .addTag(
+        'store-flow',
+        'The autonomous store loop: versioned autonomy policy, single-use ' +
+          'entry credentials, the observation → basket bridge, one review ' +
+          'queue, and exit into an order and a payment. The DEFAULT policy ' +
+          'is SHADOW — observe only, change nothing — so enabling the ' +
+          'module alters no behavior until a tenant opts in. Every step is ' +
+          'idempotent; a journey with anything awaiting review will not ' +
+          'settle.',
+      )
+      .addTag(
+        'shopper',
+        'The PUBLIC shopper surface (three routes, one principal). ' +
+          'Authenticated by Authorization: Shopper <secret> — the ' +
+          'single-use store entry credential — which authorizes exactly ' +
+          'one journey in exactly one tenant. No tenant, store, journey or ' +
+          'shopper id is ever accepted from the client, and no payment ' +
+          'data of any kind is accepted or returned.',
+      )
+      .addTag(
+        'returns',
+        'The reverse flow: customer returns, cancellation of a settled ' +
+          'order, and refunds bounded by what was actually captured and ' +
+          'idempotent on retry. Goods go back through the append-only ' +
+          'ledger; damaged goods are refunded without being restocked, and ' +
+          'the record says so. The refund gateway is SIMULATED only.',
+      )
+      .addTag(
+        'cycle-counts',
+        'Stocktakes and cycle counts. A count shows the counted figure, ' +
+          'the stored projection and a full ledger replay side by side; ' +
+          'only the difference is written, and a count that agrees writes ' +
+          'nothing. Projection-vs-ledger disagreement is reported as a ' +
+          'PLATFORM DEFECT, never folded into operator variance.',
+      )
+      .addTag(
+        'shrink',
+        'Write-offs for CV-detected loss. Bounded by what was actually ' +
+          'observed, once per observation, behind its own permission — ' +
+          'nothing automatic reaches this route, because a write-off ' +
+          'removes real stock.',
+      )
+      .addTag(
+        'esl',
+        'Vendor-neutral electronic shelf labels: gateways, label ' +
+          'discovery and binding, an update queue and a reconcile pass. ' +
+          'Activating a price version queues a push to every bound label. ' +
+          'Delivery is BEST-EFFORT by design — an unreachable label must ' +
+          'never fail a price change. The only shipped adapter is ' +
+          'SIMULATED; queue passes are operator-driven, not a background ' +
+          'worker.',
+      )
+      .addTag(
+        'loyalty',
+        'Member accounts with an append-only points ledger, and versioned ' +
+          'promotions that compose ON TOP of the price version in force ' +
+          'without ever rewriting it. GET /loyalty/quote names the price ' +
+          'version AND the promotion version behind any price. Promotions ' +
+          'do NOT stack: exactly one applies, the largest discount.',
+      )
+      .addTag(
+        'procurement',
+        'Suppliers, supplier costs, purchase orders and goods receipts. ' +
+          'Receiving writes the same append-only inventory ledger a sale ' +
+          'does, so stock and ledger history cannot disagree. Purchase ' +
+          'cost and retail price are separate. No returns to supplier, no ' +
+          'landed cost, no automatic reordering, one currency per order.',
+      )
+      .addTag(
+        'reporting',
+        'READ-ONLY reports derived on read — sales explained down to the ' +
+          'price and promotion version, inventory movements and balances, ' +
+          'count reconciliation, shrink, and CV accuracy as COUNTS ONLY ' +
+          '(no evidence, clips or crops). No roll-up tables, no cache, no ' +
+          'scheduled job and no Prisma model of its own, so reporting can ' +
+          'never become a second set of books. Every route needs ' +
+          'report:read AND the permission guarding the underlying rows.',
       )
       .addBearerAuth()
       .build();
