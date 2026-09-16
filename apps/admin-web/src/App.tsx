@@ -52,6 +52,7 @@ import {
   PaymentsPage,
 } from './pages/PaymentsPage';
 import { PilotRunDetailPage } from './pages/PilotRunsPage';
+import { PricingPage } from './pages/PricingPage';
 import {
   ReconciliationDetailPage,
   ReconciliationPage,
@@ -110,6 +111,7 @@ export function App() {
                       path="checkout-sessions/:id"
                       element={<CheckoutSessionDetailPage />}
                     />
+                    <Route path="pricing" element={<PricingPage />} />
                     <Route path="orders" element={<OrdersPage />} />
                     <Route path="orders/:id" element={<OrderDetailPage />} />
                     <Route path="payments" element={<PaymentsPage />} />

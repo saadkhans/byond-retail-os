@@ -1,7 +1,9 @@
 /**
  * Platform module catalog — the single source of truth the seed reads from.
- * These are CATALOG NAMES ONLY: no module logic beyond `core` exists in
- * Phase 1. Inventory, pricing, checkout, CV, etc. are later phases.
+ * An entry with `isActive: false` is a NAME ONLY: the module has no logic yet
+ * and can never be enabled for a tenant. Flip it to true in the phase that
+ * actually ships the module, and add a backfill migration for the tenants
+ * that already exist.
  */
 export interface PlatformModuleDefinition {
   readonly code: string;
@@ -59,9 +61,18 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
   {
     code: 'pricing',
     name: 'Pricing',
-    description: 'Versioned, auditable pricing (later phase).',
-    defaultEnabled: false,
-    isActive: false,
+    description:
+      'Versioned, auditable, reversible price books: effective-dated ' +
+      'versions, immutable entries, activation and rollback, and the ' +
+      'resolved prices checkout snapshots onto basket lines.',
+    // Shipped in Phase 25 and DEFAULT-ENABLED for the same reason as
+    // inventory/devices/checkout (see above): the only enable endpoint is
+    // @TenantOnly(), so leaving this false would strand new tenants behind
+    // 403s. RBAC still gates every route independently. Tenants that existed
+    // BEFORE Phase 25 are covered by the 20260916090001_pricing_module_backfill
+    // migration — defaultEnabled only applies at tenant creation time.
+    defaultEnabled: true,
+    isActive: true,
   },
   {
     code: 'checkout',

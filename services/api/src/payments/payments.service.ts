@@ -449,6 +449,14 @@ export class PaymentsService {
         'The order and checkout session refer to different checkouts',
       );
     }
+    if (result === 'order-amount-mismatch') {
+      // The amount is deliberately NOT echoed: the order is the authority,
+      // and repeating a rejected figure back invites a caller to treat the
+      // error as negotiable.
+      throw new ConflictException(
+        'The intent amount and currency must match the linked order’s total',
+      );
+    }
   }
 
   private async replayFromAuthorizationKey(

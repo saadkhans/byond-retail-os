@@ -215,6 +215,67 @@ export interface Product {
   barcodes?: { value: string }[];
 }
 
+/* ---------------------------------------------------------------- */
+/* Pricing (Phase 25)                                                 */
+/* ---------------------------------------------------------------- */
+
+export type PriceBookStatus = 'ACTIVE' | 'ARCHIVED';
+
+export type PriceBookVersionStatus =
+  | 'DRAFT'
+  | 'ACTIVE'
+  | 'SUPERSEDED'
+  | 'ARCHIVED';
+
+export type PriceChangeReason =
+  | 'INITIAL'
+  | 'PRICE_CHANGE'
+  | 'PROMOTION_BASE'
+  | 'CORRECTION'
+  | 'ROLLBACK';
+
+export interface PriceBookVersion {
+  id: string;
+  priceBookId: string;
+  versionNumber: number;
+  status: PriceBookVersionStatus;
+  effectiveFrom: string;
+  effectiveTo: string | null;
+  reason: PriceChangeReason;
+  note: string | null;
+  activatedAt: string | null;
+  supersededByVersionId: string | null;
+  rolledBackFromVersionId: string | null;
+  createdAt: string;
+}
+
+export interface PriceBook {
+  id: string;
+  code: string;
+  name: string;
+  currencyCode: string;
+  locationId: string | null;
+  status: PriceBookStatus;
+  createdAt: string;
+  location?: { id: string; code: string; name: string } | null;
+  versions?: PriceBookVersion[];
+}
+
+export interface PriceBookEntry {
+  id: string;
+  productId: string;
+  unitPriceMinor: number;
+  currencyCode: string;
+  product: { id: string; sku: string; name: string };
+}
+
+export interface ResolvedPrice {
+  unitPriceMinor: number;
+  currencyCode: string;
+  priceBookId: string;
+  priceBookVersionId: string;
+}
+
 export interface StockLevel {
   id: string;
   quantity: number;

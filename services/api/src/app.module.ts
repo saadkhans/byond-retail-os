@@ -4,6 +4,7 @@ import { AccessControlModule } from './access-control/access-control.module';
 import { AuthModule } from './auth/auth.module';
 import { CameraModule } from './camera/camera.module';
 import { CatalogModule } from './catalog/catalog.module';
+import { PricingModule } from './pricing/pricing.module';
 import { CheckoutModule } from './checkout/checkout.module';
 import { RequestIdMiddleware } from './common/request-id.middleware';
 import { CvDatasetModule } from './cv-dataset/cv-dataset.module';
@@ -47,6 +48,7 @@ import { VisionModule } from './vision/vision.module';
     InventoryModule,
     UnitsModule,
     DevicesModule,
+    PricingModule,
     CheckoutModule,
     OrdersModule,
     PaymentsModule,

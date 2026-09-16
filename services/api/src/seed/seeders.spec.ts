@@ -44,10 +44,10 @@ describe('platform module catalog', () => {
     expect(new Set(codes).size).toBe(codes.length);
   });
 
-  it('default-enables core plus the shipped inventory, devices, checkout, payments, cv, inference, and video-ingest modules', () => {
-    // inventory (Phase 3), devices (Phase 4), checkout (Phase 5), payments
-    // (Phase 6), cv (Phase 7), inference (Phase 9), and video-ingest
-    // (Phase 10) are default-enabled so
+  it('default-enables core plus every shipped module', () => {
+    // inventory (Phase 3), devices (Phase 4), pricing (Phase 25),
+    // checkout (Phase 5), payments (Phase 6), cv (Phase 7),
+    // inference (Phase 9), and video-ingest (Phase 10) are default-enabled so
     // their routes are reachable for every new tenant (the only enable
     // endpoint is tenant-scoped and needs a
     // module:manage tenant user, which a brand-new tenant does not yet have).
@@ -55,6 +55,7 @@ describe('platform module catalog', () => {
       'core',
       'inventory',
       'devices',
+      'pricing',
       'checkout',
       'payments',
       'cv',
@@ -65,7 +66,7 @@ describe('platform module catalog', () => {
 
   it('lists later-phase modules as catalog names only', () => {
     const codes = PLATFORM_MODULE_CATALOG.map((m) => m.code);
-    for (const expected of ['inventory', 'pricing', 'checkout', 'cv', 'esl']) {
+    for (const expected of ['inventory', 'checkout', 'cv', 'esl', 'loyalty']) {
       expect(codes).toContain(expected);
     }
   });
@@ -76,16 +77,19 @@ describe('platform module catalog', () => {
     );
     // core: Phase 1; inventory (catalog + ledger): Phase 3;
     // devices (units, devices, edge registration): Phase 4;
-    // checkout (sessions, basket lines, order foundation): Phase 5;
+    // pricing (versioned price books, resolution, checkout wiring):
+    // Phase 25; checkout (sessions, basket lines, order foundation): Phase 5;
     // payments (intents, simulated auth/capture, reconciliation): Phase 6;
     // cv (vision events, evidence bundle lineage, review → basket flow):
     // Phase 7; inference (jobs, queue foundation, simulated adapter):
     // Phase 9; video-ingest (test video upload, frame/crop extraction
     // contracts): Phase 10.
+    // esl, loyalty, reporting and procurement remain catalog names only.
     expect(active).toEqual([
       'core',
       'inventory',
       'devices',
+      'pricing',
       'checkout',
       'payments',
       'cv',
