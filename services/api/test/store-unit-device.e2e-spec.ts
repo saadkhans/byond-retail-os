@@ -170,6 +170,25 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   type Where = Record<string, any>;
 
+  /**
+   * Destructive writes carry the tenant IN the write predicate, via the
+   * `id_tenantId` composite key (see
+   * src/prisma/tenant-write-predicate.spec.ts). The stubs resolve either
+   * form and MISS when the tenant does not match, exactly as Postgres
+   * would — so a stub can never make an unscoped write look correct.
+   */
+  const findByWriteKey = <T extends Where>(
+    rows: T[],
+    where: Where,
+  ): T | undefined => {
+    const key = (where.id_tenantId ?? where) as Where;
+    return rows.find(
+      (candidate) =>
+        candidate.id === key.id &&
+        (key.tenantId === undefined || candidate.tenantId === key.tenantId),
+    );
+  };
+
   function matchScalar(row: Row, where: Where, keys: string[]): boolean {
     return keys.every(
       (key) => where[key] === undefined || row[key] === where[key],
@@ -478,9 +497,7 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
             ]) && matchSearchOr(row, where, ['name', 'code']),
         ).length,
       update: async (args: { where: Where; data: Where; include?: Where }) => {
-        const row = store.units.find(
-          (candidate) => candidate.id === args.where.id,
-        );
+        const row = findByWriteKey(store.units, args.where);
         if (!row) {
           throw { code: 'P2025' };
         }
@@ -501,9 +518,7 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
         return unitWithInclude(row, args);
       },
       delete: async ({ where }: { where: Where }) => {
-        const row = store.units.find(
-          (candidate) => candidate.id === where.id,
-        );
+        const row = findByWriteKey(store.units, where);
         if (!row) {
           throw { code: 'P2025' };
         }
@@ -599,9 +614,7 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
         include?: Where;
         omit?: Where;
       }) => {
-        const row = store.devices.find(
-          (candidate) => candidate.id === args.where.id,
-        );
+        const row = findByWriteKey(store.devices, args.where);
         if (!row) {
           throw { code: 'P2025' };
         }
@@ -627,9 +640,7 @@ describe('Stores, Units & Devices (e2e, no live database)', () => {
         return deviceShape(row, args);
       },
       delete: async ({ where }: { where: Where }) => {
-        const row = store.devices.find(
-          (candidate) => candidate.id === where.id,
-        );
+        const row = findByWriteKey(store.devices, where);
         if (!row) {
           throw { code: 'P2025' };
         }

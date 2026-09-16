@@ -126,7 +126,7 @@ export class CategoriesRepository extends TenantScopedRepository {
       }
 
       const after = await tx.productCategory.update({
-        where: { id: before.id },
+        where: { id_tenantId: { id: before.id, tenantId: scopedTenantId } },
         data,
       });
       await this.auditLog.record(buildAuditEntry(before, after), tx);
@@ -155,7 +155,9 @@ export class CategoriesRepository extends TenantScopedRepository {
       if (!existing) {
         return null;
       }
-      await tx.productCategory.delete({ where: { id: existing.id } });
+      await tx.productCategory.delete({
+        where: { id_tenantId: { id: existing.id, tenantId: scopedTenantId } },
+      });
       await this.auditLog.record(buildAuditEntry(existing), tx);
       return existing;
     });

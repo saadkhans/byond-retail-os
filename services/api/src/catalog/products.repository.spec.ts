@@ -292,7 +292,9 @@ describe('ProductsRepository barcode mutations (delete serialization)', () => {
       $queryRaw: jest.fn().mockResolvedValue([1]),
       productBarcode: {
         findFirst: jest.fn().mockResolvedValue({ id: 'bc-1' }),
-        delete: jest.fn().mockResolvedValue({ id: 'bc-1' }),
+        // ProductBarcode has no @@unique([id, tenantId]), so the removal
+        // goes through deleteMany with the tenant in the predicate.
+        deleteMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
     };
     await build(tx).removeBarcode(
@@ -302,7 +304,9 @@ describe('ProductsRepository barcode mutations (delete serialization)', () => {
       buildAuditEntry,
     );
     expect(tx.$queryRaw).toHaveBeenCalled();
-    expect(tx.productBarcode.delete).toHaveBeenCalled();
+    expect(tx.productBarcode.deleteMany).toHaveBeenCalledWith({
+      where: { id: 'bc-1', tenantId: 'tenant-a' },
+    });
   });
 });
 

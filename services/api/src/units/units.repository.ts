@@ -237,7 +237,7 @@ export class UnitsRepository extends TenantScopedRepository {
         }
       }
       const after = await tx.retailUnit.update({
-        where: { id: before.id },
+        where: { id_tenantId: { id: before.id, tenantId: scopedTenantId } },
         data,
         include: UNIT_INCLUDE,
       });
@@ -274,7 +274,9 @@ export class UnitsRepository extends TenantScopedRepository {
       }
       // Restrict FKs backstop the check above for any FUTURE referencing
       // table (P2003 is mapped to a controlled 409 in the service).
-      await tx.retailUnit.delete({ where: { id: existing.id } });
+      await tx.retailUnit.delete({
+        where: { id_tenantId: { id: existing.id, tenantId: scopedTenantId } },
+      });
       await this.auditLog.record(buildAuditEntry(existing), tx);
       return existing;
     });

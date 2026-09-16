@@ -220,7 +220,7 @@ export class EslRepository extends TenantScopedRepository {
         return 'gateway-not-found' as const;
       }
       const after = await tx.eslGateway.update({
-        where: { id },
+        where: { id_tenantId: { id: before.id, tenantId: scoped } },
         data: {
           ...(data.name === undefined ? {} : { name: data.name }),
           ...(data.status === undefined ? {} : { status: data.status }),
@@ -308,11 +308,13 @@ export class EslRepository extends TenantScopedRepository {
         return 'gateway-not-found' as const;
       }
       const existing = await tx.eslLabel.findFirst({
-        where: { gatewayId, vendorLabelId: data.vendorLabelId },
+        where: { tenantId: scoped, gatewayId, vendorLabelId: data.vendorLabelId },
       });
       const label = existing
         ? await tx.eslLabel.update({
-            where: { id: existing.id },
+            where: {
+              id_tenantId: { id: existing.id, tenantId: scoped },
+            },
             data: {
               batteryPercent: data.batteryPercent,
               signalPercent: data.signalPercent,
@@ -415,7 +417,7 @@ export class EslRepository extends TenantScopedRepository {
       const nextProductId =
         data.productId === undefined ? before.productId : data.productId;
       const after = await tx.eslLabel.update({
-        where: { id },
+        where: { id_tenantId: { id: before.id, tenantId: scoped } },
         data: {
           ...(data.productId === undefined
             ? {}

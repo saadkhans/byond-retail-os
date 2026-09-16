@@ -194,7 +194,7 @@ export class PricingRepository extends TenantScopedRepository {
         return 'book-not-found' as const;
       }
       const after = await tx.priceBook.update({
-        where: { id: before.id },
+        where: { id_tenantId: { id: before.id, tenantId: scopedTenantId } },
         data: { name: data.name, status: data.status },
       });
       await this.auditLog.record(buildAuditEntry(before, after), tx);
@@ -576,7 +576,7 @@ export class PricingRepository extends TenantScopedRepository {
         return 'effective-from-not-after-active' as const;
       }
       const supersededAfter = await tx.priceBookVersion.update({
-        where: { id: current.id },
+        where: { id_tenantId: { id: current.id, tenantId } },
         data: {
           status: PriceBookVersionStatus.SUPERSEDED,
           effectiveTo: data.effectiveFrom,
@@ -591,7 +591,7 @@ export class PricingRepository extends TenantScopedRepository {
       }
     }
     const after = await tx.priceBookVersion.update({
-      where: { id: target.id },
+      where: { id_tenantId: { id: target.id, tenantId } },
       data: {
         status: PriceBookVersionStatus.ACTIVE,
         effectiveFrom: data.effectiveFrom,

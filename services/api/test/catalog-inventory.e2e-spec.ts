@@ -156,6 +156,25 @@ describe('Catalog & Inventory (e2e, no live database)', () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   type Where = Record<string, any>;
 
+  /**
+   * Destructive writes carry the tenant IN the write predicate, via the
+   * `id_tenantId` composite key (see
+   * src/prisma/tenant-write-predicate.spec.ts). The stubs resolve either
+   * form and MISS when the tenant does not match, exactly as Postgres
+   * would — so a stub can never make an unscoped write look correct.
+   */
+  const findByWriteKey = <T extends Where>(
+    rows: T[],
+    where: Where,
+  ): T | undefined => {
+    const key = (where.id_tenantId ?? where) as Where;
+    return rows.find(
+      (candidate) =>
+        candidate.id === key.id &&
+        (key.tenantId === undefined || candidate.tenantId === key.tenantId),
+    );
+  };
+
   function matchScalar(row: Row, where: Where, keys: string[]): boolean {
     return keys.every(
       (key) => where[key] === undefined || row[key] === where[key],
@@ -348,9 +367,7 @@ describe('Catalog & Inventory (e2e, no live database)', () => {
           .filter((row) => matchScalar(row, where, ['tenantId']))
           .sort((a, b) => String(a.name).localeCompare(String(b.name))),
       update: async ({ where, data }: { where: Where; data: Where }) => {
-        const row = store.categories.find(
-          (candidate) => candidate.id === where.id,
-        )!;
+        const row = findByWriteKey(store.categories, where)!;
         if (
           data.name !== undefined &&
           store.categories.some(
@@ -366,9 +383,7 @@ describe('Catalog & Inventory (e2e, no live database)', () => {
         return row;
       },
       delete: async ({ where }: { where: Where }) => {
-        const row = store.categories.find(
-          (candidate) => candidate.id === where.id,
-        )!;
+        const row = findByWriteKey(store.categories, where)!;
         const referenced =
           store.products.some((product) => product.categoryId === row.id) ||
           store.categories.some((child) => child.parentId === row.id);
@@ -405,16 +420,12 @@ describe('Catalog & Inventory (e2e, no live database)', () => {
       findMany: async ({ where }: { where: Where }) =>
         store.brands.filter((row) => matchScalar(row, where, ['tenantId'])),
       update: async ({ where, data }: { where: Where; data: Where }) => {
-        const row = store.brands.find(
-          (candidate) => candidate.id === where.id,
-        )!;
+        const row = findByWriteKey(store.brands, where)!;
         Object.assign(row, data);
         return row;
       },
       delete: async ({ where }: { where: Where }) => {
-        const row = store.brands.find(
-          (candidate) => candidate.id === where.id,
-        )!;
+        const row = findByWriteKey(store.brands, where)!;
         if (store.products.some((product) => product.brandId === row.id)) {
           throw { code: 'P2003' };
         }
@@ -489,16 +500,12 @@ describe('Catalog & Inventory (e2e, no live database)', () => {
       count: async ({ where }: { where: Where }) =>
         store.products.filter((row) => matchesProduct(row, where)).length,
       update: async ({ where, data }: { where: Where; data: Where }) => {
-        const row = store.products.find(
-          (candidate) => candidate.id === where.id,
-        )!;
+        const row = findByWriteKey(store.products, where)!;
         Object.assign(row, data);
         return productWithInclude(row);
       },
       delete: async ({ where }: { where: Where }) => {
-        const row = store.products.find(
-          (candidate) => candidate.id === where.id,
-        )!;
+        const row = findByWriteKey(store.products, where)!;
         const referenced =
           store.levels.some((level) => level.productId === row.id) ||
           store.movements.some((movement) => movement.productId === row.id);
@@ -541,11 +548,19 @@ describe('Catalog & Inventory (e2e, no live database)', () => {
         );
         return row;
       },
+      // ProductBarcode has no @@unique([id, tenantId]), so a single
+      // barcode is removed through deleteMany with the tenant in the
+      // predicate; both the by-product and by-id forms land here.
       deleteMany: async ({ where }: { where: Where }) => {
         const before = store.barcodes.length;
         store.barcodes = store.barcodes.filter(
           (row) =>
-            !(row.productId === where.productId && row.tenantId === where.tenantId),
+            !(
+              row.tenantId === where.tenantId &&
+              (where.id === undefined || row.id === where.id) &&
+              (where.productId === undefined ||
+                row.productId === where.productId)
+            ),
         );
         return { count: before - store.barcodes.length };
       },

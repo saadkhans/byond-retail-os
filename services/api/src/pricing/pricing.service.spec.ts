@@ -86,18 +86,31 @@ function buildHarness() {
       }
       return { count: args.data.length };
     }),
-    update: jest.fn(async (args: { where: { id: string }; data: Row }) => {
-      const row = rows.find((candidate) => candidate.id === args.where.id);
-      if (!row) {
-        throw new Error(`no ${prefix} ${args.where.id}`);
-      }
-      for (const [key, value] of Object.entries(args.data)) {
-        if (value !== undefined) {
-          row[key] = value;
+    // Destructive writes carry the tenant IN the write predicate via the
+    // `id_tenantId` composite key; the fake resolves either form and
+    // misses on a tenant mismatch, exactly as Postgres would.
+    update: jest.fn(
+      async (args: {
+        where: { id?: string; id_tenantId?: { id: string; tenantId: string } };
+        data: Row;
+      }) => {
+        const key = args.where.id_tenantId ?? { id: args.where.id };
+        const row = rows.find(
+          (candidate) =>
+            candidate.id === key.id &&
+            (!("tenantId" in key) || candidate.tenantId === key.tenantId),
+        );
+        if (!row) {
+          throw new Error(`no ${prefix} ${key.id}`);
         }
-      }
-      return { ...row };
-    }),
+        for (const [field, value] of Object.entries(args.data)) {
+          if (value !== undefined) {
+            row[field] = value;
+          }
+        }
+        return { ...row };
+      },
+    ),
     deleteMany: jest.fn(async (args: { where: Row }) => {
       for (let index = rows.length - 1; index >= 0; index -= 1) {
         if (matches(rows[index], args.where)) {

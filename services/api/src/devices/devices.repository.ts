@@ -228,7 +228,7 @@ export class DevicesRepository extends TenantScopedRepository {
         }
       }
       const after = await tx.device.update({
-        where: { id: before.id },
+        where: { id_tenantId: { id: before.id, tenantId: scopedTenantId } },
         data,
         include: DEVICE_INCLUDE,
         omit: DEVICE_OMIT,
@@ -256,7 +256,9 @@ export class DevicesRepository extends TenantScopedRepository {
       if (!existing) {
         return null;
       }
-      await tx.device.delete({ where: { id: existing.id } });
+      await tx.device.delete({
+        where: { id_tenantId: { id: existing.id, tenantId: scopedTenantId } },
+      });
       await this.auditLog.record(buildAuditEntry(existing), tx);
       return existing;
     });
@@ -302,7 +304,7 @@ export class DevicesRepository extends TenantScopedRepository {
         ? DeviceStatus.ONLINE
         : before.status;
       const after = await tx.device.update({
-        where: { id: before.id },
+        where: { id_tenantId: { id: before.id, tenantId: scopedTenantId } },
         data: {
           ...data,
           status: nextStatus,
@@ -350,7 +352,7 @@ export class DevicesRepository extends TenantScopedRepository {
         return 'inactive-blocked' as const;
       }
       const after = await tx.device.update({
-        where: { id: before.id },
+        where: { id_tenantId: { id: before.id, tenantId: scopedTenantId } },
         data: {
           registrationTokenHash: data.tokenHash,
           registrationTokenExpiresAt: data.expiresAt,

@@ -117,7 +117,9 @@ export class EdgeRegistrationRepository {
       // same generic response as every other branch.
       if (device.serialNumber !== serialNumber) {
         await tx.device.update({
-          where: { id: device.id },
+          where: {
+            id_tenantId: { id: device.id, tenantId: device.tenantId },
+          },
           data: {
             registrationTokenHash: null,
             registrationTokenExpiresAt: null,
@@ -135,7 +137,7 @@ export class EdgeRegistrationRepository {
         return null;
       }
       const after = await tx.device.update({
-        where: { id: device.id },
+        where: { id_tenantId: { id: device.id, tenantId: device.tenantId } },
         data: {
           registrationTokenHash: null,
           registrationTokenExpiresAt: null,

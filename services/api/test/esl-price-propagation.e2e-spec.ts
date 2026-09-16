@@ -498,7 +498,16 @@ describe('Admin price change → ESL label (e2e, no live database)', () => {
         return { count };
       },
       update: async ({ where, data }: Loose) => {
-        const row = rows.find((candidate) => candidate.id === where.id);
+        // Destructive writes carry the tenant IN the write predicate via
+        // the `id_tenantId` composite key; the stub resolves either form
+        // and misses on a tenant mismatch, exactly as Postgres would.
+        const key = (where.id_tenantId ?? where) as Loose;
+        const row = rows.find(
+          (candidate) =>
+            candidate.id === key.id &&
+            (key.tenantId === undefined ||
+              candidate.tenantId === key.tenantId),
+        );
         if (!row) {
           throw new Error('stub: update found nothing');
         }
