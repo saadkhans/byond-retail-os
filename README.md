@@ -33,6 +33,7 @@ scripts/         Repo automation scripts
 - [SECURITY.md](SECURITY.md) — security requirements and tooling
 - [TESTING.md](TESTING.md) — required test categories
 - [docs/product/pricing.md](docs/product/pricing.md) — versioned pricing model and rules
+- [docs/product/procurement.md](docs/product/procurement.md) — suppliers, purchase orders, and receiving through the inventory ledger
 
 ## Getting started
 
@@ -72,7 +73,10 @@ pnpm run dev
 The admin web signs in via `POST /auth/login` (or a pasted access token) and
 provides read-only visibility over stores, units, devices, catalog, and
 inventory; versioned price books (create a draft, set prices, activate, roll
-back — see [docs/product/pricing.md](docs/product/pricing.md)); and a manual
+back — see [docs/product/pricing.md](docs/product/pricing.md)); procurement
+(suppliers and their costs, purchase orders, and receiving a delivery, which
+admits stock through the append-only inventory ledger — see
+[docs/product/procurement.md](docs/product/procurement.md)); and a manual
 checkout test flow: create a checkout session, manage basket lines, and
 complete it into an order, which now carries a total derived from the price
 each line was added at. The API's CORS allowlist defaults to

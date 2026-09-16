@@ -56,4 +56,10 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   { code: 'video-asset:screen', module: 'video-ingest', description: 'Record the audited frame-content screening decision that releases (QUARANTINED to UPLOADED) or rejects (media removed) a quarantined upload' },
   { code: 'video-asset:process', module: 'video-ingest', description: 'Validate videos, extract frames/crops, and create inference jobs from crops' },
   { code: 'video-asset:delete', module: 'video-ingest', description: 'Delete video assets (removes the local file, keeps audited metadata)' },
+  { code: 'supplier:read', module: 'procurement', description: 'View suppliers and what each one charges for a product' },
+  { code: 'supplier:manage', module: 'procurement', description: 'Create and update suppliers, archive them, and set supplier costs (every cost change appends a history row)' },
+  { code: 'purchase-order:read', module: 'procurement', description: 'View purchase orders, their lines, and what has been received against each line' },
+  { code: 'purchase-order:manage', module: 'procurement', description: 'Create draft purchase orders, submit them to a supplier, and cancel them' },
+  { code: 'goods-receipt:read', module: 'procurement', description: 'View goods receipts and the inventory ledger movements each one produced' },
+  { code: 'goods-receipt:manage', module: 'procurement', description: 'Record what physically arrived, admitting stock through the append-only inventory ledger' },
 ];

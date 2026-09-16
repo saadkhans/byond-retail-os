@@ -103,6 +103,10 @@ enum AuditAction {
   // draft version is an ordinary CREATE, and editing draft entries an UPDATE.
   PRICE_CHANGE
   ROLLBACK
+  // Phase 31 — procurement. RECEIVE marks a posted goods receipt (the moment
+  // stock is admitted through the ledger). Creating or submitting a purchase
+  // order is an ordinary CREATE/UPDATE, and cancelling one reuses CANCEL.
+  RECEIVE
 }
 
 enum ProductStatus {
@@ -273,6 +277,14 @@ model Tenant {
   priceBooks        PriceBook[]
   priceBookVersions PriceBookVersion[]
   priceBookEntries  PriceBookEntry[]
+
+  suppliers            Supplier[]
+  supplierProducts     SupplierProduct[]
+  supplierProductCosts SupplierProductCost[]
+  purchaseOrders       PurchaseOrder[]
+  purchaseOrderLines   PurchaseOrderLine[]
+  goodsReceipts        GoodsReceipt[]
+  goodsReceiptLines    GoodsReceiptLine[]
 }
 
 model User {
@@ -316,9 +328,16 @@ model User {
   videoAssetsUploaded   VideoAsset[]    @relation("VideoAssetUploader")
   videoArtifactsCreated VideoArtifact[] @relation("VideoArtifactActor")
 
-  priceBooksCreated         PriceBook[]        @relation("PriceBookActor")
-  priceBookVersionsCreated  PriceBookVersion[] @relation("PriceBookVersionActor")
+  priceBooksCreated          PriceBook[]        @relation("PriceBookActor")
+  priceBookVersionsCreated   PriceBookVersion[] @relation("PriceBookVersionActor")
   priceBookVersionsActivated PriceBookVersion[] @relation("PriceBookVersionActivator")
+
+  suppliersCreated             Supplier[]            @relation("SupplierActor")
+  supplierProductsCreated      SupplierProduct[]     @relation("SupplierProductActor")
+  supplierProductCostsRecorded SupplierProductCost[] @relation("SupplierProductCostActor")
+  purchaseOrdersCreated        PurchaseOrder[]       @relation("PurchaseOrderActor")
+  purchaseOrdersSubmitted      PurchaseOrder[]       @relation("PurchaseOrderSubmitter")
+  goodsReceiptsReceived        GoodsReceipt[]        @relation("GoodsReceiptActor")
 
   // Composite FK target for same-tenant creator constraints (id alone is
   // already unique; this adds nothing semantically, only an FK anchor).
@@ -403,21 +422,23 @@ model Location {
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
 
-  inventoryLevels     InventoryLevel[]
-  inventoryMovements  InventoryMovement[]
-  retailUnits         RetailUnit[]
-  checkoutSessions    CheckoutSession[]
-  orders              Order[]
-  visionEvents        VisionEvent[]
-  inferenceJobs       InferenceJob[]
-  videoAssets         VideoAsset[]
-  customerJourneys    CustomerJourney[]
-  cameraSources       CameraSource[]
-  pilotEvaluationRuns PilotEvaluationRun[]
-  cvTestProtocols     CvTestProtocol[]
+  inventoryLevels           InventoryLevel[]
+  inventoryMovements        InventoryMovement[]
+  retailUnits               RetailUnit[]
+  checkoutSessions          CheckoutSession[]
+  orders                    Order[]
+  visionEvents              VisionEvent[]
+  inferenceJobs             InferenceJob[]
+  videoAssets               VideoAsset[]
+  customerJourneys          CustomerJourney[]
+  cameraSources             CameraSource[]
+  pilotEvaluationRuns       PilotEvaluationRun[]
+  cvTestProtocols           CvTestProtocol[]
   cameraCalibrationProfiles CameraCalibrationProfile[]
-  planogramRacks      PlanogramRack[]
-  priceBooks          PriceBook[]
+  planogramRacks            PlanogramRack[]
+  priceBooks                PriceBook[]
+
+  purchaseOrders PurchaseOrder[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -560,24 +581,28 @@ model Product {
   category ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: Restrict)
   brand    Brand?           @relation(fields: [brandId], references: [id], onDelete: Restrict)
 
-  barcodes                ProductBarcode[]
-  inventoryLevels         InventoryLevel[]
-  inventoryMovements      InventoryMovement[]
-  checkoutSessionLines    CheckoutSessionLine[]
-  orderLines              OrderLine[]
-  visionEventCandidates   VisionEventCandidate[]
-  visionReviewsApplied    VisionEventReview[]          @relation("VisionReviewAppliedProduct")
-  referenceImages         ProductReferenceImage[]
-  groundTruths            VideoGroundTruth[]
-  referenceEmbeddings     ProductReferenceEmbedding[]
-  journeyEvents           CustomerJourneyEvent[]
-  journeyEventReviews     CustomerJourneyEventReview[] @relation("JourneyReviewCorrectedProduct")
-  pilotReviewExpectations PilotObservationReview[]     @relation("PilotReviewExpectedProduct")
-  bootstrapEvaluationRuns PilotEvaluationRun[]         @relation("PilotRunBootstrapProduct")
-  planogramCellAssignments PlanogramCellAssignment[]
-  cvScenarioExpectations  CvTestProtocolScenario[]     @relation("CvScenarioExpectedProduct")
+  barcodes                    ProductBarcode[]
+  inventoryLevels             InventoryLevel[]
+  inventoryMovements          InventoryMovement[]
+  checkoutSessionLines        CheckoutSessionLine[]
+  orderLines                  OrderLine[]
+  visionEventCandidates       VisionEventCandidate[]
+  visionReviewsApplied        VisionEventReview[]            @relation("VisionReviewAppliedProduct")
+  referenceImages             ProductReferenceImage[]
+  groundTruths                VideoGroundTruth[]
+  referenceEmbeddings         ProductReferenceEmbedding[]
+  journeyEvents               CustomerJourneyEvent[]
+  journeyEventReviews         CustomerJourneyEventReview[]   @relation("JourneyReviewCorrectedProduct")
+  pilotReviewExpectations     PilotObservationReview[]       @relation("PilotReviewExpectedProduct")
+  bootstrapEvaluationRuns     PilotEvaluationRun[]           @relation("PilotRunBootstrapProduct")
+  planogramCellAssignments    PlanogramCellAssignment[]
+  cvScenarioExpectations      CvTestProtocolScenario[]       @relation("CvScenarioExpectedProduct")
   calibrationZoneExpectations CameraCalibrationZoneProduct[] @relation("CameraCalibrationZoneExpectedProduct")
-  priceBookEntries        PriceBookEntry[]
+  priceBookEntries            PriceBookEntry[]
+
+  supplierProducts   SupplierProduct[]
+  purchaseOrderLines PurchaseOrderLine[]
+  goodsReceiptLines  GoodsReceiptLine[]
 
   @@unique([tenantId, sku])
   @@unique([id, tenantId])
@@ -962,10 +987,10 @@ model CameraSource {
   createdAt          DateTime           @default(now())
   updatedAt          DateTime           @updatedAt
 
-  tenant           Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location         Location            @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit             RetailUnit?         @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  replayVideoAsset VideoAsset?         @relation("CameraReplayAsset", fields: [replayVideoAssetId], references: [id], onDelete: SetNull)
+  tenant              Tenant                     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location            Location                   @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit                RetailUnit?                @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  replayVideoAsset    VideoAsset?                @relation("CameraReplayAsset", fields: [replayVideoAssetId], references: [id], onDelete: SetNull)
   pilotRuns           CameraPilotRun[]
   liveSessions        LiveCameraSession[]
   cvTestProtocols     CvTestProtocol[]
@@ -1269,6 +1294,12 @@ model InventoryMovement {
   product   Product  @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   createdBy User?    @relation("InventoryMovementActor", fields: [createdById], references: [id], onDelete: Restrict, onUpdate: NoAction)
 
+  goodsReceiptLine GoodsReceiptLine?
+
+  // Composite FK anchor (Phase 31): lets GoodsReceiptLine prove the movement
+  // it points at belongs to the SAME tenant. Purely additive — id alone is
+  // already unique, so this adds an index, not a new uniqueness rule.
+  @@unique([id, tenantId])
   @@index([tenantId, locationId, productId, createdAt(sort: Desc)])
   @@index([tenantId, createdAt(sort: Desc)])
   @@index([productId])
@@ -2361,18 +2392,18 @@ model VideoAsset {
   createdAt                DateTime              @default(now())
   updatedAt                DateTime              @updatedAt
 
-  tenant              Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location            Location?                @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit                RetailUnit?              @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  device              Device?                  @relation(fields: [deviceId], references: [id], onDelete: Restrict)
-  session             CheckoutSession?         @relation(fields: [sessionId], references: [id], onDelete: Restrict)
-  uploadedBy          User?                    @relation("VideoAssetUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
-  artifacts           VideoArtifact[]
-  extractionRequests  VideoExtractionRequest[]
-  groundTruth         VideoGroundTruth?
-  fusionRuns          PickupFusionRun[]
-  replayCameraSources CameraSource[]           @relation("CameraReplayAsset")
-  cameraPilotRuns     CameraPilotRun[]
+  tenant               Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location             Location?                @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit                 RetailUnit?              @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  device               Device?                  @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  session              CheckoutSession?         @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  uploadedBy           User?                    @relation("VideoAssetUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
+  artifacts            VideoArtifact[]
+  extractionRequests   VideoExtractionRequest[]
+  groundTruth          VideoGroundTruth?
+  fusionRuns           PickupFusionRun[]
+  replayCameraSources  CameraSource[]           @relation("CameraReplayAsset")
+  cameraPilotRuns      CameraPilotRun[]
   pretrainedVisionRuns PretrainedVisionRun[]
 
   @@unique([id, tenantId])
@@ -2488,12 +2519,12 @@ enum PilotExpectedAction {
 }
 
 model PilotEvaluationRun {
-  id          String                   @id @default(cuid())
-  tenantId    String
-  locationId  String?
-  name        String
-  description String?
-  status      PilotEvaluationRunStatus @default(OPEN)
+  id                 String                   @id @default(cuid())
+  tenantId           String
+  locationId         String?
+  name               String
+  description        String?
+  status             PilotEvaluationRunStatus @default(OPEN)
   // One-SKU bootstrap identity: the product this run bootstraps, set ONLY
   // by the bootstrap workflow's find-or-create (NULL for every other
   // pilot run). A partial unique index (raw SQL in the
@@ -2501,9 +2532,9 @@ model PilotEvaluationRun {
   // WHERE clause) allows at most ONE OPEN run per tenant/product, so
   // concurrent first corrections cannot split reviews across duplicates.
   bootstrapProductId String?
-  createdById String?
-  createdAt   DateTime                 @default(now())
-  completedAt DateTime?
+  createdById        String?
+  createdAt          DateTime                 @default(now())
+  completedAt        DateTime?
 
   tenant                 Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   location               Location?                 @relation(fields: [locationId], references: [id], onDelete: Restrict)
@@ -2540,27 +2571,27 @@ model PilotEvaluationSession {
 // review time — never caller-supplied. The newest review per observation
 // is the one metrics use; older rows remain as audit history.
 model PilotObservationReview {
-  id                 String                  @id @default(cuid())
-  tenantId           String
-  evaluationRunId    String
-  liveSessionId      String?
-  journeyEventId     String?
-  verdict            PilotObservationVerdict
-  expectedAction     PilotExpectedAction
-  expectedProductId  String?
-  expectedSku        String?
-  predictedProductId String?
-  predictedSku       String?
-  predictedAction    PilotExpectedAction?
+  id                     String                  @id @default(cuid())
+  tenantId               String
+  evaluationRunId        String
+  liveSessionId          String?
+  journeyEventId         String?
+  verdict                PilotObservationVerdict
+  expectedAction         PilotExpectedAction
+  expectedProductId      String?
+  expectedSku            String?
+  predictedProductId     String?
+  predictedSku           String?
+  predictedAction        PilotExpectedAction?
   // One-SKU bootstrap: OPAQUE id of the operator-approved manual CROP
   // VideoArtifact that supersedes the fusion run's automatic crop as
   // this observation's evidence. STRUCTURED (never parsed from notes),
   // validated tenant-scoped + same-video at write time, and carried into
   // Phase 18 candidates as evidenceCropArtifactId. Never a path or URL.
   operatorCropArtifactId String?
-  notes              String?
-  reviewedById       String?
-  createdAt          DateTime                @default(now())
+  notes                  String?
+  reviewedById           String?
+  createdAt              DateTime                @default(now())
 
   tenant          Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   evaluationRun   PilotEvaluationRun    @relation(fields: [evaluationRunId], references: [id], onDelete: Restrict)
@@ -2628,7 +2659,7 @@ model CvTestProtocol {
   createdAt        DateTime             @default(now())
   completedAt      DateTime?
 
-  tenant        Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  tenant                 Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   // SAME-TENANT composite location relation (Codex P1): the store join
   // carries the tenant in the FK itself — a malformed row can never
   // resolve another tenant's store name.
@@ -2714,33 +2745,33 @@ enum CameraCalibrationZoneType {
 }
 
 model CameraCalibrationProfile {
-  id                 String                          @id @default(cuid())
+  id                 String                         @id @default(cuid())
   tenantId           String
   cameraSourceId     String
   locationId         String?
   name               String
-  status             CameraCalibrationProfileStatus  @default(DRAFT)
-  calibrationVersion Int                             @default(1)
+  status             CameraCalibrationProfileStatus @default(DRAFT)
+  calibrationVersion Int                            @default(1)
   frameWidth         Int?
   frameHeight        Int?
-  orientation        CameraCalibrationOrientation    @default(UNKNOWN)
-  cameraMount        CameraCalibrationMount          @default(UNKNOWN)
+  orientation        CameraCalibrationOrientation   @default(UNKNOWN)
+  cameraMount        CameraCalibrationMount         @default(UNKNOWN)
   // Screened free text (reject-on-write): never a URL, path, credential,
   // or connection string — same policy as camera connectionNote.
   notes              String?
   createdById        String?
-  createdAt          DateTime                        @default(now())
-  updatedAt          DateTime                        @updatedAt
+  createdAt          DateTime                       @default(now())
+  updatedAt          DateTime                       @updatedAt
   activatedAt        DateTime?
   archivedAt         DateTime?
 
-  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  tenant                 Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   // SAME-TENANT composite relations (Codex P1): the FK itself carries the
   // tenant, so a malformed row can never resolve another tenant's source
   // or store.
-  cameraSource CameraSource @relation(fields: [cameraSourceId, tenantId], references: [id, tenantId], onDelete: Restrict)
-  location     Location?    @relation(fields: [locationId, tenantId], references: [id, tenantId], onDelete: Restrict)
-  zones        CameraCalibrationZone[]
+  cameraSource           CameraSource              @relation(fields: [cameraSourceId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  location               Location?                 @relation(fields: [locationId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  zones                  CameraCalibrationZone[]
   datasetImprovementRuns CvDatasetImprovementRun[]
 
   // At most ONE ACTIVE profile per camera source: partial unique index in
@@ -2767,9 +2798,9 @@ model CameraCalibrationZone {
   createdAt            DateTime                  @default(now())
   updatedAt            DateTime                  @updatedAt
 
-  tenant             Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  calibrationProfile CameraCalibrationProfile @relation(fields: [calibrationProfileId, tenantId], references: [id, tenantId], onDelete: Cascade)
-  cameraSource       CameraSource             @relation(fields: [cameraSourceId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  tenant             Tenant                         @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  calibrationProfile CameraCalibrationProfile       @relation(fields: [calibrationProfileId, tenantId], references: [id, tenantId], onDelete: Cascade)
+  cameraSource       CameraSource                   @relation(fields: [cameraSourceId, tenantId], references: [id, tenantId], onDelete: Restrict)
   expectedProducts   CameraCalibrationZoneProduct[]
 
   @@unique([id, tenantId])
@@ -2850,22 +2881,22 @@ enum CvDatasetEligibility {
 }
 
 model CvDatasetImprovementRun {
-  id                          String                        @id @default(cuid())
-  tenantId                    String
-  sourceEvaluationRunId       String?
-  sourceTestProtocolId        String?
-  sourceCalibrationProfileId  String?
-  name                        String
-  status                      CvDatasetImprovementRunStatus @default(DRAFT)
-  purpose                     CvDatasetPurpose
-  trainSplitPercent           Int
-  validationSplitPercent      Int
-  testSplitPercent            Int
-  minReviewedExamplesPerSku   Int
+  id                           String                        @id @default(cuid())
+  tenantId                     String
+  sourceEvaluationRunId        String?
+  sourceTestProtocolId         String?
+  sourceCalibrationProfileId   String?
+  name                         String
+  status                       CvDatasetImprovementRunStatus @default(DRAFT)
+  purpose                      CvDatasetPurpose
+  trainSplitPercent            Int
+  validationSplitPercent       Int
+  testSplitPercent             Int
+  minReviewedExamplesPerSku    Int
   minReviewedExamplesPerAction Int
   // Screened free text (reject-on-write): never a URL, path, credential,
   // or slot name — same policy as calibration notes.
-  notes                       String?
+  notes                        String?
   // sha256 over SAFE calibration content (profile id/version/orientation/
   // mount/updatedAt + zone counts, sorted zone ids, max zone updatedAt),
   // captured at candidate refresh when the linked profile is stamped on
@@ -2873,14 +2904,14 @@ model CvDatasetImprovementRun {
   // AND zone additions/updates/deletions after the refresh reject the
   // export instead of silently changing the manifest. Null when no
   // profile is linked or nothing is stamped (FILE_REPLAY exemption).
-  calibrationFingerprint      String?
-  createdById                 String?
-  createdAt                   DateTime                      @default(now())
-  updatedAt                   DateTime                      @updatedAt
-  exportedAt                  DateTime?
-  archivedAt                  DateTime?
+  calibrationFingerprint       String?
+  createdById                  String?
+  createdAt                    DateTime                      @default(now())
+  updatedAt                    DateTime                      @updatedAt
+  exportedAt                   DateTime?
+  archivedAt                   DateTime?
 
-  tenant             Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  tenant                   Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   // SAME-TENANT composite relations (Codex P1): the FK itself carries the
   // tenant, so a malformed row can never resolve another tenant's
   // evaluation run, protocol, or calibration profile.
@@ -2903,36 +2934,36 @@ model CvDatasetImprovementRun {
 // calibrationZoneLabel are ALWAYS null in the MVP: no source data exists
 // for them yet, and Phase 18 never fabricates values.
 model CvDatasetCandidate {
-  id                   String                       @id @default(cuid())
-  tenantId             String
-  runId                String
-  sourceType           CvDatasetCandidateSourceType
-  sourceId             String
-  liveSessionId        String?
-  evaluationRunId      String?
-  protocolId           String?
-  calibrationProfileId String?
-  skuId                String?
-  skuCodeSnapshot      String?
-  actionLabel          String
-  correctedActionLabel String?
-  reviewVerdict        String
-  reviewSource         String
-  confidenceBucket     String?
-  lightingBucket       String?
-  occlusionBucket      String?
-  calibrationZoneLabel String?
-  scenarioTypeSnapshot String?
+  id                     String                       @id @default(cuid())
+  tenantId               String
+  runId                  String
+  sourceType             CvDatasetCandidateSourceType
+  sourceId               String
+  liveSessionId          String?
+  evaluationRunId        String?
+  protocolId             String?
+  calibrationProfileId   String?
+  skuId                  String?
+  skuCodeSnapshot        String?
+  actionLabel            String
+  correctedActionLabel   String?
+  reviewVerdict          String
+  reviewSource           String
+  confidenceBucket       String?
+  lightingBucket         String?
+  occlusionBucket        String?
+  calibrationZoneLabel   String?
+  scenarioTypeSnapshot   String?
   // OPAQUE id of the operator-approved crop artifact this candidate's
   // evidence resolves to (copied from the source review's structured
   // operatorCropArtifactId at refresh). Null = the source event's own
   // automatic fusion crop. Reference marker only — never a path/URL.
   evidenceCropArtifactId String?
-  split                CvDatasetSplit?
-  eligibility          CvDatasetEligibility
-  exclusionReason      String?
-  createdAt            DateTime                     @default(now())
-  updatedAt            DateTime                     @updatedAt
+  split                  CvDatasetSplit?
+  eligibility            CvDatasetEligibility
+  exclusionReason        String?
+  createdAt              DateTime                     @default(now())
+  updatedAt              DateTime                     @updatedAt
 
   tenant Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   run    CvDatasetImprovementRun @relation(fields: [runId, tenantId], references: [id, tenantId], onDelete: Cascade)
@@ -3021,20 +3052,22 @@ enum PretrainedVisionRunStatus {
 // paths, raw tensors, raw media, or provider logs. Records the planogram
 // version the run was scored against (version safety).
 model PretrainedVisionRun {
-  id               String                    @id @default(cuid())
-  tenantId         String
-  videoAssetId     String
-  provider         String
-  status           PretrainedVisionRunStatus
-  planogramRackId  String?
-  planogramVersion Int?
-  /** The EXACT sanitized planogram section the run was scored against —
-   *  immutable evidence: publishing a new planogram version can never
-   *  rewrite what an old run's candidates/match status looked like. */
+  id                String                    @id @default(cuid())
+  tenantId          String
+  videoAssetId      String
+  provider          String
+  status            PretrainedVisionRunStatus
+  planogramRackId   String?
+  planogramVersion  Int?
+  /**
+   * The EXACT sanitized planogram section the run was scored against —
+   * immutable evidence: publishing a new planogram version can never
+   * rewrite what an old run's candidates/match status looked like.
+   */
   planogramEvidence Json?
-  evidence         Json
-  createdById      String?
-  createdAt        DateTime                  @default(now())
+  evidence          Json
+  createdById       String?
+  createdAt         DateTime                  @default(now())
 
   tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   videoAsset VideoAsset @relation(fields: [videoAssetId], references: [id], onDelete: Cascade)
@@ -3153,10 +3186,10 @@ model PriceBookVersion {
   createdBy   User?     @relation("PriceBookVersionActor", fields: [createdById], references: [id], onDelete: Restrict)
   activatedBy User?     @relation("PriceBookVersionActivator", fields: [activatedById], references: [id], onDelete: Restrict)
 
-  supersededBy    PriceBookVersion? @relation("PriceBookSupersession", fields: [supersededByVersionId], references: [id], onDelete: Restrict)
-  supersedes      PriceBookVersion? @relation("PriceBookSupersession")
-  rolledBackFrom  PriceBookVersion? @relation("PriceBookRollback", fields: [rolledBackFromVersionId], references: [id], onDelete: Restrict)
-  rollbackCopies  PriceBookVersion[] @relation("PriceBookRollback")
+  supersededBy   PriceBookVersion?  @relation("PriceBookSupersession", fields: [supersededByVersionId], references: [id], onDelete: Restrict)
+  supersedes     PriceBookVersion?  @relation("PriceBookSupersession")
+  rolledBackFrom PriceBookVersion?  @relation("PriceBookRollback", fields: [rolledBackFromVersionId], references: [id], onDelete: Restrict)
+  rollbackCopies PriceBookVersion[] @relation("PriceBookRollback")
 
   entries PriceBookEntry[]
 
@@ -3190,4 +3223,283 @@ model PriceBookEntry {
   @@unique([versionId, productId])
   @@index([tenantId, productId])
   @@index([tenantId, versionId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 31 — Procurement. Suppliers, purchase orders and goods receipts.
+//
+// The hard rule this domain has to respect is the inventory one: receiving
+// stock is an append-only ledger movement like every other stock change, so a
+// goods receipt NEVER writes a quantity. It posts RECEIPT movements through
+// InventoryRepository.applyMovement and lets the projection follow.
+//
+// Ordered-vs-received is likewise a projection: PurchaseOrderLine has no
+// mutable receivedQuantity counter. What was received is the sum of the
+// GoodsReceiptLine rows pointing at it, so the order can never drift from the
+// ledger the receipts produced.
+// ---------------------------------------------------------------------------
+
+enum SupplierStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  SUBMITTED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+}
+
+/// Closed vocabulary for "what arrived is not what was ordered". NONE is the
+/// ordinary case and is stored explicitly so an unset value is never ambiguous.
+enum GoodsReceiptDiscrepancy {
+  NONE
+  SHORT_DELIVERY
+  OVER_DELIVERY
+  DAMAGED
+  SUBSTITUTED
+}
+
+/// A vendor this tenant buys from. Contact metadata is deliberately a small
+/// set of plain columns rather than free-form JSON: credentials and payment
+/// instruments must never land here (AGENTS.md payments invariant), and the
+/// service screens every free-text field before it is stored.
+model Supplier {
+  id           String         @id @default(cuid())
+  tenantId     String
+  /// Short code, unique per tenant, normalized to uppercase.
+  code         String
+  name         String
+  status       SupplierStatus @default(ACTIVE)
+  contactName  String?
+  contactEmail String?
+  contactPhone String?
+  /// Default lead time in days, used to suggest an expected delivery date.
+  leadTimeDays Int?
+  notes        String?
+  createdById  String?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  tenant    Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  createdBy User?  @relation("SupplierActor", fields: [createdById], references: [id], onDelete: Restrict)
+
+  supplierProducts SupplierProduct[]
+  purchaseOrders   PurchaseOrder[]
+
+  @@unique([tenantId, code])
+  @@unique([id, tenantId])
+  @@index([tenantId, status])
+  @@index([tenantId, name])
+}
+
+/// What one supplier calls one of our products, and what they charge for it.
+/// The current cost lives here for fast reads; every change appends a
+/// SupplierProductCost row, so purchase cost is auditable and reversible the
+/// same way retail price is (see PriceBookVersion).
+model SupplierProduct {
+  id            String   @id @default(cuid())
+  tenantId      String
+  supplierId    String
+  productId     String
+  /// The supplier's own identifier for this product, as printed on their
+  /// paperwork. Unique per supplier.
+  supplierSku   String
+  /// Units of OUR product per supplier pack. Ordering 3 packs of 12 receives
+  /// 36 units into the ledger.
+  packSize      Int      @default(1)
+  /// Current purchase cost of ONE PACK, in minor currency units.
+  unitCostMinor Int
+  currencyCode  String
+  leadTimeDays  Int?
+  isPreferred   Boolean  @default(false)
+  createdById   String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  supplier  Supplier @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  createdBy User?    @relation("SupplierProductActor", fields: [createdById], references: [id], onDelete: Restrict)
+
+  costHistory        SupplierProductCost[]
+  purchaseOrderLines PurchaseOrderLine[]
+
+  @@unique([id, tenantId])
+  @@unique([supplierId, productId])
+  @@unique([supplierId, supplierSku])
+  @@index([tenantId, productId])
+  @@index([tenantId, supplierId])
+}
+
+/// Append-only cost history. Rows are never updated or deleted; the newest
+/// row by recordedAt is what SupplierProduct.unitCostMinor mirrors.
+model SupplierProductCost {
+  id                String   @id @default(cuid())
+  tenantId          String
+  supplierProductId String
+  unitCostMinor     Int
+  currencyCode      String
+  packSize          Int
+  /// Why the cost changed, in the operator's words. Screened for
+  /// credential- and payment-shaped values before it is stored.
+  reason            String?
+  recordedById      String?
+  recordedAt        DateTime @default(now())
+
+  tenant          Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  supplierProduct SupplierProduct @relation(fields: [supplierProductId], references: [id], onDelete: Cascade)
+  recordedBy      User?           @relation("SupplierProductCostActor", fields: [recordedById], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@index([tenantId, supplierProductId, recordedAt(sort: Desc)])
+}
+
+/// An order placed with a supplier, delivered to one location.
+model PurchaseOrder {
+  id                String              @id @default(cuid())
+  tenantId          String
+  /// Human-facing reference, unique per tenant (PO-2026-0001).
+  reference         String
+  supplierId        String
+  /// Where the goods are delivered; receiving writes the ledger here.
+  locationId        String
+  status            PurchaseOrderStatus @default(DRAFT)
+  currencyCode      String
+  expectedAt        DateTime?
+  submittedAt       DateTime?
+  /// Set when the order reaches RECEIVED or CANCELLED — the terminal states.
+  closedAt          DateTime?
+  cancelledReason   String?
+  /// Sum of line (packs x unit cost) at submission, in minor units. Null
+  /// while DRAFT, because a draft's lines are still moving.
+  totalCostMinor    Int?
+  notes             String?
+  /// Opaque acknowledgement reference returned by the supplier adapter. Never
+  /// a URL, a credential, or anything the adapter was given in confidence.
+  externalReference String?
+  createdById       String?
+  submittedById     String?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  supplier    Supplier @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  location    Location @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  createdBy   User?    @relation("PurchaseOrderActor", fields: [createdById], references: [id], onDelete: Restrict)
+  submittedBy User?    @relation("PurchaseOrderSubmitter", fields: [submittedById], references: [id], onDelete: Restrict)
+
+  lines    PurchaseOrderLine[]
+  receipts GoodsReceipt[]
+
+  @@unique([tenantId, reference])
+  @@unique([id, tenantId])
+  @@index([tenantId, status, createdAt(sort: Desc)])
+  @@index([tenantId, supplierId])
+  @@index([tenantId, locationId])
+}
+
+/// One product on a purchase order. There is deliberately NO receivedQuantity
+/// column: what arrived is derived from the GoodsReceiptLine rows.
+model PurchaseOrderLine {
+  id                String   @id @default(cuid())
+  tenantId          String
+  purchaseOrderId   String
+  productId         String
+  /// Nullable so a line survives the supplier catalog entry being archived.
+  supplierProductId String?
+  /// Product snapshot, immutable even if the catalog entry is edited later.
+  sku               String
+  productName       String
+  /// Packs ordered (>= 1, CHECK in migration SQL).
+  quantityOrdered   Int
+  /// Units of our product per pack, snapshotted at order time.
+  packSize          Int      @default(1)
+  /// Cost of ONE PACK in minor units at order time.
+  unitCostMinor     Int
+  currencyCode      String
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  purchaseOrder   PurchaseOrder    @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  product         Product          @relation(fields: [productId], references: [id], onDelete: Restrict)
+  supplierProduct SupplierProduct? @relation(fields: [supplierProductId], references: [id], onDelete: Restrict)
+
+  receiptLines GoodsReceiptLine[]
+
+  @@unique([id, tenantId])
+  @@unique([purchaseOrderId, productId])
+  @@index([tenantId, purchaseOrderId])
+  @@index([tenantId, productId])
+}
+
+/// What physically arrived, once. Append-only: a receipt is never edited or
+/// deleted, because the ledger movements it produced cannot be unwritten. A
+/// mistake is corrected by a further receipt or an inventory correction.
+model GoodsReceipt {
+  id              String   @id @default(cuid())
+  tenantId        String
+  purchaseOrderId String
+  /// Human-facing reference, unique per tenant (GR-2026-0001).
+  reference       String
+  /// The supplier's delivery note number, as written on the paperwork.
+  deliveryNote    String?
+  receivedAt      DateTime @default(now())
+  notes           String?
+  /// Tenant-scoped idempotency for posting replays: the same key returns the
+  /// receipt it already created instead of writing the ledger twice.
+  idempotencyKey  String?
+  receivedById    String?
+  createdAt       DateTime @default(now())
+
+  tenant        Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Restrict)
+  receivedBy    User?         @relation("GoodsReceiptActor", fields: [receivedById], references: [id], onDelete: Restrict)
+
+  lines GoodsReceiptLine[]
+
+  @@unique([tenantId, reference])
+  @@unique([tenantId, idempotencyKey])
+  @@unique([id, tenantId])
+  @@index([tenantId, purchaseOrderId, receivedAt(sort: Desc)])
+}
+
+/// One product line of one receipt, and the ledger movement it produced.
+/// `inventoryMovementId` is the audit bridge: every received unit is
+/// traceable to the exact append-only movement that admitted it.
+model GoodsReceiptLine {
+  id                  String                  @id @default(cuid())
+  tenantId            String
+  goodsReceiptId      String
+  purchaseOrderLineId String
+  productId           String
+  /// Packs accepted on this line. Zero is legal (nothing arrived); negative
+  /// is not (CHECK in migration SQL).
+  quantityReceived    Int
+  /// Units of our product per pack, snapshotted from the order line, so the
+  /// ledger delta is reconstructible without a join.
+  packSize            Int                     @default(1)
+  /// quantityReceived x packSize — the signed delta written to the ledger.
+  unitsReceived       Int
+  discrepancy         GoodsReceiptDiscrepancy @default(NONE)
+  discrepancyNote     String?
+  /// The RECEIPT movement this line appended. Null only when the line
+  /// received nothing, so no movement was written.
+  inventoryMovementId String?                 @unique
+  createdAt           DateTime                @default(now())
+
+  tenant            Tenant             @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  goodsReceipt      GoodsReceipt       @relation(fields: [goodsReceiptId], references: [id], onDelete: Cascade)
+  purchaseOrderLine PurchaseOrderLine  @relation(fields: [purchaseOrderLineId], references: [id], onDelete: Restrict)
+  product           Product            @relation(fields: [productId], references: [id], onDelete: Restrict)
+  inventoryMovement InventoryMovement? @relation(fields: [inventoryMovementId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@unique([goodsReceiptId, purchaseOrderLineId])
+  @@index([tenantId, goodsReceiptId])
+  @@index([tenantId, purchaseOrderLineId])
+  @@index([tenantId, productId])
 }

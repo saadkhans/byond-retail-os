@@ -2375,3 +2375,121 @@ export function pretrainedEvaluatePath(videoAssetId: string): string {
 export function pretrainedReportPath(videoAssetId: string): string {
   return `/pretrained-vision/videos/${encodeURIComponent(videoAssetId)}/report`;
 }
+
+/* ---------------------------------------------------------------- */
+/* Procurement (Phase 31)                                             */
+/* ---------------------------------------------------------------- */
+
+export type SupplierStatus = 'ACTIVE' | 'ARCHIVED';
+
+export type PurchaseOrderStatus =
+  | 'DRAFT'
+  | 'SUBMITTED'
+  | 'PARTIALLY_RECEIVED'
+  | 'RECEIVED'
+  | 'CANCELLED';
+
+export type GoodsReceiptDiscrepancy =
+  | 'NONE'
+  | 'SHORT_DELIVERY'
+  | 'OVER_DELIVERY'
+  | 'DAMAGED'
+  | 'SUBSTITUTED';
+
+export interface Supplier {
+  id: string;
+  code: string;
+  name: string;
+  status: SupplierStatus;
+  contactName: string | null;
+  contactEmail: string | null;
+  contactPhone: string | null;
+  leadTimeDays: number | null;
+  notes: string | null;
+  createdAt: string;
+}
+
+export interface SupplierProduct {
+  id: string;
+  supplierId: string;
+  productId: string;
+  supplierSku: string;
+  packSize: number;
+  unitCostMinor: number;
+  currencyCode: string;
+  isPreferred: boolean;
+  product?: { id: string; sku: string; name: string } | null;
+  supplier?: { id: string; code: string; name: string } | null;
+}
+
+/**
+ * Received and outstanding quantities are computed by the API from the goods
+ * receipts posted against the line. There is no stored counter, which is why
+ * they can never disagree with the inventory ledger.
+ */
+export interface PurchaseOrderLine {
+  id: string;
+  productId: string;
+  sku: string;
+  productName: string;
+  quantityOrdered: number;
+  packSize: number;
+  unitCostMinor: number;
+  currencyCode: string;
+  quantityReceived: number;
+  quantityOutstanding: number;
+  unitsReceived: number;
+}
+
+export interface GoodsReceiptLine {
+  id: string;
+  purchaseOrderLineId: string;
+  productId: string;
+  quantityReceived: number;
+  packSize: number;
+  unitsReceived: number;
+  discrepancy: GoodsReceiptDiscrepancy;
+  discrepancyNote: string | null;
+  inventoryMovementId: string | null;
+  product?: { id: string; sku: string; name: string } | null;
+}
+
+export interface GoodsReceipt {
+  id: string;
+  purchaseOrderId: string;
+  reference: string;
+  deliveryNote: string | null;
+  notes: string | null;
+  receivedAt: string;
+  lines: GoodsReceiptLine[];
+}
+
+export interface PurchaseOrder {
+  id: string;
+  reference: string;
+  supplierId: string;
+  locationId: string;
+  status: PurchaseOrderStatus;
+  currencyCode: string;
+  expectedAt: string | null;
+  submittedAt: string | null;
+  closedAt: string | null;
+  cancelledReason: string | null;
+  totalCostMinor: number | null;
+  computedTotalMinor: number;
+  externalReference: string | null;
+  notes: string | null;
+  createdAt: string;
+  supplier?: { id: string; code: string; name: string } | null;
+  location?: { id: string; code: string; name: string } | null;
+  lines: PurchaseOrderLine[];
+  receipts: GoodsReceipt[];
+}
+
+export interface ReceiptMovement {
+  id: string;
+  productId: string;
+  quantityDelta: number;
+  quantityAfter: number;
+  createdAt: string;
+}
