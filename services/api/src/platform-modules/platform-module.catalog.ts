@@ -198,9 +198,19 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
   {
     code: 'esl',
     name: 'Electronic Shelf Labels',
-    description: 'ESL vendor integration (later phase).',
-    defaultEnabled: false,
-    isActive: false,
+    description:
+      'Vendor-neutral electronic shelf labels: gateways and labels behind ' +
+      'an adapter port, price-activation propagation, and a leased retry ' +
+      'queue.',
+    // Shipped in Phase 28 and DEFAULT-ENABLED for the same reason as
+    // inventory/devices/checkout/pricing (see above): the only enable
+    // endpoint is @TenantOnly(), so leaving this false would strand new
+    // tenants behind 403s. RBAC still gates every route independently.
+    // Tenants that existed BEFORE Phase 28 are covered by the
+    // 20260916110001_esl_module_backfill migration — defaultEnabled only
+    // applies at tenant creation time.
+    defaultEnabled: true,
+    isActive: true,
   },
   {
     code: 'loyalty',

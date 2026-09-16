@@ -322,6 +322,35 @@ export class PricingRepository extends TenantScopedRepository {
   }
 
   /**
+   * The minimum an activation listener needs: where the book applies, and
+   * which products the version prices. Kept here (rather than reusing
+   * findEntries) so a listener never pulls whole entry rows — prices are not
+   * a subscriber's business, only the fact that they changed.
+   */
+  async findActivationFacts(
+    tenantId: string,
+    bookId: string,
+    versionId: string,
+  ): Promise<{ locationId: string | null; productIds: string[] } | null> {
+    const book = await this.prisma.priceBook.findFirst({
+      where: this.scope(tenantId, { id: bookId }),
+      select: { locationId: true },
+    });
+    if (!book) {
+      return null;
+    }
+    const entries = await this.prisma.priceBookEntry.findMany({
+      where: this.scope(tenantId, { versionId }),
+      select: { productId: true },
+      orderBy: { productId: 'asc' },
+    });
+    return {
+      locationId: book.locationId,
+      productIds: entries.map((entry) => entry.productId),
+    };
+  }
+
+  /**
    * Replaces the entry set of a DRAFT version.
    *
    * The DRAFT check is the immutability invariant: once a version has been

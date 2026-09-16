@@ -68,4 +68,10 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   { code: 'cycle-count:manage', module: 'returns', description: 'Open a count, record counted quantities, reconcile the count into ledger corrections, or abandon it' },
   { code: 'shrink:read', module: 'returns', description: 'View recorded shrink write-offs' },
   { code: 'shrink:record', module: 'returns', description: 'Write off a CV-detected loss as a SHRINK ledger movement' },
+  { code: 'esl-gateway:read', module: 'esl', description: 'View electronic shelf label gateways and the vendor adapters this deployment offers' },
+  { code: 'esl-gateway:manage', module: 'esl', description: 'Register, update, disable, and discover labels on ESL gateways' },
+  { code: 'esl-label:read', module: 'esl', description: 'View electronic shelf labels, their bindings, and their battery/signal health' },
+  { code: 'esl-label:manage', module: 'esl', description: 'Register labels, bind them to products and planogram cells, retire them, and request a re-render' },
+  { code: 'esl-job:read', module: 'esl', description: 'View label update jobs, their attempts, and their failure reasons' },
+  { code: 'esl-job:process', module: 'esl', description: 'Run a label update pass, reclaim expired worker leases, and reconcile labels against the price in force' },
 ];

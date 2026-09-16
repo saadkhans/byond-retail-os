@@ -2,6 +2,7 @@ import { ConflictException, NotFoundException } from '@nestjs/common';
 import { AuditLogService } from '../common/audit/audit-log.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { PlatformModulesService } from '../platform-modules/platform-modules.service';
+import { PriceActivationHub } from './price-activation.hub';
 import { PriceResolutionService } from './price-resolution.service';
 import { PricingRepository } from './pricing.repository';
 import { PricingService } from './pricing.service';
@@ -239,12 +240,14 @@ function buildHarness() {
     isEnabledForTenant: jest.fn(async () => true),
   } as unknown as PlatformModulesService;
   const resolution = new PriceResolutionService(repository, platformModules);
-  const service = new PricingService(repository, resolution);
+  const activationHub = new PriceActivationHub();
+  const service = new PricingService(repository, resolution, activationHub);
   return {
     service,
     resolution,
     repository,
     platformModules,
+    activationHub,
     books,
     versions,
     entries,

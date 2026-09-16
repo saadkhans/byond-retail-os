@@ -32,6 +32,7 @@ import {
   normalizePriceBookCode,
   ResolvedPrice,
 } from './pricing.logic';
+import { PriceActivationHub } from './price-activation.hub';
 import { PriceResolutionService } from './price-resolution.service';
 import {
   PriceBookDetail,
@@ -66,6 +67,7 @@ export class PricingService {
   constructor(
     private readonly repository: PricingRepository,
     private readonly resolution: PriceResolutionService,
+    private readonly activationHub: PriceActivationHub,
   ) {}
 
   // ---------------------------------------------------------------- books
@@ -314,7 +316,9 @@ export class PricingService {
           }),
       },
     );
-    return this.unwrapVersion(result, bookId);
+    const activated = this.unwrapVersion(result, bookId);
+    await this.announceActivation(tenantId, bookId, activated.id);
+    return activated;
   }
 
   /**
@@ -368,7 +372,40 @@ export class PricingService {
           }),
       },
     );
-    return this.unwrapVersion(result, bookId);
+    const activated = this.unwrapVersion(result, bookId);
+    // A rollback IS an activation — shopper-visible prices just changed, so
+    // subscribers must hear about it exactly as they would for a forward
+    // change. Forgetting this is how a rolled-back price stays on a shelf.
+    await this.announceActivation(tenantId, bookId, activated.id);
+    return activated;
+  }
+
+  /**
+   * Tells subscribers that a version is now in force. Runs AFTER the
+   * activation transaction has committed, so a listener can never observe a
+   * price that was rolled back — and the hub isolates listener failures, so a
+   * subscriber can never fail the price change.
+   */
+  private async announceActivation(
+    tenantId: string,
+    bookId: string,
+    versionId: string,
+  ): Promise<void> {
+    const facts = await this.repository.findActivationFacts(
+      tenantId,
+      bookId,
+      versionId,
+    );
+    if (!facts) {
+      return;
+    }
+    await this.activationHub.publish({
+      tenantId,
+      priceBookId: bookId,
+      priceBookVersionId: versionId,
+      locationId: facts.locationId,
+      productIds: facts.productIds,
+    });
   }
 
   // ------------------------------------------------------------ resolution

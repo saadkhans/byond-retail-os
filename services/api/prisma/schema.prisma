@@ -291,13 +291,15 @@ model Tenant {
   storeFlowPolicies       StoreFlowPolicy[]
   storeFlowPolicyVersions StoreFlowPolicyVersion[]
   storeFlowProjections    StoreFlowProjection[]
-
   paymentRefunds   PaymentRefund[]
   orderReturns     OrderReturn[]
   orderReturnLines OrderReturnLine[]
   cycleCounts      CycleCount[]
   cycleCountLines  CycleCountLine[]
   shrinkEvents     ShrinkEvent[]
+  eslGateways   EslGateway[]
+  eslLabels     EslLabel[]
+  eslUpdateJobs EslUpdateJob[]
 }
 
 model User {
@@ -349,12 +351,14 @@ model User {
   storeEntryTokensIssued         StoreEntryToken[]        @relation("StoreEntryTokenIssuer")
   storeFlowPoliciesCreated       StoreFlowPolicy[]        @relation("StoreFlowPolicyActor")
   storeFlowPolicyVersionsCreated StoreFlowPolicyVersion[] @relation("StoreFlowPolicyVersionActor")
-
   paymentRefundsCreated PaymentRefund[] @relation("PaymentRefundActor")
   orderReturnsRecorded  OrderReturn[]   @relation("OrderReturnActor")
   cycleCountsOpened     CycleCount[]    @relation("CycleCountActor")
   cycleCountsReconciled CycleCount[]    @relation("CycleCountReconciler")
   shrinkEventsRecorded  ShrinkEvent[]   @relation("ShrinkEventActor")
+  eslGatewaysCreated   EslGateway[]   @relation("EslGatewayActor")
+  eslLabelsCreated     EslLabel[]     @relation("EslLabelActor")
+  eslUpdateJobsCreated EslUpdateJob[] @relation("EslUpdateJobActor")
 
   // Composite FK target for same-tenant creator constraints (id alone is
   // already unique; this adds nothing semantically, only an FK anchor).
@@ -458,6 +462,7 @@ model Location {
   storeFlowPolicies         StoreFlowPolicy[]
   cycleCounts               CycleCount[]
   shrinkEvents              ShrinkEvent[]
+  eslGateways         EslGateway[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -621,6 +626,7 @@ model Product {
   orderReturnLines            OrderReturnLine[]
   cycleCountLines             CycleCountLine[]
   shrinkEvents                ShrinkEvent[]
+  eslLabels                   EslLabel[]
 
   @@unique([tenantId, sku])
   @@unique([id, tenantId])
@@ -3097,6 +3103,8 @@ model PlanogramCellAssignment {
   rack    PlanogramRack @relation(fields: [rackId], references: [id], onDelete: Cascade)
   product Product       @relation(fields: [productId], references: [id], onDelete: Restrict)
 
+  eslLabels EslLabel[]
+
   @@unique([id, tenantId])
   @@unique([rackId, cellCode, productId])
   @@index([tenantId, rackId])
@@ -3255,6 +3263,9 @@ model PriceBookVersion {
   rollbackCopies PriceBookVersion[] @relation("PriceBookRollback")
 
   entries PriceBookEntry[]
+
+  eslRenderedLabels EslLabel[]     @relation("EslLabelRenderedVersion")
+  eslUpdateJobs     EslUpdateJob[] @relation("EslJobPriceVersion")
 
   @@unique([id, tenantId])
   @@unique([priceBookId, versionNumber])
@@ -3814,4 +3825,190 @@ model ShrinkEvent {
   @@unique([id, tenantId])
   @@index([tenantId, locationId, createdAt, id])
   @@index([tenantId, productId, createdAt, id])
+// Phase 28 — Electronic shelf labels.
+//
+// Labels are physical devices owned by a vendor gateway. BYOND never speaks a
+// vendor protocol in domain code: every gateway names a `vendorCode` that
+// resolves to an adapter behind EslVendorPort, and credentials are NEVER
+// stored here — `credentialRef` is an opaque key the runtime looks up in
+// configuration. Price propagation is queue-driven with the same lease +
+// attempt-budget + fencing-token idiom as the inference queue, so a hung
+// worker cannot strand a label and a replayed activation cannot double-push.
+// ---------------------------------------------------------------------------
+
+enum EslGatewayStatus {
+  /// Registered but never reached; cannot be claimed by the processor.
+  PENDING
+  ACTIVE
+  /// Operator-disabled. Jobs for its labels are cancelled, not retried.
+  DISABLED
+  /// Was ACTIVE, last contact failed. Still claimable — it may recover.
+  UNREACHABLE
+}
+
+enum EslLabelStatus {
+  /// Discovered on the gateway, not yet bound to a product.
+  UNBOUND
+  BOUND
+  /// Physically removed. Never enqueued again.
+  RETIRED
+}
+
+enum EslUpdateJobStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  /// The label was retired or its gateway disabled before delivery.
+  CANCELLED
+}
+
+/// Why a label needed re-rendering. Closed vocabulary — a new trigger is a
+/// schema change, never a free-text string.
+enum EslUpdateTrigger {
+  PRICE_ACTIVATION
+  MANUAL_RERENDER
+  LABEL_BOUND
+  /// Enqueued by the reconciliation sweep, which repairs labels whose
+  /// rendered version drifted from the price that is actually in force.
+  RECONCILIATION
+}
+
+/// Closed error vocabulary. `lastErrorMessage` is a screened, vendor-supplied
+/// string kept for operators; code is what logic branches on.
+enum EslUpdateErrorCode {
+  GATEWAY_UNREACHABLE
+  GATEWAY_DISABLED
+  LABEL_UNREACHABLE
+  LABEL_RETIRED
+  VENDOR_REJECTED
+  VENDOR_TIMEOUT
+  /// No price resolves for the bound product, so there is nothing to show.
+  CONTENT_UNRESOLVABLE
+  UNKNOWN_VENDOR
+  LEASE_EXPIRED
+}
+
+/// A vendor gateway serving the labels in one location.
+model EslGateway {
+  id       String @id @default(cuid())
+  tenantId String
+  /// Unique per tenant, normalized to uppercase (like PriceBook.code).
+  code     String
+  name     String
+  /// Selects the adapter behind EslVendorPort. 'SIMULATED' always resolves.
+  vendorCode String
+  /// Labels belong to a store; a gateway is always location-bound.
+  locationId String
+  status     EslGatewayStatus @default(PENDING)
+  /// OPAQUE configuration key (e.g. 'ACME_STORE_01'). The runtime resolves it
+  /// to a credential from the environment. A secret must NEVER be written
+  /// here; the service rejects credential-shaped values.
+  credentialRef String?
+  /// Vendor-neutral, credential-free connection hints. Screened on write by
+  /// findSensitiveKeyPath, exactly as Device.metadata is.
+  metadata      Json?
+  lastSeenAt    DateTime?
+  createdById   String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location  Location  @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  createdBy User?     @relation("EslGatewayActor", fields: [createdById], references: [id], onDelete: Restrict)
+
+  labels     EslLabel[]
+  updateJobs EslUpdateJob[]
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, code])
+  @@index([tenantId, status])
+  @@index([tenantId, locationId, status])
+}
+
+/// One physical label.
+model EslLabel {
+  id        String @id @default(cuid())
+  tenantId  String
+  gatewayId String
+  /// The vendor's own identifier for the hardware. Unique per gateway.
+  vendorLabelId String
+  productId     String?
+  /// Optional planogram placement, so a label can be traced to a shelf cell.
+  cellAssignmentId String?
+  status           EslLabelStatus @default(UNBOUND)
+  batteryPercent   Int?
+  signalPercent    Int?
+  /// What the label is actually SHOWING — set only when a push succeeded.
+  lastRenderedAt      DateTime?
+  renderedVersionId   String?
+  /// Hash of the rendered content, so reconciliation can tell "already
+  /// correct" from "never pushed" without storing the content itself.
+  renderedContentHash String?
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant         Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  gateway        EslGateway               @relation(fields: [gatewayId], references: [id], onDelete: Restrict)
+  product        Product?                 @relation(fields: [productId], references: [id], onDelete: Restrict)
+  cellAssignment PlanogramCellAssignment? @relation(fields: [cellAssignmentId], references: [id], onDelete: Restrict)
+  renderedVersion PriceBookVersion?       @relation("EslLabelRenderedVersion", fields: [renderedVersionId], references: [id], onDelete: Restrict)
+  createdBy      User?                    @relation("EslLabelActor", fields: [createdById], references: [id], onDelete: Restrict)
+
+  updateJobs EslUpdateJob[]
+
+  @@unique([id, tenantId])
+  @@unique([gatewayId, vendorLabelId])
+  @@index([tenantId, status])
+  @@index([tenantId, productId])
+  @@index([tenantId, gatewayId, status])
+}
+
+/// A queued push of content to one label.
+model EslUpdateJob {
+  id        String @id @default(cuid())
+  tenantId  String
+  labelId   String
+  /// Denormalized from the label so the processor can batch by gateway
+  /// without a join, and so a claim stays a single indexed read.
+  gatewayId String
+  trigger   EslUpdateTrigger
+  /// The activation that caused this push, when there was one.
+  priceBookVersionId String?
+  status             EslUpdateJobStatus @default(QUEUED)
+  /// Content fingerprint at enqueue time. A push whose label already shows
+  /// this hash is a no-op success, which makes replay free.
+  contentHash String
+  /// Tenant-scoped de-duplication. For a price activation this is
+  /// "<versionId>:<labelId>", so the same activation can never enqueue twice.
+  idempotencyKey String
+  attempts       Int  @default(0)
+  /// Set on claim; the worker echoes it back as a fencing token so a late
+  /// result from a reclaimed attempt cannot commit over the live one.
+  claimedAttempt Int?
+  leaseExpiresAt DateTime?
+  /// Backoff gate: a QUEUED job is invisible to claims until this instant.
+  nextAttemptAt  DateTime  @default(now())
+  lastErrorCode    EslUpdateErrorCode?
+  lastErrorMessage String?
+  requestedAt DateTime  @default(now())
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant           Tenant            @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  label            EslLabel          @relation(fields: [labelId], references: [id], onDelete: Restrict)
+  gateway          EslGateway        @relation(fields: [gatewayId], references: [id], onDelete: Restrict)
+  priceBookVersion PriceBookVersion? @relation("EslJobPriceVersion", fields: [priceBookVersionId], references: [id], onDelete: Restrict)
+  createdBy        User?             @relation("EslUpdateJobActor", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, status, nextAttemptAt, requestedAt, id])
+  @@index([tenantId, labelId, status])
+  @@index([tenantId, gatewayId, status])
+  @@index([tenantId, priceBookVersionId])
 }

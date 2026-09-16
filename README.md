@@ -40,6 +40,7 @@ scripts/         Repo automation scripts
 - [docs/product/pricing.md](docs/product/pricing.md) — versioned pricing model and rules
 - [docs/product/store-flow.md](docs/product/store-flow.md) — the autonomous store loop: entry, the observation → basket bridge, exit settlement
 - [docs/product/returns.md](docs/product/returns.md) — the reverse flow: returns, refunds, cycle counts and shrink, all through the ledger
+- [docs/product/esl.md](docs/product/esl.md) — vendor-neutral electronic shelf labels
 
 ## Getting started
 
@@ -91,7 +92,10 @@ reconciliation page drives the Phase 27 reverse flow — record a return or
 cancel a settled order (goods back into stock as ledger movements, then a
 refund bounded by what was captured), run a cycle count or stocktake that
 reconciles the projection against the ledger, and write off a CV-detected loss
-(see [docs/product/returns.md](docs/product/returns.md)). The API's CORS
+(see [docs/product/returns.md](docs/product/returns.md)). Shelf labels are
+managed under **Shelf labels**, where a gateway is registered against a
+simulated (or real) vendor adapter and its labels follow every price
+activation — see [docs/product/esl.md](docs/product/esl.md). The API's CORS
 allowlist defaults to
 `http://localhost:5173` (override with `CORS_ORIGINS`).
 

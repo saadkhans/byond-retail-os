@@ -47,9 +47,10 @@ describe('platform module catalog', () => {
   it('default-enables core plus every shipped module', () => {
     // inventory (Phase 3), devices (Phase 4), pricing (Phase 25),
     // checkout (Phase 5), payments (Phase 6), cv (Phase 7),
-    // inference (Phase 9), video-ingest (Phase 10), store-flow (Phase 26) and
-    // returns (Phase 27) are default-enabled so their routes are reachable for
-    // every new tenant (the only enable endpoint is tenant-scoped and needs a
+    // inference (Phase 9), video-ingest (Phase 10), store-flow (Phase 26),
+    // returns (Phase 27) and esl (Phase 28) are default-enabled so their
+    // routes are reachable for every new tenant (the only enable endpoint is
+    // tenant-scoped and needs a
     // module:manage tenant user, which a brand-new tenant does not yet have).
     // store-flow being enabled changes nothing on its own: its autonomy
     // policy defaults to SHADOW. Nor does returns: it has no background jobs,
@@ -67,6 +68,7 @@ describe('platform module catalog', () => {
       'video-ingest',
       'store-flow',
       'returns',
+      'esl',
     ]);
   });
 
@@ -91,8 +93,10 @@ describe('platform module catalog', () => {
     // Phase 9; video-ingest (test video upload, frame/crop extraction
     // contracts): Phase 10; store-flow (shopper entry, the observation ->
     // basket bridge, one review queue, exit settlement): Phase 26;
-    // returns (refunds, stock reversal, cycle counts, shrink): Phase 27.
-    // esl, loyalty, reporting and procurement remain catalog names only.
+    // returns (refunds, stock reversal, cycle counts, shrink): Phase 27;
+    // esl (vendor-neutral shelf labels behind an adapter port, driven by
+    // price activation): Phase 28.
+    // loyalty, reporting and procurement remain catalog names only.
     expect(active).toEqual([
       'core',
       'inventory',
@@ -105,6 +109,7 @@ describe('platform module catalog', () => {
       'video-ingest',
       'store-flow',
       'returns',
+      'esl',
     ]);
   });
 
