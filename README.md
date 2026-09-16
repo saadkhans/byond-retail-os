@@ -19,8 +19,10 @@ packages/        Shared workspace packages
 ml/              CV training dataset + model pipeline (Phase 8) — schemas
                  and scripts only; datasets/weights external
 infra/           Infrastructure
-  docker/        Dockerfiles and compose configs
-  github-actions/ Reusable CI building blocks
+  docker/        Dockerfiles, nginx config and the local compose stack
+  github-actions/ Reusable composite actions used by the workflows
+  semgrep/       Static-analysis rules for this repo's hard rules
+  scripts/       security:scan and security:secrets entry points
 docs/            Documentation (architecture, product, security)
 scripts/         Repo automation scripts
 ```
@@ -32,6 +34,8 @@ scripts/         Repo automation scripts
 - [CONTRIBUTING.md](CONTRIBUTING.md) — branch, PR, and review workflow
 - [SECURITY.md](SECURITY.md) — security requirements and tooling
 - [TESTING.md](TESTING.md) — required test categories
+- [docs/development/docker.md](docs/development/docker.md) — running the stack in containers
+- [docs/development/ci-and-security.md](docs/development/ci-and-security.md) — CI jobs and security scanning
 
 ## Getting started
 

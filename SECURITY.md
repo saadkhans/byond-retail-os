@@ -20,10 +20,14 @@ These requirements apply to every service, app, and package in this repository.
 
 | Tool | Purpose | Where |
 | --- | --- | --- |
-| **Gitleaks** | Secret detection | CI (`.github/workflows/secrets.yml`) on every PR and push |
-| **Semgrep** | Static analysis / SAST | CI security scan (wired via `security:scan` as code lands) |
-| **Trivy** | Container and dependency vulnerability scanning | CI + image builds (`infra/docker/`) |
-| **Dependabot** | Dependency update automation | GitHub repository settings |
+| **Gitleaks** | Secret detection | CI (`.github/workflows/secrets.yml`) on every PR and push; locally via `pnpm run security:secrets` |
+| **Semgrep** | Static analysis / SAST, including this repo's hard rules in `infra/semgrep/byond-rules.yml` | CI (`.github/workflows/security.yml`); locally via `pnpm run security:scan` |
+| **Trivy** | Dependency, secret and misconfiguration scanning, plus the built images | CI (`.github/workflows/security.yml`, filesystem and image jobs); locally via `pnpm run security:scan` |
+| **Dependabot** | Dependency update automation for npm, GitHub Actions and Docker | `.github/dependabot.yml` |
+
+Only `ERROR`-severity Semgrep rules gate CI. See
+[docs/development/ci-and-security.md](docs/development/ci-and-security.md) for
+how to run each scanner locally and what the gating jobs are.
 
 ## Reporting a vulnerability
 

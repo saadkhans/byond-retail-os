@@ -1,0 +1,42 @@
+name: Set up BYOND workspace
+description: >-
+  Node 22, corepack/pnpm, a frozen-lockfile install and the generated Prisma
+  client — the four steps every job in this repository needs before it can run
+  anything. Kept here so a change to the toolchain is a one-file change.
+
+inputs:
+  node-version:
+    description: Node.js major version to install.
+    required: false
+    default: '22'
+  install-args:
+    description: >-
+      Extra arguments appended to `pnpm install --frozen-lockfile`, e.g.
+      "--filter @byond/api..." to install a single project's tree.
+    required: false
+    default: ''
+  generate-prisma:
+    description: Whether to generate the Prisma client after installing.
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Node ${{ inputs.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Enable corepack
+      shell: bash
+      run: corepack enable
+
+    - name: Install dependencies
+      shell: bash
+      run: pnpm install --frozen-lockfile ${{ inputs.install-args }}
+
+    - name: Generate Prisma client
+      if: inputs.generate-prisma == 'true'
+      shell: bash
+      run: pnpm --filter @byond/api run prisma:generate

@@ -1,0 +1,19 @@
+# Shared ignore list for the images in this folder. Docker only reads a
+# .dockerignore next to the build context root, so the repository root file
+# (../../.dockerignore) is the one that takes effect — this copy documents the
+# intent and is kept in sync with it.
+node_modules
+**/node_modules
+**/dist
+**/.turbo
+.git
+.github
+.claude
+**/*.log
+**/.env
+**/.env.*
+!**/.env.example
+ml/models
+ml/datasets
+**/coverage
+**/tsconfig.tsbuildinfo
