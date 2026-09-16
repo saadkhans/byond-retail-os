@@ -32,6 +32,7 @@ import { PickupFusionModule } from './pickup-fusion/pickup-fusion.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ReturnsModule } from './returns/returns.module';
 import { ProcurementModule } from './procurement/procurement.module';
+import { ShopperModule } from './shopper/shopper.module';
 import { TenantsModule } from './tenants/tenants.module';
 import { UnitsModule } from './units/units.module';
 import { UsersModule } from './users/users.module';
@@ -76,6 +77,7 @@ import { VisionModule } from './vision/vision.module';
     EslModule,
     LoyaltyModule,
     ProcurementModule,
+    ShopperModule,
   ],
 })
 export class AppModule implements NestModule {

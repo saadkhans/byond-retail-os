@@ -55,9 +55,13 @@ async function bootstrap(): Promise<void> {
           'are opaque, and an order is marked PAID only when its payment ' +
           'intent reaches the CAPTURED state. Real gateway adapters and ' +
           'webhook signature verification arrive in a later phase. ' +
-          'All endpoints except /health, /auth/login, and /edge/register ' +
-          'require an Authorization: Bearer <access token> header ' +
-          '(POST /auth/login). ' +
+          'All endpoints except /health, /auth/login, /edge/register, and ' +
+          'the /shopper surface require an Authorization: Bearer <access ' +
+          'token> header (POST /auth/login). The /shopper routes (Phase 35) ' +
+          'authenticate a SHOPPER instead of a user: the single-use store ' +
+          'entry credential, presented as Authorization: Shopper <secret>, ' +
+          'which authorizes exactly one journey in exactly one tenant and ' +
+          'nothing else. ' +
           'Errors use the standard Nest shape: { statusCode, message, error }.',
       )
       .setVersion('0.6.0')
