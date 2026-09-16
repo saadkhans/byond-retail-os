@@ -24,6 +24,7 @@ import {
 } from '../common/audit/audit-log.service';
 import { CheckoutSessionsService } from '../checkout/checkout-sessions.service';
 import { JourneyService } from '../journey/journey.service';
+import { isTerminalPaymentStatus } from '../payments/payment-state-machine';
 import { PaymentsService } from '../payments/payments.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { VisionEventsService } from '../vision/vision-events.service';
@@ -974,6 +975,18 @@ export class StoreFlowService {
       totals.currencyCode,
       actor,
     );
+    if (payment === null) {
+      // Phase 26 left this thread for Phase 27, which owns terminal payment
+      // states: the order's existing intent is terminal and never captured,
+      // so there is nothing to drive and nothing to refund. The order stands,
+      // unpaid and payable by hand, with the reason stated.
+      return {
+        status: StoreFlowSettlementStatus.ORDER_CREATED,
+        blockedBy: SETTLEMENT_BLOCK_REASON.PAYMENT_TERMINAL,
+        order: { id: orderId, orderNumber: completed.orderNumber },
+        payment: null,
+      };
+    }
     if (payment.status === PaymentStatus.CAPTURED) {
       await this.repository.setJourneySettlement(tenantId, journeyId, {
         orderId,
@@ -998,6 +1011,22 @@ export class StoreFlowService {
    * amount, a currency and a provider, and `SIMULATED` is the only provider
    * this repository has. A real gateway arrives as an adapter behind the same
    * contract, not as a change here.
+   *
+   * Returns null when the order's existing intent is TERMINAL and was never
+   * captured. Phase 26 knew about this case and deliberately left it to the
+   * phase that owns terminal payment states; the resolution is to REFUSE to
+   * act rather than to throw or to improvise:
+   *
+   *   * re-authorising is illegal — nothing about a terminal intent may ever
+   *     change again, and `payments.authorize` would (correctly) throw;
+   *   * minting a SECOND intent under a fresh key would take money for an
+   *     attempt somebody deliberately cancelled or that the provider
+   *     declined. Retrying payment is a decision, not a side effect of
+   *     walking out of a shop.
+   *
+   * So the exit reports PAYMENT_TERMINAL and leaves the order created and
+   * payable by hand. Nothing here is CAPTURED, so the returns module also has
+   * nothing to refund — the two halves of the terminal-state story agree.
    */
   private async takePayment(
     tenantId: string,
@@ -1005,13 +1034,16 @@ export class StoreFlowService {
     amountMinor: number,
     currencyCode: string,
     actor: AuditActor,
-  ): Promise<{ id: string; status: PaymentStatus }> {
+  ): Promise<{ id: string; status: PaymentStatus } | null> {
     const existing = await this.repository.existingIntentForOrder(
       tenantId,
       orderId,
     );
     if (existing?.status === PaymentStatus.CAPTURED) {
       return { id: existing.id, status: existing.status };
+    }
+    if (existing && isTerminalPaymentStatus(existing.status)) {
+      return null;
     }
     const intent =
       existing ??

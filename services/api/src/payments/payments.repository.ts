@@ -9,6 +9,8 @@ import {
   PaymentCaptureStatus,
   PaymentIntent,
   PaymentProvider,
+  PaymentRefund,
+  PaymentRefundStatus,
   PaymentStatus,
   Prisma,
   ReconciliationStatus,
@@ -167,6 +169,37 @@ export interface FailAuditBuilders {
 
 export interface BindAuditBuilders {
   intentBound: (before: PaymentIntent, after: PaymentIntent) => AuditEntry;
+  orderUpdated?: (before: Order, after: Order) => AuditEntry;
+}
+
+/**
+ * Phase 27 — why a refund request could not be opened.
+ *
+ * `intent-not-captured` deliberately does NOT reuse the generic
+ * `terminal-blocked` rejection. CAPTURED is a TERMINAL payment status, and a
+ * refund is the one operation that is legal precisely BECAUSE the intent is
+ * terminal in that particular way: money was taken. Every other terminal state
+ * (CANCELLED / FAILED / VOIDED / EXPIRED) means no money was ever taken, so
+ * there is nothing to give back — which is what this rejection reports.
+ */
+export type RefundRejection =
+  | 'intent-not-captured'
+  | 'refund-exceeds-capture'
+  | 'refund-amount-invalid'
+  | 'idempotency-key-conflict';
+
+export interface RefundResult {
+  refund: PaymentRefund;
+  replayed: boolean;
+}
+
+export interface OpenRefundAuditBuilders {
+  refundOpened: (refund: PaymentRefund) => AuditEntry;
+  orderUpdated?: (before: Order, after: Order) => AuditEntry;
+}
+
+export interface SettleRefundAuditBuilders {
+  refundSettled: (before: PaymentRefund, after: PaymentRefund) => AuditEntry;
   orderUpdated?: (before: Order, after: Order) => AuditEntry;
 }
 
@@ -983,7 +1016,380 @@ export class PaymentsRepository extends TenantScopedRepository {
       });
   }
 
+  // ----------------------------------------------------------------- refund
+
+  /**
+   * Phase 27, step ONE of two: record the INTENT to refund, before any money
+   * is asked for.
+   *
+   * Everything that must be decided atomically happens here, under the
+   * per-intent advisory lock:
+   *
+   *   * IDEMPOTENCY. (tenantId, idempotencyKey) is unique on PaymentRefund and
+   *     is checked inside the lock, so a replayed refund request re-reads the
+   *     original row. A key already used against a DIFFERENT intent is a
+   *     controlled conflict, never a second refund.
+   *   * THE CEILING. The sum of PENDING + SUCCEEDED refunds on this intent can
+   *     never exceed what the intent actually captured. PENDING counts: money
+   *     that is already in flight is not available to be refunded again.
+   *   * THE ORDER PROJECTION. A linked order goes PAID → REFUND_PENDING so the
+   *     commerce side shows that money is on its way back.
+   *
+   * The gateway is called by the SERVICE, after this transaction commits, and
+   * `settleRefund` records the answer. Splitting it this way is what makes a
+   * crash mid-flight visible (a PENDING refund) instead of silent, and keeps
+   * an external call out of a database transaction.
+   */
+  openRefund(
+    tenantId: string,
+    intentId: string,
+    input: {
+      amountMinor: number;
+      reason?: string;
+      providerRef?: string;
+      idempotencyKey?: string;
+      actorId?: string;
+    },
+    builders: OpenRefundAuditBuilders,
+  ): Promise<RefundResult | RefundRejection | null> {
+    const scopedTenantId = this.requireTenantId(tenantId);
+    return this.prisma.$transaction(async (tx) => {
+      await this.lockIntent(tx, scopedTenantId, intentId);
+      const intent = await tx.paymentIntent.findFirst({
+        where: { id: intentId, tenantId: scopedTenantId },
+      });
+      if (!intent) {
+        return null;
+      }
+      if (input.idempotencyKey) {
+        const existing = await tx.paymentRefund.findFirst({
+          where: {
+            tenantId: scopedTenantId,
+            idempotencyKey: input.idempotencyKey,
+          },
+        });
+        if (existing) {
+          if (existing.intentId !== intentId) {
+            return 'idempotency-key-conflict' as const;
+          }
+          // A replay of a refund that is still in flight, or already settled,
+          // returns the ORIGINAL row. The service re-drives settlement from
+          // it, which is safe because settlement is itself idempotent.
+          return { refund: existing, replayed: true };
+        }
+      }
+      // A refund is legal ONLY against a captured intent. Every other terminal
+      // state means no money moved, so there is nothing to return — see
+      // RefundRejection.
+      if (
+        intent.status !== PaymentStatus.CAPTURED ||
+        intent.capturedAmountMinor <= 0
+      ) {
+        return 'intent-not-captured' as const;
+      }
+      if (
+        !Number.isInteger(input.amountMinor) ||
+        input.amountMinor <= 0
+      ) {
+        return 'refund-amount-invalid' as const;
+      }
+      // THE CEILING. Computed from the refund rows themselves (not from the
+      // intent's denormalized total) so it is correct even if a settlement is
+      // still in flight.
+      const claimed = await tx.paymentRefund.aggregate({
+        where: {
+          tenantId: scopedTenantId,
+          intentId,
+          status: {
+            in: [PaymentRefundStatus.PENDING, PaymentRefundStatus.SUCCEEDED],
+          },
+        },
+        _sum: { amountMinor: true },
+      });
+      const remaining =
+        intent.capturedAmountMinor - (claimed._sum.amountMinor ?? 0);
+      if (input.amountMinor > remaining) {
+        return 'refund-exceeds-capture' as const;
+      }
+      // Attribute only to an actor IN THIS TENANT — same rule as the ledger:
+      // the single-column FK alone would accept any global user id.
+      const actorId = input.actorId
+        ? ((
+            await tx.user.findFirst({
+              where: { id: input.actorId, tenantId: scopedTenantId },
+              select: { id: true },
+            })
+          )?.id ?? null)
+        : null;
+      const capture = await tx.paymentCapture.findFirst({
+        where: {
+          tenantId: scopedTenantId,
+          intentId,
+          status: PaymentCaptureStatus.SUCCEEDED,
+        },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      });
+      const refund = await tx.paymentRefund.create({
+        data: {
+          tenantId: scopedTenantId,
+          intentId,
+          captureId: capture?.id ?? null,
+          status: PaymentRefundStatus.PENDING,
+          amountMinor: input.amountMinor,
+          currencyCode: intent.currencyCode,
+          reason: input.reason,
+          providerRef: input.providerRef ?? capture?.providerRef ?? null,
+          idempotencyKey: input.idempotencyKey,
+          createdById: actorId,
+        },
+      });
+      await this.auditLog.record(builders.refundOpened(refund), tx);
+      const order = await this.lockAndReloadLinkedOrder(
+        tx,
+        scopedTenantId,
+        intent,
+      );
+      await this.projectOrderRefundStatus(
+        tx,
+        scopedTenantId,
+        order,
+        OrderPaymentStatus.REFUND_PENDING,
+        builders.orderUpdated,
+      );
+      return { refund, replayed: false };
+    });
+  }
+
+  /**
+   * Phase 27, step TWO of two: record what the gateway said, exactly once.
+   *
+   * Idempotent by construction: the status flip is a CONDITIONAL, TENANT-
+   * SCOPED update that matches only a PENDING row, so replaying a settlement
+   * (a retry, a duplicate gateway answer, a crash-recovery re-drive) re-reads
+   * the settled row instead of moving the numbers again.
+   *
+   * On success the intent's denormalized `refundedAmountMinor` is RECOMPUTED
+   * from the refund rows rather than incremented, so it can never drift from
+   * them, and the linked order is projected to REFUNDED (everything captured
+   * has been returned), back to PAID (a partial refund settled and nothing is
+   * in flight), or left at REFUND_PENDING while another refund is still
+   * flying.
+   */
+  settleRefund(
+    tenantId: string,
+    refundId: string,
+    outcome: {
+      status: 'SUCCEEDED' | 'FAILED';
+      providerRefundRef?: string;
+      failureReason?: string;
+    },
+    builders: SettleRefundAuditBuilders,
+  ): Promise<RefundResult | null> {
+    const scopedTenantId = this.requireTenantId(tenantId);
+    return this.prisma.$transaction(async (tx) => {
+      const found = await tx.paymentRefund.findFirst({
+        where: { id: refundId, tenantId: scopedTenantId },
+      });
+      if (!found) {
+        return null;
+      }
+      await this.lockIntent(tx, scopedTenantId, found.intentId);
+      const before = await tx.paymentRefund.findFirst({
+        where: { id: refundId, tenantId: scopedTenantId },
+      });
+      if (!before) {
+        return null;
+      }
+      if (before.status !== PaymentRefundStatus.PENDING) {
+        return { refund: before, replayed: true };
+      }
+      const settledStatus =
+        outcome.status === 'SUCCEEDED'
+          ? PaymentRefundStatus.SUCCEEDED
+          : PaymentRefundStatus.FAILED;
+      const now = new Date();
+      const flipped = await tx.paymentRefund.updateMany({
+        // The tenant travels IN the write predicate, alongside the PENDING
+        // guard that makes the flip happen at most once.
+        where: {
+          id: refundId,
+          tenantId: scopedTenantId,
+          status: PaymentRefundStatus.PENDING,
+        },
+        data: {
+          status: settledStatus,
+          settledAt: now,
+          providerRefundRef: outcome.providerRefundRef ?? null,
+          failureReason:
+            settledStatus === PaymentRefundStatus.FAILED
+              ? (outcome.failureReason ?? 'Refund declined by the gateway')
+              : null,
+        },
+      });
+      if (flipped.count === 0) {
+        // Another settlement won the race; report its result, unchanged.
+        const current = await tx.paymentRefund.findFirstOrThrow({
+          where: { id: refundId, tenantId: scopedTenantId },
+        });
+        return { refund: current, replayed: true };
+      }
+      const after = await tx.paymentRefund.findFirstOrThrow({
+        where: { id: refundId, tenantId: scopedTenantId },
+      });
+      await this.auditLog.record(builders.refundSettled(before, after), tx);
+
+      const intent = await tx.paymentIntent.findFirstOrThrow({
+        where: { id: before.intentId, tenantId: scopedTenantId },
+      });
+      const succeeded = await tx.paymentRefund.aggregate({
+        where: {
+          tenantId: scopedTenantId,
+          intentId: before.intentId,
+          status: PaymentRefundStatus.SUCCEEDED,
+        },
+        _sum: { amountMinor: true },
+      });
+      const refundedTotal = succeeded._sum.amountMinor ?? 0;
+      const stillPending = await tx.paymentRefund.count({
+        where: {
+          tenantId: scopedTenantId,
+          intentId: before.intentId,
+          status: PaymentRefundStatus.PENDING,
+        },
+      });
+      await tx.paymentIntent.update({
+        where: { id_tenantId: { id: intent.id, tenantId: scopedTenantId } },
+        data: { refundedAmountMinor: refundedTotal },
+      });
+      const target =
+        stillPending > 0
+          ? OrderPaymentStatus.REFUND_PENDING
+          : refundedTotal >= intent.capturedAmountMinor
+            ? OrderPaymentStatus.REFUNDED
+            : OrderPaymentStatus.PAID;
+      const order = await this.lockAndReloadLinkedOrder(
+        tx,
+        scopedTenantId,
+        intent,
+      );
+      await this.projectOrderRefundStatus(
+        tx,
+        scopedTenantId,
+        order,
+        target,
+        builders.orderUpdated,
+      );
+      return { refund: after, replayed: false };
+    });
+  }
+
+  findRefundById(
+    tenantId: string,
+    id: string,
+  ): Promise<PaymentRefund | null> {
+    return this.prisma.paymentRefund.findFirst({
+      where: this.scope(tenantId, { id }),
+    });
+  }
+
+  /**
+   * The intent that actually took this order's money, if any. Used by the
+   * returns module to find what a refund should be charged back against
+   * WITHOUT it needing to know how payments resolve orders to intents.
+   */
+  findCapturedIntentForOrder(
+    tenantId: string,
+    orderId: string,
+  ): Promise<PaymentIntent | null> {
+    return this.prisma.paymentIntent.findFirst({
+      where: this.scope(tenantId, {
+        orderId,
+        status: PaymentStatus.CAPTURED,
+      }),
+      orderBy: [{ capturedAt: 'desc' }, { id: 'desc' }],
+    });
+  }
+
+  async searchRefunds(
+    tenantId: string,
+    filters: {
+      status?: PaymentRefundStatus;
+      intentId?: string;
+      skip?: number;
+      take?: number;
+    },
+  ): Promise<{ items: PaymentRefund[]; total: number }> {
+    const where: Prisma.PaymentRefundWhereInput = this.scope(tenantId);
+    if (filters.status) {
+      where.status = filters.status;
+    }
+    if (filters.intentId) {
+      where.intentId = filters.intentId;
+    }
+    const [items, total] = await Promise.all([
+      this.prisma.paymentRefund.findMany({
+        where,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip: filters.skip ?? 0,
+        take: filters.take ?? 25,
+      }),
+      this.prisma.paymentRefund.count({ where }),
+    ]);
+    return { items, total };
+  }
+
   // ---------------------------------------------------------------- helpers
+
+  /**
+   * Projects a REFUND state onto a linked order.
+   *
+   * Deliberately NOT `projectOrderPaymentStatus`: that one refuses to touch an
+   * order that is already PAID (nothing may un-pay an order) and refuses a
+   * CANCELLED one. A refund needs the exact opposite window — it may ONLY move
+   * an order that actually took money (PAID / REFUND_PENDING / REFUNDED), and
+   * it MUST still work for a CANCELLED order, because cancelling a settled
+   * order and giving the money back is the whole point of Phase 27.
+   *
+   * The `paymentStatus IN (...)` predicate is what keeps it honest: a refund
+   * can never invent a payment on an UNPAID, AUTHORIZED, PAYMENT_FAILED or
+   * VOIDED order, and `paidAt` is never rewritten — the order keeps saying
+   * when it was paid, with its refund state alongside.
+   */
+  private async projectOrderRefundStatus(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    order: Order | null,
+    target: OrderPaymentStatus,
+    buildAuditEntry?: (before: Order, after: Order) => AuditEntry,
+  ): Promise<boolean> {
+    if (!order || order.paymentStatus === target) {
+      return false;
+    }
+    const updated = await tx.order.updateMany({
+      where: {
+        id: order.id,
+        tenantId,
+        paymentStatus: {
+          in: [
+            OrderPaymentStatus.PAID,
+            OrderPaymentStatus.REFUND_PENDING,
+            OrderPaymentStatus.REFUNDED,
+          ],
+        },
+      },
+      data: { paymentStatus: target },
+    });
+    if (updated.count === 0) {
+      return false;
+    }
+    if (buildAuditEntry) {
+      const after = await tx.order.findFirstOrThrow({
+        where: { id: order.id, tenantId },
+      });
+      await this.auditLog.record(buildAuditEntry(order, after), tx);
+    }
+    return true;
+  }
 
   private async replay(
     tx: Prisma.TransactionClient,

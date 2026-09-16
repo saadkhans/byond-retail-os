@@ -57,6 +57,7 @@ export const NAV_GROUPS: NavGroup[] = [
       { to: '/payments', label: 'Payments' },
       { to: '/payment-events', label: 'Payment events' },
       { to: '/reconciliation', label: 'Reconciliation' },
+      { to: '/returns', label: 'Returns & reconciliation' },
     ],
   },
   {

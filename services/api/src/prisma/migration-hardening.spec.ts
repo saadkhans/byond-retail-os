@@ -856,11 +856,11 @@ describe('store flow migration hardening', () => {
   /** The column names one model declares in schema.prisma. */
   const schemaColumns = (model: string): string[] => {
     const body = schema.match(
-      new RegExp(`\\nmodel ${model} \\{\\n([\\s\\S]*?)\\n\\}`),
+      new RegExp(`\\r?\\nmodel ${model} \\{\\r?\\n([\\s\\S]*?)\\r?\\n\\}`),
     );
     expect(body).not.toBeNull();
     return body![1]
-      .split('\n')
+      .split(/\r?\n/)
       .map((line) => line.trim())
       .filter(
         (line) =>
@@ -878,7 +878,7 @@ describe('store flow migration hardening', () => {
   /** The column names one CREATE TABLE declares in the migration. */
   const migrationColumns = (table: string): string[] => {
     const body = sql.match(
-      new RegExp(`CREATE TABLE "${table}" \\(\\n([\\s\\S]*?)\\n\\);`),
+      new RegExp(`CREATE TABLE "${table}" \\(\\r?\\n([\\s\\S]*?)\\r?\\n\\);`),
     );
     expect(body).not.toBeNull();
     return [...body![1].matchAll(/^ {4}"([A-Za-z0-9_]+)"/gm)].map(
@@ -1069,5 +1069,270 @@ describe('store flow module backfill migration', () => {
     expect(sql).not.toContain('StoreFlowPolicy');
     expect(sql).not.toContain('AUTO_APPLY');
     expect(sql).not.toContain('PROPOSE');
+  });
+});
+
+describe('returns & reconciliation migration hardening', () => {
+  const migrationsDir = join(__dirname, '..', '..', 'prisma', 'migrations');
+  const sql = readFileSync(
+    join(
+      migrationsDir,
+      '20260916110000_phase27_returns_reconciliation',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+  // The hand-written statements are wrapped across lines for readability;
+  // compare against a whitespace-normalized copy so formatting is never
+  // load-bearing.
+  const flat = sql.replace(/\s+/g, ' ');
+
+  it('adds the two reverse-flow ledger movement types', () => {
+    // A return, a cancellation reversal and a shrink are ORDINARY movements —
+    // the enum is extended rather than a parallel stock table invented.
+    expect(sql).toContain(
+      `ALTER TYPE "InventoryMovementType" ADD VALUE 'RETURN_IN'`,
+    );
+    expect(sql).toContain(
+      `ALTER TYPE "InventoryMovementType" ADD VALUE 'SHRINK'`,
+    );
+  });
+
+  it('makes a restocked return line impossible without its ledger movement', () => {
+    // THE stock invariant, at the database level: there is no way to record
+    // goods going back on the shelf without the append-only movement that put
+    // them there.
+    expect(flat).toContain(
+      `ADD CONSTRAINT "OrderReturnLine_restock_has_movement" CHECK ("restocked" = false OR "movementId" IS NOT NULL)`,
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "OrderReturnLine_quantity_positive" CHECK ("quantity" > 0)`,
+    );
+  });
+
+  it('makes a cycle count incapable of becoming a second source of truth', () => {
+    // The variance must be DERIVED from the counted figure and the projection
+    // (never an arbitrary number), and a non-zero variance must cite the
+    // movement it became. Together: a count can only change stock by
+    // appending to the ledger.
+    expect(flat).toContain(
+      `ADD CONSTRAINT "CycleCountLine_variance_is_derived" CHECK ( "varianceQuantity" IS NULL OR "systemQuantity" IS NULL OR "varianceQuantity" = "countedQuantity" - "systemQuantity" )`,
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "CycleCountLine_variance_has_movement" CHECK ( "varianceQuantity" IS NULL OR "varianceQuantity" = 0 OR "movementId" IS NOT NULL )`,
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "CycleCountLine_counted_quantity_nonnegative" CHECK ("countedQuantity" >= 0)`,
+    );
+  });
+
+  it('never lets a count claim a status its evidence does not support', () => {
+    expect(flat).toContain('"CycleCount_status_evidence"');
+    for (const clause of [
+      `"status" = 'OPEN' AND "reconciledAt" IS NULL AND "cancelledAt" IS NULL`,
+      `"status" = 'RECONCILED' AND "reconciledAt" IS NOT NULL AND "cancelledAt" IS NULL`,
+      `"status" = 'CANCELLED' AND "cancelledAt" IS NOT NULL AND "reconciledAt" IS NULL`,
+    ]) {
+      expect(flat).toContain(clause);
+    }
+  });
+
+  it('bounds every refund by what was actually captured', () => {
+    // THE money invariant, at the database level: an intent can never report
+    // more refunded than it captured, and no refund is for nothing.
+    expect(flat).toContain(
+      `ADD CONSTRAINT "PaymentIntent_refund_within_capture" CHECK ("refundedAmountMinor" >= 0 AND "refundedAmountMinor" <= "capturedAmountMinor")`,
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "PaymentRefund_amount_positive" CHECK ("amountMinor" > 0)`,
+    );
+  });
+
+  it('makes a replayed refund impossible at the database level', () => {
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "PaymentRefund_tenantId_idempotencyKey_key" ON "PaymentRefund"("tenantId", "idempotencyKey")',
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "PaymentRefund_settlement_evidence" CHECK ( ("status" = 'PENDING' AND "settledAt" IS NULL) OR ("status" IN ('SUCCEEDED', 'FAILED') AND "settledAt" IS NOT NULL) )`,
+    );
+  });
+
+  it('makes a replayed return and a replayed write-off impossible too', () => {
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "OrderReturn_tenantId_reference_key" ON "OrderReturn"("tenantId", "reference")',
+    );
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "CycleCount_tenantId_reference_key" ON "CycleCount"("tenantId", "reference")',
+    );
+    // One observation can be written off exactly once.
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "ShrinkEvent_visionEventId_key" ON "ShrinkEvent"("visionEventId")',
+    );
+  });
+
+  it('keeps a return status and its money together', () => {
+    expect(flat).toContain(
+      `ADD CONSTRAINT "OrderReturn_refund_evidence" CHECK ( ("status" = 'RECORDED' AND "refundId" IS NULL) OR ("status" <> 'RECORDED' AND "refundId" IS NOT NULL) )`,
+    );
+  });
+
+  it('requires a CV-detected write-off to name the observation behind it', () => {
+    expect(flat).toContain(
+      `ADD CONSTRAINT "ShrinkEvent_cv_detected_has_observation" CHECK ("source" <> 'CV_DETECTED' OR "visionEventId" IS NOT NULL)`,
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "ShrinkEvent_quantity_positive" CHECK ("quantity" > 0)`,
+    );
+    // movementId is NOT NULL on the table itself: a shrink record can never
+    // exist without the ledger entry it claims to have produced.
+    expect(flat).toContain('"movementId" TEXT NOT NULL');
+  });
+
+  it('enforces same-tenant references with composite foreign keys', () => {
+    for (const [constraint, columns, parent] of [
+      ['PaymentRefund_intent_same_tenant_fkey', '"intentId", "tenantId"', 'PaymentIntent'],
+      ['PaymentRefund_capture_same_tenant_fkey', '"captureId", "tenantId"', 'PaymentCapture'],
+      ['OrderReturn_order_same_tenant_fkey', '"orderId", "tenantId"', 'Order'],
+      ['OrderReturn_refund_same_tenant_fkey', '"refundId", "tenantId"', 'PaymentRefund'],
+      ['OrderReturnLine_return_same_tenant_fkey', '"returnId", "tenantId"', 'OrderReturn'],
+      ['OrderReturnLine_order_line_same_tenant_fkey', '"orderLineId", "tenantId"', 'OrderLine'],
+      ['OrderReturnLine_product_same_tenant_fkey', '"productId", "tenantId"', 'Product'],
+      ['OrderReturnLine_movement_same_tenant_fkey', '"movementId", "tenantId"', 'InventoryMovement'],
+      ['CycleCount_location_same_tenant_fkey', '"locationId", "tenantId"', 'Location'],
+      ['CycleCountLine_count_same_tenant_fkey', '"cycleCountId", "tenantId"', 'CycleCount'],
+      ['CycleCountLine_product_same_tenant_fkey', '"productId", "tenantId"', 'Product'],
+      ['CycleCountLine_movement_same_tenant_fkey', '"movementId", "tenantId"', 'InventoryMovement'],
+      ['ShrinkEvent_location_same_tenant_fkey', '"locationId", "tenantId"', 'Location'],
+      ['ShrinkEvent_product_same_tenant_fkey', '"productId", "tenantId"', 'Product'],
+      ['ShrinkEvent_vision_event_same_tenant_fkey', '"visionEventId", "tenantId"', 'VisionEvent'],
+      ['ShrinkEvent_movement_same_tenant_fkey', '"movementId", "tenantId"', 'InventoryMovement'],
+    ] as const) {
+      expect(flat).toContain(
+        `ADD CONSTRAINT "${constraint}" FOREIGN KEY (${columns}) REFERENCES "${parent}"("id", "tenantId")`,
+      );
+    }
+  });
+
+  it('anchors the ledger composite FK with a (id, tenantId) unique index', () => {
+    // Without this, a decision record could cite another tenant's movement.
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "InventoryMovement_id_tenantId_key" ON "InventoryMovement"("id", "tenantId")',
+    );
+  });
+
+  it('never covers User references with composite FKs (platform-sandbox exception)', () => {
+    // A platform admin acting in the sandbox tenant is a (platform user,
+    // sandbox tenant) pair that User(id, tenantId) can never hold.
+    expect(flat).not.toMatch(
+      /same_tenant_fkey" FOREIGN KEY \("(createdById|recordedById|reconciledById)"/,
+    );
+  });
+
+  it('creates exactly the columns schema.prisma declares, for every new table', () => {
+    // This repo hand-writes migration SQL, so nothing else catches a column
+    // that exists in the Prisma model and not in the database. `\r?\n`
+    // throughout: the repo is checked out with core.autocrlf on Windows.
+    const schema = readFileSync(
+      join(__dirname, '..', '..', 'prisma', 'schema.prisma'),
+      'utf8',
+    );
+    const schemaColumns = (model: string): string[] => {
+      const body = schema.match(
+        new RegExp(
+          `\\r?\\nmodel ${model} \\{\\r?\\n([\\s\\S]*?)\\r?\\n\\}`,
+        ),
+      );
+      expect(body).not.toBeNull();
+      return body![1]
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(
+          (line) =>
+            line.length > 0 &&
+            !line.startsWith('//') &&
+            !line.startsWith('///') &&
+            !line.startsWith('@@') &&
+            !/^\w+\s+\w+(\[\])?\??\s+@relation/.test(line) &&
+            !/^\w+\s+\w+\[\]/.test(line),
+        )
+        .map((line) => line.split(/\s+/)[0])
+        .filter((name) => /^[a-z]/.test(name));
+    };
+    const migrationColumns = (table: string): string[] => {
+      const body = sql.match(
+        new RegExp(
+          `CREATE TABLE "${table}" \\(\\r?\\n([\\s\\S]*?)\\r?\\n\\);`,
+        ),
+      );
+      expect(body).not.toBeNull();
+      return [...body![1].matchAll(/^ {4}"([A-Za-z0-9_]+)"/gm)].map(
+        (match) => match[1],
+      );
+    };
+    for (const model of [
+      'PaymentRefund',
+      'OrderReturn',
+      'OrderReturnLine',
+      'CycleCount',
+      'CycleCountLine',
+      'ShrinkEvent',
+    ]) {
+      expect([model, migrationColumns(model).sort()]).toEqual([
+        model,
+        schemaColumns(model).sort(),
+      ]);
+    }
+  });
+
+  it('never cascades deletes into the reverse-flow tables', () => {
+    // A return, a count and a write-off are financial/stock history: removing
+    // a parent must FAIL, never silently erase the record of what happened.
+    expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
+  });
+});
+
+describe('returns module backfill migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260916110001_returns_module_backfill',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('activates a pre-existing returns module row instead of leaving it inactive', () => {
+    expect(sql).toContain('ON CONFLICT ("code") DO UPDATE SET');
+    expect(sql).toContain('"isActive" = true');
+    expect(sql).not.toMatch(/DO UPDATE SET[^;]*"id"\s*=/);
+  });
+
+  it('is idempotent and never overwrites a tenant admin choice', () => {
+    expect(sql).toContain('ON CONFLICT ("tenantId", "moduleId") DO NOTHING');
+    expect(sql).not.toMatch(/ON CONFLICT \("tenantId", "moduleId"\) DO UPDATE/);
+  });
+
+  it('enables returns for every pre-existing tenant with deterministic ids', () => {
+    expect(sql).toContain(`'tm-' || md5(t."id" || ':returns')`);
+    expect(sql).toContain(`WHERE pm."code" = 'returns'`);
+  });
+
+  it('moves no stock and no money on its own', () => {
+    // A backfill enables routes. It must never write a movement, a refund or
+    // a return — the reverse flow only ever runs when an operator asks.
+    for (const table of [
+      'InventoryMovement',
+      'InventoryLevel',
+      'PaymentRefund',
+      'OrderReturn',
+      'CycleCount',
+      'ShrinkEvent',
+    ]) {
+      expect(sql).not.toContain(table);
+    }
   });
 });

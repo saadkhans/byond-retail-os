@@ -43,6 +43,7 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   { code: 'payment:manage', module: 'payments', description: 'Create payment intents and manage their linkage (no live gateway)' },
   { code: 'payment:simulate', module: 'payments', description: 'Simulate provider-abstract authorization, capture, cancel/void, failure, and provider events' },
   { code: 'reconciliation:read', module: 'payments', description: 'View payment reconciliation records' },
+  { code: 'payment:refund', module: 'payments', description: 'Refund money against a captured payment (bounded by what was captured; no live gateway)' },
   { code: 'reconciliation:manage', module: 'payments', description: 'Update reconciliation record status (mark reconciled/mismatch — no settlement accounting)' },
   { code: 'vision:read', module: 'cv', description: 'View vision events, SKU candidates, reviews, and evidence bundle lineage records' },
   { code: 'vision:ingest', module: 'cv', description: 'Ingest normalized product interaction events (with lineage-only evidence bundles) from vision adapters' },
@@ -61,4 +62,10 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   { code: 'store-flow:operate', module: 'store-flow', description: 'Issue and revoke store entry tokens, project observations onto baskets, and exit and settle a journey' },
   { code: 'store-flow:enter', module: 'store-flow', description: 'Redeem a store entry token, opening a shopper journey and its checkout session' },
   { code: 'store-flow:review', module: 'store-flow', description: 'Decide a queued observation once, recording the journey review and driving the matching vision event review' },
+  { code: 'return:read', module: 'returns', description: 'View returns and cancellations, the stock they reversed, and the refunds they triggered' },
+  { code: 'return:manage', module: 'returns', description: 'Record a return or cancel a settled order, reversing stock through the ledger and refunding the captured payment' },
+  { code: 'cycle-count:read', module: 'returns', description: 'View cycle counts and stocktakes with their counted, projected, ledger and variance quantities' },
+  { code: 'cycle-count:manage', module: 'returns', description: 'Open a count, record counted quantities, reconcile the count into ledger corrections, or abandon it' },
+  { code: 'shrink:read', module: 'returns', description: 'View recorded shrink write-offs' },
+  { code: 'shrink:record', module: 'returns', description: 'Write off a CV-detected loss as a SHRINK ledger movement' },
 ];

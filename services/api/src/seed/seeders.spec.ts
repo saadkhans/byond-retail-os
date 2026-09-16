@@ -47,12 +47,14 @@ describe('platform module catalog', () => {
   it('default-enables core plus every shipped module', () => {
     // inventory (Phase 3), devices (Phase 4), pricing (Phase 25),
     // checkout (Phase 5), payments (Phase 6), cv (Phase 7),
-    // inference (Phase 9), video-ingest (Phase 10) and store-flow (Phase 26)
-    // are default-enabled so their routes are reachable for every new tenant
-    // (the only enable endpoint is tenant-scoped and needs a
+    // inference (Phase 9), video-ingest (Phase 10), store-flow (Phase 26) and
+    // returns (Phase 27) are default-enabled so their routes are reachable for
+    // every new tenant (the only enable endpoint is tenant-scoped and needs a
     // module:manage tenant user, which a brand-new tenant does not yet have).
     // store-flow being enabled changes nothing on its own: its autonomy
-    // policy defaults to SHADOW.
+    // policy defaults to SHADOW. Nor does returns: it has no background jobs,
+    // so nothing happens until an operator records a return, a count or a
+    // write-off.
     expect(DEFAULT_ENABLED_MODULE_CODES).toEqual([
       'core',
       'inventory',
@@ -64,6 +66,7 @@ describe('platform module catalog', () => {
       'inference',
       'video-ingest',
       'store-flow',
+      'returns',
     ]);
   });
 
@@ -87,7 +90,8 @@ describe('platform module catalog', () => {
     // Phase 7; inference (jobs, queue foundation, simulated adapter):
     // Phase 9; video-ingest (test video upload, frame/crop extraction
     // contracts): Phase 10; store-flow (shopper entry, the observation ->
-    // basket bridge, one review queue, exit settlement): Phase 26.
+    // basket bridge, one review queue, exit settlement): Phase 26;
+    // returns (refunds, stock reversal, cycle counts, shrink): Phase 27.
     // esl, loyalty, reporting and procurement remain catalog names only.
     expect(active).toEqual([
       'core',
@@ -100,6 +104,7 @@ describe('platform module catalog', () => {
       'inference',
       'video-ingest',
       'store-flow',
+      'returns',
     ]);
   });
 

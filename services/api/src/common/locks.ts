@@ -324,3 +324,60 @@ export function cvDatasetRunAdvisoryLockKey(
 ): string {
   return `cv-dataset-run:${tenantId}:${runId}`;
 }
+
+/**
+ * Serializes Phase 27 reverse-flow writes against the SAME order: a return, a
+ * cancellation-with-reversal, and each other. Each of those decides from a
+ * read-then-write ("how much of this order has already come back?") before
+ * appending RETURN_IN movements, so two operators returning the same line
+ * concurrently must not both observe the same remaining quantity and each
+ * reverse it. The (tenantId, reference) unique on OrderReturn backstops an
+ * exact replay; this lock is what stops two DIFFERENT references over-returning
+ * one order. Every reverse-flow path that writes an OrderReturn MUST derive it
+ * identically.
+ *
+ * Lock order is always order-return -> order-payment -> product, which shares
+ * its tail with every other path (payments take intent -> order; checkout takes
+ * session -> product), so no cycle is possible.
+ */
+export function orderReturnAdvisoryLockKey(
+  tenantId: string,
+  orderId: string,
+): string {
+  return `order-return:${tenantId}:${orderId}`;
+}
+
+/**
+ * Serializes a cycle count's line recording against its reconciliation within
+ * a tenant. Reconciling reads every line, compares each against the stock
+ * projection, and appends a correction movement; a line added (or re-counted)
+ * midway through would otherwise be reconciled against a snapshot the operator
+ * never saw, or skipped entirely. Both CycleCountRepository.recordLine and
+ * .reconcile MUST derive it identically.
+ */
+export function cycleCountAdvisoryLockKey(
+  tenantId: string,
+  cycleCountId: string,
+): string {
+  return `cycle-count:${tenantId}:${cycleCountId}`;
+}
+
+/**
+ * Serializes shrink write-offs recorded against the SAME vision observation.
+ * Recording a shrink decides from a read-then-write ("has this loss already
+ * been written off, and did an order account for it?"), so two concurrent
+ * decisions on one observation must not both append a SHRINK movement. The
+ * (tenantId, visionEventId) unique on ShrinkEvent backstops the race at the
+ * database level; this lock makes the check-then-write section exclusive so the
+ * loser gets a controlled replay instead of a constraint error.
+ *
+ * Deliberately NOT the vision-event lock: this path must not serialize against
+ * (or risk deadlocking with) vision review decisions, which take
+ * vision-event -> checkout-session -> product.
+ */
+export function shrinkEventAdvisoryLockKey(
+  tenantId: string,
+  visionEventId: string,
+): string {
+  return `shrink-event:${tenantId}:${visionEventId}`;
+}

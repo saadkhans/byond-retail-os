@@ -177,6 +177,25 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
     isActive: true,
   },
   {
+    code: 'returns',
+    name: 'Returns & Reconciliation',
+    description:
+      'Refunds against captured payments, stock reversal on returned and ' +
+      'cancelled orders, cycle counts and stocktakes that reconcile the ' +
+      'stock projection against the ledger, and the shrink path for ' +
+      'CV-detected loss.',
+    // Shipped in Phase 27 and DEFAULT-ENABLED for the same reason as
+    // inventory/checkout/payments/pricing/store-flow (see above): the only
+    // enable endpoint is @TenantOnly(), so leaving this false would strand
+    // new tenants behind 403s. RBAC still gates every route independently,
+    // and enabling the module changes NOTHING on its own — there are no
+    // background jobs here; every return, count and write-off is an operator
+    // action. Tenants that existed BEFORE Phase 27 are covered by the
+    // 20260916110001_returns_module_backfill migration.
+    defaultEnabled: true,
+    isActive: true,
+  },
+  {
     code: 'esl',
     name: 'Electronic Shelf Labels',
     description: 'ESL vendor integration (later phase).',
