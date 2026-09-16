@@ -38,6 +38,7 @@ scripts/         Repo automation scripts
 - [docs/development/docker.md](docs/development/docker.md) — running the stack in containers
 - [docs/development/ci-and-security.md](docs/development/ci-and-security.md) — CI jobs and security scanning
 - [docs/product/pricing.md](docs/product/pricing.md) — versioned pricing model and rules
+- [docs/product/store-flow.md](docs/product/store-flow.md) — the autonomous store loop: entry, the observation → basket bridge, exit settlement
 
 ## Getting started
 
@@ -80,7 +81,12 @@ inventory; versioned price books (create a draft, set prices, activate, roll
 back — see [docs/product/pricing.md](docs/product/pricing.md)); and a manual
 checkout test flow: create a checkout session, manage basket lines, and
 complete it into an order, which now carries a total derived from the price
-each line was added at. The API's CORS allowlist defaults to
+each line was added at. The Store flow page drives the Phase 26 loop end to end
+— set a store's autonomy level (SHADOW by default, which changes nothing),
+issue an entry credential, watch observations become basket lines, work one
+review queue, and exit the shopper into an order and a payment (see
+[docs/product/store-flow.md](docs/product/store-flow.md)). The API's CORS
+allowlist defaults to
 `http://localhost:5173` (override with `CORS_ORIGINS`).
 
 ### CV pipeline (http://localhost:3100)

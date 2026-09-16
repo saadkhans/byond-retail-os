@@ -837,3 +837,237 @@ describe('cv same-tenant fk migration hardening', () => {
     expect(sql).not.toMatch(/"createdById"/);
   });
 });
+
+describe('store flow migration hardening', () => {
+  const migrationsDir = join(__dirname, '..', '..', 'prisma', 'migrations');
+  const sql = readFileSync(
+    join(migrationsDir, '20260916100000_phase26_store_loop', 'migration.sql'),
+    'utf8',
+  );
+  const schema = readFileSync(
+    join(__dirname, '..', '..', 'prisma', 'schema.prisma'),
+    'utf8',
+  );
+  // The hand-written statements are wrapped across lines for readability;
+  // compare against a whitespace-normalized copy so formatting is never
+  // load-bearing.
+  const flat = sql.replace(/\s+/g, ' ');
+
+  /** The column names one model declares in schema.prisma. */
+  const schemaColumns = (model: string): string[] => {
+    const body = schema.match(
+      new RegExp(`\\nmodel ${model} \\{\\n([\\s\\S]*?)\\n\\}`),
+    );
+    expect(body).not.toBeNull();
+    return body![1]
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(
+        (line) =>
+          line.length > 0 &&
+          !line.startsWith('//') &&
+          !line.startsWith('@@') &&
+          // Relation fields and list fields carry no column of their own.
+          !/^\w+\s+\w+(\[\])?\??\s+@relation/.test(line) &&
+          !/^\w+\s+\w+\[\]/.test(line),
+      )
+      .map((line) => line.split(/\s+/)[0])
+      .filter((name) => /^[a-z]/.test(name));
+  };
+
+  /** The column names one CREATE TABLE declares in the migration. */
+  const migrationColumns = (table: string): string[] => {
+    const body = sql.match(
+      new RegExp(`CREATE TABLE "${table}" \\(\\n([\\s\\S]*?)\\n\\);`),
+    );
+    expect(body).not.toBeNull();
+    return [...body![1].matchAll(/^ {4}"([A-Za-z0-9_]+)"/gm)].map(
+      (match) => match[1],
+    );
+  };
+
+  it('creates exactly the columns schema.prisma declares, for every new table', () => {
+    // This repo hand-writes migration SQL, so nothing else catches a column
+    // that exists in the Prisma model and not in the database.
+    for (const model of [
+      'Shopper',
+      'StoreEntryToken',
+      'StoreFlowPolicy',
+      'StoreFlowPolicyVersion',
+      'StoreFlowProjection',
+    ]) {
+      expect([model, migrationColumns(model).sort()]).toEqual([
+        model,
+        schemaColumns(model).sort(),
+      ]);
+    }
+  });
+
+  it('adds the four commerce columns a journey was missing, all back-compatible', () => {
+    // Every one is nullable or defaulted, so the migration cannot fail on a
+    // table that already has rows, and pre-Phase-26 journeys keep their shape.
+    expect(flat).toContain(
+      'ALTER TABLE "CustomerJourney" ADD COLUMN "checkoutSessionId" TEXT,',
+    );
+    expect(flat).toContain('ADD COLUMN "orderId" TEXT,');
+    expect(flat).toContain('ADD COLUMN "shopperId" TEXT;');
+    expect(flat).toContain(
+      'ADD COLUMN "settlementStatus" "StoreFlowSettlementStatus" NOT NULL DEFAULT \'NOT_STARTED\'',
+    );
+  });
+
+  it('ships the enum values the code depends on, and defaults to SHADOW', () => {
+    expect(sql).toContain(
+      `CREATE TYPE "StoreFlowAutonomyLevel" AS ENUM ('SHADOW', 'PROPOSE', 'AUTO_APPLY')`,
+    );
+    expect(sql).toContain(
+      `CREATE TYPE "StoreFlowProjectionOutcome" AS ENUM ('SKIPPED', 'PROPOSED', 'AUTO_APPLIED', 'REVIEW_REQUIRED', 'REJECTED')`,
+    );
+    expect(sql).toContain(
+      `CREATE TYPE "StoreFlowSettlementStatus" AS ENUM ('NOT_STARTED', 'BLOCKED_ON_REVIEW', 'ORDER_CREATED', 'PAID', 'FAILED')`,
+    );
+    expect(sql).toContain(
+      `CREATE TYPE "StoreEntryTokenStatus" AS ENUM ('ISSUED', 'REDEEMED', 'REVOKED')`,
+    );
+    // The default the Prisma schema promises has to be the database's too, or
+    // a row written outside the service could arrive already autonomous.
+    expect(sql).toContain(
+      `"autonomyLevel" "StoreFlowAutonomyLevel" NOT NULL DEFAULT 'SHADOW'`,
+    );
+    expect(sql).toContain(`"settleOnExit" BOOLEAN NOT NULL DEFAULT false`);
+    expect(sql).toContain(
+      `"requireInventoryValidation" BOOLEAN NOT NULL DEFAULT true`,
+    );
+  });
+
+  it('enforces same-tenant references with composite foreign keys', () => {
+    for (const [constraint, columns, parent] of [
+      ['CustomerJourney_shopper_same_tenant_fkey', '"shopperId", "tenantId"', 'Shopper'],
+      ['CustomerJourney_session_same_tenant_fkey', '"checkoutSessionId", "tenantId"', 'CheckoutSession'],
+      ['CustomerJourney_order_same_tenant_fkey', '"orderId", "tenantId"', 'Order'],
+      ['StoreEntryToken_location_same_tenant_fkey', '"locationId", "tenantId"', 'Location'],
+      ['StoreEntryToken_unit_same_tenant_fkey', '"unitId", "tenantId"', 'RetailUnit'],
+      ['StoreEntryToken_shopper_same_tenant_fkey', '"shopperId", "tenantId"', 'Shopper'],
+      ['StoreEntryToken_journey_same_tenant_fkey', '"redeemedJourneyId", "tenantId"', 'CustomerJourney'],
+      ['StoreFlowPolicy_location_same_tenant_fkey', '"locationId", "tenantId"', 'Location'],
+      ['StoreFlowPolicy_active_version_same_tenant_fkey', '"activeVersionId", "tenantId"', 'StoreFlowPolicyVersion'],
+      ['StoreFlowPolicyVersion_policy_same_tenant_fkey', '"policyId", "tenantId"', 'StoreFlowPolicy'],
+      ['StoreFlowProjection_journey_same_tenant_fkey', '"journeyId", "tenantId"', 'CustomerJourney'],
+      ['StoreFlowProjection_event_same_tenant_fkey', '"journeyEventId", "tenantId"', 'CustomerJourneyEvent'],
+      ['StoreFlowProjection_vision_event_same_tenant_fkey', '"visionEventId", "tenantId"', 'VisionEvent'],
+    ] as const) {
+      expect(flat).toContain(
+        `ADD CONSTRAINT "${constraint}" FOREIGN KEY (${columns}) REFERENCES "${parent}"("id", "tenantId")`,
+      );
+    }
+  });
+
+  it('never covers User references with composite FKs (platform-sandbox exception)', () => {
+    // Same reason as the CV migration: a platform admin acting in the sandbox
+    // tenant is a (platform user, sandbox tenant) pair that User(id, tenantId)
+    // can never hold.
+    expect(flat).not.toMatch(
+      /same_tenant_fkey" FOREIGN KEY \("(issuedById|createdById|userId)"/,
+    );
+  });
+
+  it('keeps at most one tenant-wide default policy per tenant', () => {
+    // Postgres treats NULLs as distinct, so the (tenantId, locationId) unique
+    // index alone would let a tenant collect several tenant-wide rows and
+    // resolve to an arbitrary one.
+    expect(flat).toContain(
+      'CREATE UNIQUE INDEX "StoreFlowPolicy_tenant_default_key" ON "StoreFlowPolicy"("tenantId") WHERE "locationId" IS NULL',
+    );
+  });
+
+  it('refuses to store anything but a SHA-256 digest for an entry credential', () => {
+    expect(flat).toContain(
+      `ADD CONSTRAINT "StoreEntryToken_token_hash_is_sha256" CHECK ("tokenHash" ~ '^[0-9a-f]{64}$')`,
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "StoreEntryToken_expiry_after_issue" CHECK ("expiresAt" > "createdAt")`,
+    );
+  });
+
+  it('keeps a credential status and its evidence together', () => {
+    expect(flat).toContain('"StoreEntryToken_status_evidence"');
+    for (const clause of [
+      `"status" = 'ISSUED' AND "redeemedAt" IS NULL AND "redeemedJourneyId" IS NULL AND "revokedAt" IS NULL`,
+      `"status" = 'REDEEMED' AND "redeemedAt" IS NOT NULL AND "redeemedJourneyId" IS NOT NULL AND "revokedAt" IS NULL`,
+      `"status" = 'REVOKED' AND "revokedAt" IS NOT NULL AND "redeemedAt" IS NULL AND "redeemedJourneyId" IS NULL`,
+    ]) {
+      expect(flat).toContain(clause);
+    }
+    // One credential can only ever open one journey.
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "StoreEntryToken_redeemedJourneyId_key" ON "StoreEntryToken"("redeemedJourneyId")',
+    );
+  });
+
+  it('makes a replayed projection impossible and its audit trail honest', () => {
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "StoreFlowProjection_tenantId_journeyEventId_key" ON "StoreFlowProjection"("tenantId", "journeyEventId")',
+    );
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "StoreFlowProjection_visionEventId_key" ON "StoreFlowProjection"("visionEventId")',
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "StoreFlowProjection_outcome_evidence" CHECK ( ( "outcome" IN ('PROPOSED', 'AUTO_APPLIED', 'REJECTED') AND "visionEventId" IS NOT NULL )`,
+    );
+  });
+
+  it('bounds the autonomy threshold and every recorded score to [0, 1]', () => {
+    expect(flat).toContain(
+      `ADD CONSTRAINT "StoreFlowPolicyVersion_confidence_in_range" CHECK ("autoApplyMinConfidence" >= 0 AND "autoApplyMinConfidence" <= 1)`,
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "StoreFlowPolicyVersion_version_number_positive" CHECK ("versionNumber" >= 1)`,
+    );
+    expect(flat).toContain('"StoreFlowProjection_confidence_in_range"');
+  });
+
+  it('never lets a settled journey lose the order it became', () => {
+    expect(flat).toContain(
+      `ADD CONSTRAINT "CustomerJourney_settlement_evidence" CHECK ( "settlementStatus" NOT IN ('ORDER_CREATED', 'PAID') OR "orderId" IS NOT NULL )`,
+    );
+  });
+});
+
+describe('store flow module backfill migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260916100001_store_flow_module_backfill',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('activates a pre-existing store-flow module row instead of leaving it inactive', () => {
+    expect(sql).toContain('ON CONFLICT ("code") DO UPDATE SET');
+    expect(sql).toContain('"isActive" = true');
+    expect(sql).not.toMatch(/DO UPDATE SET[^;]*"id"\s*=/);
+  });
+
+  it('is idempotent and never overwrites a tenant admin choice', () => {
+    expect(sql).toContain('ON CONFLICT ("tenantId", "moduleId") DO NOTHING');
+    expect(sql).not.toMatch(/ON CONFLICT \("tenantId", "moduleId"\) DO UPDATE/);
+  });
+
+  it('enables store-flow for every pre-existing tenant with deterministic ids', () => {
+    expect(sql).toContain(`'tm-' || md5(t."id" || ':store-flow')`);
+    expect(sql).toContain(`WHERE pm."code" = 'store-flow'`);
+  });
+
+  it('grants no autonomy on its own', () => {
+    // The backfill must not publish a policy: a store keeps observing until
+    // an operator opts it in, which is the whole safety story of the phase.
+    expect(sql).not.toContain('StoreFlowPolicy');
+    expect(sql).not.toContain('AUTO_APPLY');
+    expect(sql).not.toContain('PROPOSE');
+  });
+});

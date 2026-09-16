@@ -273,6 +273,12 @@ model Tenant {
   priceBooks        PriceBook[]
   priceBookVersions PriceBookVersion[]
   priceBookEntries  PriceBookEntry[]
+
+  shoppers                Shopper[]
+  storeEntryTokens        StoreEntryToken[]
+  storeFlowPolicies       StoreFlowPolicy[]
+  storeFlowPolicyVersions StoreFlowPolicyVersion[]
+  storeFlowProjections    StoreFlowProjection[]
 }
 
 model User {
@@ -316,9 +322,14 @@ model User {
   videoAssetsUploaded   VideoAsset[]    @relation("VideoAssetUploader")
   videoArtifactsCreated VideoArtifact[] @relation("VideoArtifactActor")
 
-  priceBooksCreated         PriceBook[]        @relation("PriceBookActor")
-  priceBookVersionsCreated  PriceBookVersion[] @relation("PriceBookVersionActor")
+  priceBooksCreated          PriceBook[]        @relation("PriceBookActor")
+  priceBookVersionsCreated   PriceBookVersion[] @relation("PriceBookVersionActor")
   priceBookVersionsActivated PriceBookVersion[] @relation("PriceBookVersionActivator")
+
+  shopperIdentity                Shopper[]                @relation("ShopperUser")
+  storeEntryTokensIssued         StoreEntryToken[]        @relation("StoreEntryTokenIssuer")
+  storeFlowPoliciesCreated       StoreFlowPolicy[]        @relation("StoreFlowPolicyActor")
+  storeFlowPolicyVersionsCreated StoreFlowPolicyVersion[] @relation("StoreFlowPolicyVersionActor")
 
   // Composite FK target for same-tenant creator constraints (id alone is
   // already unique; this adds nothing semantically, only an FK anchor).
@@ -403,21 +414,23 @@ model Location {
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
 
-  inventoryLevels     InventoryLevel[]
-  inventoryMovements  InventoryMovement[]
-  retailUnits         RetailUnit[]
-  checkoutSessions    CheckoutSession[]
-  orders              Order[]
-  visionEvents        VisionEvent[]
-  inferenceJobs       InferenceJob[]
-  videoAssets         VideoAsset[]
-  customerJourneys    CustomerJourney[]
-  cameraSources       CameraSource[]
-  pilotEvaluationRuns PilotEvaluationRun[]
-  cvTestProtocols     CvTestProtocol[]
+  inventoryLevels           InventoryLevel[]
+  inventoryMovements        InventoryMovement[]
+  retailUnits               RetailUnit[]
+  checkoutSessions          CheckoutSession[]
+  orders                    Order[]
+  visionEvents              VisionEvent[]
+  inferenceJobs             InferenceJob[]
+  videoAssets               VideoAsset[]
+  customerJourneys          CustomerJourney[]
+  cameraSources             CameraSource[]
+  pilotEvaluationRuns       PilotEvaluationRun[]
+  cvTestProtocols           CvTestProtocol[]
   cameraCalibrationProfiles CameraCalibrationProfile[]
-  planogramRacks      PlanogramRack[]
-  priceBooks          PriceBook[]
+  planogramRacks            PlanogramRack[]
+  priceBooks                PriceBook[]
+  storeEntryTokens          StoreEntryToken[]
+  storeFlowPolicies         StoreFlowPolicy[]
 
   @@unique([tenantId, code])
   // Enables the composite tenant-integrity FKs added in migration SQL
@@ -560,24 +573,24 @@ model Product {
   category ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: Restrict)
   brand    Brand?           @relation(fields: [brandId], references: [id], onDelete: Restrict)
 
-  barcodes                ProductBarcode[]
-  inventoryLevels         InventoryLevel[]
-  inventoryMovements      InventoryMovement[]
-  checkoutSessionLines    CheckoutSessionLine[]
-  orderLines              OrderLine[]
-  visionEventCandidates   VisionEventCandidate[]
-  visionReviewsApplied    VisionEventReview[]          @relation("VisionReviewAppliedProduct")
-  referenceImages         ProductReferenceImage[]
-  groundTruths            VideoGroundTruth[]
-  referenceEmbeddings     ProductReferenceEmbedding[]
-  journeyEvents           CustomerJourneyEvent[]
-  journeyEventReviews     CustomerJourneyEventReview[] @relation("JourneyReviewCorrectedProduct")
-  pilotReviewExpectations PilotObservationReview[]     @relation("PilotReviewExpectedProduct")
-  bootstrapEvaluationRuns PilotEvaluationRun[]         @relation("PilotRunBootstrapProduct")
-  planogramCellAssignments PlanogramCellAssignment[]
-  cvScenarioExpectations  CvTestProtocolScenario[]     @relation("CvScenarioExpectedProduct")
+  barcodes                    ProductBarcode[]
+  inventoryLevels             InventoryLevel[]
+  inventoryMovements          InventoryMovement[]
+  checkoutSessionLines        CheckoutSessionLine[]
+  orderLines                  OrderLine[]
+  visionEventCandidates       VisionEventCandidate[]
+  visionReviewsApplied        VisionEventReview[]            @relation("VisionReviewAppliedProduct")
+  referenceImages             ProductReferenceImage[]
+  groundTruths                VideoGroundTruth[]
+  referenceEmbeddings         ProductReferenceEmbedding[]
+  journeyEvents               CustomerJourneyEvent[]
+  journeyEventReviews         CustomerJourneyEventReview[]   @relation("JourneyReviewCorrectedProduct")
+  pilotReviewExpectations     PilotObservationReview[]       @relation("PilotReviewExpectedProduct")
+  bootstrapEvaluationRuns     PilotEvaluationRun[]           @relation("PilotRunBootstrapProduct")
+  planogramCellAssignments    PlanogramCellAssignment[]
+  cvScenarioExpectations      CvTestProtocolScenario[]       @relation("CvScenarioExpectedProduct")
   calibrationZoneExpectations CameraCalibrationZoneProduct[] @relation("CameraCalibrationZoneExpectedProduct")
-  priceBookEntries        PriceBookEntry[]
+  priceBookEntries            PriceBookEntry[]
 
   @@unique([tenantId, sku])
   @@unique([id, tenantId])
@@ -698,33 +711,51 @@ enum JourneyEventReviewDecision {
 }
 
 model CustomerJourney {
-  id             String                   @id @default(cuid())
-  tenantId       String
-  locationId     String
-  unitId         String?
-  status         CustomerJourneyStatus    @default(OPEN)
+  id                String                    @id @default(cuid())
+  tenantId          String
+  locationId        String
+  unitId            String?
+  status            CustomerJourneyStatus     @default(OPEN)
+  /// Phase 26 — commerce binding. A journey opened by the store-flow entry
+  /// path carries the shopper it belongs to, the checkout session its
+  /// observations fold into, and (after settlement) the order it became.
+  /// All three stay NULL for the shadow journeys every earlier phase opens,
+  /// so nothing about those changes.
+  shopperId         String?
+  checkoutSessionId String?                   @unique
+  orderId           String?                   @unique
+  /// How far the store-flow settlement pipeline has taken this journey.
+  /// NOT_STARTED for every journey that is not store-flow owned.
+  settlementStatus  StoreFlowSettlementStatus @default(NOT_STARTED)
   // Phase 11 — final shadow decision, set at exit reconciliation and
   // recomputed after each event review. Null while the journey is OPEN.
-  decision       CustomerJourneyDecision?
-  decisionReason String?
-  decidedAt      DateTime?
-  startedAt      DateTime                 @default(now())
-  endedAt        DateTime?
-  createdAt      DateTime                 @default(now())
-  updatedAt      DateTime                 @updatedAt
+  decision          CustomerJourneyDecision?
+  decisionReason    String?
+  decidedAt         DateTime?
+  startedAt         DateTime                  @default(now())
+  endedAt           DateTime?
+  createdAt         DateTime                  @default(now())
+  updatedAt         DateTime                  @updatedAt
 
-  tenant             Tenant                       @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location           Location                     @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit               RetailUnit?                  @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  events             CustomerJourneyEvent[]
-  eventReviews       CustomerJourneyEventReview[]
-  cameraPilotRuns    CameraPilotRun[]
-  liveCameraSessions LiveCameraSession[]
+  tenant               Tenant                       @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location             Location                     @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit                 RetailUnit?                  @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  shopper              Shopper?                     @relation(fields: [shopperId], references: [id], onDelete: Restrict)
+  checkoutSession      CheckoutSession?             @relation("StoreFlowJourneySession", fields: [checkoutSessionId], references: [id], onDelete: Restrict)
+  order                Order?                       @relation("StoreFlowJourneyOrder", fields: [orderId], references: [id], onDelete: Restrict)
+  entryToken           StoreEntryToken?             @relation("StoreEntryTokenJourney")
+  storeFlowProjections StoreFlowProjection[]
+  events               CustomerJourneyEvent[]
+  eventReviews         CustomerJourneyEventReview[]
+  cameraPilotRuns      CameraPilotRun[]
+  liveCameraSessions   LiveCameraSession[]
 
   // Anchor for hand-written same-tenant composite FKs
   // (20260811110000_cv_same_tenant_fks).
   @@unique([id, tenantId])
   @@index([tenantId, status, startedAt(sort: Desc)])
+  @@index([tenantId, shopperId, startedAt(sort: Desc)])
+  @@index([tenantId, settlementStatus])
 }
 
 // APPEND-ONLY (service discipline; no update path exists): what the CV
@@ -752,11 +783,12 @@ model CustomerJourneyEvent {
   createdById  String?
   createdAt    DateTime                 @default(now())
 
-  tenant       Tenant                       @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  journey      CustomerJourney              @relation(fields: [journeyId], references: [id], onDelete: Cascade)
-  product      Product?                     @relation(fields: [productId], references: [id], onDelete: Restrict)
-  reviews      CustomerJourneyEventReview[]
-  pilotReviews PilotObservationReview[]
+  tenant               Tenant                       @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  journey              CustomerJourney              @relation(fields: [journeyId], references: [id], onDelete: Cascade)
+  product              Product?                     @relation(fields: [productId], references: [id], onDelete: Restrict)
+  reviews              CustomerJourneyEventReview[]
+  pilotReviews         PilotObservationReview[]
+  storeFlowProjections StoreFlowProjection[]
 
   // Anchor for the review table's same-tenant composite FK (Phase 11).
   @@unique([id, tenantId])
@@ -962,10 +994,10 @@ model CameraSource {
   createdAt          DateTime           @default(now())
   updatedAt          DateTime           @updatedAt
 
-  tenant           Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location         Location            @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit             RetailUnit?         @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  replayVideoAsset VideoAsset?         @relation("CameraReplayAsset", fields: [replayVideoAssetId], references: [id], onDelete: SetNull)
+  tenant              Tenant                     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location            Location                   @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit                RetailUnit?                @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  replayVideoAsset    VideoAsset?                @relation("CameraReplayAsset", fields: [replayVideoAssetId], references: [id], onDelete: SetNull)
   pilotRuns           CameraPilotRun[]
   liveSessions        LiveCameraSession[]
   cvTestProtocols     CvTestProtocol[]
@@ -1187,6 +1219,7 @@ model RetailUnit {
   videoAssets      VideoAsset[]
   customerJourneys CustomerJourney[]
   cameraSources    CameraSource[]
+  storeEntryTokens StoreEntryToken[]
 
   @@unique([tenantId, code])
   // Enables composite same-tenant FKs (devices must reference a unit of the
@@ -1375,17 +1408,20 @@ model CheckoutSession {
   createdAt                 DateTime              @default(now())
   updatedAt                 DateTime              @updatedAt
 
-  tenant         Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location       Location              @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit           RetailUnit            @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  device         Device?               @relation(fields: [deviceId], references: [id], onDelete: Restrict)
-  createdBy      User?                 @relation("CheckoutSessionActor", fields: [createdById], references: [id], onDelete: Restrict)
-  lines          CheckoutSessionLine[]
-  order          Order?
-  visionEvents   VisionEvent[]
-  paymentIntents PaymentIntent[]
-  inferenceJobs  InferenceJob[]
-  videoAssets    VideoAsset[]
+  tenant           Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location         Location              @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit             RetailUnit            @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  device           Device?               @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  createdBy        User?                 @relation("CheckoutSessionActor", fields: [createdById], references: [id], onDelete: Restrict)
+  lines            CheckoutSessionLine[]
+  order            Order?
+  visionEvents     VisionEvent[]
+  paymentIntents   PaymentIntent[]
+  inferenceJobs    InferenceJob[]
+  videoAssets      VideoAsset[]
+  // Phase 26 — the store-flow journey whose observations fold into this
+  // basket. NULL for every manually opened session.
+  storeFlowJourney CustomerJourney?      @relation("StoreFlowJourneySession")
 
   // Enables composite same-tenant FKs (lines/orders must reference a session
   // of the SAME tenant) — mirrors the Phase 3/4 hardening pattern.
@@ -1509,13 +1545,16 @@ model Order {
   createdAt                 DateTime           @default(now())
   updatedAt                 DateTime           @updatedAt
 
-  tenant         Tenant          @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  session        CheckoutSession @relation(fields: [checkoutSessionId], references: [id], onDelete: Restrict)
-  location       Location        @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit           RetailUnit      @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  createdBy      User?           @relation("OrderActor", fields: [createdById], references: [id], onDelete: Restrict)
-  lines          OrderLine[]
-  paymentIntents PaymentIntent[]
+  tenant           Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  session          CheckoutSession  @relation(fields: [checkoutSessionId], references: [id], onDelete: Restrict)
+  location         Location         @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit             RetailUnit       @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  createdBy        User?            @relation("OrderActor", fields: [createdById], references: [id], onDelete: Restrict)
+  lines            OrderLine[]
+  paymentIntents   PaymentIntent[]
+  // Phase 26 — the store-flow journey this order settled. NULL for orders
+  // completed through the manual checkout route.
+  storeFlowJourney CustomerJourney? @relation("StoreFlowJourneyOrder")
 
   @@unique([id, tenantId])
   @@unique([tenantId, orderNumber])
@@ -1972,16 +2011,18 @@ model VisionEvent {
   createdAt        DateTime           @default(now())
   updatedAt        DateTime           @updatedAt
 
-  tenant         Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location       Location               @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit           RetailUnit             @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  device         Device?                @relation(fields: [deviceId], references: [id], onDelete: Restrict)
-  session        CheckoutSession?       @relation(fields: [sessionId], references: [id], onDelete: Restrict)
-  evidenceBundle EvidenceBundle?        @relation(fields: [evidenceBundleId], references: [id], onDelete: Restrict)
-  createdBy      User?                  @relation("VisionEventActor", fields: [createdById], references: [id], onDelete: Restrict)
-  candidates     VisionEventCandidate[]
-  review         VisionEventReview?
-  inferenceJobs  InferenceJob[]
+  tenant              Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location            Location               @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit                RetailUnit             @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  device              Device?                @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  session             CheckoutSession?       @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  evidenceBundle      EvidenceBundle?        @relation(fields: [evidenceBundleId], references: [id], onDelete: Restrict)
+  createdBy           User?                  @relation("VisionEventActor", fields: [createdById], references: [id], onDelete: Restrict)
+  candidates          VisionEventCandidate[]
+  review              VisionEventReview?
+  inferenceJobs       InferenceJob[]
+  // Phase 26 — the store-flow projection that produced this event, if any.
+  storeFlowProjection StoreFlowProjection?
 
   @@unique([id, tenantId])
   @@unique([tenantId, idempotencyKey])
@@ -2361,18 +2402,18 @@ model VideoAsset {
   createdAt                DateTime              @default(now())
   updatedAt                DateTime              @updatedAt
 
-  tenant              Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  location            Location?                @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  unit                RetailUnit?              @relation(fields: [unitId], references: [id], onDelete: Restrict)
-  device              Device?                  @relation(fields: [deviceId], references: [id], onDelete: Restrict)
-  session             CheckoutSession?         @relation(fields: [sessionId], references: [id], onDelete: Restrict)
-  uploadedBy          User?                    @relation("VideoAssetUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
-  artifacts           VideoArtifact[]
-  extractionRequests  VideoExtractionRequest[]
-  groundTruth         VideoGroundTruth?
-  fusionRuns          PickupFusionRun[]
-  replayCameraSources CameraSource[]           @relation("CameraReplayAsset")
-  cameraPilotRuns     CameraPilotRun[]
+  tenant               Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location             Location?                @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit                 RetailUnit?              @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  device               Device?                  @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  session              CheckoutSession?         @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  uploadedBy           User?                    @relation("VideoAssetUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
+  artifacts            VideoArtifact[]
+  extractionRequests   VideoExtractionRequest[]
+  groundTruth          VideoGroundTruth?
+  fusionRuns           PickupFusionRun[]
+  replayCameraSources  CameraSource[]           @relation("CameraReplayAsset")
+  cameraPilotRuns      CameraPilotRun[]
   pretrainedVisionRuns PretrainedVisionRun[]
 
   @@unique([id, tenantId])
@@ -2488,12 +2529,12 @@ enum PilotExpectedAction {
 }
 
 model PilotEvaluationRun {
-  id          String                   @id @default(cuid())
-  tenantId    String
-  locationId  String?
-  name        String
-  description String?
-  status      PilotEvaluationRunStatus @default(OPEN)
+  id                 String                   @id @default(cuid())
+  tenantId           String
+  locationId         String?
+  name               String
+  description        String?
+  status             PilotEvaluationRunStatus @default(OPEN)
   // One-SKU bootstrap identity: the product this run bootstraps, set ONLY
   // by the bootstrap workflow's find-or-create (NULL for every other
   // pilot run). A partial unique index (raw SQL in the
@@ -2501,9 +2542,9 @@ model PilotEvaluationRun {
   // WHERE clause) allows at most ONE OPEN run per tenant/product, so
   // concurrent first corrections cannot split reviews across duplicates.
   bootstrapProductId String?
-  createdById String?
-  createdAt   DateTime                 @default(now())
-  completedAt DateTime?
+  createdById        String?
+  createdAt          DateTime                 @default(now())
+  completedAt        DateTime?
 
   tenant                 Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   location               Location?                 @relation(fields: [locationId], references: [id], onDelete: Restrict)
@@ -2540,27 +2581,27 @@ model PilotEvaluationSession {
 // review time — never caller-supplied. The newest review per observation
 // is the one metrics use; older rows remain as audit history.
 model PilotObservationReview {
-  id                 String                  @id @default(cuid())
-  tenantId           String
-  evaluationRunId    String
-  liveSessionId      String?
-  journeyEventId     String?
-  verdict            PilotObservationVerdict
-  expectedAction     PilotExpectedAction
-  expectedProductId  String?
-  expectedSku        String?
-  predictedProductId String?
-  predictedSku       String?
-  predictedAction    PilotExpectedAction?
+  id                     String                  @id @default(cuid())
+  tenantId               String
+  evaluationRunId        String
+  liveSessionId          String?
+  journeyEventId         String?
+  verdict                PilotObservationVerdict
+  expectedAction         PilotExpectedAction
+  expectedProductId      String?
+  expectedSku            String?
+  predictedProductId     String?
+  predictedSku           String?
+  predictedAction        PilotExpectedAction?
   // One-SKU bootstrap: OPAQUE id of the operator-approved manual CROP
   // VideoArtifact that supersedes the fusion run's automatic crop as
   // this observation's evidence. STRUCTURED (never parsed from notes),
   // validated tenant-scoped + same-video at write time, and carried into
   // Phase 18 candidates as evidenceCropArtifactId. Never a path or URL.
   operatorCropArtifactId String?
-  notes              String?
-  reviewedById       String?
-  createdAt          DateTime                @default(now())
+  notes                  String?
+  reviewedById           String?
+  createdAt              DateTime                @default(now())
 
   tenant          Tenant                @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   evaluationRun   PilotEvaluationRun    @relation(fields: [evaluationRunId], references: [id], onDelete: Restrict)
@@ -2628,7 +2669,7 @@ model CvTestProtocol {
   createdAt        DateTime             @default(now())
   completedAt      DateTime?
 
-  tenant        Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  tenant                 Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   // SAME-TENANT composite location relation (Codex P1): the store join
   // carries the tenant in the FK itself — a malformed row can never
   // resolve another tenant's store name.
@@ -2714,33 +2755,33 @@ enum CameraCalibrationZoneType {
 }
 
 model CameraCalibrationProfile {
-  id                 String                          @id @default(cuid())
+  id                 String                         @id @default(cuid())
   tenantId           String
   cameraSourceId     String
   locationId         String?
   name               String
-  status             CameraCalibrationProfileStatus  @default(DRAFT)
-  calibrationVersion Int                             @default(1)
+  status             CameraCalibrationProfileStatus @default(DRAFT)
+  calibrationVersion Int                            @default(1)
   frameWidth         Int?
   frameHeight        Int?
-  orientation        CameraCalibrationOrientation    @default(UNKNOWN)
-  cameraMount        CameraCalibrationMount          @default(UNKNOWN)
+  orientation        CameraCalibrationOrientation   @default(UNKNOWN)
+  cameraMount        CameraCalibrationMount         @default(UNKNOWN)
   // Screened free text (reject-on-write): never a URL, path, credential,
   // or connection string — same policy as camera connectionNote.
   notes              String?
   createdById        String?
-  createdAt          DateTime                        @default(now())
-  updatedAt          DateTime                        @updatedAt
+  createdAt          DateTime                       @default(now())
+  updatedAt          DateTime                       @updatedAt
   activatedAt        DateTime?
   archivedAt         DateTime?
 
-  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  tenant                 Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   // SAME-TENANT composite relations (Codex P1): the FK itself carries the
   // tenant, so a malformed row can never resolve another tenant's source
   // or store.
-  cameraSource CameraSource @relation(fields: [cameraSourceId, tenantId], references: [id, tenantId], onDelete: Restrict)
-  location     Location?    @relation(fields: [locationId, tenantId], references: [id, tenantId], onDelete: Restrict)
-  zones        CameraCalibrationZone[]
+  cameraSource           CameraSource              @relation(fields: [cameraSourceId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  location               Location?                 @relation(fields: [locationId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  zones                  CameraCalibrationZone[]
   datasetImprovementRuns CvDatasetImprovementRun[]
 
   // At most ONE ACTIVE profile per camera source: partial unique index in
@@ -2767,9 +2808,9 @@ model CameraCalibrationZone {
   createdAt            DateTime                  @default(now())
   updatedAt            DateTime                  @updatedAt
 
-  tenant             Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  calibrationProfile CameraCalibrationProfile @relation(fields: [calibrationProfileId, tenantId], references: [id, tenantId], onDelete: Cascade)
-  cameraSource       CameraSource             @relation(fields: [cameraSourceId, tenantId], references: [id, tenantId], onDelete: Restrict)
+  tenant             Tenant                         @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  calibrationProfile CameraCalibrationProfile       @relation(fields: [calibrationProfileId, tenantId], references: [id, tenantId], onDelete: Cascade)
+  cameraSource       CameraSource                   @relation(fields: [cameraSourceId, tenantId], references: [id, tenantId], onDelete: Restrict)
   expectedProducts   CameraCalibrationZoneProduct[]
 
   @@unique([id, tenantId])
@@ -2850,22 +2891,22 @@ enum CvDatasetEligibility {
 }
 
 model CvDatasetImprovementRun {
-  id                          String                        @id @default(cuid())
-  tenantId                    String
-  sourceEvaluationRunId       String?
-  sourceTestProtocolId        String?
-  sourceCalibrationProfileId  String?
-  name                        String
-  status                      CvDatasetImprovementRunStatus @default(DRAFT)
-  purpose                     CvDatasetPurpose
-  trainSplitPercent           Int
-  validationSplitPercent      Int
-  testSplitPercent            Int
-  minReviewedExamplesPerSku   Int
+  id                           String                        @id @default(cuid())
+  tenantId                     String
+  sourceEvaluationRunId        String?
+  sourceTestProtocolId         String?
+  sourceCalibrationProfileId   String?
+  name                         String
+  status                       CvDatasetImprovementRunStatus @default(DRAFT)
+  purpose                      CvDatasetPurpose
+  trainSplitPercent            Int
+  validationSplitPercent       Int
+  testSplitPercent             Int
+  minReviewedExamplesPerSku    Int
   minReviewedExamplesPerAction Int
   // Screened free text (reject-on-write): never a URL, path, credential,
   // or slot name — same policy as calibration notes.
-  notes                       String?
+  notes                        String?
   // sha256 over SAFE calibration content (profile id/version/orientation/
   // mount/updatedAt + zone counts, sorted zone ids, max zone updatedAt),
   // captured at candidate refresh when the linked profile is stamped on
@@ -2873,14 +2914,14 @@ model CvDatasetImprovementRun {
   // AND zone additions/updates/deletions after the refresh reject the
   // export instead of silently changing the manifest. Null when no
   // profile is linked or nothing is stamped (FILE_REPLAY exemption).
-  calibrationFingerprint      String?
-  createdById                 String?
-  createdAt                   DateTime                      @default(now())
-  updatedAt                   DateTime                      @updatedAt
-  exportedAt                  DateTime?
-  archivedAt                  DateTime?
+  calibrationFingerprint       String?
+  createdById                  String?
+  createdAt                    DateTime                      @default(now())
+  updatedAt                    DateTime                      @updatedAt
+  exportedAt                   DateTime?
+  archivedAt                   DateTime?
 
-  tenant             Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  tenant                   Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   // SAME-TENANT composite relations (Codex P1): the FK itself carries the
   // tenant, so a malformed row can never resolve another tenant's
   // evaluation run, protocol, or calibration profile.
@@ -2903,36 +2944,36 @@ model CvDatasetImprovementRun {
 // calibrationZoneLabel are ALWAYS null in the MVP: no source data exists
 // for them yet, and Phase 18 never fabricates values.
 model CvDatasetCandidate {
-  id                   String                       @id @default(cuid())
-  tenantId             String
-  runId                String
-  sourceType           CvDatasetCandidateSourceType
-  sourceId             String
-  liveSessionId        String?
-  evaluationRunId      String?
-  protocolId           String?
-  calibrationProfileId String?
-  skuId                String?
-  skuCodeSnapshot      String?
-  actionLabel          String
-  correctedActionLabel String?
-  reviewVerdict        String
-  reviewSource         String
-  confidenceBucket     String?
-  lightingBucket       String?
-  occlusionBucket      String?
-  calibrationZoneLabel String?
-  scenarioTypeSnapshot String?
+  id                     String                       @id @default(cuid())
+  tenantId               String
+  runId                  String
+  sourceType             CvDatasetCandidateSourceType
+  sourceId               String
+  liveSessionId          String?
+  evaluationRunId        String?
+  protocolId             String?
+  calibrationProfileId   String?
+  skuId                  String?
+  skuCodeSnapshot        String?
+  actionLabel            String
+  correctedActionLabel   String?
+  reviewVerdict          String
+  reviewSource           String
+  confidenceBucket       String?
+  lightingBucket         String?
+  occlusionBucket        String?
+  calibrationZoneLabel   String?
+  scenarioTypeSnapshot   String?
   // OPAQUE id of the operator-approved crop artifact this candidate's
   // evidence resolves to (copied from the source review's structured
   // operatorCropArtifactId at refresh). Null = the source event's own
   // automatic fusion crop. Reference marker only — never a path/URL.
   evidenceCropArtifactId String?
-  split                CvDatasetSplit?
-  eligibility          CvDatasetEligibility
-  exclusionReason      String?
-  createdAt            DateTime                     @default(now())
-  updatedAt            DateTime                     @updatedAt
+  split                  CvDatasetSplit?
+  eligibility            CvDatasetEligibility
+  exclusionReason        String?
+  createdAt              DateTime                     @default(now())
+  updatedAt              DateTime                     @updatedAt
 
   tenant Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   run    CvDatasetImprovementRun @relation(fields: [runId, tenantId], references: [id, tenantId], onDelete: Cascade)
@@ -3021,20 +3062,22 @@ enum PretrainedVisionRunStatus {
 // paths, raw tensors, raw media, or provider logs. Records the planogram
 // version the run was scored against (version safety).
 model PretrainedVisionRun {
-  id               String                    @id @default(cuid())
-  tenantId         String
-  videoAssetId     String
-  provider         String
-  status           PretrainedVisionRunStatus
-  planogramRackId  String?
-  planogramVersion Int?
-  /** The EXACT sanitized planogram section the run was scored against —
-   *  immutable evidence: publishing a new planogram version can never
-   *  rewrite what an old run's candidates/match status looked like. */
+  id                String                    @id @default(cuid())
+  tenantId          String
+  videoAssetId      String
+  provider          String
+  status            PretrainedVisionRunStatus
+  planogramRackId   String?
+  planogramVersion  Int?
+  /**
+   * The EXACT sanitized planogram section the run was scored against —
+   * immutable evidence: publishing a new planogram version can never
+   * rewrite what an old run's candidates/match status looked like.
+   */
   planogramEvidence Json?
-  evidence         Json
-  createdById      String?
-  createdAt        DateTime                  @default(now())
+  evidence          Json
+  createdById       String?
+  createdAt         DateTime                  @default(now())
 
   tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   videoAsset VideoAsset @relation(fields: [videoAssetId], references: [id], onDelete: Cascade)
@@ -3153,10 +3196,10 @@ model PriceBookVersion {
   createdBy   User?     @relation("PriceBookVersionActor", fields: [createdById], references: [id], onDelete: Restrict)
   activatedBy User?     @relation("PriceBookVersionActivator", fields: [activatedById], references: [id], onDelete: Restrict)
 
-  supersededBy    PriceBookVersion? @relation("PriceBookSupersession", fields: [supersededByVersionId], references: [id], onDelete: Restrict)
-  supersedes      PriceBookVersion? @relation("PriceBookSupersession")
-  rolledBackFrom  PriceBookVersion? @relation("PriceBookRollback", fields: [rolledBackFromVersionId], references: [id], onDelete: Restrict)
-  rollbackCopies  PriceBookVersion[] @relation("PriceBookRollback")
+  supersededBy   PriceBookVersion?  @relation("PriceBookSupersession", fields: [supersededByVersionId], references: [id], onDelete: Restrict)
+  supersedes     PriceBookVersion?  @relation("PriceBookSupersession")
+  rolledBackFrom PriceBookVersion?  @relation("PriceBookRollback", fields: [rolledBackFromVersionId], references: [id], onDelete: Restrict)
+  rollbackCopies PriceBookVersion[] @relation("PriceBookRollback")
 
   entries PriceBookEntry[]
 
@@ -3190,4 +3233,214 @@ model PriceBookEntry {
   @@unique([versionId, productId])
   @@index([tenantId, productId])
   @@index([tenantId, versionId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 26 — the store flow: shopper entry, the bridge that turns observed
+// pickups into basket effects, and exit settlement. Every table here is
+// tenant-scoped and every automatic effect is gated by an autonomy policy
+// whose default (SHADOW) reproduces the behaviour of every earlier phase.
+// ---------------------------------------------------------------------------
+
+enum ShopperStatus {
+  ACTIVE
+  BLOCKED
+}
+
+enum StoreEntryTokenStatus {
+  ISSUED
+  REDEEMED
+  REVOKED
+}
+
+/// How much a store is allowed to do without a human.
+enum StoreFlowAutonomyLevel {
+  /// Observe only. Identical to the behaviour of every phase before 26: the
+  /// journey stream records what the pipeline saw and nothing reaches a
+  /// basket, an order, the ledger or a payment.
+  SHADOW
+  /// Observations additionally become PENDING_REVIEW vision events bound to
+  /// the journey's checkout session, so a human can approve them in.
+  PROPOSE
+  /// As PROPOSE, and confident observations that pass inventory validation
+  /// are approved automatically. Everything else still waits for a human.
+  AUTO_APPLY
+}
+
+/// What the bridge did with one journey observation. Append-once per
+/// observation, which is what makes projection idempotent.
+enum StoreFlowProjectionOutcome {
+  /// Not a product observation (entry, exit, shelf interaction), or the
+  /// policy was SHADOW when it was projected.
+  SKIPPED
+  /// A vision event was created and awaits a human.
+  PROPOSED
+  /// A vision event was created and approved automatically into the basket.
+  AUTO_APPLIED
+  /// Deliberately routed to a human: low confidence, an inventory
+  /// implausibility, or an observation the pipeline itself flagged.
+  REVIEW_REQUIRED
+  /// A human rejected the observation through the unified queue.
+  REJECTED
+}
+
+/// How far the settlement pipeline has taken a store-flow journey.
+enum StoreFlowSettlementStatus {
+  NOT_STARTED
+  BLOCKED_ON_REVIEW
+  ORDER_CREATED
+  PAID
+  FAILED
+}
+
+/// A shopper in one tenant's stores. Anonymous by default — a row exists so
+/// journeys, baskets and orders have a stable subject, and it carries no
+/// personal data of its own. userId is set only when the shopper is a
+/// signed-in platform user (staff testing the flow, or an app account).
+model Shopper {
+  id        String        @id @default(cuid())
+  tenantId  String
+  userId    String?
+  status    ShopperStatus @default(ACTIVE)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  user   User?  @relation("ShopperUser", fields: [userId], references: [id], onDelete: Restrict)
+
+  entryTokens StoreEntryToken[]
+  journeys    CustomerJourney[]
+
+  @@unique([id, tenantId])
+  @@index([tenantId, status, createdAt])
+  @@index([tenantId, userId])
+}
+
+/// A single-use, short-TTL store entry credential (SECURITY.md: store-entry
+/// and session tokens are single-use and short-TTL, and no long-lived entry
+/// credential is ever issued). The secret is returned exactly once at
+/// issuance; only its SHA-256 digest is stored, so a database read can never
+/// recover a usable token.
+model StoreEntryToken {
+  id                String                @id @default(cuid())
+  tenantId          String
+  locationId        String
+  unitId            String
+  shopperId         String?
+  /// Hex SHA-256 of the issued secret. Never the secret itself.
+  tokenHash         String
+  status            StoreEntryTokenStatus @default(ISSUED)
+  expiresAt         DateTime
+  redeemedAt        DateTime?
+  /// Set on redemption. UNIQUE, so one token can only ever open one journey.
+  redeemedJourneyId String?               @unique
+  revokedAt         DateTime?
+  issuedById        String?
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+
+  tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location Location         @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  unit     RetailUnit       @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  shopper  Shopper?         @relation(fields: [shopperId], references: [id], onDelete: Restrict)
+  issuedBy User?            @relation("StoreEntryTokenIssuer", fields: [issuedById], references: [id], onDelete: Restrict)
+  journey  CustomerJourney? @relation("StoreEntryTokenJourney", fields: [redeemedJourneyId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, tokenHash])
+  @@index([tenantId, status, expiresAt])
+  @@index([tenantId, locationId, unitId])
+}
+
+/// The autonomy policy for a tenant, or for one store within it. The row
+/// itself holds no settings — it points at the ACTIVE version, so a change is
+/// always a new immutable version and reverting is copying an old one
+/// forward, exactly like a price book.
+model StoreFlowPolicy {
+  id              String   @id @default(cuid())
+  tenantId        String
+  /// NULL = the tenant-wide default. Set = overrides the default at that
+  /// store. A partial unique index in migration SQL keeps at most one
+  /// tenant-wide row per tenant (Postgres treats NULLs as distinct).
+  locationId      String?
+  activeVersionId String?  @unique
+  createdById     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant        Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  location      Location?                @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  createdBy     User?                    @relation("StoreFlowPolicyActor", fields: [createdById], references: [id], onDelete: Restrict)
+  activeVersion StoreFlowPolicyVersion?  @relation("StoreFlowPolicyActiveVersion", fields: [activeVersionId], references: [id], onDelete: Restrict)
+  versions      StoreFlowPolicyVersion[] @relation("StoreFlowPolicyVersions")
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, locationId])
+  @@index([tenantId, locationId])
+}
+
+/// One immutable set of autonomy settings. Never edited after creation.
+model StoreFlowPolicyVersion {
+  id                         String                 @id @default(cuid())
+  tenantId                   String
+  policyId                   String
+  /// Monotonic per policy, starting at 1. Never reused.
+  versionNumber              Int
+  autonomyLevel              StoreFlowAutonomyLevel @default(SHADOW)
+  /// Minimum fused score an observation must carry before AUTO_APPLY may
+  /// apply it without a human. This is an uncalibrated ranking score, not a
+  /// probability — see docs/cv/clip-lab.md.
+  autoApplyMinConfidence     Float                  @default(0.7)
+  /// When true (the default) an observation is checked against the store's
+  /// inventory projection before it can be applied automatically.
+  requireInventoryValidation Boolean                @default(true)
+  /// When true, exiting a journey completes its checkout session into an
+  /// order and settles it through the payment state machine.
+  settleOnExit               Boolean                @default(false)
+  /// Operator note. Screened for credential- and payment-bearing content on
+  /// the way in, like every other free-text field in this codebase.
+  note                       String?
+  createdById                String?
+  createdAt                  DateTime               @default(now())
+
+  tenant    Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  policy    StoreFlowPolicy  @relation("StoreFlowPolicyVersions", fields: [policyId], references: [id], onDelete: Restrict)
+  createdBy User?            @relation("StoreFlowPolicyVersionActor", fields: [createdById], references: [id], onDelete: Restrict)
+  activeFor StoreFlowPolicy? @relation("StoreFlowPolicyActiveVersion")
+
+  @@unique([id, tenantId])
+  @@unique([policyId, versionNumber])
+  @@index([tenantId, policyId, versionNumber])
+}
+
+/// The record of what the bridge did with one journey observation. One row
+/// per journey event (UNIQUE), which is what makes a replayed sync a no-op
+/// instead of a second basket line.
+model StoreFlowProjection {
+  id             String                     @id @default(cuid())
+  tenantId       String
+  journeyId      String
+  journeyEventId String
+  outcome        StoreFlowProjectionOutcome
+  /// Controlled vocabulary only (see store-flow.constants.ts) — never
+  /// pipeline or reviewer free text.
+  reasonCode     String
+  /// The vision event this observation became, when it became one.
+  visionEventId  String?                    @unique
+  /// The autonomy level in force when the observation was projected.
+  autonomyLevel  StoreFlowAutonomyLevel
+  /// The observation's fused score at projection time, for the audit trail.
+  confidence     Float?
+  createdAt      DateTime                   @default(now())
+  updatedAt      DateTime                   @updatedAt
+
+  tenant       Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  journey      CustomerJourney      @relation(fields: [journeyId], references: [id], onDelete: Cascade)
+  journeyEvent CustomerJourneyEvent @relation(fields: [journeyEventId], references: [id], onDelete: Cascade)
+  visionEvent  VisionEvent?         @relation(fields: [visionEventId], references: [id], onDelete: Restrict)
+
+  @@unique([id, tenantId])
+  @@unique([tenantId, journeyEventId])
+  @@index([tenantId, journeyId, createdAt])
+  @@index([tenantId, outcome])
 }

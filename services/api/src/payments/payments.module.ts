@@ -32,5 +32,8 @@ import { ReconciliationService } from './reconciliation.service';
     ReconciliationService,
     ReconciliationRepository,
   ],
+  // Phase 26: store-flow settlement drives the SAME provider-neutral intent
+  // state machine an operator drives by hand. No second payment path.
+  exports: [PaymentsService],
 })
 export class PaymentsModule {}

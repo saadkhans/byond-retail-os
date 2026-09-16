@@ -2375,3 +2375,152 @@ export function pretrainedEvaluatePath(videoAssetId: string): string {
 export function pretrainedReportPath(videoAssetId: string): string {
   return `/pretrained-vision/videos/${encodeURIComponent(videoAssetId)}/report`;
 }
+
+// --- Phase 26: the store flow ------------------------------------------------
+
+export type StoreFlowAutonomyLevel = 'SHADOW' | 'PROPOSE' | 'AUTO_APPLY';
+
+export type StoreFlowProjectionOutcome =
+  | 'SKIPPED'
+  | 'PROPOSED'
+  | 'AUTO_APPLIED'
+  | 'REVIEW_REQUIRED'
+  | 'REJECTED';
+
+export type StoreFlowSettlementStatus =
+  | 'NOT_STARTED'
+  | 'BLOCKED_ON_REVIEW'
+  | 'ORDER_CREATED'
+  | 'PAID'
+  | 'FAILED';
+
+export interface StoreFlowPolicyVersion {
+  id: string;
+  versionNumber: number;
+  autonomyLevel: StoreFlowAutonomyLevel;
+  autoApplyMinConfidence: number;
+  requireInventoryValidation: boolean;
+  settleOnExit: boolean;
+  note: string | null;
+  createdAt: string;
+}
+
+export interface StoreFlowPolicy {
+  id: string;
+  locationId: string | null;
+  activeVersionId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  versions: StoreFlowPolicyVersion[];
+}
+
+export interface EffectiveStoreFlowPolicy {
+  autonomyLevel: StoreFlowAutonomyLevel;
+  autoApplyMinConfidence: number;
+  requireInventoryValidation: boolean;
+  settleOnExit: boolean;
+  policyVersionId: string | null;
+  policyLocationId: string | null;
+}
+
+export interface StoreEntryToken {
+  id: string;
+  locationId: string;
+  unitId: string;
+  shopperId: string | null;
+  status: 'ISSUED' | 'REDEEMED' | 'REVOKED';
+  expiresAt: string;
+  redeemedAt: string | null;
+  redeemedJourneyId: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+}
+
+/** The redemption response carries the secret exactly once. */
+export interface StoreEntryIssued {
+  token: StoreEntryToken;
+  secret: string;
+  expiresAt: string;
+}
+
+export interface StoreFlowEntry {
+  journeyId: string;
+  shopperId: string;
+  checkoutSessionId: string;
+  locationId: string;
+  unitId: string;
+}
+
+export interface StoreFlowBasketLine {
+  id: string;
+  productId: string;
+  sku: string;
+  productName: string;
+  quantity: number;
+  unitPriceMinor: number | null;
+  lineTotalMinor: number | null;
+  currencyCode: string | null;
+}
+
+export interface StoreFlowJourney {
+  id: string;
+  locationId: string;
+  unitId: string | null;
+  status: string;
+  shopperId: string | null;
+  checkoutSessionId: string | null;
+  orderId: string | null;
+  settlementStatus: StoreFlowSettlementStatus;
+  startedAt: string;
+  endedAt: string | null;
+  lines: StoreFlowBasketLine[];
+}
+
+export interface StoreFlowProjection {
+  id: string;
+  journeyId: string;
+  journeyEventId: string;
+  outcome: StoreFlowProjectionOutcome;
+  reasonCode: string;
+  visionEventId: string | null;
+  autonomyLevel: StoreFlowAutonomyLevel;
+  confidence: number | null;
+  createdAt: string;
+}
+
+export interface StoreFlowQueueItem {
+  journeyId: string;
+  eventId: string;
+  eventType: string;
+  occurredAt: string;
+  candidateSku: string | null;
+  fusedTopScore: number | null;
+  reason: string;
+  storeFlow: {
+    projectionId: string;
+    outcome: StoreFlowProjectionOutcome;
+    reasonCode: string;
+    autonomyLevel: StoreFlowAutonomyLevel;
+    visionEventId: string | null;
+    visionEventStatus: string | null;
+    checkoutSessionId: string | null;
+  } | null;
+}
+
+export interface StoreFlowSettlement {
+  status: StoreFlowSettlementStatus;
+  blockedBy: string | null;
+  order: { id: string; orderNumber: string } | null;
+  payment: { id: string; status: string } | null;
+}
+
+export interface StoreFlowExitResult {
+  settlement: StoreFlowSettlement;
+}
+
+export interface StoreFlowSyncResult {
+  journeyId: string;
+  autonomyLevel: StoreFlowAutonomyLevel;
+  projected: StoreFlowProjection[];
+  skippedShadow: boolean;
+}
