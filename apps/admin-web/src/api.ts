@@ -276,6 +276,93 @@ export interface ResolvedPrice {
   priceBookVersionId: string;
 }
 
+/* ---------------------------------------------------------------- */
+/* Electronic shelf labels (Phase 28)                                 */
+/* ---------------------------------------------------------------- */
+
+export type EslGatewayStatus =
+  | 'PENDING'
+  | 'ACTIVE'
+  | 'DISABLED'
+  | 'UNREACHABLE';
+
+export type EslLabelStatus = 'UNBOUND' | 'BOUND' | 'RETIRED';
+
+export type EslUpdateJobStatus =
+  | 'QUEUED'
+  | 'RUNNING'
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'CANCELLED';
+
+export type EslUpdateTrigger =
+  | 'PRICE_ACTIVATION'
+  | 'MANUAL_RERENDER'
+  | 'LABEL_BOUND'
+  | 'RECONCILIATION';
+
+export interface EslGateway {
+  id: string;
+  code: string;
+  name: string;
+  vendorCode: string;
+  locationId: string;
+  status: EslGatewayStatus;
+  /** Never the credential itself — only whether one is configured. */
+  credentialRef: string | null;
+  lastSeenAt: string | null;
+  createdAt: string;
+  location?: { id: string; code: string; name: string } | null;
+  _count?: { labels: number };
+}
+
+export interface EslLabel {
+  id: string;
+  gatewayId: string;
+  vendorLabelId: string;
+  productId: string | null;
+  cellAssignmentId: string | null;
+  status: EslLabelStatus;
+  batteryPercent: number | null;
+  signalPercent: number | null;
+  lastRenderedAt: string | null;
+  renderedVersionId: string | null;
+  renderedContentHash: string | null;
+  gateway?: {
+    id: string;
+    code: string;
+    vendorCode: string;
+    status: EslGatewayStatus;
+  } | null;
+  product?: { id: string; sku: string; name: string } | null;
+  cellAssignment?: { id: string; cellCode: string; rackId: string } | null;
+}
+
+export interface EslUpdateJob {
+  id: string;
+  labelId: string;
+  gatewayId: string;
+  trigger: EslUpdateTrigger;
+  priceBookVersionId: string | null;
+  status: EslUpdateJobStatus;
+  attempts: number;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  requestedAt: string;
+  finishedAt: string | null;
+  label?: { id: string; vendorLabelId: string; productId: string | null } | null;
+  gateway?: { id: string; code: string; vendorCode: string } | null;
+}
+
+export interface EslProcessSummary {
+  claimed: number;
+  succeeded: number;
+  failed: number;
+  requeued: number;
+  leaseReclaimed: number;
+  leaseFailed: number;
+}
+
 export interface StockLevel {
   id: string;
   quantity: number;

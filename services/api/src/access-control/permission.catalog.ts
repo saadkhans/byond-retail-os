@@ -56,4 +56,10 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   { code: 'video-asset:screen', module: 'video-ingest', description: 'Record the audited frame-content screening decision that releases (QUARANTINED to UPLOADED) or rejects (media removed) a quarantined upload' },
   { code: 'video-asset:process', module: 'video-ingest', description: 'Validate videos, extract frames/crops, and create inference jobs from crops' },
   { code: 'video-asset:delete', module: 'video-ingest', description: 'Delete video assets (removes the local file, keeps audited metadata)' },
+  { code: 'esl-gateway:read', module: 'esl', description: 'View electronic shelf label gateways and the vendor adapters this deployment offers' },
+  { code: 'esl-gateway:manage', module: 'esl', description: 'Register, update, disable, and discover labels on ESL gateways' },
+  { code: 'esl-label:read', module: 'esl', description: 'View electronic shelf labels, their bindings, and their battery/signal health' },
+  { code: 'esl-label:manage', module: 'esl', description: 'Register labels, bind them to products and planogram cells, retire them, and request a re-render' },
+  { code: 'esl-job:read', module: 'esl', description: 'View label update jobs, their attempts, and their failure reasons' },
+  { code: 'esl-job:process', module: 'esl', description: 'Run a label update pass, reclaim expired worker leases, and reconcile labels against the price in force' },
 ];

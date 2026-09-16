@@ -33,6 +33,7 @@ scripts/         Repo automation scripts
 - [SECURITY.md](SECURITY.md) — security requirements and tooling
 - [TESTING.md](TESTING.md) — required test categories
 - [docs/product/pricing.md](docs/product/pricing.md) — versioned pricing model and rules
+- [docs/product/esl.md](docs/product/esl.md) — vendor-neutral electronic shelf labels
 
 ## Getting started
 
@@ -75,7 +76,10 @@ inventory; versioned price books (create a draft, set prices, activate, roll
 back — see [docs/product/pricing.md](docs/product/pricing.md)); and a manual
 checkout test flow: create a checkout session, manage basket lines, and
 complete it into an order, which now carries a total derived from the price
-each line was added at. The API's CORS allowlist defaults to
+each line was added at. Shelf labels are managed under **Shelf labels**, where
+a gateway is registered against a simulated (or real) vendor adapter and its
+labels follow every price activation — see
+[docs/product/esl.md](docs/product/esl.md). The API's CORS allowlist defaults to
 `http://localhost:5173` (override with `CORS_ORIGINS`).
 
 ### ML pipeline (Phase 8)

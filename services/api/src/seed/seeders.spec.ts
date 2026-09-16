@@ -47,9 +47,9 @@ describe('platform module catalog', () => {
   it('default-enables core plus every shipped module', () => {
     // inventory (Phase 3), devices (Phase 4), pricing (Phase 25),
     // checkout (Phase 5), payments (Phase 6), cv (Phase 7),
-    // inference (Phase 9), and video-ingest (Phase 10) are default-enabled so
-    // their routes are reachable for every new tenant (the only enable
-    // endpoint is tenant-scoped and needs a
+    // inference (Phase 9), video-ingest (Phase 10) and esl (Phase 28) are
+    // default-enabled so their routes are reachable for every new tenant (the
+    // only enable endpoint is tenant-scoped and needs a
     // module:manage tenant user, which a brand-new tenant does not yet have).
     expect(DEFAULT_ENABLED_MODULE_CODES).toEqual([
       'core',
@@ -61,6 +61,7 @@ describe('platform module catalog', () => {
       'cv',
       'inference',
       'video-ingest',
+      'esl',
     ]);
   });
 
@@ -83,8 +84,9 @@ describe('platform module catalog', () => {
     // cv (vision events, evidence bundle lineage, review → basket flow):
     // Phase 7; inference (jobs, queue foundation, simulated adapter):
     // Phase 9; video-ingest (test video upload, frame/crop extraction
-    // contracts): Phase 10.
-    // esl, loyalty, reporting and procurement remain catalog names only.
+    // contracts): Phase 10; esl (vendor-neutral shelf labels behind an
+    // adapter port, driven by price activation): Phase 28.
+    // loyalty, reporting and procurement remain catalog names only.
     expect(active).toEqual([
       'core',
       'inventory',
@@ -95,6 +97,7 @@ describe('platform module catalog', () => {
       'cv',
       'inference',
       'video-ingest',
+      'esl',
     ]);
   });
 

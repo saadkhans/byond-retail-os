@@ -11,6 +11,7 @@ import { CvDatasetModule } from './cv-dataset/cv-dataset.module';
 import { CvEvaluationModule } from './cv-evaluation/cv-evaluation.module';
 import { validateEnv } from './config/env.validation';
 import { DevicesModule } from './devices/devices.module';
+import { EslModule } from './esl/esl.module';
 import { HealthModule } from './health/health.module';
 import { InferenceModule } from './inference/inference.module';
 import { InventoryModule } from './inventory/inventory.module';
@@ -66,6 +67,7 @@ import { VisionModule } from './vision/vision.module';
     PlanogramModule,
     PretrainedVisionModule,
     ClipLabModule,
+    EslModule,
   ],
 })
 export class AppModule implements NestModule {
