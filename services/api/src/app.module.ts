@@ -29,6 +29,7 @@ import { PickupDetectionModule } from './pickup-detection/pickup-detection.modul
 import { PickupFusionModule } from './pickup-fusion/pickup-fusion.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ReturnsModule } from './returns/returns.module';
+import { ShopperModule } from './shopper/shopper.module';
 import { TenantsModule } from './tenants/tenants.module';
 import { UnitsModule } from './units/units.module';
 import { UsersModule } from './users/users.module';
@@ -70,6 +71,7 @@ import { VisionModule } from './vision/vision.module';
     ClipLabModule,
     StoreFlowModule,
     ReturnsModule,
+    ShopperModule,
   ],
 })
 export class AppModule implements NestModule {

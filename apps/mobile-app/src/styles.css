@@ -1,0 +1,239 @@
+/*
+ * Mobile-first, one column, large touch targets, and readable in a shop with
+ * a phone held at arm's length. Nothing here is decorative enough to need a
+ * framework.
+ */
+
+:root {
+  --ink: #12211f;
+  --ink-soft: #52635f;
+  --ground: #f6f7f5;
+  --card: #ffffff;
+  --line: #dde2df;
+  --brand: #0e6b73;
+  --brand-ink: #ffffff;
+  --warn-ground: #fff5e6;
+  --warn-line: #e0b877;
+  --good-ground: #eaf6ef;
+  --good-line: #8fc6a5;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #eef2f0;
+    --ink-soft: #a7b5b1;
+    --ground: #101614;
+    --card: #182120;
+    --line: #2b3735;
+    --brand: #53b7bf;
+    --brand-ink: #06201f;
+    --warn-ground: #2a2418;
+    --warn-line: #6b5730;
+    --good-ground: #16261d;
+    --good-line: #34573f;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-size: 17px;
+  line-height: 1.45;
+}
+
+.screen {
+  max-width: 34rem;
+  margin: 0 auto;
+  padding: calc(env(safe-area-inset-top, 0px) + 1.5rem) 1.25rem
+    calc(env(safe-area-inset-bottom, 0px) + 2.5rem);
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.screen-head h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.6rem;
+  line-height: 1.2;
+}
+
+.lede {
+  margin: 0;
+  color: var(--ink-soft);
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-weight: 600;
+}
+
+.field input {
+  font: inherit;
+  padding: 0.85rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--card);
+  color: var(--ink);
+  min-height: 3rem;
+}
+
+.help,
+.fine-print {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+}
+
+.fine-print {
+  margin-top: auto;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+}
+
+button.primary {
+  font: inherit;
+  font-weight: 600;
+  min-height: 3.25rem;
+  border: none;
+  border-radius: 0.6rem;
+  background: var(--brand);
+  color: var(--brand-ink);
+  cursor: pointer;
+}
+
+button.primary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.notice {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-left-width: 4px;
+  border-radius: 0.5rem;
+  padding: 0.75rem 0.9rem;
+}
+
+.notice p {
+  margin: 0.25rem 0 0;
+  color: var(--ink-soft);
+}
+
+.notice-problem {
+  background: var(--warn-ground);
+  border-color: var(--warn-line);
+}
+
+.empty {
+  margin: 0;
+  padding: 1.5rem 1rem;
+  text-align: center;
+  color: var(--ink-soft);
+  background: var(--card);
+  border: 1px dashed var(--line);
+  border-radius: 0.6rem;
+}
+
+.lines {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.line {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: baseline;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  padding: 0.75rem 0.9rem;
+}
+
+.line-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.line-name {
+  font-weight: 600;
+}
+
+.line-sku {
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+}
+
+.line-side {
+  display: flex;
+  gap: 0.75rem;
+  white-space: nowrap;
+}
+
+.line-qty {
+  color: var(--ink-soft);
+}
+
+.total {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 0.75rem 0.9rem;
+  border-top: 2px solid var(--line);
+  font-size: 1.1rem;
+}
+
+.receipt {
+  margin: 0;
+  padding: 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--card);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.receipt div {
+  display: flex;
+  justify-content: space-between;
+}
+
+.receipt dt {
+  color: var(--ink-soft);
+}
+
+.receipt dd {
+  margin: 0;
+  font-weight: 600;
+}
+
+.receipt-good {
+  background: var(--good-ground);
+  border-color: var(--good-line);
+}
+
+.receipt-action {
+  background: var(--warn-ground);
+  border-color: var(--warn-line);
+}

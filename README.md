@@ -7,7 +7,7 @@ BYOND is an edge-first, cloud-managed, multitenant retail operating system. Comp
 ```
 apps/            User-facing applications
   admin-web/     Admin web console
-  mobile-app/    Shopper / staff mobile app
+  mobile-app/    Shopper app (mobile-first web) — entry, basket, exit, payment
 services/        Backend services
   api/           Core multitenant API
   edge-runtime/  In-store edge runtime
@@ -35,6 +35,7 @@ scripts/         Repo automation scripts
 - [docs/product/pricing.md](docs/product/pricing.md) — versioned pricing model and rules
 - [docs/product/store-flow.md](docs/product/store-flow.md) — the autonomous store loop: entry, the observation → basket bridge, exit settlement
 - [docs/product/returns.md](docs/product/returns.md) — the reverse flow: returns, refunds, cycle counts and shrink, all through the ledger
+- [docs/product/shopper-app.md](docs/product/shopper-app.md) — the shopper application: the journey-scoped credential, the four screens, and what makes a public API surface safe
 
 ## Getting started
 
@@ -89,6 +90,25 @@ reconciles the projection against the ledger, and write off a CV-detected loss
 (see [docs/product/returns.md](docs/product/returns.md)). The API's CORS
 allowlist defaults to
 `http://localhost:5173` (override with `CORS_ORIGINS`).
+
+### Shopper app (http://localhost:5174)
+
+```bash
+cd apps/mobile-app
+cp .env.example .env        # VITE_API_BASE_URL, defaults to localhost:3000
+pnpm run dev
+```
+
+The shopper app is the customer-facing half of the Phase 26 loop: redeem the
+entry code from the door, watch the basket fill, walk out, and see what the
+payment did. It holds a journey-scoped credential rather than a staff token,
+so it can reach exactly one journey and nothing else, and it collects no card
+data of any kind — payment goes through the API's simulated provider
+abstraction (see
+[docs/product/shopper-app.md](docs/product/shopper-app.md)). Under the default
+SHADOW policy the basket stays empty on purpose, and the app says so. Add its
+origin to the API's allowlist when running both:
+`CORS_ORIGINS=http://localhost:5173,http://localhost:5174`.
 
 ### ML pipeline (Phase 8)
 
