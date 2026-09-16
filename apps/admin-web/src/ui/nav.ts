@@ -13,7 +13,10 @@ export const NAV_GROUPS: NavGroup[] = [
     id: 'overview',
     label: 'Overview',
     icon: 'overview',
-    items: [{ to: '/', label: 'Dashboard', end: true }],
+    items: [
+      { to: '/', label: 'Dashboard', end: true },
+      { to: '/reports', label: 'Reports' },
+    ],
   },
   {
     id: 'store-operations',
