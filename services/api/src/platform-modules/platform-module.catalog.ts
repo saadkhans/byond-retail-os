@@ -159,6 +159,24 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
     isActive: true,
   },
   {
+    code: 'store-flow',
+    name: 'Store Flow',
+    description:
+      'Shopper entry and identity, the governed bridge from observed ' +
+      'pickups to basket lines, one review queue over both streams, and ' +
+      'exit settlement into an order and a payment.',
+    // Shipped in Phase 26 and DEFAULT-ENABLED for the same reason as
+    // inventory/devices/checkout/pricing (see above): the only enable
+    // endpoint is @TenantOnly(), so leaving this false would strand new
+    // tenants behind 403s. RBAC still gates every route independently, and
+    // enabling the module changes NOTHING on its own — the autonomy policy
+    // defaults to SHADOW, so a store keeps observing until an operator opts
+    // in. Tenants that existed BEFORE Phase 26 are covered by the
+    // 20260916100001_store_flow_module_backfill migration.
+    defaultEnabled: true,
+    isActive: true,
+  },
+  {
     code: 'esl',
     name: 'Electronic Shelf Labels',
     description: 'ESL vendor integration (later phase).',

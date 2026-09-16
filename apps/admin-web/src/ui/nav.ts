@@ -64,6 +64,7 @@ export const NAV_GROUPS: NavGroup[] = [
     label: 'Vision review',
     icon: 'review',
     items: [
+      { to: '/store-flow', label: 'Store flow' },
       { to: '/review-queue', label: 'Review queue' },
       { to: '/journeys', label: 'Journeys' },
       { to: '/vision-events', label: 'CV events' },

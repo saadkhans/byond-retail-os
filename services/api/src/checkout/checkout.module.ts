@@ -17,5 +17,9 @@ import { CheckoutSessionsService } from './checkout-sessions.service';
   imports: [InventoryModule, PricingModule],
   controllers: [CheckoutSessionsController],
   providers: [CheckoutSessionsService, CheckoutSessionsRepository],
+  // Phase 26: the store-flow bridge opens a session on shopper entry and
+  // completes it on exit through the SAME service the manual route uses —
+  // never a parallel implementation of basket or order rules.
+  exports: [CheckoutSessionsService],
 })
 export class CheckoutModule {}

@@ -56,4 +56,9 @@ export const PERMISSION_CATALOG: readonly PermissionDefinition[] = [
   { code: 'video-asset:screen', module: 'video-ingest', description: 'Record the audited frame-content screening decision that releases (QUARANTINED to UPLOADED) or rejects (media removed) a quarantined upload' },
   { code: 'video-asset:process', module: 'video-ingest', description: 'Validate videos, extract frames/crops, and create inference jobs from crops' },
   { code: 'video-asset:delete', module: 'video-ingest', description: 'Delete video assets (removes the local file, keeps audited metadata)' },
+  { code: 'store-flow:read', module: 'store-flow', description: 'View the autonomy policy and its versions, store-flow journeys, their projections, and the unified review queue' },
+  { code: 'store-flow:manage', module: 'store-flow', description: 'Change the autonomy policy for a tenant or a store by publishing a new immutable policy version' },
+  { code: 'store-flow:operate', module: 'store-flow', description: 'Issue and revoke store entry tokens, project observations onto baskets, and exit and settle a journey' },
+  { code: 'store-flow:enter', module: 'store-flow', description: 'Redeem a store entry token, opening a shopper journey and its checkout session' },
+  { code: 'store-flow:review', module: 'store-flow', description: 'Decide a queued observation once, recording the journey review and driving the matching vision event review' },
 ];

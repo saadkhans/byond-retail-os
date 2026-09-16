@@ -5,6 +5,7 @@ import { AuthModule } from './auth/auth.module';
 import { CameraModule } from './camera/camera.module';
 import { CatalogModule } from './catalog/catalog.module';
 import { PricingModule } from './pricing/pricing.module';
+import { StoreFlowModule } from './store-flow/store-flow.module';
 import { CheckoutModule } from './checkout/checkout.module';
 import { RequestIdMiddleware } from './common/request-id.middleware';
 import { CvDatasetModule } from './cv-dataset/cv-dataset.module';
@@ -66,6 +67,7 @@ import { VisionModule } from './vision/vision.module';
     PlanogramModule,
     PretrainedVisionModule,
     ClipLabModule,
+    StoreFlowModule,
   ],
 })
 export class AppModule implements NestModule {
