@@ -1,0 +1,21 @@
+# Keep build contexts small and keep local secrets, model weights and media
+# out of every image. Mirrored for reference in infra/docker/.dockerignore.
+node_modules
+**/node_modules
+**/dist
+.git
+.github
+.claude
+.vscode
+**/*.log
+**/.env
+**/.env.*
+!**/.env.example
+# Model weights, datasets and captured media are external artifacts.
+ml/models
+ml/datasets
+Training videos 30
+Plannogram 2x2 test
+*.png
+**/coverage
+**/tsconfig.tsbuildinfo

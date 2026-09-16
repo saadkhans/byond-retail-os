@@ -9,30 +9,20 @@ on:
 
 jobs:
   ci:
+    # Branch protection matches on this name — do not rename it.
     name: Lint, typecheck, test, build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node 22
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
+      - name: Setup workspace
+        uses: ./infra/github-actions/setup-workspace
 
       - name: Setup Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Enable corepack
-        run: corepack enable
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Generate Prisma client
-        run: pnpm --filter @byond/api run prisma:generate
 
       - name: Lint
         run: pnpm run lint
@@ -48,3 +38,45 @@ jobs:
 
       - name: Build
         run: pnpm run build
+
+  integration:
+    # A new job name, so existing branch protection is unaffected until someone
+    # chooses to require it. Proves the committed migrations apply cleanly to an
+    # empty database and runs the API suite against a real Postgres, which the
+    # stubbed-Prisma unit tests cannot do.
+    name: Integration (Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: byond
+          POSTGRES_PASSWORD: byond
+          POSTGRES_DB: byond_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U byond -d byond_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://byond:byond@localhost:5432/byond_test?schema=public
+      JWT_SECRET: ci-only-non-production-secret-value-0123456789
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup workspace
+        uses: ./infra/github-actions/setup-workspace
+        with:
+          install-args: --filter @byond/api...
+
+      - name: Apply migrations
+        run: pnpm --filter @byond/api exec prisma migrate deploy
+
+      - name: Seed baseline data
+        run: pnpm --filter @byond/api run db:seed
+
+      - name: API test suite against Postgres
+        run: pnpm --filter @byond/api run test

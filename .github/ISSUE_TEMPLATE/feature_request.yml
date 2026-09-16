@@ -1,0 +1,29 @@
+name: Feature request
+description: Propose new behaviour or a change in scope.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What cannot be done today, and who is blocked by it.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: adapters
+    attributes:
+      label: Vendor and adapter impact
+      description: >-
+        Which external system does this touch, and what adapter interface owned
+        by this repository does it sit behind? Concrete vendors are plug-ins.
+  - type: textarea
+    id: tests
+    attributes:
+      label: Required test categories
+      description: See TESTING.md — name the categories this change would need.
