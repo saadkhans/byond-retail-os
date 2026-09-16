@@ -6,20 +6,15 @@ import {
   CheckoutSession,
   Paginated,
   Product,
+  VISION_EVENT_STATUS_VALUES,
+  VISION_EVENT_TYPE_VALUES,
   VisionEvent,
 } from '../api';
 import { formatDate, Page, Pagination, StatusBadge, useLoad } from '../components';
 
-const EVENT_STATUSES = ['', 'PENDING_REVIEW', 'APPROVED', 'REJECTED', 'OVERRIDDEN'];
+const EVENT_STATUSES = ['', ...VISION_EVENT_STATUS_VALUES];
 
-const EVENT_TYPES = [
-  '',
-  'PRODUCT_PICKUP',
-  'PRODUCT_RETURN',
-  'PRODUCT_TRANSFER',
-  'CART_INSERTION',
-  'EXIT_RECONCILIATION',
-];
+const EVENT_TYPES = ['', ...VISION_EVENT_TYPE_VALUES];
 
 /** Only these event types mutate the basket on approval (or override). */
 const BASKET_AFFECTING_TYPES = [

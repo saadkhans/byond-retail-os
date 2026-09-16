@@ -5,6 +5,63 @@
  * - The access token is a Bearer header, kept in localStorage. It is never
  *   embedded in URLs and never logged.
  */
+
+/**
+ * The domain contract lives in `@byond/shared`: the wire vocabularies
+ * (status/type unions plus their value lists), the paginated list
+ * envelope, the normalized rack rectangle and the Clip Lab report are
+ * declared ONCE there and spoken by `services/api` too, so this client
+ * cannot drift from the API. Re-exported so pages keep importing every
+ * contract type from '../api'.
+ */
+export * from '@byond/shared';
+import type {
+  CalibrationReadinessLevel,
+  CameraCalibrationMount,
+  CameraCalibrationOrientation,
+  CameraCalibrationProfileStatus,
+  CameraCalibrationZoneType,
+  CameraSourceStatus,
+  CameraSourceType,
+  CheckoutSessionStatus,
+  CvDatasetCandidateSourceType,
+  CvDatasetEligibility,
+  CvDatasetPurpose,
+  CvDatasetReadiness,
+  CvDatasetRunStatus,
+  CvDatasetSplit,
+  CvTestProtocolStatus,
+  CvTestScenario,
+  CvTestScenarioResult,
+  CvTestScenarioType,
+  GroundTruthEventKind,
+  InferenceJobStatus,
+  InferenceJobType,
+  JourneyDecision,
+  JourneyEventType,
+  JourneyReviewDecision,
+  LiveSessionStatus,
+  OneSkuCropWarning,
+  OrderPaymentStatus,
+  OrderStatus,
+  PaymentCaptureStatus,
+  PaymentEventStatus,
+  PaymentEventType,
+  PaymentProvider,
+  PaymentStatus,
+  PilotEvaluationStatus,
+  PilotExpectedAction,
+  PilotRunStatus,
+  PilotVerdict,
+  RackFrameRegion,
+  ReconciliationStatus,
+  VideoArtifactType,
+  VideoAssetStatus,
+  VideoCropReason,
+  VisionEventStatus,
+  VisionEventType,
+} from '@byond/shared';
+
 const API_BASE_URL = (
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000'
 ).replace(/\/+$/, '');
@@ -145,14 +202,6 @@ export async function apiObjectUrl(path: string): Promise<string | null> {
     return null;
   }
   return URL.createObjectURL(await response.blob());
-}
-
-/** Standard paginated list envelope used by the search endpoints. */
-export interface Paginated<T> {
-  items: T[];
-  total: number;
-  skip: number;
-  take: number;
 }
 
 export interface Store {
@@ -513,61 +562,9 @@ export interface SafeUser {
   tenantId: string | null;
 }
 
-export type CheckoutSessionStatus =
-  | 'OPEN'
-  | 'ACTIVE'
-  | 'PENDING_REVIEW'
-  | 'COMPLETED'
-  | 'CANCELLED'
-  | 'EXPIRED';
-
-export type OrderStatus = 'DRAFT' | 'CONFIRMED' | 'CANCELLED';
-
-export type OrderPaymentStatus =
-  | 'UNPAID'
-  | 'AUTHORIZED'
-  | 'PAID'
-  | 'PAYMENT_FAILED'
-  | 'VOIDED'
-  | 'REFUND_PENDING'
-  | 'REFUNDED';
-
 // Phase 6 — provider-neutral payment abstraction. NO live gateway: authorize
 // and capture are SIMULATED. Provider references are opaque; only SAFE card
 // metadata (brand, last4, expiry, wallet) is ever stored.
-export type PaymentProvider = 'SIMULATED' | 'MANUAL';
-
-export type PaymentStatus =
-  | 'CREATED'
-  | 'REQUIRES_AUTHORIZATION'
-  | 'AUTHORIZED'
-  | 'CAPTURE_PENDING'
-  | 'CAPTURED'
-  | 'FAILED'
-  | 'CANCELLED'
-  | 'VOIDED'
-  | 'EXPIRED';
-
-export type PaymentCaptureStatus = 'PENDING' | 'SUCCEEDED' | 'FAILED';
-
-export type PaymentEventStatus = 'RECEIVED' | 'PROCESSED' | 'IGNORED' | 'FAILED';
-
-export type PaymentEventType =
-  | 'AUTHORIZATION_SUCCEEDED'
-  | 'AUTHORIZATION_FAILED'
-  | 'CAPTURE_SUCCEEDED'
-  | 'CAPTURE_FAILED'
-  | 'PAYMENT_CANCELLED'
-  | 'PAYMENT_VOIDED'
-  | 'PAYMENT_EXPIRED'
-  | 'UNKNOWN';
-
-export type ReconciliationStatus =
-  | 'PENDING'
-  | 'MATCHED'
-  | 'MISMATCH'
-  | 'RECONCILED'
-  | 'FAILED';
 
 export interface PaymentAuthorization {
   id: string;
@@ -730,19 +727,6 @@ export interface OrderLine extends EvidenceRefs {
   createdAt: string;
 }
 
-export type VisionEventType =
-  | 'PRODUCT_PICKUP'
-  | 'PRODUCT_RETURN'
-  | 'PRODUCT_TRANSFER'
-  | 'CART_INSERTION'
-  | 'EXIT_RECONCILIATION';
-
-export type VisionEventStatus =
-  | 'PENDING_REVIEW'
-  | 'APPROVED'
-  | 'REJECTED'
-  | 'OVERRIDDEN';
-
 export interface VisionEventCandidate {
   id: string;
   eventId: string;
@@ -823,20 +807,6 @@ export interface VisionEvent {
 // Phase 9 — provider-neutral CV inference jobs. No real ML runs here: jobs
 // are simulated via the admin UI, and successful results convert into
 // Phase 7 vision events. Only safe descriptors — never raw media.
-export type InferenceJobType =
-  | 'TRACKING_EVENT'
-  | 'SHELF_AUDIT'
-  | 'PRODUCT_RECOGNITION'
-  | 'OCR_REVIEW'
-  | 'VLM_REVIEW'
-  | 'EXIT_RECONCILIATION';
-
-export type InferenceJobStatus =
-  | 'QUEUED'
-  | 'RUNNING'
-  | 'SUCCEEDED'
-  | 'FAILED'
-  | 'CANCELLED';
 
 export interface InferenceCandidate {
   id: string;
@@ -916,25 +886,6 @@ export interface Order extends EvidenceRefs {
 // download URL, or media byte field anywhere in these shapes — the API
 // never exposes storage locations, and crops feed Phase 9 inference jobs
 // by opaque id.
-export type VideoAssetStatus =
-  | 'PENDING_MEDIA'
-  | 'QUARANTINED'
-  | 'UPLOADED'
-  | 'VALIDATED'
-  | 'REJECTED'
-  | 'PROCESSING'
-  | 'READY'
-  | 'FAILED';
-
-export type VideoArtifactType = 'FRAME' | 'CROP';
-
-export type VideoCropReason =
-  | 'PRODUCT_PICKUP'
-  | 'PRODUCT_RETURN'
-  | 'SHELF_AUDIT'
-  | 'CART_INSERTION'
-  | 'OCR_REVIEW'
-  | 'VLM_REVIEW';
 
 export interface VideoAsset {
   id: string;
@@ -966,60 +917,6 @@ export interface VideoAsset {
   // Phase 22 — planogram binding captured at upload (or set afterwards).
   planogramRackCode?: string | null;
   rackFrameRegion?: { x: number; y: number; width: number; height: number } | null;
-}
-
-// Phase 22 — Clip Lab: ONE consolidated, shadow-only report for a clip
-// (classified codes, SKUs, normalized numbers; never media or paths).
-export interface ClipLabStepResult {
-  step: 'SCREENING' | 'VALIDATE' | 'DETECTION' | 'FUSION' | 'PRETRAINED';
-  status: 'OK' | 'SKIPPED' | 'FAILED' | 'BLOCKED' | 'NOT_RUN';
-  reasonCode: string | null;
-  ms: number | null;
-}
-
-export interface ClipLabReport {
-  asset: {
-    id: string;
-    name: string;
-    status: string;
-    store: { id: string; name: string; code: string } | null;
-    unit: { id: string; name: string } | null;
-    rackCode: string | null;
-    rackFrameRegion: { x: number; y: number; width: number; height: number } | null;
-    groundTruth: { eventKind: string; sku: string | null; actualTimestampMs: number | null } | null;
-  };
-  steps: ClipLabStepResult[];
-  suggestion: { sku: string | null; action: string; reviewRequired: boolean; notes: string[] } | null;
-  planogram: {
-    configured: boolean;
-    rackCode: string | null;
-    bindingSource: string;
-    cell: string | null;
-    coordinateSource: string;
-    matchStatus: string;
-    expectedSkus: string[];
-    flags: string[];
-  } | null;
-  candidates: { scoped: boolean; excludedProductCount: number; items: { sku: string; score: number }[] };
-  providers: { provider: string; availability: string; reasonCode: string | null; modelId: string | null }[];
-  /** Uncalibrated 0..1 signals per stage (never probabilities); overall is the review gate. */
-  confidence: ClipLabConfidence;
-  why: string[];
-  links: { videoAssetPage: string; pretrainedPage: string };
-}
-
-export interface ClipLabConfidence {
-  detection: { status: 'OK' | 'FAILED' | 'SKIPPED' | 'NOT_RUN'; score: number | null };
-  detector: {
-    provider: string | null;
-    topDetection: number | null;
-    productFrames: number | null;
-    sampledFrames: number | null;
-  };
-  fusionTop: { sku: string; score: number; margin: number } | null;
-  planogramCell: { cell: string; confidence: number } | null;
-  vlm: { status: string | null; verdict: string | null; sku: string | null; support: string | null } | null;
-  overall: { reviewRequired: true; gate: 'REVIEW_REQUIRED' };
 }
 
 // Quarantine screening preview — the ONE deliberate exception to the
@@ -1137,18 +1034,8 @@ export interface ImportReport {
   }[];
 }
 
-export type GroundTruthEventKind = 'PICKUP' | 'RETURN' | 'NONE';
-
 // Phase 11 — which controlled test scenario a ground-truthed clip
 // exercises (the evaluation dashboard breaks accuracy down per scenario).
-export type CvTestScenario =
-  | 'PICKUP_SINGLE'
-  | 'RETURN_SINGLE'
-  | 'FALSE_TOUCH'
-  | 'TWO_SIMILAR_PICK_ONE'
-  | 'TWO_VISIBLE_PICK_ONE'
-  | 'VLM_UNAVAILABLE'
-  | 'VLM_INVALID_SKU';
 
 export interface GroundTruthView {
   videoAssetId: string;
@@ -1302,23 +1189,6 @@ export interface VlmReadiness {
 }
 
 // Customer journey skeleton (shadow mode).
-export type JourneyEventType =
-  | 'ENTRY'
-  | 'EXIT'
-  | 'SHELF_INTERACTION'
-  | 'PRODUCT_PICKUP'
-  | 'PRODUCT_RETURN'
-  | 'REVIEW_REQUIRED';
-
-// Phase 11 — final SHADOW decision of an exited journey (recorded
-// conclusion only; never triggers checkout/order/payment writes).
-export type JourneyDecision =
-  | 'READY_TO_SETTLE_SHADOW'
-  | 'NEEDS_EVENT_REVIEW'
-  | 'NEEDS_JOURNEY_REVIEW'
-  | 'FAILED';
-
-export type JourneyReviewDecision = 'APPROVE' | 'REJECT' | 'CORRECT';
 
 /** One append-only reviewer decision over one journey observation. */
 export interface JourneyEventReview {
@@ -1489,13 +1359,6 @@ export interface EvaluationTestRuns {
 // Camera-source responses NEVER carry a URL or a credential — only
 // whether a secret slot NAME is configured; RTSP stream URLs live in
 // server-side runtime configuration only.
-export type CameraSourceType =
-  | 'FILE_REPLAY'
-  | 'RTSP_PLACEHOLDER'
-  | 'LOCAL_WEBCAM_PLACEHOLDER'
-  | 'RTSP_SHADOW';
-
-export type CameraSourceStatus = 'ACTIVE' | 'DISABLED' | 'ERROR';
 
 export interface CameraSourceView {
   id: string;
@@ -1513,8 +1376,6 @@ export interface CameraSourceView {
   createdAt: string;
   updatedAt: string;
 }
-
-export type PilotRunStatus = 'RUNNING' | 'SUCCEEDED' | 'FAILED';
 
 export interface PilotRunView {
   runId: string;
@@ -1562,12 +1423,6 @@ export interface PilotRunDetail extends PilotRunView {
 // Phase 13 — live RTSP shadow sessions. One row per live camera start;
 // the session owns one shadow journey and its LIVE_WINDOW fusion runs.
 // Responses never carry a URL, credential, or slot value.
-export type LiveSessionStatus =
-  | 'STARTING'
-  | 'RUNNING'
-  | 'STOPPING'
-  | 'STOPPED'
-  | 'ERROR';
 
 export interface LiveSessionView {
   sessionId: string;
@@ -1681,16 +1536,6 @@ export interface ReviewQueueItem {
 }
 
 /** Phase 15 — pilot evaluation loop (shadow only). */
-export type PilotEvaluationStatus = 'OPEN' | 'COMPLETED' | 'CANCELLED';
-export type PilotVerdict =
-  | 'CORRECT'
-  | 'INCORRECT'
-  | 'UNCERTAIN'
-  | 'FALSE_TOUCH'
-  | 'WRONG_SKU'
-  | 'WRONG_ACTION'
-  | 'MISSED_EVENT';
-export type PilotExpectedAction = 'PICKUP' | 'RETURN' | 'NO_OP' | 'UNKNOWN';
 
 export interface PilotEvaluationRunView {
   evaluationRunId: string;
@@ -1822,24 +1667,6 @@ export interface PilotDatasetExport {
 }
 
 /** Phase 16 — CV test protocols (shadow only). */
-export type CvTestProtocolStatus = 'DRAFT' | 'ACTIVE' | 'COMPLETED' | 'CANCELLED';
-export type CvTestScenarioResult = 'PASS' | 'FAIL' | 'INCONCLUSIVE';
-export type CvTestScenarioType =
-  | 'SINGLE_PICKUP'
-  | 'SINGLE_RETURN'
-  | 'FALSE_TOUCH_NO_PRODUCT_MOVED'
-  | 'MISSED_PICKUP'
-  | 'MISSED_RETURN'
-  | 'TWO_PRODUCTS_VISIBLE_ONE_PICKED'
-  | 'SIMILAR_SKU_CONFUSION'
-  | 'MULTI_QUANTITY_PICKUP'
-  | 'HAND_OCCLUSION'
-  | 'FAST_PICKUP'
-  | 'SLOW_PICKUP'
-  | 'LOW_LIGHT'
-  | 'BAD_ANGLE'
-  | 'EMPTY_SHELF'
-  | 'UNKNOWN_PRODUCT';
 
 export interface CvTestProtocolView {
   protocolId: string;
@@ -1954,23 +1781,6 @@ export interface LiveTestPreflight {
 }
 
 /** Phase 17 — camera calibration & pilot hardening (shadow only). */
-export type CameraCalibrationProfileStatus = 'DRAFT' | 'ACTIVE' | 'ARCHIVED';
-export type CameraCalibrationOrientation = 'LANDSCAPE' | 'PORTRAIT' | 'UNKNOWN';
-export type CameraCalibrationMount =
-  | 'OVERHEAD'
-  | 'FRONT_SHELF'
-  | 'ANGLED_SHELF'
-  | 'UNKNOWN';
-export type CameraCalibrationZoneType =
-  | 'SHELF_ZONE'
-  | 'INTERACTION_ZONE'
-  | 'IGNORE_ZONE'
-  | 'ENTRY_EXIT_ZONE';
-export type CalibrationReadinessLevel =
-  | 'READY'
-  | 'WARNING'
-  | 'NOT_READY'
-  | 'NOT_APPLICABLE';
 
 export interface CalibrationPolygonPoint {
   x: number;
@@ -2085,22 +1895,6 @@ export interface PilotHardeningReport {
 /** Phase 18 — dataset improvement & model tuning (advisory, shadow only).
  *  Runs organize reviewed/corrected examples into training-ready metadata;
  *  they never carry raw media, source URLs, paths, or credentials. */
-export type CvDatasetRunStatus = 'DRAFT' | 'READY' | 'EXPORTED' | 'ARCHIVED';
-export type CvDatasetPurpose =
-  | 'SKU_CLASSIFICATION'
-  | 'ACTION_RECOGNITION'
-  | 'FALSE_TOUCH_FILTERING'
-  | 'MISSED_EVENT_RECOVERY'
-  | 'CALIBRATION_VALIDATION'
-  | 'MIXED';
-export type CvDatasetCandidateSourceType =
-  | 'LIVE_REVIEW'
-  | 'MISSED_EVENT'
-  | 'PROTOCOL_SCENARIO'
-  | 'DATASET_EXPORT_ITEM';
-export type CvDatasetSplit = 'TRAIN' | 'VALIDATION' | 'TEST' | 'HOLDOUT';
-export type CvDatasetEligibility = 'ELIGIBLE' | 'EXCLUDED';
-export type CvDatasetReadiness = 'READY' | 'WARNING' | 'NOT_READY';
 
 export interface CvDatasetRunView {
   id: string;
@@ -2301,14 +2095,6 @@ export interface OneSkuCropSummary {
   qualityKnown: boolean;
 }
 
-export type OneSkuCropWarning =
-  | 'PRODUCT_TOO_SMALL'
-  | 'HIGH_OCCLUSION'
-  | 'LOW_SHARPNESS'
-  | 'CROP_MISALIGNED'
-  | 'NO_CLEAR_PRODUCT_FRAME'
-  | 'UNKNOWN_GEOMETRY';
-
 export interface OneSkuFusionSummary {
   createdAt: string;
   policy: string;
@@ -2494,14 +2280,6 @@ export interface PretrainedProviderEvidence {
     eventBox: { x: number; y: number; width: number; height: number } | null;
   } | null;
   notes: string[];
-}
-
-/** Normalized rectangle of the analysis frame the rack occupies. */
-export interface RackFrameRegion {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
 }
 
 export interface PlanogramReportSection {

@@ -1,6 +1,6 @@
 import { ReactNode, useEffect, useState } from 'react';
 import { ApiError } from './api';
-import { PageHeader, usePageTitle } from './ui/primitives';
+import { PageHeader, usePageTitle } from '@byond/ui';
 
 export {
   Badge,
@@ -17,8 +17,8 @@ export {
   StatTiles,
   Tabs,
   usePageTitle,
-} from './ui/primitives';
-export type { BadgeTone, DataColumn } from './ui/primitives';
+} from '@byond/ui';
+export type { BadgeTone, DataColumn } from '@byond/ui';
 export { AppShell, Sidebar, ThemeSwitch, TopBar } from './ui/shell';
 
 /** Shared hook: load data, expose loading/error, reload on dependency change. */

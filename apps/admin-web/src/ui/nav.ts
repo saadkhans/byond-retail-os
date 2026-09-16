@@ -4,28 +4,9 @@
  * absorbed pages (pickup validation → CV Evaluation tab) keep their old
  * routes as redirects (see App.tsx and nav.spec.ts).
  */
-export type NavIcon =
-  | 'overview'
-  | 'store'
-  | 'commerce'
-  | 'review'
-  | 'lab'
-  | 'camera'
-  | 'evaluation';
+import type { NavGroup, NavItem } from '@byond/ui';
 
-export interface NavItem {
-  to: string;
-  label: string;
-  /** `end` matching for the index route only. */
-  end?: boolean;
-}
-
-export interface NavGroup {
-  id: string;
-  label: string;
-  icon: NavIcon;
-  items: NavItem[];
-}
+export type { NavGroup, NavIcon, NavItem } from '@byond/ui';
 
 export const NAV_GROUPS: NavGroup[] = [
   {
