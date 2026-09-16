@@ -11,7 +11,8 @@ apps/            User-facing applications
 services/        Backend services
   api/           Core multitenant API
   edge-runtime/  In-store edge runtime
-  cv-pipeline/   Computer vision event pipeline
+  cv-pipeline/   Tier-1 tracking + tier-2 trigger service (proposes
+                 moments; product identity stays in the API)
 packages/        Shared workspace packages
   shared/        Shared types and utilities
   config/        Shared lint/TS/build configuration
@@ -78,6 +79,19 @@ inventory, plus a manual checkout test flow: create a checkout session, manage
 basket lines, and complete it into an order (no payment capture — pricing and
 payments arrive in a later phase). The API's CORS allowlist defaults to
 `http://localhost:5173` (override with `CORS_ORIGINS`).
+
+### CV pipeline (http://localhost:3100)
+
+```bash
+cd services/cv-pipeline
+cp .env.example .env        # set CV_PIPELINE_API_TOKEN and CV_PIPELINE_ZONES
+pnpm run start
+```
+
+Watches one camera, tracks motion on a downscaled stream, and creates an
+inference job for each moment worth a heavy model. The defaults need no camera,
+no ffmpeg and no model weights. See
+[docs/cv/cv-pipeline-service.md](docs/cv/cv-pipeline-service.md).
 
 ### ML pipeline (Phase 8)
 
