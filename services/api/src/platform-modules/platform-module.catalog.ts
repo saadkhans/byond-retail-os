@@ -207,7 +207,7 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
     // endpoint is @TenantOnly(), so leaving this false would strand new
     // tenants behind 403s. RBAC still gates every route independently.
     // Tenants that existed BEFORE Phase 28 are covered by the
-    // 20260916110001_esl_module_backfill migration — defaultEnabled only
+    // 20260916111001_esl_module_backfill migration — defaultEnabled only
     // applies at tenant creation time.
     defaultEnabled: true,
     isActive: true,

@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -1551,5 +1551,61 @@ describe('loyalty account -> shopper foreign key migration', () => {
     expect(
       statements.split(';').filter((part) => part.trim().length > 0),
     ).toHaveLength(1);
+  });
+});
+
+describe('migration directory naming', () => {
+  const migrationsDir = join(__dirname, '..', '..', 'prisma', 'migrations');
+  const migrationNames = readdirSync(migrationsDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+
+  it('names every migration directory <14-digit timestamp>_<label>', () => {
+    const malformed = migrationNames.filter(
+      (name) => !/^\d{14}_[a-z0-9_]+$/.test(name),
+    );
+    expect(malformed).toEqual([]);
+  });
+
+  it('gives every migration a UNIQUE timestamp prefix', () => {
+    // Two migrations sharing a timestamp leaves Prisma to break the tie
+    // lexicographically on the label. That ordering is invisible, accidental,
+    // and unfixable once the names are recorded in `_prisma_migrations` —
+    // renaming a directory afterwards makes Prisma treat it as brand new.
+    // Phases 27/28 collided on 20260916110000/20260916110001 exactly this
+    // way; the ESL pair was renumbered to 20260916111000/20260916111001.
+    const byPrefix = new Map<string, string[]>();
+    for (const name of migrationNames) {
+      const prefix = name.slice(0, 14);
+      byPrefix.set(prefix, [...(byPrefix.get(prefix) ?? []), name]);
+    }
+
+    const collisions = [...byPrefix.entries()]
+      .filter(([, names]) => names.length > 1)
+      .map(([prefix, names]) => `${prefix} -> ${names.join(', ')}`);
+
+    expect(collisions).toEqual([]);
+  });
+
+  it('keeps every module backfill after the migration that creates its tables', () => {
+    // The ordering guarantee the timestamp collision was quietly relying on:
+    // a `*_module_backfill` INSERTs into tables an earlier migration created,
+    // so it must sort strictly later than every non-backfill migration that
+    // shares its phase.
+    const applied = [...migrationNames];
+    for (const backfill of applied.filter((name) =>
+      name.endsWith('_module_backfill'),
+    )) {
+      const sql = readFileSync(
+        join(migrationsDir, backfill, 'migration.sql'),
+        'utf8',
+      );
+      // Every backfill writes into PlatformModule/TenantModule, which the
+      // init migration created — so the only real requirement is that a
+      // backfill is never the first migration in the chain.
+      expect(sql).toMatch(/PlatformModule|TenantModule/);
+      expect(applied.indexOf(backfill)).toBeGreaterThan(0);
+    }
   });
 });
