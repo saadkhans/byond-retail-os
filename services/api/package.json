@@ -12,6 +12,7 @@
     "start:dev": "nest start --watch",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
+    "prisma:migrate-deploy": "prisma migrate deploy",
     "db:seed": "prisma db seed"
   },
   "dependencies": {

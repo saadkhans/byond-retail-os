@@ -68,47 +68,88 @@ exhaust a 16 GB machine. Use per-package runs with `--maxWorkers=4`.
 A release note that hides known risk is worse than none. Everything below is a
 real gap in this release, ordered roughly by how much damage it can do.
 
-### 1. The migration chain has never been applied to a live PostgreSQL — RELEASE BLOCKER
+### 1. The migration chain — RESOLVED, with one caveat (was: RELEASE BLOCKER)
 
-Fourteen migrations landed today (`20260916090000_phase25_pricing` through
-`20260916150001_reporting_module_backfill`), on top of an existing chain of
-about fifty-five. **Not one of them has been run against a real database.**
+**Status: the chain has now been applied to a live PostgreSQL 16, twice.** It
+failed the first time, and the fix is in this branch.
 
-They have been verified only two ways, and both are text:
-
-- `prisma validate` parses `schema.prisma` and says the *schema* is
-  well-formed. It does not read the migrations at all.
-- `services/api/src/prisma/migration-hardening.spec.ts` reads migration `.sql`
-  files **as strings** and asserts that particular constraint text appears in
-  them. It never executes SQL.
-
-Every test suite in this repository runs against an in-memory Prisma double.
-Nothing listens on 5432 or 5433 on the machine this was built on, and the Docker
-daemon is not running, so `docker compose up` could not be used either.
-
-What this means concretely: a migration that references a column in the wrong
-order, a `CHECK` that PostgreSQL rejects, a foreign key against a table created
-later in the chain, an index name longer than 63 characters, a `NOT NULL` added
-to a table with existing rows and no default — none of these would have been
-caught. The failure mode is a deploy that halts partway through the chain, on a
-database that is now in neither the old shape nor the new one.
-
-**Required before merge to `main`:**
+What was run (Postgres 16, `byond-postgres-dev`, host port 5433):
 
 ```bash
-# against a scratch database, from an empty schema
-DATABASE_URL=... pnpm --filter @byond/api run prisma:migrate-deploy
-DATABASE_URL=... pnpm --filter @byond/api run db:seed
-# then again against a restore of production, to prove the chain
-# applies forward from the shape production is actually in
+# a. from empty
+DATABASE_URL=...byond_integration_empty pnpm --filter @byond/api run prisma:migrate-deploy
+DATABASE_URL=...byond_integration_empty pnpm --filter @byond/api run db:seed
+
+# b. forward onto a clone of the real lab database
+#    CREATE DATABASE byond_qa_copy TEMPLATE byond_dev;
+DATABASE_URL=...byond_qa_copy pnpm --filter @byond/api run prisma:migrate-deploy
+DATABASE_URL=...byond_qa_copy pnpm --filter @byond/api run db:seed   # twice
 ```
 
-Both runs matter. A chain that works from empty can still fail forward from a
-populated database.
+**The first run from empty failed**, at migration 23 of the 2026-09-16 batch:
 
-### 2. Two migration timestamp collisions — order is safe by luck, not design
+```
+Migration name: 20260916120000_phase31_procurement
+Database error code: 42P07
+ERROR: relation "InventoryMovement_id_tenantId_key" already exists
+```
 
-Four migrations share two timestamps:
+Phases 27 and 31 were generated on parallel branches from a baseline that
+lacked `InventoryMovement @@unique([id, tenantId])`, so **both** emitted
+`CREATE UNIQUE INDEX "InventoryMovement_id_tenantId_key"`. Phase 27 always
+sorts first and creates it; Phase 31 then aborted the whole deploy. This is
+exactly the class of failure no string-matching test could see, and it would
+have halted a production deploy 23 migrations in.
+
+**Fix:** Phase 31's statement is now `CREATE UNIQUE INDEX IF NOT EXISTS`. The
+guarantee is unchanged (procurement's composite FKs into `InventoryMovement`
+still require the index); the second creation is a no-op in either order.
+
+After the fix, both runs are clean: 69/69 migrations applied from empty, and
+the 14 pending migrations applied forward onto the populated clone. `db:seed`
+is idempotent — run twice against the migrated clone it reports 79 permissions
+and 15 platform modules both times and changes no counts. The lab data survived
+intact: 13 products, 73 product reference images, 95 video assets. A
+`prisma migrate diff` against the resulting database shows no unexplained
+drift — only the hand-written same-tenant composite foreign keys and extra
+indexes that `schema.prisma` deliberately cannot express.
+
+The specific hazards called out above were checked and are clear:
+
+- **`NOT NULL` on a populated table:** only one, `PaymentIntent.refundedAmountMinor
+  INTEGER NOT NULL DEFAULT 0`. Postgres 11+ applies that as a metadata-only
+  default, with no rewrite and no violation.
+- **`CHECK` rejected by existing rows:** every new `CHECK`
+  (`CustomerJourney_settlement_evidence`, `*_promotion_subtractive`,
+  `*_promotion_needs_price_version`) constrains **columns added in the same
+  migration**, which are `NULL`/defaulted for every pre-existing row. They are
+  structurally satisfiable on any prior database, not merely satisfied by ours.
+- **Index name over 63 characters:** none. The longest identifier in the chain
+  is exactly 63 (`CameraCalibrationZone_tenantId_calibrationProfileId_sortOrd_idx`),
+  so nothing is silently truncated.
+- **Enum values used before they are added:** `ALTER TYPE
+  "InventoryMovementType" ADD VALUE 'RETURN_IN'/'SHRINK'` is never consumed in
+  the same migration, and applied cleanly on PG 16.
+- **Duplicate object creation:** an audit of every `CREATE INDEX`,
+  `CREATE TABLE`, `CREATE TYPE` and `ADD CONSTRAINT` name across all 69
+  migrations found exactly the one collision above (the repeated
+  `ADD CONSTRAINT` names in `20260811090000_restore_same_tenant_fks` are
+  deliberate drop-and-recreate and apply cleanly).
+
+**The remaining caveat.** `byond_dev` was already at
+`20260907180000_video_asset_planogram_binding`, so run (b) proved the **14
+new** migrations apply forward onto real data — not the whole chain. And of the
+pre-existing tables those migrations alter, only `CustomerJourney` (24 rows) had
+any data: `CheckoutSession`, `CheckoutSessionLine`, `OrderLine` and
+`PaymentIntent` were all empty. The `ADD COLUMN`s against them are nullable or
+defaulted so the shapes are safe by construction, but **the forward run has not
+been executed against a database with real checkout, order or payment volume.**
+Before a first production deploy, run (b) again against a restore of that
+database.
+
+### 2. Two migration timestamp collisions — RESOLVED
+
+Four migrations shared two timestamps:
 
 ```
 20260916110000_phase27_returns_reconciliation
@@ -118,38 +159,33 @@ Four migrations share two timestamps:
 ```
 
 Phases 27 and 28 were developed on parallel branches and both picked the same
-hour. Prisma orders migrations by directory name, so it breaks the tie
-lexicographically and applies them in this order:
+hour. Prisma orders migrations by directory name, so it broke the tie
+lexicographically. That order happened to be correct — but by luck: had the ESL
+backfill sorted before the ESL table creation, the deploy would have failed.
 
-1. `...110000_phase27_returns_reconciliation` (`phase27` < `phase28`)
-2. `...110000_phase28_esl`
-3. `...110001_esl_module_backfill` (`esl` < `returns`)
-4. `...110001_returns_module_backfill`
+**Done in this branch,** before anything was applied to a database that will be
+kept: the ESL pair is renumbered to `20260916111000_phase28_esl` and
+`20260916111001_esl_module_backfill`, leaving returns where it is so the
+already-correct order is preserved. Renumbering was free *then* and is
+impossible *now* on any database that has since recorded these names — renaming
+a directory makes Prisma treat it as a new, unapplied migration.
 
-That order happens to be correct — returns and ESL create independent tables,
-and each module backfill lands after its own tables exist. **That is luck.** Had
-the ESL backfill sorted before the ESL table creation, the deploy would fail at
-step 3, and nothing in this repository would have told us in advance. There is
-no guard asserting migration timestamps are unique.
+The only reference to the old names outside the directories themselves was one
+comment in `services/api/src/platform-modules/platform-module.catalog.ts`; the
+two string literals in `services/api/src/prisma/migration-hardening.spec.ts`
+name the *returns* pair, which did not move.
 
-**Recommendation:** renumber `phase28_esl` to `20260916111000` and
-`esl_module_backfill` to `20260916111001` before the chain is ever applied to a
-database that will be kept. Renumbering is free *now* and impossible *later* —
-once a migration is in `_prisma_migrations` on any database you care about,
-renaming its directory makes Prisma treat it as a new, unapplied migration.
+**The guard is in place.** `migration-hardening.spec.ts` now has a
+`migration directory naming` block asserting that every migration carries a
+unique 14-digit timestamp prefix, that every directory matches
+`<14 digits>_<label>`, and that no `*_module_backfill` is the first migration in
+the chain. Injecting a duplicate prefix fails it with the colliding pair named:
 
-If you renumber, the directory names are referenced from two files that must be updated in the same commit:
-
-- `services/api/src/prisma/migration-hardening.spec.ts` (two string literals:
-  `'20260916110000_phase27_returns_reconciliation'` and
-  `'20260916110001_returns_module_backfill'`)
-- `services/api/src/platform-modules/platform-module.catalog.ts` (two comments
-  naming `20260916110001_returns_module_backfill` and
-  `20260916110001_esl_module_backfill`)
-
-Add a guard in the same commit: a test that reads the migrations directory and
-fails on a duplicate timestamp prefix. This costs five lines and removes the
-class of problem.
+```
+Array [
+  "20260916110001 -> 20260916110001_duplicate_probe, 20260916110001_returns_module_backfill",
+]
+```
 
 ### 3. The first public API surface in the repository — needs a personal security review
 
@@ -409,9 +445,12 @@ suspected of not having looked.
 
 Honest assessment. The code is in good shape; the deployment is not.
 
-**Would break immediately:** nothing, *if* the migration chain applies. That is
-the whole question, and it is untested. If it does not apply, the deploy halts
-partway through and leaves the database in an intermediate shape.
+**Would break immediately:** nothing. The migration chain has now been applied
+to a live PostgreSQL 16 — from empty, and forward onto a clone of the real lab
+database. It failed the first time (duplicate
+`InventoryMovement_id_tenantId_key` in Phase 31) and that is fixed here. See
+§1 for the one part still unproven: no forward run has been done against a
+database carrying real checkout, order or payment volume.
 
 **Would break within the first day:** shelf labels drift silently from prices,
 because nothing drains the ESL queue on a timer. The shopper app fails to load
@@ -424,8 +463,8 @@ for a tenant that reaches ten thousand in a year.
 **Would not break, but is unproven:** the entire money path, the entire hardware
 path, and reporting performance against a real ledger.
 
-**The one thing to do first:** run the migration chain against a scratch
-database and then against a production restore, and renumber the colliding
-timestamps before either of those runs makes the current names permanent.
+**The one thing to do first:** run `prisma:migrate-deploy` against a restore of
+the production database — the one forward run still missing is the one against
+real checkout, order and payment volume. Everything else in §1 and §2 is done.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)

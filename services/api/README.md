@@ -38,7 +38,7 @@ pnpm install
 # From services/api
 cp .env.example .env           # then adjust if your Postgres differs
 pnpm run prisma:generate       # generate the Prisma client (no DB needed)
-pnpm run prisma:migrate        # apply migrations (needs DB)
+pnpm run prisma:migrate        # DEVELOPMENT ONLY — `prisma migrate dev` (needs DB)
 pnpm run db:seed               # idempotent: permission + platform-module catalogs,
                                # platform-sandbox tenant, local dev fixtures
 pnpm run start:dev             # http://localhost:3000, Swagger at /docs
@@ -53,8 +53,26 @@ pnpm run start:dev             # http://localhost:3000, Swagger at /docs
 | `pnpm run test` | Prisma generate + Jest (unit + e2e, **no database required**) |
 | `pnpm run build` | Prisma generate + `nest build` |
 | `pnpm run db:seed` | Idempotent seed; refuses `NODE_ENV=production` unless `SEED_ALLOW_PROD=true` |
+| `pnpm run prisma:migrate` | **Development only.** `prisma migrate dev` — it diffs the schema, may *generate* a new migration, and can offer to **RESET (drop) the database** when it finds drift. Never point it at a database whose data matters. |
+| `pnpm run prisma:migrate-deploy` | **What a real deployment runs.** `prisma migrate deploy` — applies pending migrations in order and nothing else: it never generates a migration, never prompts, and never resets. Safe for staging/production and for CI. |
 
 All four also run from the repo root via `pnpm run lint|typecheck|test|build`.
+
+### Deploying a schema change
+
+```bash
+# staging / production — DATABASE_URL points at the target
+pnpm --filter @byond/api run prisma:migrate-deploy
+pnpm --filter @byond/api run db:seed     # idempotent; safe to re-run
+```
+
+`prisma migrate deploy` exits non-zero on the first migration that fails, and
+leaves the ones already applied recorded in `_prisma_migrations` — so a failed
+deploy is resumable once the offending migration is fixed. Migration directory
+names are immutable after they are recorded: renaming one makes Prisma treat it
+as a brand-new, unapplied migration. `migration-hardening.spec.ts` asserts that
+every migration carries a unique 14-digit timestamp prefix, so ordering can
+never fall back to a lexicographic tie-break on the label.
 
 ## Architecture notes
 

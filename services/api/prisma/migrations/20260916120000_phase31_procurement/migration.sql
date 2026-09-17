@@ -246,7 +246,14 @@ CREATE UNIQUE INDEX "GoodsReceiptLine_id_tenantId_key" ON "GoodsReceiptLine"("id
 CREATE UNIQUE INDEX "GoodsReceiptLine_goodsReceiptId_purchaseOrderLineId_key" ON "GoodsReceiptLine"("goodsReceiptId", "purchaseOrderLineId");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "InventoryMovement_id_tenantId_key" ON "InventoryMovement"("id", "tenantId");
+-- Phase 31 and Phase 27 were developed on parallel branches from a baseline
+-- that lacked this index, so BOTH generated migrations emit it. Phase 27
+-- (20260916110000) always sorts first and creates it unconditionally, which
+-- made this statement fail with 42P07 ("relation already exists") the first
+-- time the chain was applied to a real database. IF NOT EXISTS keeps the
+-- guarantee (procurement's composite FKs into InventoryMovement need it)
+-- while making the second creation a no-op, in either apply order.
+CREATE UNIQUE INDEX IF NOT EXISTS "InventoryMovement_id_tenantId_key" ON "InventoryMovement"("id", "tenantId");
 
 -- AddForeignKey
 ALTER TABLE "Supplier" ADD CONSTRAINT "Supplier_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
