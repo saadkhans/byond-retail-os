@@ -174,3 +174,6 @@ storage/**/*.[aA][vV][iI][fF]
 # Screenshots dropped at the repo root by browser-automation sessions; real
 # image assets always live under an app/service directory, never the root.
 /*.png
+
+# local lab clip folders (never commit footage)
+Training videos*/

@@ -222,6 +222,7 @@ function buildService(overrides: {
   maxScreeningDurationMs?: string;
   maxScreeningFrames?: string;
   screeningTimeoutMs?: string;
+  screeningOcrConcurrency?: string;
   // The CONTROLLED TEST-MEDIA POLICY GATE — the only thing that authorizes
   // an ingest. Defaults below open it ('true' + a non-production NODE_ENV)
   // so the rest of the suite exercises the paths behind it; the policy-gate
@@ -596,6 +597,7 @@ function buildService(overrides: {
     VIDEO_MAX_SCREENING_DURATION_MS: overrides.maxScreeningDurationMs,
     VIDEO_MAX_SCREENING_FRAMES: overrides.maxScreeningFrames,
     VIDEO_SCREENING_TIMEOUT_MS: overrides.screeningTimeoutMs,
+    VIDEO_SCREENING_OCR_CONCURRENCY: overrides.screeningOcrConcurrency,
     VIDEO_UNSAFE_ALLOW_UNSCREENED_UPLOADS: overrides.allowUnscreenedUploads,
     // Policy gate OPEN by default so the suite reaches the code behind it.
     // 'testMediaIngestEnabled' in overrides is checked (not ??) so a test
@@ -2054,6 +2056,237 @@ describe('VideoAssetsService.upload pre-storage frame screening', () => {
       expect(storage.put).not.toHaveBeenCalled();
     },
   );
+
+  describe('bounded recognizer pool (VIDEO_SCREENING_OCR_CONCURRENCY)', () => {
+    // Real recorder clips arrive at 60 fps: ~530 frames for 9 s, ~0.4 s of
+    // OCR each, ~220 s sequentially against the 120 s enforceable deadline.
+    // The pool runs up to N recognitions side by side. These tests pin the
+    // invariants that make that safe: every unique frame is still
+    // recognized, the in-flight count never exceeds N, a pooled hit still
+    // rejects and names the EARLIEST tripped frame, and a pooled failure
+    // still fails closed — with N = 1 identical to the sequential screen.
+    const POOL_PREFIX = 'pool-frame-';
+    const poolFrames = (count: number) =>
+      Array.from({ length: count }, (_, index) =>
+        Buffer.from(`${POOL_PREFIX}${index}`),
+      );
+    const indexOf = (frame: Buffer) =>
+      Number(frame.toString().slice(POOL_PREFIX.length));
+    const settleLater = (ticks: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, ticks));
+
+    function trackingRecognizer(
+      textFor: (index: number) => Promise<string> | string,
+    ) {
+      let inFlight = 0;
+      const peak = { value: 0 };
+      const seen: number[] = [];
+      const recognize = jest.fn(async (frame: Buffer) => {
+        const index = indexOf(frame);
+        inFlight += 1;
+        peak.value = Math.max(peak.value, inFlight);
+        seen.push(index);
+        try {
+          return await textFor(index);
+        } finally {
+          inFlight -= 1;
+        }
+      });
+      return { recognize, peak, seen };
+    }
+
+    it('runs at most N recognitions side by side and still recognizes EVERY unique frame', async () => {
+      const tracking = trackingRecognizer(async () => {
+        await settleLater(2);
+        return 'aisle four shelf camera';
+      });
+      const { service, recognizer, storage } = buildService({
+        screeningOcrConcurrency: '4',
+        extractor: { streamFrames: jest.fn(async () => poolFrames(40)) },
+        recognizer: { recognize: tracking.recognize },
+      });
+      const asset = await service.upload(TENANT, uploadFile(), { ...ATTEST });
+      expect((asset as { status: VideoAssetStatus }).status).toBe(
+        VideoAssetStatus.QUARANTINED,
+      );
+      // Every one of the 40 distinct frames was recognized exactly once.
+      expect(recognizer.recognize).toHaveBeenCalledTimes(40);
+      expect(new Set(tracking.seen).size).toBe(40);
+      // The pool was USED (4 in flight) and never EXCEEDED.
+      expect(tracking.peak.value).toBe(4);
+      expect(storage.put).toHaveBeenCalledTimes(1);
+    });
+
+    it('at the default N = 1 recognition is strictly sequential (the former behaviour)', async () => {
+      const tracking = trackingRecognizer(async () => {
+        await settleLater(1);
+        return 'aisle four shelf camera';
+      });
+      const { service, recognizer } = buildService({
+        extractor: { streamFrames: jest.fn(async () => poolFrames(12)) },
+        recognizer: { recognize: tracking.recognize },
+      });
+      await service.upload(TENANT, uploadFile(), { ...ATTEST });
+      expect(recognizer.recognize).toHaveBeenCalledTimes(12);
+      expect(tracking.peak.value).toBe(1);
+      // Decode order preserved when nothing runs side by side.
+      expect(tracking.seen).toEqual(Array.from({ length: 12 }, (_, i) => i));
+    });
+
+    it('falls back to N = 1 for an out-of-range value that skipped boot validation', async () => {
+      for (const configured of ['0', '17', '-3', 'six', '']) {
+        const tracking = trackingRecognizer(async () => {
+          await settleLater(1);
+          return 'aisle four';
+        });
+        const { service } = buildService({
+          screeningOcrConcurrency: configured,
+          extractor: { streamFrames: jest.fn(async () => poolFrames(12)) },
+          recognizer: { recognize: tracking.recognize },
+        });
+        await service.upload(TENANT, uploadFile(), { ...ATTEST });
+        expect(tracking.peak.value).toBe(1);
+      }
+    });
+
+    it('a hit inside a pooled recognition rejects, stops the stream, and attributes the EARLIEST tripped frame', async () => {
+      // Frame 5 trips the screen immediately; frame 2 trips it LATER (a
+      // slower recognition). Both land before the verdict is read, and the
+      // audited index must be 2 — the earliest frame carrying card text —
+      // not 5, the first result to arrive.
+      const pan = '4111 1111 1111 1111';
+      let auditReason: string | undefined;
+      const transitionStatus = jest.fn(
+        async (
+          _t: string,
+          _id: string,
+          _expected: unknown,
+          data: { status: VideoAssetStatus },
+          build: (b: unknown, a: unknown) => { reason?: string },
+        ) => {
+          const after = assetRow(data);
+          auditReason = build(
+            assetRow({ status: VideoAssetStatus.PENDING_MEDIA }),
+            after,
+          ).reason;
+          return after;
+        },
+      );
+      const tracking = trackingRecognizer(async (index) => {
+        if (index === 5) {
+          return `PAY CARD ${pan} OK`;
+        }
+        if (index === 2) {
+          await settleLater(6);
+          return `PAY CARD ${pan} OK`;
+        }
+        await settleLater(1);
+        return 'aisle four';
+      });
+      const { service, repository, storage, recognizer, inspectClose } =
+        buildService({
+          screeningOcrConcurrency: '8',
+          extractor: { streamFrames: jest.fn(async () => poolFrames(40)) },
+          recognizer: { recognize: tracking.recognize },
+          repository: { transitionStatus },
+        });
+      const error: Error = await service
+        .upload(TENANT, uploadFile(), { ...ATTEST })
+        .then(() => {
+          throw new Error('expected rejection');
+        })
+        .catch((caught: Error) => caught);
+      expect(error).toBeInstanceOf(BadRequestException);
+      expect(error.message).not.toContain('4111');
+      expect(auditReason).not.toContain('4111');
+      expect(auditReason).toContain('frame 2');
+      expect(auditReason).not.toContain('frame 5');
+      // The stream was abandoned at the hit: far fewer than 40 frames
+      // reached the recognizer.
+      expect(recognizer.recognize.mock.calls.length).toBeLessThan(40);
+      const [, , expected, data] = repository.transitionStatus.mock
+        .calls[0] as unknown as [
+        string,
+        string,
+        VideoAssetStatus[],
+        { status: VideoAssetStatus; errorCode: string },
+      ];
+      expect(expected).toEqual([VideoAssetStatus.PENDING_MEDIA]);
+      expect(data.status).toBe(VideoAssetStatus.REJECTED);
+      expect(data.errorCode).toBe('PRESTORE_SCREENING_REJECTED');
+      expect(storage.put).not.toHaveBeenCalled();
+      // The verdict waited for the pool to DRAIN: no recognition was still
+      // running when the session closed.
+      expect(inspectClose).toHaveBeenCalledTimes(1);
+    });
+
+    it('a hit that lands only after the stream ended (last frames in flight) still rejects', async () => {
+      // The final frame trips the screen but its recognition settles after
+      // the decode has already yielded every frame — the drain before the
+      // verdict is what catches it.
+      const pan = '4111 1111 1111 1111';
+      const tracking = trackingRecognizer(async (index) => {
+        if (index === 9) {
+          await settleLater(5);
+          return `PAY CARD ${pan} OK`;
+        }
+        return 'aisle four';
+      });
+      const { service, repository, storage } = buildService({
+        screeningOcrConcurrency: '4',
+        extractor: { streamFrames: jest.fn(async () => poolFrames(10)) },
+        recognizer: { recognize: tracking.recognize },
+      });
+      await expect(
+        service.upload(TENANT, uploadFile(), { ...ATTEST }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      const [, , , data] = repository.transitionStatus.mock
+        .calls[0] as unknown as [
+        string,
+        string,
+        VideoAssetStatus[],
+        { status: VideoAssetStatus; errorCode: string },
+      ];
+      expect(data.status).toBe(VideoAssetStatus.REJECTED);
+      expect(data.errorCode).toBe('PRESTORE_SCREENING_REJECTED');
+      expect(storage.put).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['OCR infrastructure failure', new FrameTextRecognitionInfrastructureError()],
+      ['OCR content failure', new FrameTextRecognitionFailedError()],
+    ])('a pooled %s fails closed through the same FAILED/UPLOAD_INCOMPLETE 503 path', async (_case, failure) => {
+      const tracking = trackingRecognizer(async (index) => {
+        await settleLater(1);
+        if (index === 3) {
+          throw failure;
+        }
+        return 'aisle four';
+      });
+      const { service, repository, storage, inspectClose } = buildService({
+        screeningOcrConcurrency: '4',
+        extractor: { streamFrames: jest.fn(async () => poolFrames(40)) },
+        recognizer: { recognize: tracking.recognize },
+      });
+      await expect(
+        service.upload(TENANT, uploadFile(), { ...ATTEST }),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+      const [, , expected, data] = repository.transitionStatus.mock
+        .calls[0] as unknown as [
+        string,
+        string,
+        VideoAssetStatus[],
+        { status: VideoAssetStatus; errorCode: string },
+      ];
+      expect(expected).toEqual([VideoAssetStatus.PENDING_MEDIA]);
+      expect(data.status).toBe(VideoAssetStatus.FAILED);
+      expect(data.errorCode).toBe('UPLOAD_INCOMPLETE');
+      expect(storage.put).not.toHaveBeenCalled();
+      expect(inspectClose).toHaveBeenCalledTimes(1);
+      // The failure stopped the stream: not all 40 frames were recognized.
+      expect(tracking.seen.length).toBeLessThan(40);
+    });
+  });
 
   it.each([
     ['OCR infrastructure failure', new FrameTextRecognitionInfrastructureError()],

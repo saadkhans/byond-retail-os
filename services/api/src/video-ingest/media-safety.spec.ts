@@ -4,10 +4,52 @@ import {
   fileExtensionOf,
   filenameCarriesSensitiveContent,
   isAllowedVideoUpload,
+  isoBmffTopLevelAtoms,
   isUnsafeUploadFilename,
   looksLikeVideoContent,
+  payloadScanBytes,
+  redactLocationMetadata,
   sanitizeOriginalFilename,
 } from './media-safety';
+
+/**
+ * Minimal ISO BMFF atom: 32-bit BE size + 4-char type + payload. `largesize`
+ * writes the size-1 / 64-bit form; `toEnd` writes size 0 (runs to EOF).
+ */
+function atom(
+  type: string,
+  payload: Buffer,
+  form: 'plain' | 'largesize' | 'toEnd' = 'plain',
+): Buffer {
+  if (form === 'largesize') {
+    const header = Buffer.alloc(16);
+    header.writeUInt32BE(1, 0);
+    header.write(type, 4, 'latin1');
+    header.writeBigUInt64BE(BigInt(16 + payload.length), 8);
+    return Buffer.concat([header, payload]);
+  }
+  const header = Buffer.alloc(8);
+  header.writeUInt32BE(form === 'toEnd' ? 0 : 8 + payload.length, 0);
+  header.write(type, 4, 'latin1');
+  return Buffer.concat([header, payload]);
+}
+
+const FTYP = atom('ftyp', Buffer.from('qt  \0\0\0\0qt  ', 'latin1'));
+
+/** Pseudo-random letter-bearing bytes standing in for codec/table data. */
+function noiseBytes(length: number, seed = 37): Buffer {
+  return Buffer.from(Array.from({ length }, (_, i) => (i * seed + 11) % 256));
+}
+
+/** A QuickTime `data` atom value: type indicator 1 (UTF-8) + locale + text. */
+function quickTimeStringValue(text: string): Buffer {
+  return Buffer.concat([
+    Buffer.from([0, 0, 0, 1, 0, 0, 0, 0]),
+    Buffer.from(text, 'latin1'),
+  ]);
+}
+
+const APPLE_LOCATION = '+21.5630+039.1182+006.893/';
 
 describe('media-safety', () => {
   describe('isUnsafeUploadFilename', () => {
@@ -1040,6 +1082,200 @@ describe('media-safety', () => {
     it('rejects unknown extensions and short buffers outright', () => {
       expect(looksLikeVideoContent(mp4, '.exe')).toBe(false);
       expect(looksLikeVideoContent(Buffer.alloc(2), '.mp4')).toBe(false);
+    });
+  });
+
+  describe('ISO BMFF container scope (payload screen reads metadata atoms, never mdat)', () => {
+    const fragment = Buffer.concat([
+      Buffer.alloc(2),
+      Buffer.from('cvv123', 'ascii'),
+      Buffer.alloc(2),
+    ]);
+
+    describe('isoBmffTopLevelAtoms', () => {
+      it('walks plain, largesize, and to-end-of-file atoms', () => {
+        const file = Buffer.concat([
+          FTYP,
+          atom('moov', noiseBytes(64)),
+          atom('free', Buffer.alloc(32), 'largesize'),
+          atom('mdat', noiseBytes(128), 'toEnd'),
+        ]);
+        const atoms = isoBmffTopLevelAtoms(file);
+        expect(atoms?.map((a) => a.type)).toEqual(['ftyp', 'moov', 'free', 'mdat']);
+        expect(atoms?.at(-1)?.end).toBe(file.length);
+        expect(atoms?.[2]).toMatchObject({ start: FTYP.length + 72, end: FTYP.length + 72 + 48 });
+      });
+
+      it('returns null for non-ISO-BMFF buffers and malformed trees', () => {
+        expect(isoBmffTopLevelAtoms(noiseBytes(64))).toBeNull();
+        // Size smaller than its own header.
+        const tooSmall = Buffer.alloc(8);
+        tooSmall.writeUInt32BE(3, 0);
+        tooSmall.write('moov', 4, 'latin1');
+        expect(isoBmffTopLevelAtoms(Buffer.concat([FTYP, tooSmall]))).toBeNull();
+        // Size reaching past the buffer.
+        const overshoot = atom('mdat', noiseBytes(16));
+        overshoot.writeUInt32BE(1024, 0);
+        expect(isoBmffTopLevelAtoms(Buffer.concat([FTYP, overshoot]))).toBeNull();
+        // Trailing partial header.
+        expect(isoBmffTopLevelAtoms(Buffer.concat([FTYP, Buffer.alloc(5)]))).toBeNull();
+      });
+    });
+
+    describe('payloadScanBytes', () => {
+      it('drops mdat and keeps every other atom in file order', () => {
+        const moov = atom('moov', noiseBytes(64));
+        const free = atom('free', Buffer.alloc(16));
+        const file = Buffer.concat([FTYP, moov, atom('mdat', noiseBytes(256)), free]);
+        expect(payloadScanBytes(file).equals(Buffer.concat([FTYP, moov, free]))).toBe(true);
+      });
+
+      it('returns the buffer itself when nothing can be skipped', () => {
+        const noMdat = Buffer.concat([FTYP, atom('moov', noiseBytes(64))]);
+        expect(payloadScanBytes(noMdat)).toBe(noMdat);
+        const ebml = Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3]), noiseBytes(64)]);
+        expect(payloadScanBytes(ebml)).toBe(ebml);
+      });
+    });
+
+    it('does not read codec payload bytes as metadata text', () => {
+      // The exact shape that rejected the whole first lab batch: a chance
+      // "cvv123"-like run inside compressed frame data.
+      const file = Buffer.concat([
+        FTYP,
+        atom('moov', noiseBytes(64)),
+        atom('mdat', Buffer.concat([noiseBytes(512), fragment, noiseBytes(512)])),
+      ]);
+      expect(bufferCarriesSensitiveText(file)).toBe(false);
+    });
+
+    it('still rejects the same fragment in a metadata atom', () => {
+      for (const type of ['moov', 'free', 'uuid']) {
+        const file = Buffer.concat([
+          FTYP,
+          atom(type, Buffer.concat([noiseBytes(64), fragment, noiseBytes(64)])),
+          atom('mdat', noiseBytes(512)),
+        ]);
+        expect(bufferCarriesSensitiveText(file)).toBe(true);
+      }
+    });
+
+    it('skips largesize and to-end-of-file mdat atoms alike', () => {
+      const payload = Buffer.concat([noiseBytes(256), fragment, noiseBytes(256)]);
+      expect(
+        bufferCarriesSensitiveText(
+          Buffer.concat([FTYP, atom('moov', noiseBytes(32)), atom('mdat', payload, 'largesize')]),
+        ),
+      ).toBe(false);
+      expect(
+        bufferCarriesSensitiveText(
+          Buffer.concat([FTYP, atom('moov', noiseBytes(32)), atom('mdat', payload, 'toEnd')]),
+        ),
+      ).toBe(false);
+    });
+
+    it('falls back to the full-buffer scan when the atom tree is malformed', () => {
+      // An "mdat" whose declared size overshoots the file cannot be trusted
+      // to bound anything — so its bytes are scanned, and the fragment rejects.
+      const mdat = atom('mdat', Buffer.concat([noiseBytes(64), fragment, noiseBytes(64)]));
+      mdat.writeUInt32BE(mdat.length + 100, 0);
+      expect(bufferCarriesSensitiveText(Buffer.concat([FTYP, mdat]))).toBe(true);
+    });
+
+    it('keeps the full-buffer scan for containers it cannot walk', () => {
+      const ebml = Buffer.concat([
+        Buffer.from([0x1a, 0x45, 0xdf, 0xa3]),
+        noiseBytes(256),
+        fragment,
+        noiseBytes(256),
+      ]);
+      expect(bufferCarriesSensitiveText(ebml)).toBe(true);
+    });
+
+    describe('redactLocationMetadata', () => {
+      function movWithLocation(location: string, extra = ''): Buffer {
+        const value = quickTimeStringValue(location + extra);
+        return Buffer.concat([
+          FTYP,
+          atom('moov', Buffer.concat([noiseBytes(64), atom('data', value), noiseBytes(64)])),
+          atom('mdat', noiseBytes(512)),
+        ]);
+      }
+
+      it('pins the reason: a real recorder position is a Luhn-valid digit chain', () => {
+        // "+21.5630+039.1182+006.893/" joins to 19 digits with a Luhn-valid
+        // window — the governing "no digit shape rescues Luhn" policy rejects
+        // it, as it did for all 30 first-batch clips. Blanking, not exemption,
+        // is what makes such uploads pass.
+        expect(bufferCarriesSensitiveText(movWithLocation(APPLE_LOCATION))).toBe(true);
+      });
+
+      it('blanks the ISO 6709 string in place, same length, and the screen then passes', () => {
+        const file = movWithLocation(APPLE_LOCATION);
+        const before = file.length;
+        const at = file.indexOf(APPLE_LOCATION, 0, 'latin1');
+        expect(at).toBeGreaterThan(0);
+
+        expect(redactLocationMetadata(file)).toBe(1);
+
+        expect(file.length).toBe(before);
+        expect(file.toString('latin1', at, at + APPLE_LOCATION.length)).toBe(
+          ' '.repeat(APPLE_LOCATION.length),
+        );
+        expect(file.indexOf(APPLE_LOCATION, 0, 'latin1')).toBe(-1);
+        // Atom sizes untouched: the tree still walks.
+        expect(isoBmffTopLevelAtoms(file)?.map((a) => a.type)).toEqual(['ftyp', 'moov', 'mdat']);
+        expect(bufferCarriesSensitiveText(file)).toBe(false);
+      });
+
+      it.each([
+        ['+21.5630+039.1182/'], // legacy ©xyz form, no altitude
+        ['-33.8688+151.2093+000.000/'], // southern / eastern hemisphere
+        ['+4807.038-01131.000/'], // DDMM.MMM / DDDMM.MMM form
+        ['+21.5630+039.1182+006.893CRSWGS_84/'], // with a CRS suffix
+      ])('recognises the ISO 6709 variant %p', (location) => {
+        const file = movWithLocation(location);
+        expect(redactLocationMetadata(file)).toBe(1);
+        expect(file.indexOf(location, 0, 'latin1')).toBe(-1);
+      });
+
+      it('blanks a PAN written in coordinate shape too — it is never stored', () => {
+        const disguised = '+4111.1111+1111.1111/';
+        const file = movWithLocation(disguised);
+        expect(redactLocationMetadata(file)).toBe(1);
+        expect(file.indexOf(disguised, 0, 'latin1')).toBe(-1);
+      });
+
+      it('leaves a PAN in any other shape in the same atom for the screen to reject', () => {
+        const file = movWithLocation(APPLE_LOCATION, ' card 4111 1111 1111 1111');
+        expect(redactLocationMetadata(file)).toBe(1);
+        expect(bufferCarriesSensitiveText(file)).toBe(true);
+      });
+
+      it('never touches mdat, non-ISO-BMFF buffers, or malformed trees', () => {
+        const inMdat = Buffer.concat([
+          FTYP,
+          atom('moov', noiseBytes(32)),
+          atom('mdat', Buffer.from(APPLE_LOCATION, 'latin1')),
+        ]);
+        expect(redactLocationMetadata(inMdat)).toBe(0);
+        expect(inMdat.indexOf(APPLE_LOCATION, 0, 'latin1')).toBeGreaterThan(0);
+
+        const ebml = Buffer.concat([
+          Buffer.from([0x1a, 0x45, 0xdf, 0xa3]),
+          Buffer.from(APPLE_LOCATION, 'latin1'),
+        ]);
+        expect(redactLocationMetadata(ebml)).toBe(0);
+
+        const malformed = atom('moov', Buffer.from(APPLE_LOCATION, 'latin1'));
+        malformed.writeUInt32BE(malformed.length + 50, 0);
+        expect(redactLocationMetadata(Buffer.concat([FTYP, malformed]))).toBe(0);
+      });
+
+      it('ignores ordinary metadata numbers that are not a location string', () => {
+        const file = movWithLocation('creation 2026-09-12T12:52:00+0300 v1.2.3');
+        expect(redactLocationMetadata(file)).toBe(0);
+      });
     });
   });
 });
