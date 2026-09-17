@@ -11,6 +11,7 @@ import {
   SupplierStatus,
 } from '@prisma/client';
 import { AuditEntry, AuditLogService } from '../common/audit/audit-log.service';
+import { procurementReferenceAdvisoryLockKey } from '../common/locks';
 import {
   AdjustmentRejected,
   InventoryRepository,
@@ -23,6 +24,7 @@ import {
   RECEIPT_MOVEMENT_REFERENCE_TYPE,
 } from './procurement.constants';
 import {
+  AllocatedReference,
   derivePurchaseOrderStatus,
   nextReference,
   OrderLineQuantities,
@@ -452,97 +454,101 @@ export class ProcurementRepository extends TenantScopedRepository {
     if (new Set(productIds).size !== productIds.length) {
       return Promise.resolve('duplicate-product' as const);
     }
-    return this.prisma.$transaction(async (tx) => {
-      const supplier = await tx.supplier.findFirst({
-        where: { id: data.supplierId, tenantId: scopedTenantId },
-        select: { id: true, status: true },
-      });
-      if (!supplier) {
-        return 'supplier-not-found' as const;
-      }
-      if (supplier.status === SupplierStatus.ARCHIVED) {
-        return 'supplier-archived' as const;
-      }
-      const location = await tx.location.findFirst({
-        where: { id: data.locationId, tenantId: scopedTenantId },
-        select: { id: true },
-      });
-      if (!location) {
-        return 'location-not-found' as const;
-      }
-      const products = await tx.product.findMany({
-        where: { tenantId: scopedTenantId, id: { in: productIds } },
-        select: { id: true, sku: true, name: true },
-      });
-      if (products.length !== productIds.length) {
-        return 'product-not-found' as const;
-      }
-      const productById = new Map(products.map((p) => [p.id, p]));
-      const supplierLinks = await tx.supplierProduct.findMany({
-        where: {
-          tenantId: scopedTenantId,
-          supplierId: data.supplierId,
-          productId: { in: productIds },
-        },
-      });
-      const linkByProduct = new Map(
-        supplierLinks.map((link) => [link.productId, link]),
-      );
-
-      const resolvedLines = data.lines.map((line) => {
-        const link = linkByProduct.get(line.productId);
-        const product = productById.get(line.productId)!;
-        return {
-          productId: line.productId,
-          supplierProductId: link?.id ?? null,
-          sku: product.sku,
-          productName: product.name,
-          quantityOrdered: line.quantityOrdered,
-          // Fall back to the supplier catalog when the caller does not
-          // override, and to a single-unit pack at zero cost when the product
-          // is not in that catalog at all — an order for an unlisted product
-          // is legal, it just carries no cost until someone states one.
-          packSize: line.packSize ?? link?.packSize ?? 1,
-          unitCostMinor: line.unitCostMinor ?? link?.unitCostMinor ?? 0,
-          currencyCode: data.currencyCode,
-        };
-      });
-
-      const reference = await this.allocateReference(
-        tx,
-        scopedTenantId,
-        'purchaseOrder',
-        PURCHASE_ORDER_REFERENCE_PREFIX,
-      );
-      const order = await tx.purchaseOrder.create({
-        data: {
-          tenantId: scopedTenantId,
-          reference,
-          supplierId: data.supplierId,
-          locationId: data.locationId,
-          currencyCode: data.currencyCode,
-          expectedAt: data.expectedAt ?? null,
-          notes: data.notes ?? null,
-          createdById: data.createdById,
-          lines: {
-            create: resolvedLines.map((line) => ({
-              tenantId: scopedTenantId,
-              productId: line.productId,
-              supplierProductId: line.supplierProductId,
-              sku: line.sku,
-              productName: line.productName,
-              quantityOrdered: line.quantityOrdered,
-              packSize: line.packSize,
-              unitCostMinor: line.unitCostMinor,
-              currencyCode: line.currencyCode,
-            })),
+    return this.withReferenceRetry(() =>
+      this.prisma.$transaction(async (tx) => {
+        const supplier = await tx.supplier.findFirst({
+          where: { id: data.supplierId, tenantId: scopedTenantId },
+          select: { id: true, status: true },
+        });
+        if (!supplier) {
+          return 'supplier-not-found' as const;
+        }
+        if (supplier.status === SupplierStatus.ARCHIVED) {
+          return 'supplier-archived' as const;
+        }
+        const location = await tx.location.findFirst({
+          where: { id: data.locationId, tenantId: scopedTenantId },
+          select: { id: true },
+        });
+        if (!location) {
+          return 'location-not-found' as const;
+        }
+        const products = await tx.product.findMany({
+          where: { tenantId: scopedTenantId, id: { in: productIds } },
+          select: { id: true, sku: true, name: true },
+        });
+        if (products.length !== productIds.length) {
+          return 'product-not-found' as const;
+        }
+        const productById = new Map(products.map((p) => [p.id, p]));
+        const supplierLinks = await tx.supplierProduct.findMany({
+          where: {
+            tenantId: scopedTenantId,
+            supplierId: data.supplierId,
+            productId: { in: productIds },
           },
-        },
-        include: ORDER_DETAIL_INCLUDE,
-      });
-      await this.auditLog.record(buildAuditEntry(order), tx);
-      return order;
-    });
+        });
+        const linkByProduct = new Map(
+          supplierLinks.map((link) => [link.productId, link]),
+        );
+
+        const resolvedLines = data.lines.map((line) => {
+          const link = linkByProduct.get(line.productId);
+          const product = productById.get(line.productId)!;
+          return {
+            productId: line.productId,
+            supplierProductId: link?.id ?? null,
+            sku: product.sku,
+            productName: product.name,
+            quantityOrdered: line.quantityOrdered,
+            // Fall back to the supplier catalog when the caller does not
+            // override, and to a single-unit pack at zero cost when the product
+            // is not in that catalog at all — an order for an unlisted product
+            // is legal, it just carries no cost until someone states one.
+            packSize: line.packSize ?? link?.packSize ?? 1,
+            unitCostMinor: line.unitCostMinor ?? link?.unitCostMinor ?? 0,
+            currencyCode: data.currencyCode,
+          };
+        });
+
+        const allocated = await this.allocateReference(
+          tx,
+          scopedTenantId,
+          'purchaseOrder',
+          PURCHASE_ORDER_REFERENCE_PREFIX,
+        );
+        const order = await tx.purchaseOrder.create({
+          data: {
+            tenantId: scopedTenantId,
+            reference: allocated.reference,
+            referenceYear: allocated.year,
+            referenceSequence: allocated.sequence,
+            supplierId: data.supplierId,
+            locationId: data.locationId,
+            currencyCode: data.currencyCode,
+            expectedAt: data.expectedAt ?? null,
+            notes: data.notes ?? null,
+            createdById: data.createdById,
+            lines: {
+              create: resolvedLines.map((line) => ({
+                tenantId: scopedTenantId,
+                productId: line.productId,
+                supplierProductId: line.supplierProductId,
+                sku: line.sku,
+                productName: line.productName,
+                quantityOrdered: line.quantityOrdered,
+                packSize: line.packSize,
+                unitCostMinor: line.unitCostMinor,
+                currencyCode: line.currencyCode,
+              })),
+            },
+          },
+          include: ORDER_DETAIL_INCLUDE,
+        });
+        await this.auditLog.record(buildAuditEntry(order), tx);
+        return order;
+      }),
+    );
   }
 
   async findPurchaseOrders(
@@ -693,195 +699,201 @@ export class ProcurementRepository extends TenantScopedRepository {
     if (new Set(lineIds).size !== lineIds.length) {
       return Promise.resolve('duplicate-line' as const);
     }
-    return this.prisma
-      .$transaction(async (tx) => {
-        if (input.idempotencyKey) {
-          await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`goods-receipt:${scopedTenantId}:${input.idempotencyKey}`}))::text`;
-          const existing = await tx.goodsReceipt.findFirst({
+    return this.withReferenceRetry(() =>
+      this.prisma
+        .$transaction(async (tx) => {
+          if (input.idempotencyKey) {
+            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`goods-receipt:${scopedTenantId}:${input.idempotencyKey}`}))::text`;
+            const existing = await tx.goodsReceipt.findFirst({
+              where: {
+                tenantId: scopedTenantId,
+                idempotencyKey: input.idempotencyKey,
+              },
+              include: RECEIPT_DETAIL_INCLUDE,
+            });
+            if (existing) {
+              // A replay is only a replay when it asks for the SAME receipt
+              // against the same order. Anything else is a reused key.
+              if (existing.purchaseOrderId !== orderId) {
+                throw new ReceiptRejectedError('reference-mismatch');
+              }
+              return existing;
+            }
+          }
+
+          const order = await tx.purchaseOrder.findFirst({
+            where: { id: orderId, tenantId: scopedTenantId },
+            include: { lines: true },
+          });
+          if (!order) {
+            throw new ReceiptRejectedError('order-not-found');
+          }
+          if (
+            order.status !== PurchaseOrderStatus.SUBMITTED &&
+            order.status !== PurchaseOrderStatus.PARTIALLY_RECEIVED
+          ) {
+            throw new ReceiptRejectedError('order-not-receivable');
+          }
+          const orderLineById = new Map(
+            order.lines.map((line) => [line.id, line]),
+          );
+          for (const line of input.lines) {
+            if (!orderLineById.has(line.purchaseOrderLineId)) {
+              throw new ReceiptRejectedError('line-not-on-order');
+            }
+          }
+
+          // What had already arrived BEFORE this receipt — needed so a
+          // discrepancy suggestion looks at the running total, not one delivery
+          // in isolation.
+          const priorReceiptLines = await tx.goodsReceiptLine.findMany({
             where: {
               tenantId: scopedTenantId,
-              idempotencyKey: input.idempotencyKey,
+              purchaseOrderLineId: { in: order.lines.map((l) => l.id) },
             },
+            select: { purchaseOrderLineId: true, quantityReceived: true },
+          });
+          const priorPacks = receivedPacksByLine(
+            order.lines as OrderLineQuantities[],
+            priorReceiptLines,
+          );
+
+          const allocated = await this.allocateReference(
+            tx,
+            scopedTenantId,
+            'goodsReceipt',
+            GOODS_RECEIPT_REFERENCE_PREFIX,
+          );
+          const receipt = await tx.goodsReceipt.create({
+            data: {
+              tenantId: scopedTenantId,
+              purchaseOrderId: order.id,
+              reference: allocated.reference,
+              referenceYear: allocated.year,
+              referenceSequence: allocated.sequence,
+              deliveryNote: input.deliveryNote ?? null,
+              notes: input.notes ?? null,
+              receivedAt: input.receivedAt ?? new Date(),
+              idempotencyKey: input.idempotencyKey ?? null,
+              receivedById: input.receivedById,
+            },
+          });
+
+          // Sort by product id so two concurrent receipts touching the same
+          // products acquire the per-product advisory locks in the same order
+          // and cannot deadlock — the rule checkout completion follows.
+          const sorted = [...input.lines].sort((a, b) => {
+            const pa = orderLineById.get(a.purchaseOrderLineId)!.productId;
+            const pb = orderLineById.get(b.purchaseOrderLineId)!.productId;
+            return pa < pb ? -1 : pa > pb ? 1 : 0;
+          });
+
+          for (const line of sorted) {
+            const orderLine = orderLineById.get(line.purchaseOrderLineId)!;
+            const units = unitsForPacks(
+              line.quantityReceived,
+              orderLine.packSize,
+            );
+            let movementId: string | null = null;
+            if (units > 0) {
+              try {
+                const { movement } =
+                  await this.inventoryRepository.applyMovement(tx, {
+                    tenantId: scopedTenantId,
+                    locationId: order.locationId,
+                    productId: orderLine.productId,
+                    quantityDelta: units,
+                    movementType: InventoryMovementType.RECEIPT,
+                    reason: `Goods receipt ${receipt.reference} against ${order.reference}`,
+                    referenceType: RECEIPT_MOVEMENT_REFERENCE_TYPE,
+                    referenceId: receipt.id,
+                    createdById: input.receivedById,
+                  });
+                movementId = movement.id;
+              } catch (error) {
+                if (error instanceof AdjustmentRejected) {
+                  throw new ReceiptRejectedError(
+                    'stock-rejected',
+                    error.reason,
+                  );
+                }
+                throw error;
+              }
+            }
+            const discrepancy =
+              line.discrepancy &&
+              line.discrepancy !== GoodsReceiptDiscrepancy.NONE
+                ? line.discrepancy
+                : suggestDiscrepancy(
+                    orderLine.quantityOrdered,
+                    priorPacks.get(orderLine.id) ?? 0,
+                    line.quantityReceived,
+                  );
+            await tx.goodsReceiptLine.create({
+              data: {
+                tenantId: scopedTenantId,
+                goodsReceiptId: receipt.id,
+                purchaseOrderLineId: orderLine.id,
+                productId: orderLine.productId,
+                quantityReceived: line.quantityReceived,
+                packSize: orderLine.packSize,
+                unitsReceived: units,
+                discrepancy,
+                discrepancyNote: line.discrepancyNote ?? null,
+                inventoryMovementId: movementId,
+              },
+            });
+          }
+
+          // Recompute the order's status from ALL receipt lines that now exist,
+          // rather than nudging it forward. Received quantity stays a
+          // projection; only the lifecycle status is stored.
+          const allReceiptLines = await tx.goodsReceiptLine.findMany({
+            where: {
+              tenantId: scopedTenantId,
+              purchaseOrderLineId: { in: order.lines.map((l) => l.id) },
+            },
+            select: { purchaseOrderLineId: true, quantityReceived: true },
+          });
+          const nextStatus = derivePurchaseOrderStatus(
+            order.status,
+            order.lines as OrderLineQuantities[],
+            receivedPacksByLine(
+              order.lines as OrderLineQuantities[],
+              allReceiptLines,
+            ),
+          );
+          if (nextStatus !== order.status) {
+            const updated = await tx.purchaseOrder.update({
+              where: {
+                id_tenantId: { id: order.id, tenantId: scopedTenantId },
+              },
+              data: {
+                status: nextStatus,
+                ...(nextStatus === PurchaseOrderStatus.RECEIVED
+                  ? { closedAt: new Date() }
+                  : {}),
+              },
+            });
+            await this.auditLog.record(
+              builders.orderStatusChanged(updated, order.status, nextStatus),
+              tx,
+            );
+          }
+
+          await this.auditLog.record(builders.receiptPosted(receipt), tx);
+          return tx.goodsReceipt.findFirstOrThrow({
+            where: { id: receipt.id, tenantId: scopedTenantId },
             include: RECEIPT_DETAIL_INCLUDE,
           });
-          if (existing) {
-            // A replay is only a replay when it asks for the SAME receipt
-            // against the same order. Anything else is a reused key.
-            if (existing.purchaseOrderId !== orderId) {
-              throw new ReceiptRejectedError('reference-mismatch');
-            }
-            return existing;
+        })
+        .catch((error: unknown) => {
+          if (error instanceof ReceiptRejectedError) {
+            return error.rejection;
           }
-        }
-
-        const order = await tx.purchaseOrder.findFirst({
-          where: { id: orderId, tenantId: scopedTenantId },
-          include: { lines: true },
-        });
-        if (!order) {
-          throw new ReceiptRejectedError('order-not-found');
-        }
-        if (
-          order.status !== PurchaseOrderStatus.SUBMITTED &&
-          order.status !== PurchaseOrderStatus.PARTIALLY_RECEIVED
-        ) {
-          throw new ReceiptRejectedError('order-not-receivable');
-        }
-        const orderLineById = new Map(
-          order.lines.map((line) => [line.id, line]),
-        );
-        for (const line of input.lines) {
-          if (!orderLineById.has(line.purchaseOrderLineId)) {
-            throw new ReceiptRejectedError('line-not-on-order');
-          }
-        }
-
-        // What had already arrived BEFORE this receipt — needed so a
-        // discrepancy suggestion looks at the running total, not one delivery
-        // in isolation.
-        const priorReceiptLines = await tx.goodsReceiptLine.findMany({
-          where: {
-            tenantId: scopedTenantId,
-            purchaseOrderLineId: { in: order.lines.map((l) => l.id) },
-          },
-          select: { purchaseOrderLineId: true, quantityReceived: true },
-        });
-        const priorPacks = receivedPacksByLine(
-          order.lines as OrderLineQuantities[],
-          priorReceiptLines,
-        );
-
-        const reference = await this.allocateReference(
-          tx,
-          scopedTenantId,
-          'goodsReceipt',
-          GOODS_RECEIPT_REFERENCE_PREFIX,
-        );
-        const receipt = await tx.goodsReceipt.create({
-          data: {
-            tenantId: scopedTenantId,
-            purchaseOrderId: order.id,
-            reference,
-            deliveryNote: input.deliveryNote ?? null,
-            notes: input.notes ?? null,
-            receivedAt: input.receivedAt ?? new Date(),
-            idempotencyKey: input.idempotencyKey ?? null,
-            receivedById: input.receivedById,
-          },
-        });
-
-        // Sort by product id so two concurrent receipts touching the same
-        // products acquire the per-product advisory locks in the same order
-        // and cannot deadlock — the rule checkout completion follows.
-        const sorted = [...input.lines].sort((a, b) => {
-          const pa = orderLineById.get(a.purchaseOrderLineId)!.productId;
-          const pb = orderLineById.get(b.purchaseOrderLineId)!.productId;
-          return pa < pb ? -1 : pa > pb ? 1 : 0;
-        });
-
-        for (const line of sorted) {
-          const orderLine = orderLineById.get(line.purchaseOrderLineId)!;
-          const units = unitsForPacks(
-            line.quantityReceived,
-            orderLine.packSize,
-          );
-          let movementId: string | null = null;
-          if (units > 0) {
-            try {
-              const { movement } = await this.inventoryRepository.applyMovement(
-                tx,
-                {
-                  tenantId: scopedTenantId,
-                  locationId: order.locationId,
-                  productId: orderLine.productId,
-                  quantityDelta: units,
-                  movementType: InventoryMovementType.RECEIPT,
-                  reason: `Goods receipt ${receipt.reference} against ${order.reference}`,
-                  referenceType: RECEIPT_MOVEMENT_REFERENCE_TYPE,
-                  referenceId: receipt.id,
-                  createdById: input.receivedById,
-                },
-              );
-              movementId = movement.id;
-            } catch (error) {
-              if (error instanceof AdjustmentRejected) {
-                throw new ReceiptRejectedError('stock-rejected', error.reason);
-              }
-              throw error;
-            }
-          }
-          const discrepancy =
-            line.discrepancy && line.discrepancy !== GoodsReceiptDiscrepancy.NONE
-              ? line.discrepancy
-              : suggestDiscrepancy(
-                  orderLine.quantityOrdered,
-                  priorPacks.get(orderLine.id) ?? 0,
-                  line.quantityReceived,
-                );
-          await tx.goodsReceiptLine.create({
-            data: {
-              tenantId: scopedTenantId,
-              goodsReceiptId: receipt.id,
-              purchaseOrderLineId: orderLine.id,
-              productId: orderLine.productId,
-              quantityReceived: line.quantityReceived,
-              packSize: orderLine.packSize,
-              unitsReceived: units,
-              discrepancy,
-              discrepancyNote: line.discrepancyNote ?? null,
-              inventoryMovementId: movementId,
-            },
-          });
-        }
-
-        // Recompute the order's status from ALL receipt lines that now exist,
-        // rather than nudging it forward. Received quantity stays a
-        // projection; only the lifecycle status is stored.
-        const allReceiptLines = await tx.goodsReceiptLine.findMany({
-          where: {
-            tenantId: scopedTenantId,
-            purchaseOrderLineId: { in: order.lines.map((l) => l.id) },
-          },
-          select: { purchaseOrderLineId: true, quantityReceived: true },
-        });
-        const nextStatus = derivePurchaseOrderStatus(
-          order.status,
-          order.lines as OrderLineQuantities[],
-          receivedPacksByLine(
-            order.lines as OrderLineQuantities[],
-            allReceiptLines,
-          ),
-        );
-        if (nextStatus !== order.status) {
-          const updated = await tx.purchaseOrder.update({
-            where: {
-              id_tenantId: { id: order.id, tenantId: scopedTenantId },
-            },
-            data: {
-              status: nextStatus,
-              ...(nextStatus === PurchaseOrderStatus.RECEIVED
-                ? { closedAt: new Date() }
-                : {}),
-            },
-          });
-          await this.auditLog.record(
-            builders.orderStatusChanged(updated, order.status, nextStatus),
-            tx,
-          );
-        }
-
-        await this.auditLog.record(builders.receiptPosted(receipt), tx);
-        return tx.goodsReceipt.findFirstOrThrow({
-          where: { id: receipt.id, tenantId: scopedTenantId },
-          include: RECEIPT_DETAIL_INCLUDE,
-        });
-      })
-      .catch((error: unknown) => {
-        if (error instanceof ReceiptRejectedError) {
-          return error.rejection;
-        }
-        throw error;
-      });
+          throw error;
+        }),
+    );
   }
 
   async findGoodsReceipts(
@@ -939,32 +951,102 @@ export class ProcurementRepository extends TenantScopedRepository {
   }
 
   /**
-   * Next reference in the tenant's yearly sequence. Read inside the caller's
-   * transaction; the unique index on (tenantId, reference) is the real
-   * guarantee, so a racing pair produces a rejected insert rather than two
-   * orders sharing a number.
+   * Next reference in the tenant's yearly sequence, read inside the caller's
+   * transaction.
+   *
+   * Ordering is on the INTEGER `referenceSequence`, never on the reference
+   * string. A string sort agrees with numeric order only while every sequence
+   * is the same width: the moment `PO-2026-10000` exists,
+   * `'PO-2026-9999' > 'PO-2026-10000'`, so a string-ordered lookup keeps
+   * returning 9999, keeps computing 10000, and keeps being rejected by the
+   * (tenantId, reference) unique — every subsequent order for the tenant-year
+   * a permanent failure. The integer column has a total order at every width.
+   *
+   * The advisory lock serializes allocation for this (tenant, prefix, year) so
+   * two simultaneous creations do not read the same maximum. The unique index
+   * remains the real guarantee behind it, and `withReferenceRetry` turns the
+   * rare loser — a row inserted out of band, say — into a second attempt that
+   * reads a strictly larger maximum.
    */
   private async allocateReference(
     tx: Prisma.TransactionClient,
     tenantId: string,
     model: 'purchaseOrder' | 'goodsReceipt',
     prefix: string,
-  ): Promise<string> {
+  ): Promise<AllocatedReference> {
     const year = new Date().getUTCFullYear();
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${procurementReferenceAdvisoryLockKey(
+      tenantId,
+      prefix,
+      year,
+    )}))::text`;
+    const where = { tenantId, referenceYear: year };
+    const orderBy = { referenceSequence: 'desc' } as const;
+    const select = { referenceSequence: true } as const;
     const latest =
       model === 'purchaseOrder'
-        ? await tx.purchaseOrder.findFirst({
-            where: { tenantId, reference: { startsWith: `${prefix}-${year}-` } },
-            orderBy: { reference: 'desc' },
-            select: { reference: true },
-          })
-        : await tx.goodsReceipt.findFirst({
-            where: { tenantId, reference: { startsWith: `${prefix}-${year}-` } },
-            orderBy: { reference: 'desc' },
-            select: { reference: true },
-          });
-    return nextReference(prefix, year, latest?.reference ?? null);
+        ? await tx.purchaseOrder.findFirst({ where, orderBy, select })
+        : await tx.goodsReceipt.findFirst({ where, orderBy, select });
+    return nextReference(prefix, year, latest?.referenceSequence ?? null);
   }
+
+  /**
+   * Runs a reference-allocating transaction, retrying a bounded number of
+   * times when the (tenantId, reference) unique rejects the insert.
+   *
+   * This loop TERMINATES because each attempt re-reads the year's maximum
+   * sequence and adds one. The loser of a race re-reads a maximum that now
+   * includes the winner's committed row, so the number it computes is strictly
+   * larger than the one that was rejected. That was precisely what the
+   * string-ordered lookup could not promise: it recomputed the same rejected
+   * value forever, which is what made the 10,000th document of a year a
+   * permanent 500 rather than a momentary conflict.
+   *
+   * Only a reference conflict is retried. A reused idempotency key, a domain
+   * rejection, or any other error is the caller's answer and is rethrown
+   * unchanged.
+   */
+  private async withReferenceRetry<T>(run: () => Promise<T>): Promise<T> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await run();
+      } catch (error) {
+        if (
+          attempt >= REFERENCE_ALLOCATION_ATTEMPTS ||
+          !isReferenceConflict(error)
+        ) {
+          throw error;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * How many times a reference-allocating transaction may be replayed before the
+ * conflict is reported. Each attempt allocates a strictly larger sequence, so
+ * more than a couple means something other than a race — an out-of-band writer
+ * inserting references faster than we can step over them — and failing loudly
+ * beats spinning.
+ */
+const REFERENCE_ALLOCATION_ATTEMPTS = 5;
+
+/**
+ * Was this the (tenantId, reference) unique rejecting a collision?
+ *
+ * Deliberately narrow: GoodsReceipt also carries a (tenantId, idempotencyKey)
+ * unique, and a reused key must reach the caller as a conflict rather than
+ * being retried into a second receipt.
+ */
+function isReferenceConflict(error: unknown): boolean {
+  if ((error as { code?: unknown } | null)?.code !== 'P2002') {
+    return false;
+  }
+  const target = (error as { meta?: { target?: unknown } }).meta?.target;
+  if (Array.isArray(target)) {
+    return target.includes('reference');
+  }
+  return typeof target === 'string' && target.includes('reference');
 }
 
 /**

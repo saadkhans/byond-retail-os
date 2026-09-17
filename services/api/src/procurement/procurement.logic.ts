@@ -166,28 +166,74 @@ export function suggestDiscrepancy(
 }
 
 /**
- * Next reference in a `PREFIX-YYYY-NNNN` sequence.
+ * A minted reference and the two numbers it was minted from. Both are stored:
+ * the string is what a human reads on the paperwork, the year and sequence are
+ * what the allocator orders by.
+ */
+export interface AllocatedReference {
+  reference: string;
+  /** The calendar year the sequence belongs to; it resets every January. */
+  year: number;
+  /** Position within that year, 1-based. Strictly increasing, never padded. */
+  sequence: number;
+}
+
+/**
+ * Formats one reference in the `PREFIX-YYYY-NNNN` shape.
  *
- * Deterministic and derived from the highest existing reference for the year,
- * so two orders created in the same second cannot collide silently: the unique
- * index on (tenantId, reference) rejects the loser and the caller retries.
+ * Four digits is a MINIMUM WIDTH, not a ceiling: `padStart` pads and never
+ * truncates, so sequence 9999 formats as `PO-2026-9999`, 10000 as
+ * `PO-2026-10000`, and the year's numbering simply carries on getting wider.
+ * Nothing downstream may compare two of these strings to decide which came
+ * first — `'PO-2026-9999' > 'PO-2026-10000'` lexicographically, which is
+ * exactly the trap this module fell into. Order by `sequence`.
+ */
+export function formatReference(
+  prefix: string,
+  year: number,
+  sequence: number,
+): string {
+  return `${prefix}-${String(year).padStart(4, '0')}-${String(sequence).padStart(4, '0')}`;
+}
+
+/**
+ * The sequence a reference carries, or null when the string is not one of ours
+ * — a legacy import, a hand-typed number, anything that does not match the
+ * canonical shape for this prefix and year. Used by the migration's backfill
+ * and by nothing on the hot path.
+ */
+export function referenceSequenceOf(
+  prefix: string,
+  year: number,
+  reference: string,
+): number | null {
+  const match = new RegExp(
+    `^${prefix}-${String(year).padStart(4, '0')}-(\\d+)$`,
+  ).exec(reference);
+  return match ? Number.parseInt(match[1], 10) : null;
+}
+
+/**
+ * Next reference for a (tenant, prefix, year), given the highest sequence
+ * already allocated in that year.
+ *
+ * Takes the NUMBER, not the previous string, on purpose. The caller reads the
+ * maximum from an integer column with a total numeric order, so the successor
+ * is correct at 10,000 and at 100,000 alike; deriving it by parsing "the
+ * lexicographically largest reference" is what broke at the four-digit
+ * boundary. `null` means the year is empty and numbering starts at 1.
+ *
+ * The successor strictly increases with the maximum it is given, which is what
+ * makes the caller's conflict retry terminate: a losing racer re-reads a
+ * maximum that now includes the winner's row and computes a different number.
  */
 export function nextReference(
   prefix: string,
   year: number,
-  latestReference: string | null,
-): string {
-  const yearPart = String(year).padStart(4, '0');
-  let next = 1;
-  if (latestReference) {
-    const match = new RegExp(`^${prefix}-${yearPart}-(\\d+)$`).exec(
-      latestReference,
-    );
-    if (match) {
-      next = Number.parseInt(match[1], 10) + 1;
-    }
-  }
-  return `${prefix}-${yearPart}-${String(next).padStart(4, '0')}`;
+  latestSequence: number | null,
+): AllocatedReference {
+  const sequence = (latestSequence ?? 0) + 1;
+  return { reference: formatReference(prefix, year, sequence), year, sequence };
 }
 
 /** Statuses from which an order may still be cancelled. */
