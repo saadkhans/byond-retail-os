@@ -21,3 +21,9 @@ process.env.LOGIN_THROTTLE_IP_LIMIT =
 // firing mid-suite would crash as an unhandled rejection in whichever test
 // happens to be running. Force it off for every test process.
 process.env.PICKUP_DETECTION_ENABLED = 'false';
+// Same reasoning for the ESL queue runner: a sweep firing mid-suite would
+// claim jobs against whatever Prisma double the running test installed (most
+// have no eslUpdateJob delegate at all) and surface as an unhandled
+// rejection in an unrelated test. It is off by default, and forced off here
+// so a developer .env that enables it cannot leak into a test process.
+process.env.ESL_QUEUE_WORKER_ENABLED = 'false';

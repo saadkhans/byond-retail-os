@@ -73,6 +73,44 @@ class EnvironmentVariables {
   @Min(1000)
   LOGIN_THROTTLE_WINDOW_MS?: number;
 
+  // ── ESL queue runner (Phase 28 background drain) ─────────────────────
+  // The clock behind POST /esl/update-jobs/process and POST /esl/reconcile.
+  // Without it a price activation queues label pushes that nothing performs,
+  // and the shelf silently diverges from what checkout charges.
+
+  // Master switch. OFF by default — a deployment that drives the queue with
+  // an external scheduler leaves this unset. Same strict boolean idiom as
+  // PICKUP_DETECTION_ENABLED.
+  @IsOptional()
+  @Matches(/^(true|false)$/i, {
+    message: 'ESL_QUEUE_WORKER_ENABLED must be true or false',
+  })
+  ESL_QUEUE_WORKER_ENABLED?: string;
+
+  // Milliseconds between sweeps (default 15000; 1 s .. 1 h).
+  @IsOptional()
+  @IsInt()
+  @Min(1000)
+  @Max(3_600_000)
+  ESL_QUEUE_WORKER_INTERVAL_MS?: number;
+
+  // Jobs claimed per tenant per sweep (default 50). The ceiling is
+  // ESL_PROCESS_MAX_BATCH, which processBatch clamps to anyway.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  ESL_QUEUE_WORKER_BATCH_SIZE?: number;
+
+  // Milliseconds between drift-repair passes per tenant (default 900000 =
+  // 15 min; 1 min .. 24 h). Reconciliation reads every bound label and
+  // re-resolves its price, so it runs on a much slower clock than the drain.
+  @IsOptional()
+  @IsInt()
+  @Min(60_000)
+  @Max(86_400_000)
+  ESL_RECONCILE_INTERVAL_MS?: number;
+
   // Comma-separated list of browser origins allowed by CORS (the admin
   // web app). Default: the local Vite dev server. Never a wildcard.
   // No MinLength: deployments that materialize unset vars as CORS_ORIGINS=

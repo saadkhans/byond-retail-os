@@ -467,10 +467,15 @@ export class EslService implements OnModuleInit, PriceActivationListener {
    * price in force says it should be gets a job. This is what makes the
    * best-effort activation hand-off safe — a listener that was down when a
    * price changed is caught here.
+   *
+   * `actor` is null when the sweep is the background runner's rather than an
+   * operator's, exactly as the price-activation listener enqueues with no
+   * creator: the jobs are the system's, and attributing them to a user who
+   * did not ask for them would be a lie in the audit trail.
    */
   async reconcile(
     tenantId: string,
-    actor: AuditActor,
+    actor: AuditActor | null,
   ): Promise<{ inspected: number; enqueued: number }> {
     const labels = await this.repository.findAllBoundLabels(tenantId);
     const stale: EslLabelDetail[] = [];
@@ -488,7 +493,7 @@ export class EslService implements OnModuleInit, PriceActivationListener {
       stale,
       EslUpdateTrigger.RECONCILIATION,
       null,
-      actor.id,
+      actor?.id ?? null,
     );
     return { inspected: labels.length, enqueued };
   }
