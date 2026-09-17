@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { ShopperThrottleGuard } from '../auth/guards/shopper-throttle.guard';
 import { PlatformModulesModule } from '../platform-modules/platform-modules.module';
 import { StoreFlowModule } from '../store-flow/store-flow.module';
 import { ShopperController } from './shopper.controller';
@@ -20,10 +21,14 @@ import { ShopperService } from './shopper.service';
  * Notably absent: CheckoutModule, OrdersModule, PaymentsModule, VisionModule,
  * InventoryModule. A shopper-facing surface has no business holding a
  * reference to any of them, and boundary.spec.ts fails if one appears.
+ *
+ * ShopperThrottleGuard is a provider rather than a bare class so it is ONE
+ * instance for the whole module: its sliding window is per-process state, and
+ * a guard re-instantiated per request would count nothing.
  */
 @Module({
   imports: [PlatformModulesModule, StoreFlowModule],
   controllers: [ShopperController],
-  providers: [ShopperService, ShopperRepository],
+  providers: [ShopperService, ShopperRepository, ShopperThrottleGuard],
 })
 export class ShopperModule {}

@@ -73,6 +73,43 @@ class EnvironmentVariables {
   @Min(1000)
   LOGIN_THROTTLE_WINDOW_MS?: number;
 
+  // ── Shopper throttle (Phase 35's @Public() routes) ───────────────────
+  // The same sliding window as the login throttle, applied to the only
+  // unauthenticated commerce surface. Every bucket is keyed on the CALLER
+  // (its IP, and for the visit routes a digest of whatever it presented) and
+  // never on whether what it sent was valid, so being throttled can never
+  // reveal that a credential was real. TRUST_PROXY governs how req.ip is
+  // derived here too: behind an untrusted proxy every shopper shares one
+  // bucket, which is why the defaults are sized for a storeful of phones.
+
+  // POST /shopper/session: redemption attempts per IP per window. The
+  // tightest limit — this is the credential-guessing surface. Default 30.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  SHOPPER_SESSION_THROTTLE_LIMIT?: number;
+
+  // GET /shopper/basket, POST /shopper/exit: requests per CREDENTIAL per
+  // window. The bucket a real shopper meets (the app polls its basket every
+  // few seconds). Default 60.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  SHOPPER_VISIT_THROTTLE_LIMIT?: number;
+
+  // The same two routes: requests per IP per window regardless of how many
+  // credentials are presented, so rotating them evades nothing. Default 600.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  SHOPPER_VISIT_IP_THROTTLE_LIMIT?: number;
+
+  // Sliding-window width for every shopper bucket. Default 60000.
+  @IsOptional()
+  @IsInt()
+  @Min(1000)
+  SHOPPER_THROTTLE_WINDOW_MS?: number;
+
   // ── ESL queue runner (Phase 28 background drain) ─────────────────────
   // The clock behind POST /esl/update-jobs/process and POST /esl/reconcile.
   // Without it a price activation queues label pushes that nothing performs,

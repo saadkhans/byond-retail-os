@@ -16,6 +16,16 @@ process.env.JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN ?? '15m';
 process.env.LOGIN_THROTTLE_LIMIT = process.env.LOGIN_THROTTLE_LIMIT ?? '1000';
 process.env.LOGIN_THROTTLE_IP_LIMIT =
   process.env.LOGIN_THROTTLE_IP_LIMIT ?? '5000';
+// Same for the shopper surface: every suite shares one loopback address, so
+// without generous defaults a suite that exercises the three public routes
+// would throttle itself. The dedicated shopper-throttle e2e overrides these
+// with small limits, exactly as the login one does.
+process.env.SHOPPER_SESSION_THROTTLE_LIMIT =
+  process.env.SHOPPER_SESSION_THROTTLE_LIMIT ?? '1000';
+process.env.SHOPPER_VISIT_THROTTLE_LIMIT =
+  process.env.SHOPPER_VISIT_THROTTLE_LIMIT ?? '5000';
+process.env.SHOPPER_VISIT_IP_THROTTLE_LIMIT =
+  process.env.SHOPPER_VISIT_IP_THROTTLE_LIMIT ?? '5000';
 // The developer .env enables the pickup-detection polling worker; e2e suites
 // stub PrismaService without the videoAsset delegate, so a background scan
 // firing mid-suite would crash as an unhandled rejection in whichever test
