@@ -833,3 +833,150 @@ describe('audit trail', () => {
     expect(entry.actorEmail).toBe(ACTOR.email);
   });
 });
+
+/**
+ * The 10,000th document of a year.
+ *
+ * References are allocated by taking the highest one already issued for the
+ * tenant-year and adding one. While every sequence was four digits wide, a
+ * STRING sort and a numeric sort agreed, so ordering by the reference column
+ * looked right. It stops being right the moment `PO-2026-10000` exists:
+ * lexicographically `'PO-2026-9999' > 'PO-2026-10000'`, so the lookup keeps
+ * returning 9999, the allocator keeps proposing 10000, the (tenantId,
+ * reference) unique keeps rejecting it, and every purchase order and goods
+ * receipt for that tenant-year fails permanently until January.
+ *
+ * These tests seed populations that CROSS that boundary — which is exactly
+ * what the rest of the suite never does, and why it passed over the bug.
+ */
+describe('reference numbering past four digits', () => {
+  let h: Harness;
+
+  beforeEach(() => {
+    // Pin the clock: references are keyed by the calendar year, so a suite
+    // that seeds "this year" has to say which year that is.
+    jest.useFakeTimers({ doNotFake: ['nextTick'] });
+    jest.setSystemTime(new Date('2026-09-16T12:00:00Z'));
+    h = buildHarness();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  /** A purchase order created the ordinary way, returning its reference. */
+  async function createOrder(harness: Harness): Promise<string> {
+    const supplier = await harness.service.createSupplier(
+      TENANT,
+      { code: `acme-${harness.rows.suppliers.length}`, name: 'Acme' },
+      ACTOR,
+    );
+    const order = await harness.service.createPurchaseOrder(
+      TENANT,
+      {
+        supplierId: supplier.id,
+        locationId: 'store-1',
+        currencyCode: 'AED',
+        lines: [{ productId: 'prod-a', quantityOrdered: 1, unitCostMinor: 1 }],
+      },
+      ACTOR,
+    );
+    return order.reference;
+  }
+
+  it('allocates 10000 after 9999, and 10001 after that', async () => {
+    h.seedReference('purchaseOrder', 'PO-2026-9998');
+    h.seedReference('purchaseOrder', 'PO-2026-9999');
+
+    await expect(createOrder(h)).resolves.toBe('PO-2026-10000');
+    await expect(createOrder(h)).resolves.toBe('PO-2026-10001');
+  });
+
+  it('allocates 100000 after 99999 — the fix is not a wider constant', async () => {
+    // Widening the padding to six digits would have made the previous test
+    // pass and moved the cliff here instead. Ordering on an integer has no
+    // cliff at any width.
+    h.seedReference('purchaseOrder', 'PO-2026-99999');
+
+    await expect(createOrder(h)).resolves.toBe('PO-2026-100000');
+    await expect(createOrder(h)).resolves.toBe('PO-2026-100001');
+  });
+
+  it('finds the true maximum in a population of mixed widths', async () => {
+    // Sorted as strings this year reads
+    //   PO-2026-9999 > PO-2026-20000 > PO-2026-10000 > PO-2026-0007,
+    // because '9' > '2' > '1' > '0' at the first digit and length never
+    // enters into it. A string-ordered lookup answers 9999 and proposes a
+    // number issued ten thousand documents ago.
+    for (const reference of [
+      'PO-2026-0007',
+      'PO-2026-9999',
+      'PO-2026-10000',
+      'PO-2026-20000',
+    ]) {
+      h.seedReference('purchaseOrder', reference);
+    }
+
+    await expect(createOrder(h)).resolves.toBe('PO-2026-20001');
+  });
+
+  it('numbers goods receipts past the boundary as well', async () => {
+    // Both sides of the boundary, so the string order really disagrees:
+    // 'GR-2026-9999' sorts above 'GR-2026-10000'.
+    h.seedReference('goodsReceipt', 'GR-2026-9999');
+    h.seedReference('goodsReceipt', 'GR-2026-10000');
+    const { orderId, lineIds } = await submittedOrder(h);
+
+    const receipt = await h.service.postGoodsReceipt(
+      TENANT,
+      orderId,
+      { lines: [{ purchaseOrderLineId: lineIds[0], quantityReceived: 10 }] },
+      ACTOR,
+    );
+
+    expect(receipt.reference).toBe('GR-2026-10001');
+  });
+
+  it('restarts at 0001 in the new year, however high the old year reached', async () => {
+    h.seedReference('purchaseOrder', 'PO-2026-100000');
+    jest.setSystemTime(new Date('2027-01-02T09:00:00Z'));
+
+    await expect(createOrder(h)).resolves.toBe('PO-2027-0001');
+    await expect(createOrder(h)).resolves.toBe('PO-2027-0002');
+  });
+
+  it('leaves another tenant of the same year untouched', async () => {
+    h.seedReference('purchaseOrder', 'PO-2026-10000', OTHER_TENANT);
+
+    await expect(createOrder(h)).resolves.toBe('PO-2026-0001');
+  });
+
+  it('gives two simultaneous creations distinct references', async () => {
+    // Both transactions read the same maximum before either inserts, so the
+    // loser meets the (tenantId, reference) unique. It must come back with a
+    // DIFFERENT number rather than retrying into the same one forever —
+    // termination is the whole point, and it holds because every attempt
+    // re-reads a maximum that now includes the winner's row.
+    h.seedReference('purchaseOrder', 'PO-2026-9999');
+
+    const references = await Promise.all([createOrder(h), createOrder(h)]);
+
+    expect(new Set(references).size).toBe(2);
+    expect([...references].sort()).toEqual(['PO-2026-10000', 'PO-2026-10001']);
+    // Three inserts for two orders: the collision really happened and was
+    // resolved by one replay, not avoided by the fake serializing the work.
+    expect(h.prisma.purchaseOrder.create).toHaveBeenCalledTimes(3);
+    expect(
+      h.rows.purchaseOrders.map((order) => order.reference as string).sort(),
+    ).toEqual(['PO-2026-10000', 'PO-2026-10001', 'PO-2026-9999']);
+  });
+
+  it('stores the year and sequence the ordering depends on', async () => {
+    await createOrder(h);
+    const order = h.rows.purchaseOrders.at(-1)!;
+
+    expect(order.reference).toBe('PO-2026-0001');
+    expect(order.referenceYear).toBe(2026);
+    expect(order.referenceSequence).toBe(1);
+  });
+});

@@ -4530,6 +4530,12 @@ model PurchaseOrder {
   tenantId          String
   /// Human-facing reference, unique per tenant (PO-2026-0001).
   reference         String
+  /// The year `reference` belongs to, and the position within it. The STRING
+  /// is for humans; these two are what the allocator filters and orders by,
+  /// because a string sort puts PO-2026-9999 above PO-2026-10000 and would
+  /// hand out 10000 forever once it existed.
+  referenceYear     Int
+  referenceSequence Int
   supplierId        String
   /// Where the goods are delivered; receiving writes the ledger here.
   locationId        String
@@ -4563,6 +4569,9 @@ model PurchaseOrder {
 
   @@unique([tenantId, reference])
   @@unique([id, tenantId])
+  /// The allocator's index: seek straight to this tenant-year's highest
+  /// sequence instead of range-scanning a year of references and sorting.
+  @@index([tenantId, referenceYear, referenceSequence(sort: Desc)])
   @@index([tenantId, status, createdAt(sort: Desc)])
   @@index([tenantId, supplierId])
   @@index([tenantId, locationId])
@@ -4607,20 +4616,24 @@ model PurchaseOrderLine {
 /// deleted, because the ledger movements it produced cannot be unwritten. A
 /// mistake is corrected by a further receipt or an inventory correction.
 model GoodsReceipt {
-  id              String   @id @default(cuid())
-  tenantId        String
-  purchaseOrderId String
+  id                String   @id @default(cuid())
+  tenantId          String
+  purchaseOrderId   String
   /// Human-facing reference, unique per tenant (GR-2026-0001).
-  reference       String
+  reference         String
+  /// Year and position within it — see PurchaseOrder. Ordering receipts by
+  /// the reference STRING has the same four-digit cliff.
+  referenceYear     Int
+  referenceSequence Int
   /// The supplier's delivery note number, as written on the paperwork.
-  deliveryNote    String?
-  receivedAt      DateTime @default(now())
-  notes           String?
+  deliveryNote      String?
+  receivedAt        DateTime @default(now())
+  notes             String?
   /// Tenant-scoped idempotency for posting replays: the same key returns the
   /// receipt it already created instead of writing the ledger twice.
-  idempotencyKey  String?
-  receivedById    String?
-  createdAt       DateTime @default(now())
+  idempotencyKey    String?
+  receivedById      String?
+  createdAt         DateTime @default(now())
 
   tenant        Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Restrict)
@@ -4631,6 +4644,7 @@ model GoodsReceipt {
   @@unique([tenantId, reference])
   @@unique([tenantId, idempotencyKey])
   @@unique([id, tenantId])
+  @@index([tenantId, referenceYear, referenceSequence(sort: Desc)])
   @@index([tenantId, purchaseOrderId, receivedAt(sort: Desc)])
 }
 

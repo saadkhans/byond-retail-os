@@ -1,8 +1,10 @@
 import { GoodsReceiptDiscrepancy, PurchaseOrderStatus } from '@prisma/client';
 import {
   derivePurchaseOrderStatus,
+  formatReference,
   isCurrencyCode,
   nextReference,
+  referenceSequenceOf,
   normalizeCurrencyCode,
   normalizeSupplierCode,
   normalizeSupplierSku,
@@ -207,20 +209,90 @@ describe('suggestDiscrepancy', () => {
   });
 });
 
+describe('formatReference', () => {
+  it('pads a short sequence to four digits', () => {
+    expect(formatReference('PO', 2026, 41)).toBe('PO-2026-0041');
+  });
+
+  it('keeps going past four digits instead of wrapping or truncating', () => {
+    // Four digits is a minimum width, not a ceiling. This is the boundary the
+    // module used to break at: the 10,000th document of a year.
+    expect(formatReference('PO', 2026, 9999)).toBe('PO-2026-9999');
+    expect(formatReference('PO', 2026, 10000)).toBe('PO-2026-10000');
+    expect(formatReference('PO', 2026, 99999)).toBe('PO-2026-99999');
+    expect(formatReference('PO', 2026, 100000)).toBe('PO-2026-100000');
+  });
+});
+
+describe('referenceSequenceOf', () => {
+  it('reads the sequence back out of a reference at any width', () => {
+    expect(referenceSequenceOf('PO', 2026, 'PO-2026-0041')).toBe(41);
+    expect(referenceSequenceOf('PO', 2026, 'PO-2026-10000')).toBe(10000);
+    expect(referenceSequenceOf('GR', 2026, 'GR-2026-100000')).toBe(100000);
+  });
+
+  it('refuses a reference from another year or prefix', () => {
+    expect(referenceSequenceOf('PO', 2026, 'PO-2025-0041')).toBeNull();
+    expect(referenceSequenceOf('PO', 2026, 'GR-2026-0041')).toBeNull();
+  });
+
+  it('refuses a reference that is not one of ours at all', () => {
+    expect(referenceSequenceOf('GR', 2026, 'legacy-import-7')).toBeNull();
+  });
+});
+
 describe('nextReference', () => {
   it('starts a year at 0001', () => {
-    expect(nextReference('PO', 2026, null)).toBe('PO-2026-0001');
+    expect(nextReference('PO', 2026, null)).toEqual({
+      reference: 'PO-2026-0001',
+      year: 2026,
+      sequence: 1,
+    });
   });
 
-  it('increments the highest reference in the same year', () => {
-    expect(nextReference('PO', 2026, 'PO-2026-0041')).toBe('PO-2026-0042');
+  it('increments the highest sequence in the same year', () => {
+    expect(nextReference('PO', 2026, 41).reference).toBe('PO-2026-0042');
   });
 
-  it('restarts when the latest reference belongs to another year', () => {
-    expect(nextReference('PO', 2027, 'PO-2026-0041')).toBe('PO-2027-0001');
+  it('crosses the four-digit boundary instead of stopping at it', () => {
+    // 9999 -> 10000 is where the old string-ordered lookup died: it could
+    // compute this successor, but never see it afterwards.
+    expect(nextReference('PO', 2026, 9999).reference).toBe('PO-2026-10000');
+    expect(nextReference('PO', 2026, 10000).reference).toBe('PO-2026-10001');
   });
 
-  it('ignores a reference that does not match the sequence shape', () => {
-    expect(nextReference('GR', 2026, 'legacy-import-7')).toBe('GR-2026-0001');
+  it('crosses the five-digit boundary too — the fix is not a wider constant', () => {
+    expect(nextReference('GR', 2026, 99999).reference).toBe('GR-2026-100000');
+    expect(nextReference('GR', 2026, 100000).reference).toBe('GR-2026-100001');
+  });
+
+  it('restarts numbering when the year changes', () => {
+    expect(nextReference('PO', 2027, null)).toEqual({
+      reference: 'PO-2027-0001',
+      year: 2027,
+      sequence: 1,
+    });
+  });
+
+  it('is strictly increasing, which is what makes the conflict retry end', () => {
+    // A losing racer re-reads a maximum that now includes the winner's row.
+    // If the successor did not strictly increase with its input, the retry
+    // would recompute the rejected number forever — the actual bug.
+    let sequence = 9998;
+    const seen = new Set<string>();
+    for (let i = 0; i < 5; i += 1) {
+      const allocated = nextReference('PO', 2026, sequence);
+      expect(allocated.sequence).toBeGreaterThan(sequence);
+      expect(seen.has(allocated.reference)).toBe(false);
+      seen.add(allocated.reference);
+      sequence = allocated.sequence;
+    }
+    expect([...seen]).toEqual([
+      'PO-2026-9999',
+      'PO-2026-10000',
+      'PO-2026-10001',
+      'PO-2026-10002',
+      'PO-2026-10003',
+    ]);
   });
 });

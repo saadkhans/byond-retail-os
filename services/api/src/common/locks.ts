@@ -381,3 +381,29 @@ export function shrinkEventAdvisoryLockKey(
 ): string {
   return `shrink-event:${tenantId}:${visionEventId}`;
 }
+
+/**
+ * Serializes procurement reference allocation per (tenant, prefix, year).
+ * Allocation is a read-then-write — take this year's highest sequence, add
+ * one, insert — so two simultaneous creations must not observe the same
+ * maximum. The (tenantId, reference) unique on PurchaseOrder and GoodsReceipt
+ * backstops the race at the database level; this lock is what turns the loser
+ * into a short wait instead of a rolled-back transaction that has to replay
+ * its ledger writes.
+ *
+ * Keyed by prefix as well as tenant because purchase orders and goods receipts
+ * number independently: PO-2026-0007 and GR-2026-0007 are unrelated documents
+ * and must not queue behind each other.
+ *
+ * Lock order on the receiving path is goods-receipt (idempotency) ->
+ * procurement-reference -> product-stock, and order creation takes only the
+ * middle one, so no path can cycle. Every call site MUST derive it
+ * identically.
+ */
+export function procurementReferenceAdvisoryLockKey(
+  tenantId: string,
+  prefix: string,
+  year: number,
+): string {
+  return `procurement-reference:${tenantId}:${prefix}:${year}`;
+}

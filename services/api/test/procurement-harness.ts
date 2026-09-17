@@ -1,4 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import { Prisma } from '@prisma/client';
 import { AuditLogService } from '../src/common/audit/audit-log.service';
 import {
   AdjustmentRejected,
@@ -6,6 +7,11 @@ import {
 } from '../src/inventory/inventory.repository';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { ProcurementRepository } from '../src/procurement/procurement.repository';
+import {
+  GOODS_RECEIPT_REFERENCE_PREFIX,
+  PURCHASE_ORDER_REFERENCE_PREFIX,
+} from '../src/procurement/procurement.constants';
+import { referenceSequenceOf } from '../src/procurement/procurement.logic';
 import { ProcurementService } from '../src/procurement/procurement.service';
 import { SimulatedSupplierAdapter } from '../src/procurement/adapters/simulated-supplier.adapter';
 import { SupplierIntegrationPort } from '../src/procurement/supplier-integration.port';
@@ -51,6 +57,45 @@ export interface Harness {
   /** The fake client, so a test can assert on the predicate a write used. */
   prisma: any;
   seedProduct(id: string, tenantId?: string): void;
+  /**
+   * Drops a purchase order or goods receipt straight into the table, the way a
+   * tenant that has been ordering all year already has thousands. The year and
+   * sequence are derived from the reference with the SAME parser the backfill
+   * migration uses, so a seeded population is shaped like a migrated one.
+   */
+  seedReference(
+    model: 'purchaseOrder' | 'goodsReceipt',
+    reference: string,
+    tenantId?: string,
+  ): void;
+}
+
+/**
+ * The (tenantId, reference) unique index, enforced in the fake.
+ *
+ * Without it the fake would happily store two orders sharing a reference and
+ * the bug this harness exists to catch — a lookup that keeps proposing a
+ * number the database has already taken — would look like success. Throwing
+ * the real Prisma error means the repository's conflict handling is exercised
+ * exactly as it is in production.
+ */
+function assertReferenceFree(rows: Row[], data: Row): void {
+  if (
+    data.reference !== undefined &&
+    rows.some(
+      (row) =>
+        row.tenantId === data.tenantId && row.reference === data.reference,
+    )
+  ) {
+    throw new Prisma.PrismaClientKnownRequestError(
+      `Unique constraint failed on the fields: (\`tenantId\`,\`reference\`)`,
+      {
+        code: 'P2002',
+        clientVersion: 'harness',
+        meta: { target: ['tenantId', 'reference'] },
+      },
+    );
+  }
 }
 
 function matches(row: Row, where: Row): boolean {
@@ -186,6 +231,23 @@ export function buildHarness(): Harness {
     }),
   });
 
+  /** `table`, plus the (tenantId, reference) unique on create. */
+  const tableWithUniqueReference = (
+    rows: Row[],
+    prefix: string,
+    defaults: Row = {},
+  ) => {
+    const base = table(rows, prefix, defaults);
+    const rawCreate = base.create;
+    return {
+      ...base,
+      create: jest.fn(async (args: Row) => {
+        assertReferenceFree(rows, args.data as Row);
+        return rawCreate(args);
+      }),
+    };
+  };
+
   const now = new Date('2026-09-16T12:00:00Z');
 
   const prisma: any = {
@@ -317,6 +379,7 @@ export function buildHarness(): Harness {
   const rawOrderCreate = prisma.purchaseOrder.create;
   prisma.purchaseOrder.create = jest.fn(async (args: Row) => {
     const { lines, ...data } = args.data as Row;
+    assertReferenceFree(purchaseOrders, data);
     const order = await rawOrderCreate({ data });
     if (lines?.create) {
       for (const line of lines.create as Row[]) {
@@ -361,7 +424,7 @@ export function buildHarness(): Harness {
   });
 
   prisma.goodsReceipt = {
-    ...table(goodsReceipts, 'gr', {
+    ...tableWithUniqueReference(goodsReceipts, 'gr', {
       deliveryNote: null,
       notes: null,
       idempotencyKey: null,
@@ -486,6 +549,42 @@ export function buildHarness(): Harness {
     prisma,
     seedProduct(id: string, tenantId: string = TENANT) {
       products.push({ id, tenantId, sku: id.toUpperCase(), name: id });
+    },
+    seedReference(
+      model: 'purchaseOrder' | 'goodsReceipt',
+      reference: string,
+      tenantId: string = TENANT,
+    ) {
+      const prefix =
+        model === 'purchaseOrder'
+          ? PURCHASE_ORDER_REFERENCE_PREFIX
+          : GOODS_RECEIPT_REFERENCE_PREFIX;
+      const year = Number.parseInt(reference.split('-')[1] ?? '0', 10);
+      const sequence = referenceSequenceOf(prefix, year, reference);
+      const row: Row = {
+        id: nextId(model === 'purchaseOrder' ? 'po' : 'gr'),
+        tenantId,
+        reference,
+        referenceYear: Number.isNaN(year) ? now.getUTCFullYear() : year,
+        referenceSequence: sequence ?? 0,
+        createdAt: now,
+      };
+      if (model === 'purchaseOrder') {
+        purchaseOrders.push({
+          ...row,
+          supplierId: 'seeded',
+          locationId: 'store-1',
+          status: 'RECEIVED',
+          currencyCode: 'AED',
+          updatedAt: now,
+        });
+      } else {
+        goodsReceipts.push({
+          ...row,
+          purchaseOrderId: 'seeded',
+          receivedAt: now,
+        });
+      }
     },
   };
 }

@@ -1554,6 +1554,75 @@ describe('loyalty account -> shopper foreign key migration', () => {
   });
 });
 
+describe('procurement reference sequence migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260917090000_procurement_reference_sequence',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('backfills both tables from the references that already exist', () => {
+    // Without the backfill an upgraded tenant's existing references would be
+    // invisible to the allocator (sequence NULL, or 0 everywhere), and the
+    // next order created would restart at 0001 straight into the
+    // (tenantId, reference) unique. The parser must match the canonical
+    // PREFIX-YYYY-NNNN shape exactly and read the capture group.
+    expect(sql).toContain('UPDATE "PurchaseOrder" SET');
+    expect(sql).toContain('UPDATE "GoodsReceipt" SET');
+    expect(sql).toContain(`'^PO-[0-9]{4}-([0-9]+)$'`);
+    expect(sql).toContain(`'^GR-[0-9]{4}-([0-9]+)$'`);
+    expect(sql).toContain(`'^PO-([0-9]{4})-[0-9]+$'`);
+    expect(sql).toContain(`'^GR-([0-9]{4})-[0-9]+$'`);
+  });
+
+  it('makes both columns mandatory only AFTER the backfill has run', () => {
+    // Adding them NOT NULL up front would fail on any table with rows; adding
+    // them with a default would silently give every historical order sequence
+    // 0. The order of these statements is the whole guarantee.
+    for (const table of ['PurchaseOrder', 'GoodsReceipt']) {
+      for (const column of ['referenceYear', 'referenceSequence']) {
+        const added = sql.indexOf(
+          `ALTER TABLE "${table}" ADD COLUMN "${column}" INTEGER;`,
+        );
+        const backfilled = sql.indexOf(`UPDATE "${table}" SET`);
+        const required = sql.indexOf(
+          `ALTER TABLE "${table}" ALTER COLUMN "${column}" SET NOT NULL;`,
+        );
+        expect(added).toBeGreaterThan(-1);
+        expect(backfilled).toBeGreaterThan(added);
+        expect(required).toBeGreaterThan(backfilled);
+      }
+    }
+  });
+
+  it('indexes the allocator lookup and never touches the reference column', () => {
+    expect(sql).toContain(
+      'CREATE INDEX "PurchaseOrder_tenantId_referenceYear_referenceSequence_idx" ON "PurchaseOrder"("tenantId", "referenceYear", "referenceSequence" DESC);',
+    );
+    expect(sql).toContain(
+      'CREATE INDEX "GoodsReceipt_tenantId_referenceYear_referenceSequence_idx" ON "GoodsReceipt"("tenantId", "referenceYear", "referenceSequence" DESC);',
+    );
+    // The human-facing reference is left exactly as issued: this migration
+    // adds an ordering, it does not renumber anybody's paperwork.
+    expect(sql).not.toMatch(/SET\s+"reference"\s*=/);
+    expect(sql).not.toMatch(/DROP COLUMN "reference"/);
+  });
+
+  it('keeps a sequence non-negative and a year plausible', () => {
+    expect(sql).toContain('PurchaseOrder_referenceSequence_nonneg_check');
+    expect(sql).toContain('GoodsReceipt_referenceSequence_nonneg_check');
+    expect(sql).toContain('PurchaseOrder_referenceYear_range_check');
+    expect(sql).toContain('GoodsReceipt_referenceYear_range_check');
+  });
+});
+
 describe('migration directory naming', () => {
   const migrationsDir = join(__dirname, '..', '..', 'prisma', 'migrations');
   const migrationNames = readdirSync(migrationsDir, { withFileTypes: true })
