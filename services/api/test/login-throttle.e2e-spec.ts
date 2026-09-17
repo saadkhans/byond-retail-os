@@ -1,5 +1,5 @@
 // Order matters: the env side-effect must precede the AppModule import.
-import './set-throttle-env';
+import { restoreGenerousThrottleLimits } from './set-throttle-env';
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
@@ -32,8 +32,7 @@ describe('POST /auth/login throttling (e2e)', () => {
   afterAll(async () => {
     // Restore the generous suite-wide defaults (setup-env) so any later
     // suite in this worker process compiles with them.
-    process.env.LOGIN_THROTTLE_LIMIT = '1000';
-    process.env.LOGIN_THROTTLE_IP_LIMIT = '5000';
+    restoreGenerousThrottleLimits();
     await app.close();
   });
 

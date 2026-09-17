@@ -1,10 +1,23 @@
-import { Body, Controller, Get, Headers, HttpCode, Post } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Headers,
+  HttpCode,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
 import {
   ApiOperation,
   ApiTags,
+  ApiTooManyRequestsResponse,
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 import { Public } from '../auth/decorators/access-policy.decorators';
+import {
+  ShopperThrottle,
+  ShopperThrottleGuard,
+} from '../auth/guards/shopper-throttle.guard';
 import { EnterStoreDto } from './shopper.dto';
 import { ShopperService } from './shopper.service';
 import { ShopperView } from './shopper.logic';
@@ -27,12 +40,15 @@ import { ShopperView } from './shopper.logic';
  * proxy in between.
  */
 @ApiTags('shopper')
+@ApiTooManyRequestsResponse({ description: 'Too many requests' })
+@UseGuards(ShopperThrottleGuard)
 @Controller('shopper')
 export class ShopperController {
   constructor(private readonly shopper: ShopperService) {}
 
   @Post('session')
   @Public()
+  @ShopperThrottle('session')
   @HttpCode(200)
   @ApiOperation({
     summary: 'Redeem an entry credential and open the visit.',
@@ -49,6 +65,7 @@ export class ShopperController {
 
   @Get('basket')
   @Public()
+  @ShopperThrottle('visit')
   @ApiOperation({
     summary: 'The shopper’s own basket and what the store is doing with it.',
     description:
@@ -66,6 +83,7 @@ export class ShopperController {
 
   @Post('exit')
   @Public()
+  @ShopperThrottle('visit')
   @HttpCode(200)
   @ApiOperation({
     summary: 'Leave the store and settle, if the store settles on exit.',
