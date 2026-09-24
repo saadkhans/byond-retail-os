@@ -3,10 +3,15 @@ import { QualifiedCrop, VlmRequestEvidence } from '../ports';
 import {
   COMPARATIVE_MAX_CANDIDATES,
   DEFAULT_REFERENCES_PER_CANDIDATE,
+  EVENT_CHECK_MAX_SIDE,
   MIN_CROP_EDGE,
   buildPromptParts,
+  encodeEventCheckImage,
   enlargeCrop,
   maxImagesForContext,
+  normalizeObservedDescription,
+  parseEventCountResult,
+  parseStrictVerdict,
   planPromptImages,
   referencesPerCandidateFromConfig,
 } from './vlm-shared';
@@ -208,5 +213,150 @@ describe('referencesPerCandidateFromConfig — validated numeric form', () => {
     expect(referencesPerCandidateFromConfig(undefined)).toBe(3);
     expect(referencesPerCandidateFromConfig('')).toBe(3);
     expect(() => referencesPerCandidateFromConfig(9)).toThrow(/safe range/);
+  });
+});
+
+// Phase 25 — the event-count answer is parsed as strictly as the identity
+// verdict: whitelisted fields, bounded integers, and a change word that must
+// AGREE with the counts.
+describe('parseEventCountResult', () => {
+  it('accepts a consistent answer and returns typed counts', () => {
+    expect(
+      parseEventCountResult('{"before": 2, "after": 1, "change": "REMOVED", "confidence": "HIGH"}'),
+    ).toEqual({
+      status: 'VERDICT',
+      before: 2,
+      after: 1,
+      change: 'REMOVED',
+      confidence: 'HIGH',
+      errorCode: null,
+      errorDetail: null,
+    });
+    expect(
+      parseEventCountResult('{"before": 1, "after": 1, "change": "NONE", "confidence": "LOW"}'),
+    ).toMatchObject({ status: 'VERDICT', change: 'NONE', confidence: 'LOW' });
+    expect(
+      parseEventCountResult('{"before": 0, "after": 1, "change": "ADDED", "confidence": "HIGH"}'),
+    ).toMatchObject({ status: 'VERDICT', change: 'ADDED' });
+  });
+
+  it('rejects a change word that disagrees with the counts', () => {
+    expect(
+      parseEventCountResult('{"before": 2, "after": 1, "change": "NONE", "confidence": "HIGH"}'),
+    ).toMatchObject({ status: 'FAILED', errorCode: 'INVALID_SCHEMA', change: null });
+    expect(
+      parseEventCountResult('{"before": 1, "after": 1, "change": "REMOVED", "confidence": "HIGH"}'),
+    ).toMatchObject({ status: 'FAILED', errorCode: 'INVALID_SCHEMA' });
+  });
+
+  it('rejects out-of-range, non-integer, missing, or unknown fields', () => {
+    expect(parseEventCountResult('{"before": 21, "after": 1, "change": "REMOVED", "confidence": "HIGH"}'))
+      .toMatchObject({ status: 'FAILED', errorCode: 'INVALID_SCHEMA' });
+    expect(parseEventCountResult('{"before": 1.5, "after": 1, "change": "NONE", "confidence": "HIGH"}'))
+      .toMatchObject({ status: 'FAILED', errorCode: 'INVALID_SCHEMA' });
+    expect(parseEventCountResult('{"before": "2", "after": 1, "change": "REMOVED", "confidence": "HIGH"}'))
+      .toMatchObject({ status: 'FAILED', errorCode: 'INVALID_SCHEMA' });
+    expect(parseEventCountResult('{"before": 2, "after": 1, "change": "TAKEN", "confidence": "HIGH"}'))
+      .toMatchObject({ status: 'FAILED', errorCode: 'INVALID_SCHEMA' });
+    expect(parseEventCountResult('{"before": 2, "after": 1, "change": "REMOVED", "confidence": "MAYBE"}'))
+      .toMatchObject({ status: 'FAILED', errorCode: 'INVALID_SCHEMA' });
+    expect(parseEventCountResult('{"before": 2, "after": 1}')).toMatchObject({
+      status: 'FAILED',
+      errorCode: 'INVALID_SCHEMA',
+    });
+  });
+
+  it('classifies malformed text: empty, prose, broken JSON, arrays', () => {
+    expect(parseEventCountResult('')).toMatchObject({ status: 'FAILED', errorCode: 'MALFORMED_RESPONSE' });
+    expect(parseEventCountResult('sure, here you go')).toMatchObject({
+      status: 'FAILED',
+      errorCode: 'MALFORMED_RESPONSE',
+    });
+    expect(parseEventCountResult('{"before": 2,')).toMatchObject({
+      status: 'FAILED',
+      errorCode: 'MALFORMED_RESPONSE',
+    });
+    expect(parseEventCountResult('{"before": 2, "after": }')).toMatchObject({
+      status: 'FAILED',
+      errorCode: 'INVALID_JSON',
+    });
+    expect(parseEventCountResult('[1, 2]')).toMatchObject({ status: 'FAILED', errorCode: 'MALFORMED_RESPONSE' });
+  });
+
+  it('strips fences and surrounding prose only in the explicit local-dev mode', () => {
+    const fenced = '```json\n{"before": 1, "after": 0, "change": "REMOVED", "confidence": "HIGH"}\n```';
+    expect(parseEventCountResult(fenced)).toMatchObject({ status: 'FAILED' });
+    expect(parseEventCountResult(fenced, { stripFences: true })).toMatchObject({
+      status: 'VERDICT',
+      change: 'REMOVED',
+    });
+  });
+});
+
+describe('encodeEventCheckImage', () => {
+  function rgb(width: number, height: number): RgbImage {
+    return { width, height, rgb: Buffer.alloc(width * height * 3, 90) };
+  }
+  function pngDimensions(png: Buffer): { width: number; height: number } {
+    return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
+  }
+
+  it('keeps a small crop at its size and downscales a large one to the longest-side cap', () => {
+    expect(pngDimensions(encodeEventCheckImage(rgb(320, 240)))).toEqual({ width: 320, height: 240 });
+    const large = pngDimensions(encodeEventCheckImage(rgb(1280, 960)));
+    expect(large.width).toBe(EVENT_CHECK_MAX_SIDE);
+    expect(large.height).toBe(Math.round((960 * EVENT_CHECK_MAX_SIDE) / 1280));
+    const tall = pngDimensions(encodeEventCheckImage(rgb(600, 1200)));
+    expect(tall.height).toBe(EVENT_CHECK_MAX_SIDE);
+    expect(tall.width).toBe(Math.round((600 * EVENT_CHECK_MAX_SIDE) / 1200));
+  });
+});
+
+describe('describe-then-choose identity prompt', () => {
+  it('asks for an observedDescription before the choice and makes material/colour mismatches exclusions', () => {
+    const parts = buildPromptParts(evidence({ candidates: 2 }));
+    const stepOne = parts.instruction.indexOf('STEP 1');
+    const question = parts.instruction.indexOf('Which ONE of these');
+    expect(stepOne).toBeGreaterThan(-1);
+    expect(stepOne).toBeLessThan(question);
+    expect(parts.instruction).toContain('"observedDescription": string');
+    expect(parts.instruction).toContain('different material or a different dominant colour');
+    expect(parts.instruction).toContain('otherwise answer UNKNOWN');
+    expect(parts.instruction).toContain('"visualSupport" is STRONG only when');
+  });
+});
+
+describe('observedDescription parsing', () => {
+  const allowed = new Set(['SKU-1']);
+  const strict = (extra: Record<string, unknown>) =>
+    JSON.stringify({
+      verdict: 'MATCH',
+      selectedSku: 'SKU-1',
+      visualSupport: 'MEDIUM',
+      ocrSupport: 'NONE',
+      barcodeSupport: 'NONE',
+      reasonCodes: [],
+      contradictions: [],
+      requiresHumanReview: false,
+      ...extra,
+    });
+
+  it('keeps a bounded, whitespace-collapsed description and tolerates its absence', () => {
+    const parsed = parseStrictVerdict(strict({ observedDescription: '  clear\n plastic   bottle ' }), allowed);
+    expect(parsed.status).toBe('VERDICT');
+    expect(parsed.result?.observedDescription).toBe('clear plastic bottle');
+    const absent = parseStrictVerdict(strict({}), allowed);
+    expect(absent.status).toBe('VERDICT');
+    expect(absent.result?.observedDescription).toBeNull();
+    const wrongType = parseStrictVerdict(strict({ observedDescription: 42 }), allowed);
+    expect(wrongType.status).toBe('VERDICT');
+    expect(wrongType.result?.observedDescription).toBeNull();
+  });
+
+  it('normalizes: non-strings to null, control characters to spaces, 120-char cap', () => {
+    expect(normalizeObservedDescription(null)).toBeNull();
+    expect(normalizeObservedDescription('')).toBeNull();
+    expect(normalizeObservedDescription('a\u0000b\tc')).toBe('a b c');
+    expect(normalizeObservedDescription('x'.repeat(500))).toHaveLength(120);
   });
 });

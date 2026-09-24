@@ -1,6 +1,12 @@
 import { Logger, Provider } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { VlmRequestEvidence, VlmVerdict, VlmVerifier } from './ports';
+import {
+  VlmEventCheckRequest,
+  VlmEventCheckVerdict,
+  VlmRequestEvidence,
+  VlmVerdict,
+  VlmVerifier,
+} from './ports';
 import { AnthropicVlmVerifier } from './adapters/vlm-verifier';
 import { OllamaVlmVerifier } from './adapters/ollama-vlm';
 import { allowedSkus, parseStrictVerdict } from './adapters/vlm-shared';
@@ -77,6 +83,31 @@ export function withFaultInjection(
     adapterKey: verifier.adapterKey,
     version: verifier.version,
     checkReady: () => verifier.checkReady(),
+    // The event-count check follows the identity path's fault posture:
+    // UNAVAILABLE reports the provider down (the pipeline then behaves as
+    // if the check never ran); INVALID_SKU is an identity-only drill, so
+    // the count check passes through to the real provider when present.
+    ...(verifier.verifyEvent
+      ? {
+          verifyEvent: async (
+            request: VlmEventCheckRequest,
+            timeoutMs: number,
+          ): Promise<VlmEventCheckVerdict> =>
+            mode === 'UNAVAILABLE'
+              ? {
+                  status: 'UNAVAILABLE',
+                  before: null,
+                  after: null,
+                  change: null,
+                  confidence: null,
+                  latencyMs: 0,
+                  errorCode: 'PROVIDER_UNREACHABLE',
+                  errorDetail: 'fault injection: PICKUP_VLM_FAULT=UNAVAILABLE',
+                  modelKey: verifier.adapterKey,
+                }
+              : verifier.verifyEvent!(request, timeoutMs),
+        }
+      : {}),
     verify: async (evidence: VlmRequestEvidence): Promise<VlmVerdict> => {
       if (mode === 'UNAVAILABLE') {
         return {

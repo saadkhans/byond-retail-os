@@ -60,6 +60,8 @@ describe('strict schema enforcement (parseStrictVerdict)', () => {
       reasonCodes: ['REFERENCE_VISUAL_MATCH'],
       contradictions: [],
       requiresHumanReview: false,
+      // Optional describe-then-choose field: absent in the fixture → null.
+      observedDescription: null,
     });
   });
 
