@@ -31,7 +31,7 @@ runs:
       run: semgrep scan --error --quiet ${{ inputs.semgrep-config }}
 
     - name: Run Trivy (filesystem and dependencies)
-      uses: aquasecurity/trivy-action@0.28.0
+      uses: aquasecurity/trivy-action@v0.36.0
       with:
         scan-type: fs
         scan-ref: .
