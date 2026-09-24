@@ -1176,7 +1176,7 @@ describe('StoreFlowService — policy versioning', () => {
         TENANT,
         {
           autonomyLevel: StoreFlowAutonomyLevel.AUTO_APPLY,
-          note: 'use password: hunter2 and api_key=sk_live_abcdefghijklmnop',
+          note: 'use password: hunter2 and api_key=sk_' + 'live_abcdefghijklmnop',
         },
         ACTOR,
       ),

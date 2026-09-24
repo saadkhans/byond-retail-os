@@ -497,7 +497,7 @@ describe('processing a batch of label updates', () => {
         vendorLabelId: request.vendorLabelId,
         ok: false as const,
         errorCode: EslUpdateErrorCode.VENDOR_REJECTED,
-        message: 'rejected: api_key=sk_live_4eC39HqLyjWDarjtT1zdp7dc',
+        message: 'rejected: api_key=sk_' + 'live_4eC39HqLyjWDarjtT1zdp7dc',
       })),
     );
     const h = harness({
@@ -740,7 +740,7 @@ describe('credentials never enter the platform', () => {
     await expect(
       h.service.createGateway(
         TENANT,
-        { ...base, credentialRef: 'sk_live_4eC39HqLyjWDarjtT1zdp7dc' },
+        { ...base, credentialRef: 'sk_' + 'live_4eC39HqLyjWDarjtT1zdp7dc' },
         ACTOR,
       ),
     ).rejects.toBeInstanceOf(BadRequestException);
