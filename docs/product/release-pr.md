@@ -1,4 +1,4 @@
-# Release: `dev` → `main`
+# `integration/completion-program` → `dev`
 
 Ready-to-paste description for the release pull request. Read the **What is not
 proven** section before approving; it is the point of this document.
@@ -40,6 +40,49 @@ reports are derived on read.
 | Documentation | 37 | This release, plus a correction pass over the top-level docs |
 | Cross-cutting | — | Repo-wide tenant write-predicate hardening and a guard that walks the whole API source tree |
 
+## Landed after this document was first written
+
+The release doc was written at `afb0284`. Everything below came after it, and the
+branch is now at `c0fcd58`.
+
+**The migration chain was run against a live PostgreSQL 16 and failed on the first
+attempt.** This is the single best argument in the whole programme for testing against
+a real database:
+
+```
+Applying migration `20260916120000_phase31_procurement`
+Error: P3018   Database error code: 42P07
+ERROR: relation "InventoryMovement_id_tenantId_key" already exists
+```
+
+Phases 27 and 31 were generated on parallel branches from a baseline lacking that
+unique index, so **both** emit the same `CREATE UNIQUE INDEX`. Phase 27 always sorts
+first, so Phase 31 aborted the deploy 23 migrations in, leaving the database in neither
+the old shape nor the new one. **No string-matching test could have caught this** — and
+we have a migration-hardening spec that reads migration SQL as text; it passed. Fixed
+with `IF NOT EXISTS`; an audit of every CREATE/ADD CONSTRAINT name across all 69
+migrations found it was the only genuine collision.
+
+Also landed: the ESL queue worker, rate limiting on the public shopper routes (keyed on
+IP alone, never the presented secret, and every admitted request charged — so being
+throttled can never reveal whether a code was real), the `.env.example` regeneration,
+the procurement reference sequence, the iPhone upload screening fixes, and
+`prisma:migrate-deploy` as a script with `prisma:migrate` marked development-only
+because it can offer to RESET a database.
+
+**CV work.** `feat/vlm-event-verification` is merged (`c655229`), adding a VLM
+before/after unit-count check that runs before any identity work. It is **inert on
+merge** — `PICKUP_VLM_EVENT_CHECK` defaults to false. The measurement behind it is in
+[`docs/cv/vlm-labelling-handoff.md`](../cv/vlm-labelling-handoff.md): across 192 fusion
+runs the local VLM **never once returned `MISMATCH`**, and on the 101 `MATCH` runs with
+a human label it was right 81 times against the pipeline's 83 — with all 20 errors being
+one confusion, `WATER-BOTTLE-500ML` read as `SKU-LIME-GREEN`. Asked instead to *count*
+units before and after, the same model scores 26/27, because counting is checkable and
+identity is not. That document is written for a session with no prior context and is the
+execution plan for the follow-up accuracy work.
+
+---
+
 ## Verification
 
 Run from the repository root on the merged tree. All green.
@@ -48,7 +91,7 @@ Run from the repository root on the merged tree. All green.
 | --- | --- |
 | `pnpm -r --if-present run lint` | pass (5 pre-existing `react-hooks/exhaustive-deps` warnings, 0 errors) |
 | `pnpm -r --if-present run typecheck` | pass |
-| `pnpm --filter @byond/api run test --ci --maxWorkers=4` | 199 suites / 4871 tests |
+| `pnpm --filter @byond/api run test --ci --maxWorkers=2` | **203 suites / 5002 tests** |
 | `pnpm --filter @byond/admin-web run test` | 23 files / 328 tests |
 | `pnpm --filter @byond/mobile-app run test` | 3 files / 58 tests |
 | `pnpm --filter @byond/edge-runtime run test --ci --maxWorkers=4` | 18 suites / 196 tests |
@@ -277,7 +320,20 @@ data change, and it closes a footgun rather than fixing a bug. `UserRole` is
 more nuanced because platform grants carry `tenantId: null`; leave it and keep
 the allowlist entry, which already explains itself.
 
-### 6. Reference-number rollover in procurement at the 10,000th document per tenant-year
+### 6. Reference-number rollover in procurement — RESOLVED (was: hard failure)
+
+Fixed by `45e0099`. `PurchaseOrder`/`GoodsReceipt` now carry integer
+`referenceYear` + `referenceSequence` columns and the allocator orders on the
+integer, so ordering is numeric and total at every width. Existing rows are
+backfilled in the same migration by parsing their current reference, so numbering
+continues rather than restarting into its own unique index; proven forward on a
+clone with a deliberately mixed-width population. A second, unrelated bug surfaced
+while fixing it: the doc comment claimed the caller retried on a reference
+collision and **no retry existed**, so a same-second race was already a 500 at any
+document count. `withReferenceRetry` now replays only on a P2002 naming `reference`.
+
+The original finding, for context:
+
 
 `nextReference()` in `services/api/src/procurement/procurement.logic.ts:175`
 builds `PREFIX-YYYY-NNNN` by finding the highest existing reference for the year
@@ -310,7 +366,18 @@ Note that `formatOrderNumber` in
 digits but derives its value from a numeric sequence, so past 999,999 it simply
 produces a seven-digit number. Cosmetic, not a collision.
 
-### 7. The ESL update queue has no worker
+### 7. The ESL update queue has no worker — RESOLVED
+
+Fixed by `be0faef`. `EslQueueWorker` drains the queue on a timer and reconciles on
+a slower per-tenant clock, **off by default** (`ESL_QUEUE_WORKER_ENABLED=false`),
+`setInterval` + `.unref()`, a re-entrancy flag that drops an overlapping tick rather
+than queueing it, and one `try` per tenant so one failure cannot stop the sweep. It
+calls the operator route's own `processBatch`, so leases, fencing tokens and the
+attempt budget are untouched. `test/setup-env.ts` force-disables it in every jest
+process.
+
+The original finding, for context:
+
 
 `POST /esl/update-jobs/process` drains the queue. Nothing calls it on a timer.
 
@@ -325,7 +392,17 @@ someone runs `POST /esl/reconcile`.
 Whatever drives it in production needs to be part of the deployment, not
 discovered afterwards.
 
-### 8. `services/api/.env.example` has lagged since Phase 4
+### 8. `services/api/.env.example` drift — RESOLVED
+
+Fixed by `960dc03`. The file now documents **all 62 declared keys**, grouped, each
+with its default, placeholder values only. `test/env-example-drift.spec.ts` fails
+the build in **both** directions — a key in the validator missing from the example,
+or documented in the example but not declared (those are whitelist-stripped and
+silently dead). Note the original count below was itself stale: it was 58 at the
+time of writing, not 52.
+
+The original finding, for context:
+
 
 `src/config/env.validation.ts` declares 52 keys. `.env.example` contains five:
 `DATABASE_URL`, `PORT`, `NODE_ENV`, `JWT_SECRET`, `JWT_EXPIRES_IN`. Everything
