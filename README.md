@@ -7,11 +7,12 @@ BYOND is an edge-first, cloud-managed, multitenant retail operating system. Comp
 ```
 apps/            User-facing applications
   admin-web/     Admin web console
-  mobile-app/    Shopper / staff mobile app
+  mobile-app/    Shopper app (mobile-first web) — entry, basket, exit, payment
 services/        Backend services
   api/           Core multitenant API
   edge-runtime/  In-store edge runtime
-  cv-pipeline/   Computer vision event pipeline
+  cv-pipeline/   Tier-1 tracking + tier-2 trigger service (proposes
+                 moments; product identity stays in the API)
 packages/        Shared workspace packages
   shared/        Shared types and utilities
   config/        Shared lint/TS/build configuration
@@ -19,8 +20,10 @@ packages/        Shared workspace packages
 ml/              CV training dataset + model pipeline (Phase 8) — schemas
                  and scripts only; datasets/weights external
 infra/           Infrastructure
-  docker/        Dockerfiles and compose configs
-  github-actions/ Reusable CI building blocks
+  docker/        Dockerfiles, nginx config and the local compose stack
+  github-actions/ Reusable composite actions used by the workflows
+  semgrep/       Static-analysis rules for this repo's hard rules
+  scripts/       security:scan and security:secrets entry points
 docs/            Documentation (architecture, product, security)
 scripts/         Repo automation scripts
 ```
@@ -28,10 +31,23 @@ scripts/         Repo automation scripts
 ## Key documents
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system principles and design invariants
+- [docs/architecture/edge-runtime.md](docs/architecture/edge-runtime.md) — the in-store data plane: the file-backed store, the local ledger, sync and the hardware abstraction layer
 - [AGENTS.md](AGENTS.md) — AI agent roles and hard rules
 - [CONTRIBUTING.md](CONTRIBUTING.md) — branch, PR, and review workflow
 - [SECURITY.md](SECURITY.md) — security requirements and tooling
 - [TESTING.md](TESTING.md) — required test categories
+- [docs/development/docker.md](docs/development/docker.md) — running the stack in containers
+- [docs/development/ci-and-security.md](docs/development/ci-and-security.md) — CI jobs and security scanning
+- [docs/product/pricing.md](docs/product/pricing.md) — versioned pricing model and rules
+- [docs/product/store-flow.md](docs/product/store-flow.md) — the autonomous store loop: entry, the observation → basket bridge, exit settlement
+- [docs/product/returns.md](docs/product/returns.md) — the reverse flow: returns, refunds, cycle counts and shrink, all through the ledger
+- [docs/product/esl.md](docs/product/esl.md) — vendor-neutral electronic shelf labels
+- [docs/product/loyalty.md](docs/product/loyalty.md) — loyalty points and promotions that compose on top of a price version
+- [docs/product/procurement.md](docs/product/procurement.md) — suppliers, purchase orders, and receiving through the inventory ledger
+- [docs/product/reporting.md](docs/product/reporting.md) — read-only sales, inventory, shrink and CV-accuracy reporting derived from the ledger and the evaluation tables
+- [docs/product/shopper-app.md](docs/product/shopper-app.md) — the shopper application: the journey-scoped credential, the four screens, and what makes a public API surface safe
+- [docs/product/release-notes.md](docs/product/release-notes.md) — what shipped, phase by phase
+- [docs/product/release-pr.md](docs/product/release-pr.md) — the `dev` → `main` release pull request, including what is NOT proven
 
 ## Getting started
 
@@ -43,6 +59,11 @@ pnpm run typecheck
 pnpm run test
 pnpm run build
 ```
+
+`pnpm run test` fans out to every package at once. On a developer machine prefer
+per-package runs with a worker cap — `pnpm --filter @byond/api run test --ci
+--maxWorkers=4` — because the recursive form spawns a Jest worker pool per
+package and will exhaust a 16 GB machine.
 
 ## Running locally
 
@@ -70,10 +91,93 @@ pnpm run dev
 
 The admin web signs in via `POST /auth/login` (or a pasted access token) and
 provides read-only visibility over stores, units, devices, catalog, and
-inventory, plus a manual checkout test flow: create a checkout session, manage
-basket lines, and complete it into an order (no payment capture — pricing and
-payments arrive in a later phase). The API's CORS allowlist defaults to
+inventory; versioned price books (create a draft, set prices, activate, roll
+back — see [docs/product/pricing.md](docs/product/pricing.md)); procurement
+(suppliers and their costs, purchase orders, and receiving a delivery, which
+admits stock through the append-only inventory ledger — see
+[docs/product/procurement.md](docs/product/procurement.md)); and a manual
+checkout test flow: create a checkout session, manage basket lines, and
+complete it into an order, which now carries a total derived from the price
+each line was added at. The Store flow page drives the Phase 26 loop end to end
+— set a store's autonomy level (SHADOW by default, which changes nothing),
+issue an entry credential, watch observations become basket lines, work one
+review queue, and exit the shopper into an order and a payment (see
+[docs/product/store-flow.md](docs/product/store-flow.md)). The Returns &
+reconciliation page drives the Phase 27 reverse flow — record a return or
+cancel a settled order (goods back into stock as ledger movements, then a
+refund bounded by what was captured), run a cycle count or stocktake that
+reconciles the projection against the ledger, and write off a CV-detected loss
+(see [docs/product/returns.md](docs/product/returns.md)). Shelf labels are
+managed under **Shelf labels**, where a gateway is registered against a
+simulated (or real) vendor adapter and its labels follow every price
+activation — see [docs/product/esl.md](docs/product/esl.md). **Loyalty &
+promotions** covers member accounts with an append-only points ledger and
+versioned promotions that subtract from the price version in force without
+ever rewriting it — the quote panel there names the price version and the
+promotion version behind any price, see
+[docs/product/loyalty.md](docs/product/loyalty.md). **Reports** is the Phase
+30 read-only surface: sales explained down to the price version and promotion
+behind each line, inventory balances derived from the append-only ledger with
+the stock projection beside them as a cross-check, shrink reconciled against
+its `SHRINK` movements (damaged returns counted separately, because they write
+no movement), and CV accuracy over the evaluation tables as counts, never
+evidence. Every figure is derived on read and says when it was computed — see
+[docs/product/reporting.md](docs/product/reporting.md). The API's CORS allowlist
+defaults to
 `http://localhost:5173` (override with `CORS_ORIGINS`).
+
+### Shopper app (http://localhost:5174)
+
+```bash
+cd apps/mobile-app
+cp .env.example .env        # VITE_API_BASE_URL, defaults to localhost:3000
+pnpm run dev
+```
+
+The shopper app is the customer-facing half of the Phase 26 loop: redeem the
+entry code from the door, watch the basket fill, walk out, and see what the
+payment did. It holds a journey-scoped credential rather than a staff token,
+so it can reach exactly one journey and nothing else, and it collects no card
+data of any kind — payment goes through the API's simulated provider
+abstraction (see
+[docs/product/shopper-app.md](docs/product/shopper-app.md)). Under the default
+SHADOW policy the basket stays empty on purpose, and the app says so. Add its
+origin to the API's allowlist when running both:
+`CORS_ORIGINS=http://localhost:5173,http://localhost:5174`.
+
+### Edge runtime
+
+```bash
+cd services/edge-runtime
+cp .env.example .env        # EDGE_TENANT_ID, EDGE_LOCATION_ID, EDGE_DEVICE_ID,
+                            # EDGE_STORE_ROOT and the control-plane URL + token
+pnpm run start
+```
+
+The in-store data plane. It has no database: its durable state is a directory of
+files under `EDGE_STORE_ROOT`, split into replaceable records the cloud pushes
+down and append-only logs of facts the store observed. It keeps trading while
+the cloud link is down — local ledger, local decisioning, a local review queue
+an operator can clear offline — and reconciles through an at-least-once ordered
+outbox when the link returns. Every hardware kind ships a simulated driver, so
+the whole thing runs with no cameras, no scales and no labels. The store is
+sealed on first open to one tenant, location and device and refuses to start
+against a directory sealed to anything else. `GET /health` and `GET /metrics`
+bind to loopback unless deliberately widened. See
+[docs/architecture/edge-runtime.md](docs/architecture/edge-runtime.md).
+
+### CV pipeline (http://localhost:3100)
+
+```bash
+cd services/cv-pipeline
+cp .env.example .env        # set CV_PIPELINE_API_TOKEN and CV_PIPELINE_ZONES
+pnpm run start
+```
+
+Watches one camera, tracks motion on a downscaled stream, and creates an
+inference job for each moment worth a heavy model. The defaults need no camera,
+no ffmpeg and no model weights. See
+[docs/cv/cv-pipeline-service.md](docs/cv/cv-pipeline-service.md).
 
 ### ML pipeline (Phase 8)
 

@@ -98,6 +98,14 @@ export interface PickupEventProposal {
 export interface PickupDetectionOutput {
   events: PickupEventProposal[];
   tracks: ObjectTrack[];
+  /** The motion window the detector settled on (analysis timeline),
+   *  reported even when NO durable change survived — so a caller can run
+   *  a before/after check on the touched cell. Absent/null when no motion
+   *  window was found at all. */
+  motionWindow?: { startMs: number; peakMs: number; endMs: number } | null;
+  /** The cell neighbourhood (ANALYSIS geometry) the motion concentrated
+   *  in — the fallback/relaxed search area. Null when unknown. */
+  localizedArea?: BoundingBox | null;
   /** Fixed-vocabulary refusals ('CAMERA_MOTION_SUSPECTED', 'NO_MOTION_EVENT', ...). */
   warnings: string[];
 }
@@ -355,6 +363,10 @@ export interface VlmStructuredResult {
   reasonCodes: VlmReasonCode[];
   contradictions: VlmContradictionCode[];
   requiresHumanReview: boolean;
+  /** The model's short description of what it saw in the crop (material,
+   *  colour, shape, label text) written BEFORE it chose — optional, free
+   *  text bounded to 120 chars by the parser, screened before persistence. */
+  observedDescription?: string | null;
 }
 
 export interface VlmVerdict {
@@ -383,6 +395,52 @@ export interface VlmVerdict {
  *  Unavailability/timeout must degrade to review. */
 export interface VlmVerifier extends VersionedAdapter {
   verify(evidence: VlmRequestEvidence, timeoutMs: number): Promise<VlmVerdict>;
+  /**
+   * OPTIONAL event-count check (Phase 25): given the SAME shelf cell before
+   * and after the hand motion, count the product units in each and report
+   * whether one was REMOVED, ADDED, or NONE changed. A verifier that does
+   * not implement it (cloud vendor, stubs) is treated as NOT_RUN — the
+   * pipeline behaves exactly as before the check existed.
+   */
+  verifyEvent?(
+    request: VlmEventCheckRequest,
+    timeoutMs: number,
+  ): Promise<VlmEventCheckVerdict>;
+}
+
+export type VlmEventChange = 'REMOVED' | 'ADDED' | 'NONE';
+export type VlmEventConfidence = 'HIGH' | 'LOW';
+export type VlmEventCheckStatus = 'VERDICT' | 'UNAVAILABLE' | 'FAILED' | 'NOT_RUN';
+
+export interface VlmEventCheckRequest {
+  /** Encoded (PNG/JPEG) crop of the shelf cell BEFORE the hand reached in. */
+  preFrame: Buffer;
+  /** Encoded crop of the SAME cell after the hand left. */
+  postFrame: Buffer;
+  /** Planogram cell code when known ("A2"), else null — prompt context only. */
+  cellLabel: string | null;
+}
+
+/**
+ * The strict event-count result. Structural guarantees enforced by the
+ * shared parser, never trusted to the model: integer counts in 0..20, and
+ * `change` CONSISTENT with the counts (REMOVED iff after < before, ADDED
+ * iff after > before, NONE iff equal) — an inconsistent answer is FAILED.
+ */
+export interface VlmEventCheckVerdict {
+  status: VlmEventCheckStatus;
+  before: number | null;
+  after: number | null;
+  change: VlmEventChange | null;
+  confidence: VlmEventConfidence | null;
+  latencyMs: number | null;
+  /** Classified failure code (PROVIDER_UNREACHABLE, MODEL_NOT_FOUND,
+   *  TIMEOUT, PROVIDER_ERROR, MALFORMED_RESPONSE, INVALID_JSON,
+   *  INVALID_SCHEMA) — never model output. */
+  errorCode?: string | null;
+  /** Short, safe failure detail — never images or payloads. */
+  errorDetail?: string | null;
+  modelKey?: string | null;
 }
 
 // ---------------------------------------------------------------- validate

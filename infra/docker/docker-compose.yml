@@ -1,0 +1,74 @@
+# Local development stack: Postgres, the API and the admin console.
+#
+#   docker compose -f infra/docker/docker-compose.yml up --build
+#
+# Run it from the repository root — the build contexts below are relative to
+# this file and resolve to the repo root via `../..`.
+#
+# No secrets are committed. POSTGRES_PASSWORD and JWT_SECRET come from a
+# `.env` file next to this one (see .env.example) or from the shell.
+
+name: byond
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-byond}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in infra/docker/.env}
+      POSTGRES_DB: ${POSTGRES_DB:-byond}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-byond} -d ${POSTGRES_DB:-byond}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-shot: applies the committed migrations, then exits. The API waits for
+  # it so a fresh volume never serves traffic against an empty schema.
+  migrate:
+    build:
+      context: ../..
+      dockerfile: infra/docker/api.Dockerfile
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-byond}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-byond}?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["node_modules/.bin/prisma", "migrate", "deploy"]
+    restart: "no"
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/api.Dockerfile
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-byond}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-byond}?schema=public
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in infra/docker/.env}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+    ports:
+      - "${API_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  admin-web:
+    build:
+      context: ../..
+      dockerfile: infra/docker/admin-web.Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:3000}
+    ports:
+      - "${ADMIN_WEB_PORT:-8080}:8080"
+    depends_on:
+      - api
+
+volumes:
+  postgres-data:

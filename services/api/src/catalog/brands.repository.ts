@@ -68,7 +68,7 @@ export class BrandsRepository extends TenantScopedRepository {
         return null;
       }
       const after = await tx.brand.update({
-        where: { id: before.id },
+        where: { id_tenantId: { id: before.id, tenantId: scopedTenantId } },
         data,
       });
       await this.auditLog.record(buildAuditEntry(before, after), tx);
@@ -96,7 +96,9 @@ export class BrandsRepository extends TenantScopedRepository {
       if (!existing) {
         return null;
       }
-      await tx.brand.delete({ where: { id: existing.id } });
+      await tx.brand.delete({
+        where: { id_tenantId: { id: existing.id, tenantId: scopedTenantId } },
+      });
       await this.auditLog.record(buildAuditEntry(existing), tx);
       return existing;
     });

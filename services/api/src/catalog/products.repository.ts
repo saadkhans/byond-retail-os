@@ -228,7 +228,7 @@ export class ProductsRepository extends TenantScopedRepository {
       }
 
       const after = await tx.product.update({
-        where: { id: before.id },
+        where: { id_tenantId: { id: before.id, tenantId: scopedTenantId } },
         data,
         include: PRODUCT_INCLUDE,
       });
@@ -268,7 +268,9 @@ export class ProductsRepository extends TenantScopedRepository {
       await tx.productBarcode.deleteMany({
         where: { productId: existing.id, tenantId: scopedTenantId },
       });
-      await tx.product.delete({ where: { id: existing.id } });
+      await tx.product.delete({
+        where: { id_tenantId: { id: existing.id, tenantId: scopedTenantId } },
+      });
       // `existing` carries the removed barcodes into the audit before-snapshot.
       await this.auditLog.record(buildAuditEntry(existing), tx);
       return existing;
@@ -325,7 +327,17 @@ export class ProductsRepository extends TenantScopedRepository {
       if (!existing) {
         return null;
       }
-      await tx.productBarcode.delete({ where: { id: existing.id } });
+      // ProductBarcode is the one tenant-scoped model here WITHOUT an
+      // @@unique([id, tenantId]) (its composite key is [tenantId, value]),
+      // so `delete` cannot take the tenant in its unique predicate.
+      // deleteMany can, and the count below preserves the 404 that the
+      // previous unique delete raised as P2025.
+      const removed = await tx.productBarcode.deleteMany({
+        where: { id: existing.id, tenantId: scopedTenantId },
+      });
+      if (removed.count === 0) {
+        return null;
+      }
       await this.auditLog.record(buildAuditEntry(existing), tx);
       return existing;
     });

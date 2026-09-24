@@ -1,0 +1,41 @@
+name: BYOND security scan
+description: >-
+  Semgrep (static analysis, including this repository's own hard-rule rules)
+  and Trivy (dependency and filesystem vulnerabilities). Both fail the job on
+  findings at or above the configured severity.
+
+inputs:
+  severity:
+    description: Lowest severity that fails the job (HIGH or CRITICAL).
+    required: false
+    default: 'HIGH,CRITICAL'
+  semgrep-config:
+    description: Semgrep configuration to run.
+    required: false
+    default: 'p/ci infra/semgrep/byond-rules.yml'
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Python for Semgrep
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install Semgrep
+      shell: bash
+      run: python -m pip install --disable-pip-version-check --quiet semgrep
+
+    - name: Run Semgrep
+      shell: bash
+      run: semgrep scan --error --quiet ${{ inputs.semgrep-config }}
+
+    - name: Run Trivy (filesystem and dependencies)
+      uses: aquasecurity/trivy-action@v0.36.0
+      with:
+        scan-type: fs
+        scan-ref: .
+        scanners: vuln,secret,misconfig
+        severity: ${{ inputs.severity }}
+        ignore-unfixed: true
+        exit-code: '1'

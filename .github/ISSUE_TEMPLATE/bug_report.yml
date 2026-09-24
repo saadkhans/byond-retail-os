@@ -1,0 +1,49 @@
+name: Bug report
+description: Something behaves differently from how it is documented or intended.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not paste secrets, access tokens, customer data or card data into
+        this issue. Redact identifiers before you attach logs.
+  - type: input
+    id: area
+    attributes:
+      label: Area
+      description: Module or app, e.g. pickup-fusion, checkout, admin-web.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should happen
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happens instead
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The shortest sequence that shows the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Redacted logs, request IDs, timestamps, commit SHA.
+  - type: checkboxes
+    id: invariants
+    attributes:
+      label: Does this touch a hard rule?
+      options:
+        - label: Tenant isolation
+        - label: Inventory ledger
+        - label: Pricing versioning
+        - label: Payment data handling

@@ -1,0 +1,55 @@
+name: Security Scan
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - dev
+  schedule:
+    # Weekly, so a newly disclosed dependency vulnerability surfaces even when
+    # nobody has opened a pull request.
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Semgrep and Trivy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run security scan
+        uses: ./infra/github-actions/security-scan
+
+  images:
+    name: Container image scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build API image
+        run: docker build -f infra/docker/api.Dockerfile -t byond/api:ci .
+
+      - name: Build admin web image
+        run: docker build -f infra/docker/admin-web.Dockerfile -t byond/admin-web:ci .
+
+      - name: Scan API image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: byond/api:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Scan admin web image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: byond/admin-web:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'

@@ -86,8 +86,15 @@ export class OrdersService {
       throw new ConflictException('Order is already cancelled');
     }
     if (result === 'order-paid') {
+      // Phase 27 built the path this message used to defer. A paid order is
+      // cancelled by RECORDING A RETURN of kind ORDER_CANCELLATION, which
+      // reverses the stock through the ledger and refunds the captured
+      // payment. Cancelling it here would leave the goods and the money
+      // unaccounted for, so it is still refused — but now with somewhere to go.
       throw new ConflictException(
-        'Order is paid and cannot be cancelled here; returns/refunds are a later phase',
+        'Order is paid and cannot be cancelled here. Cancel it through ' +
+          'POST /returns with kind ORDER_CANCELLATION, which reverses the ' +
+          'stock and refunds the captured payment.',
       );
     }
     if (result === 'order-payment-active') {

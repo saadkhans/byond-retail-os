@@ -78,6 +78,7 @@ import {
   isAllowedVideoUpload,
   isUnsafeUploadFilename,
   looksLikeVideoContent,
+  redactLocationMetadata,
   sanitizeOriginalFilename,
   VIDEO_ERROR_CODES,
 } from './media-safety';
@@ -205,6 +206,19 @@ export const DEFAULT_SCREENING_TIMEOUT_MS = 30_000;
  * deadline that is actually enforced.
  */
 export const SCREENING_DEADLINE_CEILING_MS = 120_000;
+
+/**
+ * Default bound on how many decoded frames may be in RECOGNITION at once
+ * during the pre-storage screen (VIDEO_SCREENING_OCR_CONCURRENCY,
+ * boot-validated to 1..16). 1 is the sequential behaviour the screen has
+ * always had; a deployment raises it when real recorder clips (60 fps
+ * phones: ~0.4 s of OCR per frame, 500+ frames per 9 s clip) cannot fit
+ * the enforceable deadline one frame at a time. The screen inspects EVERY
+ * unique frame at any setting — the bound changes only how many run side
+ * by side.
+ */
+export const DEFAULT_SCREENING_OCR_CONCURRENCY = 1;
+export const MAX_SCREENING_OCR_CONCURRENCY = 16;
 
 /**
  * The REQUIRED operator attestations on every upload, re-checked here as
@@ -610,6 +624,15 @@ export class VideoAssetsService {
   private readonly screeningTimeoutMs: number;
 
   /**
+   * How many decoded frames may be in recognition at once during the
+   * pre-storage screen (VIDEO_SCREENING_OCR_CONCURRENCY, boot-validated to
+   * 1..16). Every unique frame is still recognized; this bounds only the
+   * in-flight recognizer calls (and therefore child processes and held
+   * frame buffers) per upload.
+   */
+  private readonly screeningOcrConcurrency: number;
+
+  /**
    * TRUE only when the CONTROLLED TEST-MEDIA POLICY GATE is open — the
    * ONLY thing in Phase 10 that authorizes storing an uploaded clip.
    * Requires BOTH the explicit opt-in (VIDEO_TEST_MEDIA_INGEST_ENABLED,
@@ -685,6 +708,19 @@ export class VideoAssetsService {
         : DEFAULT_SCREENING_TIMEOUT_MS,
       SCREENING_DEADLINE_CEILING_MS,
     );
+    // Same local re-check idiom for the recognizer parallelism bound (boot
+    // validation enforces 1..16): a value that somehow skipped validateEnv
+    // can never zero the pool (nothing would ever be recognized) or fork
+    // an unbounded number of recognizer processes per upload.
+    const configuredOcrConcurrency = Number(
+      config.get<string>('VIDEO_SCREENING_OCR_CONCURRENCY'),
+    );
+    this.screeningOcrConcurrency =
+      Number.isInteger(configuredOcrConcurrency) &&
+      configuredOcrConcurrency >= 1 &&
+      configuredOcrConcurrency <= MAX_SCREENING_OCR_CONCURRENCY
+        ? configuredOcrConcurrency
+        : DEFAULT_SCREENING_OCR_CONCURRENCY;
     // The controlled test-media policy gate: opt-in flag AND an explicitly
     // non-production runtime, both required, both fail-closed on anything
     // unexpected (an unset or unrecognized value keeps the gate shut).
@@ -825,9 +861,21 @@ export class VideoAssetsService {
         'File content does not match the declared video container',
       );
     }
+    // Recorder GPS position (com.apple.quicktime.location.ISO6709 and the
+    // legacy ©xyz atom, written by every iPhone recording) is personal data
+    // of the OPERATOR filming and has no CV use. It is blanked IN PLACE
+    // before the screen, the checksum, and the put, so the stored bytes
+    // never carry it. This is also what lets real recorder clips pass the
+    // screen below: a coordinate string joins to ~19 digits and roughly one
+    // position in ten contains a Luhn-valid window (the whole first lab
+    // batch did) — the policy that no digit shape rescues a Luhn hit is
+    // unchanged; the remedy it names (strip metadata) is applied here.
+    redactLocationMetadata(file.buffer);
     // Payload-level screen: text embedded in the container (metadata atoms,
     // subtitle tracks, XMP/ID3) must not smuggle a PAN or credential into
-    // durable storage. Frame-VISIBLE content is not decodable without real
+    // durable storage. For ISO BMFF the screen reads the metadata atoms and
+    // skips the compressed mdat payload (see media-safety CONTAINER SCOPE).
+    // Frame-VISIBLE content is not decodable without real
     // CV (explicitly out of Phase 10 scope) — the operational control there
     // is staged, controlled TEST clips only (README guidance) plus
     // local-only, never-served storage; later CV phases add frame review.
@@ -1352,7 +1400,7 @@ export class VideoAssetsService {
         // each digest is the one recognized — so a detection is attributed
         // to the FIRST frame index carrying those bytes.
         const screenedDigests = new Set<string>();
-        // Recorded from INSIDE the streaming callback. The callback stops
+        // Recorded from INSIDE the recognizer tasks. The callback stops
         // the stream for exactly TWO reasons — a detection or the expired
         // deadline — so an early stop with no recorded detection IS the
         // deadline, and no closure-mutated flag is needed to tell them
@@ -1360,6 +1408,43 @@ export class VideoAssetsService {
         const detectedFrameIndexes: number[] = [];
         let framesSeen = 0;
         let stoppedEarly = false;
+        // BOUNDED RECOGNIZER POOL. The adapter hands frames to onFrame one
+        // at a time and does not read the next until the callback
+        // resolves, so awaiting each recognizer call inside the callback
+        // serializes OCR completely — ~0.4 s per 1080p frame, which puts a
+        // 60 fps recorder clip (530 frames / 9 s) at ~220 s against the
+        // 120 s enforceable deadline. Instead each frame's recognition is
+        // STARTED in the callback and the callback yields only while the
+        // pool is full (VIDEO_SCREENING_OCR_CONCURRENCY in flight), so up
+        // to that many recognizer processes run side by side while the
+        // decode keeps streaming. Invariants kept: EVERY unique frame is
+        // recognized (the pool changes when, never whether); a detection
+        // in any task stops the stream at the next frame and the LOWEST
+        // hit index is attributed (arrival order is no longer decode
+        // order); a recognizer failure in any task is surfaced through the
+        // same path an awaited rejection took; and the pool is DRAINED
+        // before any verdict is read, so no recognition is ever outrun by
+        // the decision. At concurrency 1 this is exactly the former
+        // sequential behaviour. Tasks never reject — their outcome is
+        // recorded — so draining with Promise.all cannot throw.
+        const inFlight = new Set<Promise<void>>();
+        let recognizerFailure: unknown = null;
+        const startRecognition = (frame: Buffer, index: number): void => {
+          const task: Promise<void> = this.recognizer
+            .recognize(frame)
+            .then((text) => {
+              if (containsSensitiveFreeText(text)) {
+                detectedFrameIndexes.push(index);
+              }
+            })
+            .catch((error: unknown) => {
+              recognizerFailure ??= error;
+            })
+            .finally(() => {
+              inFlight.delete(task);
+            });
+          inFlight.add(task);
+        };
         const remainingMs = deadlineAt - Date.now();
         if (remainingMs <= 0) {
           // The budget was already spent opening and probing — nothing is
@@ -1384,6 +1469,18 @@ export class VideoAssetsService {
                   // upload.
                   return 'stop';
                 }
+                if (detectedFrameIndexes.length > 0) {
+                  // A pooled recognition already hit: nothing further is
+                  // recognized and the stream is abandoned (the verdict
+                  // below rejects on the recorded hit).
+                  return 'stop';
+                }
+                if (recognizerFailure !== null) {
+                  // A pooled recognizer call failed: surface it exactly as
+                  // an awaited rejection would have — out of onFrame, so
+                  // the port propagates it unchanged.
+                  throw recognizerFailure;
+                }
                 const digest = createHash('sha256')
                   .update(frame)
                   .digest('hex');
@@ -1391,17 +1488,36 @@ export class VideoAssetsService {
                   return 'continue';
                 }
                 screenedDigests.add(digest);
-                const text = await this.recognizer.recognize(frame);
-                if (containsSensitiveFreeText(text)) {
-                  detectedFrameIndexes.push(index);
+                startRecognition(frame, index);
+                if (inFlight.size >= this.screeningOcrConcurrency) {
+                  // Pool full: yield until ANY in-flight recognition
+                  // settles, then re-read the shared outcome so a hit or a
+                  // failure stops the stream before another decode step.
+                  await Promise.race(inFlight);
+                }
+                if (detectedFrameIndexes.length > 0) {
                   return 'stop';
+                }
+                if (recognizerFailure !== null) {
+                  throw recognizerFailure;
                 }
                 return 'continue';
               },
             });
             framesSeen = outcome.framesSeen;
             stoppedEarly = outcome.stoppedEarly;
+            // DRAIN before any verdict: recognitions still in flight when
+            // the stream ended (its last frames, or the frames behind a
+            // 'stop') must finish so a late hit or failure is not outrun.
+            await Promise.all(inFlight);
+            if (recognizerFailure !== null) {
+              throw recognizerFailure;
+            }
           } catch (error) {
+            // A stream that threw may still have recognitions in flight;
+            // they settle here (tasks never reject) so no recognizer
+            // process outlives the request's decision.
+            await Promise.all(inFlight);
             if (error instanceof FrameUnavailableError) {
               // The decode ran and yielded no frame at all — handled below
               // as zero-of-required coverage, never a quiet result.
@@ -1429,7 +1545,9 @@ export class VideoAssetsService {
           }
         }
         if (detectedFrameIndexes.length > 0) {
-          hitFrameIndex = detectedFrameIndexes[0];
+          // Pooled recognitions settle out of decode order: attribute the
+          // EARLIEST frame that tripped the screen, not the first to land.
+          hitFrameIndex = Math.min(...detectedFrameIndexes);
         } else if (stoppedEarly) {
           // The callback's only other stop reason is the spent deadline.
           deadlineExceeded = true;

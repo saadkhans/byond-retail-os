@@ -1,9 +1,17 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { VlmRequestEvidence, VlmVerdict, VlmVerifier } from '../ports';
+import {
+  VlmEventCheckRequest,
+  VlmEventCheckVerdict,
+  VlmRequestEvidence,
+  VlmVerdict,
+  VlmVerifier,
+} from '../ports';
 import {
   allowedSkus,
   buildPromptParts,
+  EVENT_COUNT_INSTRUCTION,
+  parseEventCountResult,
   parseStrictVerdict,
   safeRawPreview,
   maxImagesForContext,
@@ -352,6 +360,166 @@ export class OllamaVlmVerifier implements VlmVerifier {
           error instanceof Error
             ? `${error.constructor.name}: ${error.message.slice(0, 120)}`
             : 'unknown error'
+        })`,
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Phase 25 event-count check: two cell crops (before/after), the fixed
+   * counting instruction, JSON-constrained decoding at temperature 0. The
+   * SAME media boundary (loopback only, no redirects) and the same
+   * classified failure posture as verify(): never throws, never collapses
+   * failures into a generic unavailable, logs safe fields only.
+   */
+  async verifyEvent(
+    request: VlmEventCheckRequest,
+    timeoutMs: number,
+  ): Promise<VlmEventCheckVerdict> {
+    const endpoint = `${this.baseUrl}/api/chat`;
+    const startedAt = Date.now();
+    const notRun = (): VlmEventCheckVerdict => ({
+      status: 'NOT_RUN',
+      before: null,
+      after: null,
+      change: null,
+      confidence: null,
+      latencyMs: null,
+      modelKey: this.model || null,
+    });
+    const finish = (
+      verdict: VlmEventCheckVerdict,
+      httpStatus: number | null,
+    ): VlmEventCheckVerdict => {
+      this.logger.log(
+        `vlm-event-check endpoint=${endpoint} model=${this.model || '(unset)'} ` +
+          `status=${verdict.status} code=${verdict.errorCode ?? '-'} ` +
+          `http=${httpStatus ?? '-'} latencyMs=${verdict.latencyMs ?? '-'} ` +
+          `timeoutMs=${timeoutMs}`,
+      );
+      return verdict;
+    };
+    const fail = (
+      status: 'UNAVAILABLE' | 'FAILED',
+      errorCode: string,
+      errorDetail: string,
+      httpStatus: number | null = null,
+    ): VlmEventCheckVerdict =>
+      finish(
+        {
+          ...notRun(),
+          status,
+          latencyMs: Date.now() - startedAt,
+          errorCode,
+          errorDetail,
+        },
+        httpStatus,
+      );
+
+    if (!this.baseUrlLoopback) {
+      return fail(
+        'UNAVAILABLE',
+        'PROVIDER_UNREACHABLE',
+        'PICKUP_VLM_BASE_URL must be a loopback http(s) URL — cell crops never leave this machine',
+      );
+    }
+    const readiness = await this.readiness();
+    if (!readiness.serverReachable) {
+      return fail(
+        'UNAVAILABLE',
+        'PROVIDER_UNREACHABLE',
+        `Ollama server not reachable at ${this.baseUrl}`,
+      );
+    }
+    if (!readiness.modelAvailable) {
+      return fail(
+        'UNAVAILABLE',
+        'MODEL_NOT_FOUND',
+        this.model.length === 0
+          ? 'PICKUP_VLM_MODEL is not configured'
+          : `model ${this.model} is not installed`,
+      );
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        signal: controller.signal,
+        redirect: 'error',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: this.model,
+          stream: false,
+          format: 'json',
+          messages: [
+            {
+              role: 'user',
+              content:
+                `Image 1: shelf cell${request.cellLabel ? ` ${request.cellLabel}` : ''} BEFORE. ` +
+                `Image 2: the same cell AFTER.\n${EVENT_COUNT_INSTRUCTION}`,
+              images: [
+                request.preFrame.toString('base64'),
+                request.postFrame.toString('base64'),
+              ],
+            },
+          ],
+          options: { temperature: 0, num_ctx: this.numCtx },
+        }),
+      });
+      const latencyMs = Date.now() - startedAt;
+      if (!response.ok) {
+        const errorText = safeRawPreview(await response.text().catch(() => ''), 160);
+        const modelMissing =
+          response.status === 404 && /model/i.test(errorText) && /not found/i.test(errorText);
+        return fail(
+          modelMissing ? 'UNAVAILABLE' : 'FAILED',
+          modelMissing ? 'MODEL_NOT_FOUND' : 'PROVIDER_ERROR',
+          `HTTP ${response.status}${errorText ? `: ${errorText}` : ''}`,
+          response.status,
+        );
+      }
+      let body: { message?: { content?: string } };
+      try {
+        body = (await response.json()) as { message?: { content?: string } };
+      } catch {
+        return fail(
+          'FAILED',
+          'MALFORMED_RESPONSE',
+          'response body was not valid JSON (not an Ollama chat response)',
+          response.status,
+        );
+      }
+      const content = body.message?.content ?? '';
+      const parsed = parseEventCountResult(content, { stripFences: true });
+      if (parsed.status === 'FAILED') {
+        return fail('FAILED', parsed.errorCode, parsed.errorDetail, response.status);
+      }
+      return finish(
+        {
+          status: 'VERDICT',
+          before: parsed.before,
+          after: parsed.after,
+          change: parsed.change,
+          confidence: parsed.confidence,
+          latencyMs,
+          errorCode: null,
+          errorDetail: null,
+          modelKey: this.model || null,
+        },
+        response.status,
+      );
+    } catch (error) {
+      if (controller.signal.aborted) {
+        return fail('FAILED', 'TIMEOUT', `no completion within ${timeoutMs} ms`);
+      }
+      return fail(
+        'UNAVAILABLE',
+        'PROVIDER_UNREACHABLE',
+        `fetch failed (${
+          error instanceof Error ? error.constructor.name : 'unknown error'
         })`,
       );
     } finally {

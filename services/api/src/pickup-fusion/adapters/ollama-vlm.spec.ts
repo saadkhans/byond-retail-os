@@ -428,3 +428,128 @@ describe('OllamaVlmVerifier', () => {
     expect(typeof warm.lastInference?.latencyMs).toBe('number');
   });
 });
+
+// Phase 25 — the before/after unit-count check.
+describe('OllamaVlmVerifier.verifyEvent (event-count check)', () => {
+  const PRE = Buffer.from('pre-png-bytes');
+  const POST = Buffer.from('post-png-bytes');
+
+  function captureServer(
+    content: string,
+    status = 200,
+  ): Promise<{ server: Server; port: number; bodies: Record<string, unknown>[] }> {
+    const bodies: Record<string, unknown>[] = [];
+    const server = createServer((request, response) => {
+      if (request.url === '/api/tags') {
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({ models: [{ name: 'test-vision:7b' }] }));
+        return;
+      }
+      let raw = '';
+      request.on('data', (chunk: Buffer) => {
+        raw += chunk.toString();
+      });
+      request.on('end', () => {
+        bodies.push(JSON.parse(raw) as Record<string, unknown>);
+        response.statusCode = status;
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({ message: { content } }));
+      });
+    });
+    return new Promise((resolvePromise) =>
+      server.listen(0, '127.0.0.1', () =>
+        resolvePromise({
+          server,
+          port: (server.address() as { port: number }).port,
+          bodies,
+        }),
+      ),
+    );
+  }
+
+  it('sends exactly the two cell crops, JSON-constrained at temperature 0, and returns the strict counts', async () => {
+    const { server, port, bodies } = await captureServer(
+      JSON.stringify({ before: 2, after: 1, change: 'REMOVED', confidence: 'HIGH' }),
+    );
+    const verifier = new OllamaVlmVerifier(configFor(port));
+    const verdict = await verifier.verifyEvent(
+      { preFrame: PRE, postFrame: POST, cellLabel: 'A2' },
+      5000,
+    );
+    server.close();
+    expect(verdict).toMatchObject({
+      status: 'VERDICT',
+      before: 2,
+      after: 1,
+      change: 'REMOVED',
+      confidence: 'HIGH',
+      modelKey: 'test-vision:7b',
+    });
+    expect(typeof verdict.latencyMs).toBe('number');
+    expect(bodies).toHaveLength(1);
+    const body = bodies[0] as {
+      model: string;
+      format: string;
+      stream: boolean;
+      options: { temperature: number };
+      messages: { content: string; images: string[] }[];
+    };
+    expect(body.model).toBe('test-vision:7b');
+    expect(body.format).toBe('json');
+    expect(body.stream).toBe(false);
+    expect(body.options.temperature).toBe(0);
+    expect(body.messages).toHaveLength(1);
+    expect(body.messages[0].images).toEqual([PRE.toString('base64'), POST.toString('base64')]);
+    expect(body.messages[0].content).toContain('A2');
+    expect(body.messages[0].content).toContain('Count the product units');
+  });
+
+  it('rejects an answer whose change word disagrees with the counts (never trusted)', async () => {
+    const { server, port } = await captureServer(
+      JSON.stringify({ before: 2, after: 1, change: 'NONE', confidence: 'HIGH' }),
+    );
+    const verdict = await new OllamaVlmVerifier(configFor(port)).verifyEvent(
+      { preFrame: PRE, postFrame: POST, cellLabel: null },
+      5000,
+    );
+    server.close();
+    expect(verdict.status).toBe('FAILED');
+    expect(verdict.errorCode).toBe('INVALID_SCHEMA');
+    expect(verdict.change).toBeNull();
+  });
+
+  it('media boundary: a non-loopback base URL is refused before any byte is sent', async () => {
+    const config = {
+      get: (key: string) =>
+        key === 'PICKUP_VLM_BASE_URL'
+          ? 'http://10.0.0.5:11434'
+          : key === 'PICKUP_VLM_MODEL'
+            ? 'test-vision:7b'
+            : undefined,
+    } as unknown as ConfigService;
+    const verdict = await new OllamaVlmVerifier(config).verifyEvent(
+      { preFrame: PRE, postFrame: POST, cellLabel: null },
+      5000,
+    );
+    expect(verdict.status).toBe('UNAVAILABLE');
+    expect(verdict.errorCode).toBe('PROVIDER_UNREACHABLE');
+  });
+
+  it('unreachable server → UNAVAILABLE; provider HTTP error → FAILED/PROVIDER_ERROR', async () => {
+    const down = await new OllamaVlmVerifier(configFor(null)).verifyEvent(
+      { preFrame: PRE, postFrame: POST, cellLabel: null },
+      3000,
+    );
+    expect(down.status).toBe('UNAVAILABLE');
+    expect(down.errorCode).toBe('PROVIDER_UNREACHABLE');
+
+    const { server, port } = await captureServer('oops', 500);
+    const failed = await new OllamaVlmVerifier(configFor(port)).verifyEvent(
+      { preFrame: PRE, postFrame: POST, cellLabel: null },
+      5000,
+    );
+    server.close();
+    expect(failed.status).toBe('FAILED');
+    expect(failed.errorCode).toBe('PROVIDER_ERROR');
+  });
+});

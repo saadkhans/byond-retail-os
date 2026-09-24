@@ -21,6 +21,9 @@ import {
   PickupFusionService,
   applyVlmVerdictToEvidence,
   fusionCropIdempotencyKey,
+  fusionPredictedSku,
+  orderReferenceRows,
+  policyFromVlmResult,
 } from './pickup-fusion.service';
 import { CandidateSignal, OcrExecutionStatus, VlmVerdict } from './ports';
 
@@ -216,6 +219,9 @@ function buildService(options: {
   ocrStatus?: OcrExecutionStatus;
   config?: Record<string, string>;
   vlmVerify?: jest.Mock;
+  /** Phase 25: the OPTIONAL event-count check on the verifier port. Absent
+   *  = the verifier does not implement it (the check is NOT_RUN). */
+  vlmVerifyEvent?: jest.Mock;
   /** Inventory validator port fake — defaults to PLAUSIBLE for every
    *  requested candidate (the gate FAILS CLOSED on anything else). */
   inventoryValidate?: jest.Mock;
@@ -393,6 +399,7 @@ function buildService(options: {
         adapterKey: 'stub-vlm',
         version: '1.0.0',
         verify: options.vlmVerify ?? jest.fn(),
+        ...(options.vlmVerifyEvent ? { verifyEvent: options.vlmVerifyEvent } : {}),
       },
       readiness: jest.fn(),
     } as never,
@@ -1831,5 +1838,674 @@ describe('Phase 22 — planogram-scoped fusion candidates', () => {
     await service.run('tenant-1', 'asset-1');
     expect(createdRuns[0].data.evidence.planogramScope).toBeNull();
     expect(createdRuns[0].data.evidence.fused.map((row) => row.sku)).toContain(CHIPS.sku);
+  });
+});
+
+// Phase 25 — VLM EVENT VERIFICATION (PICKUP_VLM_EVENT_CHECK): the
+// before/after unit-count check on the touched cell, run BEFORE any
+// identity signal. Pinned here: a confident "no unit change" is a TOUCH
+// (no identity work, no proposal), a confident REMOVED/ADDED fixes the
+// event kind, low confidence demotes an auto-proposal to review, every
+// failure leaves the pipeline exactly as it was, the flag gates it all,
+// and a motion window with no durable change can be RECOVERED into an
+// event by the count.
+describe('VLM event verification (Phase 25)', () => {
+  const WATER: CatalogFixture = { id: 'p-water', sku: 'WATER-500', name: 'Water', status: ProductStatus.ACTIVE, barcode: '6281000000010' };
+  const CAN: CatalogFixture = { id: 'p-can', sku: 'CAN-250', name: 'Can', status: ProductStatus.ACTIVE, barcode: '6281000000011' };
+  const ENABLED = { PICKUP_VLM_ENABLED: 'true', PICKUP_VLM_EVENT_CHECK: 'true' };
+  const count = (before: number, after: number, confidence: 'HIGH' | 'LOW' = 'HIGH') => ({
+    status: 'VERDICT' as const,
+    before,
+    after,
+    change: after < before ? ('REMOVED' as const) : after > before ? ('ADDED' as const) : ('NONE' as const),
+    confidence,
+    latencyMs: 12,
+    modelKey: 'stub-vlm',
+  });
+  /** A barcode-confirmed water pickup: auto-proposes without the check. */
+  const confident = () => ({
+    catalog: [WATER, CAN],
+    barcodeSeen: WATER.barcode,
+    classicalSignals: [{ productId: WATER.id, sku: WATER.sku, score: 0.6 }],
+  });
+
+  it('a confident "units unchanged" is a TOUCH: no identity work, no proposal, evidence recorded', async () => {
+    const verifyEvent = jest.fn(async () => count(1, 1));
+    const { service, createdRuns, contextProvider, videoAssets, decoder } = buildService({
+      ...confident(),
+      config: ENABLED,
+      vlmVerifyEvent: verifyEvent,
+    });
+    await service.run('tenant-1', 'asset-1');
+    // The first "unchanged" answer is CONFIRMED on a later after-frame
+    // before it may veto the event: two calls, one touch.
+    expect(verifyEvent).toHaveBeenCalledTimes(2);
+    const [request, timeoutMs] = (verifyEvent as jest.Mock).mock.calls[0] as unknown as [
+      { preFrame: Buffer; postFrame: Buffer; cellLabel: string | null },
+      number,
+    ];
+    // PNG crops, not raw pixels; no planogram → no cell label; default deadline.
+    expect(request.preFrame.subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    expect(request.postFrame.subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    expect(request.cellLabel).toBeNull();
+    expect(timeoutMs).toBe(60_000);
+    const { data } = createdRuns[0];
+    expect(data.policy).toBe(FusionPolicyResult.UNKNOWN_PRODUCT);
+    expect(data.evidence.policy.reason).toContain('TOUCH_ONLY');
+    expect(data.evidence.policy.reason).toContain('units 1->1');
+    expect(data.evidence.detector.warnings).toContain('TOUCH_ONLY');
+    expect(data.evidence.fused).toEqual([]);
+    expect(data.evidence.classical.candidates).toEqual([]);
+    expect(data.fusedTopSku).toBeNull();
+    expect(data.evidence.eventVerification).toMatchObject({
+      status: 'VERDICT',
+      source: 'primary',
+      before: 1,
+      after: 1,
+      change: 'NONE',
+      confidence: 'HIGH',
+      cellLabel: null,
+      kindOverride: null,
+    });
+    expect(data.evidence.eventVerification?.cropBox).not.toBeNull();
+    expect(data.evidence.eventVerification?.preMs).toBe(700); // 1500 − 800
+    expect(data.evidence.eventVerification?.postMs).toBe(3700); // 2500 + 1200
+    expect(data.evidence.eventVerification?.confirmation).toMatchObject({
+      status: 'VERDICT',
+      change: 'NONE',
+      confidence: 'HIGH',
+      preMs: 0, // 1500 − 2500, clamped
+      postMs: 5000, // 2500 + 2500
+    });
+    // Identity stages never ran: no context lookup, no crop artifact.
+    expect(contextProvider.contextFor).not.toHaveBeenCalled();
+    expect(videoAssets.createCrop).not.toHaveBeenCalled();
+    // Only the check frames were decoded (two per call, two calls).
+    expect(decoder.decodeFrameAt).toHaveBeenCalledTimes(4);
+    expect(data.evidence.stages.some((stage) => stage.stage === 'event-verification' && stage.adapterKey === 'stub-vlm-count')).toBe(true);
+  });
+
+  it('a confident REMOVED replaces a contrast-derived RETURN kind and identity runs as usual', async () => {
+    const verifyEvent = jest.fn(async () => count(2, 1));
+    const { service, createdRuns, detector, contextProvider } = buildService({
+      ...confident(),
+      config: ENABLED,
+      vlmVerifyEvent: verifyEvent,
+    });
+    (detector.detect as jest.Mock).mockResolvedValueOnce({
+      events: [
+        {
+          kind: 'RETURN' as const,
+          startMs: 1500,
+          peakMs: 2000,
+          endMs: 2500,
+          trackId: 't1',
+          shelfZoneId: 'z-1-1',
+          box: { x: 4, y: 4, width: 12, height: 12 },
+        },
+      ],
+      tracks: [],
+      warnings: [],
+    });
+    await service.run('tenant-1', 'asset-1');
+    const { data } = createdRuns[0];
+    expect(data.evidence.detector.events[0].kind).toBe('PICKUP');
+    expect(data.evidence.eventVerification).toMatchObject({ change: 'REMOVED', kindOverride: 'PICKUP' });
+    expect(contextProvider.contextFor).toHaveBeenCalledTimes(1);
+    expect(data.policy).toBe(FusionPolicyResult.AUTO_PROPOSE);
+    expect(data.fusedTopSku).toBe(WATER.sku);
+  });
+
+  it('an "unchanged" answer that the later frame contradicts (ADDED) is NOT a touch: the return proceeds with the corrected kind', async () => {
+    // The lab miss this closes: a return whose jar was still being set
+    // down at +1.2 s read as 1→1 there and 0→1... i.e. ADDED at +2.5 s.
+    const verifyEvent = jest
+      .fn()
+      .mockResolvedValueOnce(count(1, 1))
+      .mockResolvedValueOnce(count(0, 1));
+    const { service, createdRuns, contextProvider } = buildService({
+      ...confident(),
+      config: ENABLED,
+      vlmVerifyEvent: verifyEvent,
+    });
+    await service.run('tenant-1', 'asset-1');
+    expect(verifyEvent).toHaveBeenCalledTimes(2);
+    const { data } = createdRuns[0];
+    expect(data.evidence.detector.warnings).not.toContain('TOUCH_ONLY');
+    expect(data.evidence.detector.events[0].kind).toBe('RETURN');
+    expect(data.evidence.eventVerification).toMatchObject({
+      change: 'ADDED',
+      before: 0,
+      after: 1,
+      kindOverride: 'RETURN',
+      confirmation: { change: 'ADDED', confidence: 'HIGH' },
+    });
+    expect(contextProvider.contextFor).toHaveBeenCalledTimes(1);
+    expect(data.policy).toBe(FusionPolicyResult.AUTO_PROPOSE);
+  });
+
+  it('a LOW-confidence "unchanged" lets identity run but demotes an auto-proposal to review', async () => {
+    const { service, createdRuns, contextProvider } = buildService({
+      ...confident(),
+      config: ENABLED,
+      vlmVerifyEvent: jest.fn(async () => count(1, 1, 'LOW')),
+    });
+    await service.run('tenant-1', 'asset-1');
+    const { data } = createdRuns[0];
+    expect(contextProvider.contextFor).toHaveBeenCalledTimes(1);
+    expect(data.fusedTopSku).toBe(WATER.sku);
+    expect(data.policy).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+    expect(data.evidence.policy.reason).toContain('LOW confidence');
+    expect(data.evidence.detector.warnings).not.toContain('TOUCH_ONLY');
+  });
+
+  it.each([
+    ['FAILED', { status: 'FAILED' as const, errorCode: 'TIMEOUT' }],
+    ['UNAVAILABLE', { status: 'UNAVAILABLE' as const, errorCode: 'PROVIDER_UNREACHABLE' }],
+    ['a thrown error', null],
+  ])('%s from the check leaves the pipeline exactly as it was (auto-proposal stands, failure recorded)', async (_label, outcome) => {
+    const verifyEvent = outcome
+      ? jest.fn(async () => ({ ...outcome, before: null, after: null, change: null, confidence: null, latencyMs: 5 }))
+      : jest.fn(async () => {
+          throw new Error('boom');
+        });
+    const { service, createdRuns } = buildService({
+      ...confident(),
+      config: ENABLED,
+      vlmVerifyEvent: verifyEvent,
+    });
+    await service.run('tenant-1', 'asset-1');
+    const { data } = createdRuns[0];
+    expect(data.policy).toBe(FusionPolicyResult.AUTO_PROPOSE);
+    expect(data.fusedTopSku).toBe(WATER.sku);
+    expect(data.evidence.eventVerification?.status).toBe(outcome ? outcome.status : 'FAILED');
+    expect(data.evidence.eventVerification?.errorCode).toBe(outcome ? outcome.errorCode : 'ADAPTER_THREW');
+    expect(data.evidence.detector.warnings).not.toContain('TOUCH_ONLY');
+  });
+
+  it('with the flag off — or a verifier without the check — nothing is asked and the evidence says NOT_RUN', async () => {
+    const verifyEvent = jest.fn(async () => count(1, 1));
+    const flagOff = buildService({
+      ...confident(),
+      config: { PICKUP_VLM_ENABLED: 'true' },
+      vlmVerifyEvent: verifyEvent,
+    });
+    await flagOff.service.run('tenant-1', 'asset-1');
+    expect(verifyEvent).not.toHaveBeenCalled();
+    expect(flagOff.createdRuns[0].data.policy).toBe(FusionPolicyResult.AUTO_PROPOSE);
+    expect(flagOff.createdRuns[0].data.evidence.eventVerification?.status).toBe('NOT_RUN');
+    expect(
+      flagOff.createdRuns[0].data.evidence.stages.some(
+        (stage) => stage.stage === 'event-verification' && stage.adapterKey === 'not-run',
+      ),
+    ).toBe(true);
+
+    const noMethod = buildService({ ...confident(), config: ENABLED });
+    await noMethod.service.run('tenant-1', 'asset-1');
+    expect(noMethod.createdRuns[0].data.policy).toBe(FusionPolicyResult.AUTO_PROPOSE);
+    expect(noMethod.createdRuns[0].data.evidence.eventVerification?.status).toBe('NOT_RUN');
+
+    // VLM stage disabled altogether: the check is part of the VLM stage.
+    const vlmOff = buildService({
+      ...confident(),
+      config: { PICKUP_VLM_EVENT_CHECK: 'true' },
+      vlmVerifyEvent: verifyEvent,
+    });
+    await vlmOff.service.run('tenant-1', 'asset-1');
+    expect(verifyEvent).not.toHaveBeenCalled();
+  });
+
+  it('missed-event recovery: motion with no durable change plus a confident REMOVED count becomes the primary event', async () => {
+    const verifyEvent = jest.fn(async () => count(1, 0));
+    const { service, createdRuns, detector, contextProvider } = buildService({
+      ...confident(),
+      config: ENABLED,
+      vlmVerifyEvent: verifyEvent,
+    });
+    (detector.detect as jest.Mock).mockResolvedValueOnce({
+      events: [],
+      tracks: [],
+      warnings: ['LOCALIZED_MOTION_FALLBACK', 'NO_DURABLE_CHANGE'],
+      motionWindow: { startMs: 1500, peakMs: 2000, endMs: 2500 },
+      localizedArea: { x: 6, y: 6, width: 18, height: 18 },
+    });
+    await service.run('tenant-1', 'asset-1');
+    const { data } = createdRuns[0];
+    expect(verifyEvent).toHaveBeenCalledTimes(1);
+    expect(data.evidence.eventVerification).toMatchObject({
+      source: 'motion-window',
+      change: 'REMOVED',
+      kindOverride: 'PICKUP',
+    });
+    expect(data.evidence.detector.warnings).toContain('EVENT_FROM_VLM_COUNT');
+    expect(data.evidence.detector.events).toHaveLength(1);
+    expect(data.evidence.detector.events[0]).toMatchObject({
+      kind: 'PICKUP',
+      trackId: 'vlm-count',
+      startMs: 1500,
+      peakMs: 2000,
+      endMs: 2500,
+    });
+    // The synthesized event box is reported in SOURCE pixels (480×360 from 48×36).
+    expect(data.evidence.detector.events[0].box).toMatchObject({ x: 60, y: 60 });
+    expect(contextProvider.contextFor).toHaveBeenCalledTimes(1);
+    expect(data.policy).toBe(FusionPolicyResult.AUTO_PROPOSE);
+    expect(data.fusedTopSku).toBe(WATER.sku);
+  });
+
+  it('missed-event recovery with a rack: the mapped cell is counted first, then each other cell of the row until one changed', async () => {
+    const rack = {
+      rackId: 'rack-1',
+      locationId: 'store-1',
+      rackCode: 'R1',
+      version: 1,
+      rows: 2,
+      columns: 2,
+      cells: [
+        { productId: WATER.id, sku: WATER.sku, rowIndex: 0, columnIndex: 0, cellCode: 'A1' },
+        { productId: CAN.id, sku: CAN.sku, rowIndex: 0, columnIndex: 1, cellCode: 'A2' },
+      ],
+    };
+    // The motion peak maps to A1 (unchanged there); the bottle left A2.
+    const verifyEvent = jest
+      .fn()
+      .mockResolvedValueOnce(count(1, 1))
+      .mockResolvedValueOnce(count(1, 0));
+    const { service, createdRuns, detector } = buildService({
+      ...confident(),
+      config: ENABLED,
+      vlmVerifyEvent: verifyEvent,
+      locationId: 'store-1',
+      planogramRackCode: 'R1',
+      planograms: { listRacks: jest.fn(async () => [rack]) },
+    });
+    (detector.detect as jest.Mock).mockResolvedValueOnce({
+      events: [],
+      tracks: [],
+      warnings: ['NO_DURABLE_CHANGE'],
+      motionWindow: { startMs: 1500, peakMs: 2000, endMs: 2500 },
+      localizedArea: { x: 6, y: 6, width: 18, height: 18 },
+    });
+    await service.run('tenant-1', 'asset-1');
+    expect(verifyEvent).toHaveBeenCalledTimes(2);
+    const labels = (verifyEvent as jest.Mock).mock.calls.map(
+      (call) => (call[0] as { cellLabel: string | null }).cellLabel,
+    );
+    expect(labels).toEqual(['A1', 'A2']);
+    const { data } = createdRuns[0];
+    expect(data.evidence.eventVerification).toMatchObject({
+      source: 'motion-window',
+      cellLabel: 'A2',
+      change: 'REMOVED',
+      kindOverride: 'PICKUP',
+    });
+    expect(data.evidence.detector.warnings).toContain('EVENT_FROM_VLM_COUNT');
+    expect(data.evidence.detector.events).toHaveLength(1);
+    expect(data.policy).toBe(FusionPolicyResult.AUTO_PROPOSE);
+  });
+
+  it('missed-event recovery: an unchanged count keeps the "no pickup event proposed" outcome', async () => {
+    const verifyEvent = jest.fn(async () => count(1, 1));
+    const { service, createdRuns, detector, contextProvider } = buildService({
+      ...confident(),
+      config: ENABLED,
+      vlmVerifyEvent: verifyEvent,
+    });
+    (detector.detect as jest.Mock).mockResolvedValueOnce({
+      events: [],
+      tracks: [],
+      warnings: ['NO_DURABLE_CHANGE'],
+      motionWindow: { startMs: 1500, peakMs: 2000, endMs: 2500 },
+      localizedArea: { x: 6, y: 6, width: 18, height: 18 },
+    });
+    await service.run('tenant-1', 'asset-1');
+    const { data } = createdRuns[0];
+    expect(verifyEvent).toHaveBeenCalledTimes(1);
+    expect(data.policy).toBe(FusionPolicyResult.UNKNOWN_PRODUCT);
+    expect(data.evidence.policy.reason).toContain('no pickup event proposed');
+    expect(data.evidence.detector.events).toEqual([]);
+    expect(contextProvider.contextFor).not.toHaveBeenCalled();
+  });
+
+  it('camera motion or no motion window at all never triggers the check', async () => {
+    const verifyEvent = jest.fn(async () => count(1, 0));
+    const { service, detector, createdRuns } = buildService({
+      ...confident(),
+      config: ENABLED,
+      vlmVerifyEvent: verifyEvent,
+    });
+    (detector.detect as jest.Mock).mockResolvedValueOnce({
+      events: [],
+      tracks: [],
+      warnings: ['CAMERA_MOTION_SUSPECTED'],
+      motionWindow: { startMs: 1500, peakMs: 2000, endMs: 2500 },
+      localizedArea: { x: 6, y: 6, width: 18, height: 18 },
+    });
+    await service.run('tenant-1', 'asset-1');
+    expect(verifyEvent).not.toHaveBeenCalled();
+    expect(createdRuns[0].data.policy).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+
+    (detector.detect as jest.Mock).mockResolvedValueOnce({ events: [], tracks: [], warnings: ['NO_MOTION_EVENT'] });
+    await service.run('tenant-1', 'asset-1');
+    expect(verifyEvent).not.toHaveBeenCalled();
+    expect(createdRuns[1].data.policy).toBe(FusionPolicyResult.UNKNOWN_PRODUCT);
+  });
+
+  it('with a bound rack the crop is the mapped planogram CELL (padded) and carries its label', async () => {
+    const rack = {
+      rackId: 'rack-1',
+      locationId: 'store-1',
+      rackCode: 'R1',
+      version: 1,
+      rows: 2,
+      columns: 2,
+      cells: [
+        { productId: WATER.id, sku: WATER.sku, rowIndex: 0, columnIndex: 0, cellCode: 'A1' },
+        { productId: CAN.id, sku: CAN.sku, rowIndex: 0, columnIndex: 1, cellCode: 'A2' },
+      ],
+    };
+    const verifyEvent = jest.fn(async () => count(1, 0));
+    const { service, createdRuns } = buildService({
+      ...confident(),
+      config: ENABLED,
+      vlmVerifyEvent: verifyEvent,
+      locationId: 'store-1',
+      planogramRackCode: 'R1',
+      planograms: { listRacks: jest.fn(async () => [rack]) },
+    });
+    await service.run('tenant-1', 'asset-1');
+    const request = (verifyEvent as jest.Mock).mock.calls[0][0] as unknown as { cellLabel: string | null };
+    // The stub event box (4,4,12,12) in a 48×36 frame centres at (0.21, 0.28)
+    // → top-left cell A1 of a 2×2 rack filling the frame.
+    expect(request.cellLabel).toBe('A1');
+    const check = createdRuns[0].data.evidence.eventVerification!;
+    expect(check.cellLabel).toBe('A1');
+    // Cell A1 spans x 0..240, y 0..180 of the 480×360 source; padded 10%
+    // and clamped at the frame edge.
+    expect(check.cropBox).toMatchObject({ x: 0, y: 0, width: 264, height: 198 });
+  });
+});
+
+describe('identity VLM disagreement credit rule', () => {
+  const match = (selectedSku: string, visualSupport: 'STRONG' | 'MEDIUM' | 'WEAK') => ({
+    verdict: 'MATCH' as const,
+    selectedSku,
+    visualSupport,
+    ocrSupport: 'NONE' as const,
+    barcodeSupport: 'NONE' as const,
+    reasonCodes: [],
+    contradictions: [],
+    requiresHumanReview: false,
+  });
+  const fusedWaterFirst = [{ sku: 'WATER' }, { sku: 'NESCAFE' }];
+
+  it('fusion confident + weakly supported VLM disagreement: fusion credited, still review', () => {
+    const evidence = emptyEvidence();
+    evidence.fused = fusedWaterFirst as FusionEvidence['fused'];
+    applyVlmVerdictToEvidence(
+      evidence,
+      {
+        status: 'VERDICT',
+        result: match('NESCAFE', 'WEAK'),
+        modelKey: 'm',
+        modelVersion: 'm',
+        latencyMs: 1,
+      },
+      'AUTO_PROPOSE',
+      'WATER',
+      'x',
+    );
+    expect(evidence.policy.result).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+    expect(evidence.policy.reason).toContain('WATER credited');
+    expect(evidence.vlm.fusionDecision).toBe('AUTO_PROPOSE');
+    expect(evidence.vlm.selectedSku).toBe('NESCAFE'); // the pick itself is still recorded
+    expect(fusionPredictedSku(evidence)).toBe('WATER');
+  });
+
+  it('fusion confident + STRONG VLM disagreement: the VLM pick is credited, review', () => {
+    const evidence = emptyEvidence();
+    evidence.fused = fusedWaterFirst as FusionEvidence['fused'];
+    applyVlmVerdictToEvidence(
+      evidence,
+      {
+        status: 'VERDICT',
+        result: match('NESCAFE', 'STRONG'),
+        modelKey: 'm',
+        modelVersion: 'm',
+        latencyMs: 1,
+      },
+      'AUTO_PROPOSE',
+      'WATER',
+      'x',
+    );
+    expect(evidence.policy.result).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+    expect(evidence.policy.reason).toBe(
+      'VLM chose NESCAFE but fusion ranked WATER first — review',
+    );
+    expect(fusionPredictedSku(evidence)).toBe('NESCAFE');
+  });
+
+  it('fusion not confident (NEEDS_VLM): the VLM pick is credited whatever its support', () => {
+    for (const support of ['WEAK', 'MEDIUM', 'STRONG'] as const) {
+      const evidence = emptyEvidence();
+      evidence.fused = fusedWaterFirst as FusionEvidence['fused'];
+      applyVlmVerdictToEvidence(
+        evidence,
+        {
+          status: 'VERDICT',
+          result: match('NESCAFE', support),
+          modelKey: 'm',
+          modelVersion: 'm',
+          latencyMs: 1,
+        },
+        'NEEDS_VLM',
+        'WATER',
+        'x',
+      );
+      expect(evidence.policy.result).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+      expect(fusionPredictedSku(evidence)).toBe('NESCAFE');
+    }
+  });
+
+  it('agreement still auto-proposes and historical rows without fusionDecision keep the old credit', () => {
+    const agree = policyFromVlmResult(match('WATER', 'MEDIUM'), 'AUTO_PROPOSE', 'WATER');
+    expect(agree.result).toBe(FusionPolicyResult.AUTO_PROPOSE);
+    // A row written before the rule: no fusionDecision → the VLM pick is credited.
+    expect(
+      fusionPredictedSku({
+        vlm: { status: 'VERDICT', verdict: 'MATCH', selectedSku: 'NESCAFE', visualSupport: 'WEAK' },
+        fused: fusedWaterFirst,
+      }),
+    ).toBe('NESCAFE');
+  });
+
+  it('screens the observed description before persisting it', () => {
+    const evidence = emptyEvidence();
+    evidence.fused = fusedWaterFirst as FusionEvidence['fused'];
+    applyVlmVerdictToEvidence(
+      evidence,
+      {
+        status: 'VERDICT',
+        result: {
+          ...match('WATER', 'STRONG'),
+          observedDescription: 'clear plastic bottle, blue cap, label AKOYA',
+        },
+        modelKey: 'm',
+        modelVersion: 'm',
+        latencyMs: 1,
+      },
+      'AUTO_PROPOSE',
+      'WATER',
+      'x',
+    );
+    expect(evidence.vlm.observedDescription).toBe('clear plastic bottle, blue cap, label AKOYA');
+    const leaky = emptyEvidence();
+    applyVlmVerdictToEvidence(
+      leaky,
+      {
+        status: 'VERDICT',
+        result: { ...match('WATER', 'STRONG'), observedDescription: `card ${PAN} cvv 123` },
+        modelKey: 'm',
+        modelVersion: 'm',
+        latencyMs: 1,
+      },
+      'AUTO_PROPOSE',
+      'WATER',
+      'x',
+    );
+    expect(leaky.vlm.observedDescription).toBe(OCR_TEXT_SUPPRESSED);
+    expect(JSON.stringify(leaky)).not.toContain(PAN);
+  });
+});
+
+describe('orderReferenceRows (identity VLM reference selection)', () => {
+  it('puts the largest files first, then the oldest, then id — placeholders sort last', () => {
+    const rows = [
+      { id: 'c', sizeBytes: 310, createdAt: new Date('2026-08-16T00:00:00Z') },
+      { id: 'a', sizeBytes: 88_887, createdAt: new Date('2026-08-05T14:41:00Z') },
+      { id: 'b', sizeBytes: 4_974, createdAt: new Date('2026-08-05T11:01:00Z') },
+      { id: 'e', sizeBytes: 88_887, createdAt: new Date('2026-08-05T14:41:00Z') },
+      { id: 'd', sizeBytes: 82_382, createdAt: new Date('2026-08-05T14:41:00Z') },
+    ];
+    expect(orderReferenceRows(rows).map((row) => row.id)).toEqual(['a', 'e', 'd', 'b', 'c']);
+  });
+});
+
+describe('lone LABEL_MISMATCH on a strong, agreeing match is not a contradiction', () => {
+  const base = (over: Partial<Parameters<typeof policyFromVlmResult>[0]>) => ({
+    verdict: 'MATCH' as const,
+    selectedSku: 'WATER',
+    visualSupport: 'STRONG' as const,
+    ocrSupport: 'STRONG' as const,
+    barcodeSupport: 'NONE' as const,
+    reasonCodes: [],
+    contradictions: ['LABEL_MISMATCH' as const],
+    requiresHumanReview: false,
+    ...over,
+  });
+
+  it('STRONG + agrees + only LABEL_MISMATCH → AUTO_PROPOSE with the discount noted', () => {
+    const policy = policyFromVlmResult(base({}), 'AUTO_PROPOSE', 'WATER');
+    expect(policy.result).toBe(FusionPolicyResult.AUTO_PROPOSE);
+    expect(policy.reason).toContain('catalog-name label mismatch ignored');
+    // ocrSupport is irrelevant to the discount.
+    expect(
+      policyFromVlmResult(base({ ocrSupport: 'NONE' }), 'NEEDS_VLM', 'WATER').result,
+    ).toBe(FusionPolicyResult.AUTO_PROPOSE);
+  });
+
+  it('MEDIUM visual support keeps the review', () => {
+    const policy = policyFromVlmResult(base({ visualSupport: 'MEDIUM' }), 'AUTO_PROPOSE', 'WATER');
+    expect(policy.result).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+    expect(policy.reason).toContain('LABEL_MISMATCH');
+  });
+
+  it('any additional contradiction keeps the review', () => {
+    const policy = policyFromVlmResult(
+      base({ contradictions: ['LABEL_MISMATCH', 'COLOR_MISMATCH'] }),
+      'AUTO_PROPOSE',
+      'WATER',
+    );
+    expect(policy.result).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+  });
+
+  it('a disagreement with fusion keeps the review', () => {
+    const policy = policyFromVlmResult(base({}), 'AUTO_PROPOSE', 'NESCAFE');
+    expect(policy.result).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+  });
+
+  it('requiresHumanReview keeps the review', () => {
+    const policy = policyFromVlmResult(base({ requiresHumanReview: true }), 'AUTO_PROPOSE', 'WATER');
+    expect(policy.result).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+  });
+});
+
+describe('identity verify retries once on a malformed answer', () => {
+  const ACTIVE: CatalogFixture = {
+    id: 'p-retry',
+    sku: 'RETRY-SKU',
+    name: 'Retry product',
+    status: ProductStatus.ACTIVE,
+    barcode: '6281000000099',
+  };
+  const invalid = () => ({
+    status: 'INVALID_SCHEMA' as const,
+    result: null,
+    modelKey: 'stub-vlm',
+    modelVersion: 'stub-vlm',
+    latencyMs: 1,
+    errorDetail: null,
+    rawPreview: null,
+  });
+  const good = () => ({
+    status: 'VERDICT' as const,
+    result: {
+      verdict: 'MATCH' as const,
+      selectedSku: ACTIVE.sku,
+      visualSupport: 'STRONG' as const,
+      ocrSupport: 'NONE' as const,
+      barcodeSupport: 'NONE' as const,
+      reasonCodes: [],
+      contradictions: [],
+      requiresHumanReview: false,
+    },
+    modelKey: 'stub-vlm',
+    modelVersion: 'stub-vlm',
+    latencyMs: 1,
+    errorDetail: null,
+    rawPreview: null,
+  });
+
+  it('fails then succeeds: two identical calls, retries=1, the second verdict decides', async () => {
+    const vlmVerify: jest.Mock = jest.fn().mockResolvedValueOnce(invalid()).mockResolvedValueOnce(good());
+    const { service, createdRuns } = buildService({
+      catalog: [ACTIVE],
+      barcodeSeen: 'none',
+      barcodeFormat: 'QR_CODE',
+      classicalSignals: [{ productId: ACTIVE.id, sku: ACTIVE.sku, score: 1 }],
+      config: { PICKUP_VLM_ENABLED: 'true' },
+      vlmVerify,
+    });
+    await service.run('tenant-1', 'asset-1');
+    expect(vlmVerify).toHaveBeenCalledTimes(2);
+    expect(vlmVerify.mock.calls[0][0]).toBe(vlmVerify.mock.calls[1][0]);
+    expect(vlmVerify.mock.calls[0][1]).toBe(vlmVerify.mock.calls[1][1]);
+    const { data } = createdRuns[0];
+    expect(data.evidence.vlm.retries).toBe(1);
+    expect(data.evidence.vlm.status).toBe('VERDICT');
+    expect(data.evidence.vlm.selectedSku).toBe(ACTIVE.sku);
+  });
+
+  it('fails twice: no third call, retries=1, classified failure routes to review', async () => {
+    const vlmVerify: jest.Mock = jest.fn().mockResolvedValue(invalid());
+    const { service, createdRuns } = buildService({
+      catalog: [ACTIVE],
+      barcodeSeen: 'none',
+      barcodeFormat: 'QR_CODE',
+      classicalSignals: [{ productId: ACTIVE.id, sku: ACTIVE.sku, score: 1 }],
+      config: { PICKUP_VLM_ENABLED: 'true' },
+      vlmVerify,
+    });
+    await service.run('tenant-1', 'asset-1');
+    expect(vlmVerify).toHaveBeenCalledTimes(2);
+    const { data } = createdRuns[0];
+    expect(data.evidence.vlm.retries).toBe(1);
+    expect(data.evidence.vlm.status).toBe('INVALID_SCHEMA');
+    expect(data.policy).toBe(FusionPolicyResult.NEEDS_HUMAN_REVIEW);
+  });
+
+  it('a clean first answer is never retried', async () => {
+    const vlmVerify: jest.Mock = jest.fn().mockResolvedValue(good());
+    const { service, createdRuns } = buildService({
+      catalog: [ACTIVE],
+      barcodeSeen: 'none',
+      barcodeFormat: 'QR_CODE',
+      classicalSignals: [{ productId: ACTIVE.id, sku: ACTIVE.sku, score: 1 }],
+      config: { PICKUP_VLM_ENABLED: 'true' },
+      vlmVerify,
+    });
+    await service.run('tenant-1', 'asset-1');
+    expect(vlmVerify).toHaveBeenCalledTimes(1);
+    expect(createdRuns[0].data.evidence.vlm.retries).toBe(0);
   });
 });

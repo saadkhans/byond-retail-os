@@ -18,6 +18,7 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
+import { PaymentRefund } from '@prisma/client';
 import {
   RequireModule,
   RequirePermissions,
@@ -36,6 +37,8 @@ import { CreatePaymentIntentDto } from './dto/create-payment-intent.dto';
 import { FailIntentDto } from './dto/fail-intent.dto';
 import { QueryCapturesDto } from './dto/query-captures.dto';
 import { QueryPaymentIntentsDto } from './dto/query-payment-intents.dto';
+import { QueryRefundsDto } from './dto/query-refunds.dto';
+import { RefundIntentDto } from './dto/refund-intent.dto';
 import {
   CaptureWithIntent,
   PaymentIntentDetail,
@@ -233,6 +236,55 @@ export class PaymentsController {
     return this.paymentsService.fail(tenantId, id, dto, {
       id: actor.userId,
       email: actor.email,
+    });
+  }
+
+  @Post('intents/:id/refund')
+  @HttpCode(HttpStatus.OK)
+  @RequirePermissions('payment:refund')
+  @ApiOperation({
+    summary: 'Refund money against a captured payment (simulated)',
+    description:
+      'Phase 27. Legal ONLY against a CAPTURED intent — every other terminal ' +
+      'state means no money was taken, so there is nothing to return. The ' +
+      'amount is bounded by what the intent captured, less anything already ' +
+      'refunded or in flight, and a duplicate request with the same ' +
+      'idempotencyKey never moves money twice. The request leaves through the ' +
+      'owned refund-gateway port; the only adapter is SIMULATED.',
+  })
+  @ApiOkResponse({ description: 'Refund recorded and settled (simulated)' })
+  @ApiNotFoundResponse({ description: 'Not found in this tenant' })
+  @ApiConflictResponse({
+    description: 'Intent never captured, ceiling exceeded, or key conflict',
+  })
+  refund(
+    @CurrentTenantId() tenantId: string,
+    @Param('id') id: string,
+    @Body() dto: RefundIntentDto,
+    @CurrentUser() actor: RequestContext,
+  ): Promise<PaymentRefund> {
+    return this.paymentsService.refund(tenantId, id, dto, {
+      id: actor.userId,
+      email: actor.email,
+    });
+  }
+
+  @Get('refunds')
+  @RequirePermissions('payment:read')
+  @ApiOperation({
+    summary: 'List refunds in the caller’s tenant',
+    description:
+      'Newest first with an id tie-breaker, paginated via skip/take. ' +
+      'Optionally filtered to one payment intent.',
+  })
+  listRefunds(
+    @CurrentTenantId() tenantId: string,
+    @Query() query: QueryRefundsDto,
+  ): Promise<{ items: PaymentRefund[]; total: number }> {
+    return this.paymentsService.listRefunds(tenantId, {
+      intentId: query.intentId,
+      skip: query.skip,
+      take: query.take,
     });
   }
 

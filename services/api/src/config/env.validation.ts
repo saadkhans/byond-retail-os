@@ -73,6 +73,81 @@ class EnvironmentVariables {
   @Min(1000)
   LOGIN_THROTTLE_WINDOW_MS?: number;
 
+  // ── Shopper throttle (Phase 35's @Public() routes) ───────────────────
+  // The same sliding window as the login throttle, applied to the only
+  // unauthenticated commerce surface. Every bucket is keyed on the CALLER
+  // (its IP, and for the visit routes a digest of whatever it presented) and
+  // never on whether what it sent was valid, so being throttled can never
+  // reveal that a credential was real. TRUST_PROXY governs how req.ip is
+  // derived here too: behind an untrusted proxy every shopper shares one
+  // bucket, which is why the defaults are sized for a storeful of phones.
+
+  // POST /shopper/session: redemption attempts per IP per window. The
+  // tightest limit — this is the credential-guessing surface. Default 30.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  SHOPPER_SESSION_THROTTLE_LIMIT?: number;
+
+  // GET /shopper/basket, POST /shopper/exit: requests per CREDENTIAL per
+  // window. The bucket a real shopper meets (the app polls its basket every
+  // few seconds). Default 60.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  SHOPPER_VISIT_THROTTLE_LIMIT?: number;
+
+  // The same two routes: requests per IP per window regardless of how many
+  // credentials are presented, so rotating them evades nothing. Default 600.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  SHOPPER_VISIT_IP_THROTTLE_LIMIT?: number;
+
+  // Sliding-window width for every shopper bucket. Default 60000.
+  @IsOptional()
+  @IsInt()
+  @Min(1000)
+  SHOPPER_THROTTLE_WINDOW_MS?: number;
+
+  // ── ESL queue runner (Phase 28 background drain) ─────────────────────
+  // The clock behind POST /esl/update-jobs/process and POST /esl/reconcile.
+  // Without it a price activation queues label pushes that nothing performs,
+  // and the shelf silently diverges from what checkout charges.
+
+  // Master switch. OFF by default — a deployment that drives the queue with
+  // an external scheduler leaves this unset. Same strict boolean idiom as
+  // PICKUP_DETECTION_ENABLED.
+  @IsOptional()
+  @Matches(/^(true|false)$/i, {
+    message: 'ESL_QUEUE_WORKER_ENABLED must be true or false',
+  })
+  ESL_QUEUE_WORKER_ENABLED?: string;
+
+  // Milliseconds between sweeps (default 15000; 1 s .. 1 h).
+  @IsOptional()
+  @IsInt()
+  @Min(1000)
+  @Max(3_600_000)
+  ESL_QUEUE_WORKER_INTERVAL_MS?: number;
+
+  // Jobs claimed per tenant per sweep (default 50). The ceiling is
+  // ESL_PROCESS_MAX_BATCH, which processBatch clamps to anyway.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  ESL_QUEUE_WORKER_BATCH_SIZE?: number;
+
+  // Milliseconds between drift-repair passes per tenant (default 900000 =
+  // 15 min; 1 min .. 24 h). Reconciliation reads every bound label and
+  // re-resolves its price, so it runs on a much slower clock than the drain.
+  @IsOptional()
+  @IsInt()
+  @Min(60_000)
+  @Max(86_400_000)
+  ESL_RECONCILE_INTERVAL_MS?: number;
+
   // Comma-separated list of browser origins allowed by CORS (the admin
   // web app). Default: the local Vite dev server. Never a wildcard.
   // No MinLength: deployments that materialize unset vars as CORS_ORIGINS=
@@ -204,6 +279,24 @@ class EnvironmentVariables {
   @Max(300_000)
   VIDEO_SCREENING_TIMEOUT_MS?: number;
 
+  // Bounded PARALLELISM of the recognizer (OCR) calls inside the mandatory
+  // pre-storage frame screen: how many decoded frames may be in
+  // recognition at once. The screen still inspects EVERY unique source
+  // frame — this changes only how many run side by side, never which
+  // frames are looked at. It exists because the recognizer is an external
+  // process that costs ~0.4 s per 1080p frame on a laptop-class CPU, so a
+  // 60 fps recorder clip (530 frames for 9 s) needs ~220 s sequentially
+  // against the 120 s enforceable deadline; at 6 the same clip screens in
+  // ~40 s. Each in-flight call holds one PNG frame (≤ the per-frame byte
+  // budget) and one child process, so size it to roughly cores / 3.
+  // Default 1 (sequential, the previous behaviour); bounds 1..16 so a
+  // deployment typo fails at boot instead of fork-bombing the host.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(16)
+  VIDEO_SCREENING_OCR_CONCURRENCY?: number;
+
   // ── Pickup detection / fusion (Phase 10 CV) ─────────────────────────
   // Every PICKUP_* key read through ConfigService is declared here so the
   // env contract is explicit and a deployment typo fails at boot. Note
@@ -315,6 +408,29 @@ class EnvironmentVariables {
   @Min(1000)
   @Max(600_000)
   PICKUP_VLM_TIMEOUT_MS?: number;
+
+  // Phase 25 — VLM EVENT VERIFICATION: before the identity stages run,
+  // the local VLM counts the product units in the touched shelf cell
+  // BEFORE and AFTER the hand motion. NONE (units unchanged, HIGH
+  // confidence) is a touch — no pickup is proposed and no identity work
+  // runs; REMOVED/ADDED fixes the event kind. Motion with no durable
+  // pixel change is also checked, so a clear bottle that left the shelf
+  // without tripping the pixel threshold can still become an event.
+  // Opt-in (strict true/false, default false); needs PICKUP_VLM_ENABLED
+  // with the local provider.
+  @IsOptional()
+  @Matches(/^(true|false)$/i, {
+    message: 'PICKUP_VLM_EVENT_CHECK must be true or false',
+  })
+  PICKUP_VLM_EVENT_CHECK?: string;
+
+  // Deadline for ONE event-count check (two small images). Default 60000;
+  // bounds 5 s .. 3 min so a typo cannot stall a run or abort a warm-up.
+  @IsOptional()
+  @IsInt()
+  @Min(5000)
+  @Max(180_000)
+  PICKUP_VLM_EVENT_CHECK_TIMEOUT_MS?: number;
 
   // Local (Ollama) verifier endpoint — the adapter itself refuses any
   // non-loopback URL, so no host validation is duplicated here.

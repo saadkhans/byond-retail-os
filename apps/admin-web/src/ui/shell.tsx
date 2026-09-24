@@ -1,10 +1,14 @@
 import { ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
-import { useAuth } from '../auth';
-import { CollapseIcon, GroupIcon, MenuIcon, MoonIcon, SignOutIcon, SunIcon, SystemIcon } from './icons';
-import { NAV_GROUPS } from './nav';
-import { PageTitleContext } from './primitives';
 import {
+  CollapseIcon,
+  GroupIcon,
+  MenuIcon,
+  MoonIcon,
+  PageTitleContext,
+  SignOutIcon,
+  SunIcon,
+  SystemIcon,
   THEME_OPTIONS,
   ThemePreference,
   applyThemePreference,
@@ -12,7 +16,9 @@ import {
   readThemePreference,
   writeSidebarCollapsed,
   writeThemePreference,
-} from './theme';
+} from '@byond/ui';
+import { useAuth } from '../auth';
+import { NAV_GROUPS } from './nav';
 
 export function ThemeSwitch() {
   const [preference, setPreference] = useState<ThemePreference>(() => readThemePreference());

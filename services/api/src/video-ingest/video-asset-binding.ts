@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
+import type { RackFrameRegion } from '@byond/shared';
 import { PlanogramRackStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -14,12 +15,8 @@ import { PrismaService } from '../prisma/prisma.service';
  * region is four clamped numbers.
  */
 
-export interface RackFrameRegion {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
+/** Declared in `@byond/shared` — the admin web binds the same rectangle. */
+export type { RackFrameRegion } from '@byond/shared';
 
 const RACK_CODE_PATTERN = /^[A-Z0-9][A-Z0-9_-]{0,31}$/;
 

@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -835,5 +835,846 @@ describe('cv same-tenant fk migration hardening', () => {
     // sandbox tenant) — a pair that can never exist in User(id, tenantId).
     expect(sql).not.toMatch(/REFERENCES "User"/);
     expect(sql).not.toMatch(/"createdById"/);
+  });
+});
+
+describe('store flow migration hardening', () => {
+  const migrationsDir = join(__dirname, '..', '..', 'prisma', 'migrations');
+  const sql = readFileSync(
+    join(migrationsDir, '20260916100000_phase26_store_loop', 'migration.sql'),
+    'utf8',
+  );
+  const schema = readFileSync(
+    join(__dirname, '..', '..', 'prisma', 'schema.prisma'),
+    'utf8',
+  );
+  // The hand-written statements are wrapped across lines for readability;
+  // compare against a whitespace-normalized copy so formatting is never
+  // load-bearing.
+  const flat = sql.replace(/\s+/g, ' ');
+
+  /** The column names one model declares in schema.prisma. */
+  const schemaColumns = (model: string): string[] => {
+    const body = schema.match(
+      new RegExp(`\\r?\\nmodel ${model} \\{\\r?\\n([\\s\\S]*?)\\r?\\n\\}`),
+    );
+    expect(body).not.toBeNull();
+    return body![1]
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(
+        (line) =>
+          line.length > 0 &&
+          !line.startsWith('//') &&
+          !line.startsWith('@@') &&
+          // Relation fields and list fields carry no column of their own.
+          !/^\w+\s+\w+(\[\])?\??\s+@relation/.test(line) &&
+          !/^\w+\s+\w+\[\]/.test(line),
+      )
+      .map((line) => line.split(/\s+/)[0])
+      .filter((name) => /^[a-z]/.test(name));
+  };
+
+  /** The column names one CREATE TABLE declares in the migration. */
+  const migrationColumns = (table: string): string[] => {
+    const body = sql.match(
+      new RegExp(`CREATE TABLE "${table}" \\(\\r?\\n([\\s\\S]*?)\\r?\\n\\);`),
+    );
+    expect(body).not.toBeNull();
+    return [...body![1].matchAll(/^ {4}"([A-Za-z0-9_]+)"/gm)].map(
+      (match) => match[1],
+    );
+  };
+
+  it('creates exactly the columns schema.prisma declares, for every new table', () => {
+    // This repo hand-writes migration SQL, so nothing else catches a column
+    // that exists in the Prisma model and not in the database.
+    for (const model of [
+      'Shopper',
+      'StoreEntryToken',
+      'StoreFlowPolicy',
+      'StoreFlowPolicyVersion',
+      'StoreFlowProjection',
+    ]) {
+      expect([model, migrationColumns(model).sort()]).toEqual([
+        model,
+        schemaColumns(model).sort(),
+      ]);
+    }
+  });
+
+  it('adds the four commerce columns a journey was missing, all back-compatible', () => {
+    // Every one is nullable or defaulted, so the migration cannot fail on a
+    // table that already has rows, and pre-Phase-26 journeys keep their shape.
+    expect(flat).toContain(
+      'ALTER TABLE "CustomerJourney" ADD COLUMN "checkoutSessionId" TEXT,',
+    );
+    expect(flat).toContain('ADD COLUMN "orderId" TEXT,');
+    expect(flat).toContain('ADD COLUMN "shopperId" TEXT;');
+    expect(flat).toContain(
+      'ADD COLUMN "settlementStatus" "StoreFlowSettlementStatus" NOT NULL DEFAULT \'NOT_STARTED\'',
+    );
+  });
+
+  it('ships the enum values the code depends on, and defaults to SHADOW', () => {
+    expect(sql).toContain(
+      `CREATE TYPE "StoreFlowAutonomyLevel" AS ENUM ('SHADOW', 'PROPOSE', 'AUTO_APPLY')`,
+    );
+    expect(sql).toContain(
+      `CREATE TYPE "StoreFlowProjectionOutcome" AS ENUM ('SKIPPED', 'PROPOSED', 'AUTO_APPLIED', 'REVIEW_REQUIRED', 'REJECTED')`,
+    );
+    expect(sql).toContain(
+      `CREATE TYPE "StoreFlowSettlementStatus" AS ENUM ('NOT_STARTED', 'BLOCKED_ON_REVIEW', 'ORDER_CREATED', 'PAID', 'FAILED')`,
+    );
+    expect(sql).toContain(
+      `CREATE TYPE "StoreEntryTokenStatus" AS ENUM ('ISSUED', 'REDEEMED', 'REVOKED')`,
+    );
+    // The default the Prisma schema promises has to be the database's too, or
+    // a row written outside the service could arrive already autonomous.
+    expect(sql).toContain(
+      `"autonomyLevel" "StoreFlowAutonomyLevel" NOT NULL DEFAULT 'SHADOW'`,
+    );
+    expect(sql).toContain(`"settleOnExit" BOOLEAN NOT NULL DEFAULT false`);
+    expect(sql).toContain(
+      `"requireInventoryValidation" BOOLEAN NOT NULL DEFAULT true`,
+    );
+  });
+
+  it('enforces same-tenant references with composite foreign keys', () => {
+    for (const [constraint, columns, parent] of [
+      ['CustomerJourney_shopper_same_tenant_fkey', '"shopperId", "tenantId"', 'Shopper'],
+      ['CustomerJourney_session_same_tenant_fkey', '"checkoutSessionId", "tenantId"', 'CheckoutSession'],
+      ['CustomerJourney_order_same_tenant_fkey', '"orderId", "tenantId"', 'Order'],
+      ['StoreEntryToken_location_same_tenant_fkey', '"locationId", "tenantId"', 'Location'],
+      ['StoreEntryToken_unit_same_tenant_fkey', '"unitId", "tenantId"', 'RetailUnit'],
+      ['StoreEntryToken_shopper_same_tenant_fkey', '"shopperId", "tenantId"', 'Shopper'],
+      ['StoreEntryToken_journey_same_tenant_fkey', '"redeemedJourneyId", "tenantId"', 'CustomerJourney'],
+      ['StoreFlowPolicy_location_same_tenant_fkey', '"locationId", "tenantId"', 'Location'],
+      ['StoreFlowPolicy_active_version_same_tenant_fkey', '"activeVersionId", "tenantId"', 'StoreFlowPolicyVersion'],
+      ['StoreFlowPolicyVersion_policy_same_tenant_fkey', '"policyId", "tenantId"', 'StoreFlowPolicy'],
+      ['StoreFlowProjection_journey_same_tenant_fkey', '"journeyId", "tenantId"', 'CustomerJourney'],
+      ['StoreFlowProjection_event_same_tenant_fkey', '"journeyEventId", "tenantId"', 'CustomerJourneyEvent'],
+      ['StoreFlowProjection_vision_event_same_tenant_fkey', '"visionEventId", "tenantId"', 'VisionEvent'],
+    ] as const) {
+      expect(flat).toContain(
+        `ADD CONSTRAINT "${constraint}" FOREIGN KEY (${columns}) REFERENCES "${parent}"("id", "tenantId")`,
+      );
+    }
+  });
+
+  it('never covers User references with composite FKs (platform-sandbox exception)', () => {
+    // Same reason as the CV migration: a platform admin acting in the sandbox
+    // tenant is a (platform user, sandbox tenant) pair that User(id, tenantId)
+    // can never hold.
+    expect(flat).not.toMatch(
+      /same_tenant_fkey" FOREIGN KEY \("(issuedById|createdById|userId)"/,
+    );
+  });
+
+  it('keeps at most one tenant-wide default policy per tenant', () => {
+    // Postgres treats NULLs as distinct, so the (tenantId, locationId) unique
+    // index alone would let a tenant collect several tenant-wide rows and
+    // resolve to an arbitrary one.
+    expect(flat).toContain(
+      'CREATE UNIQUE INDEX "StoreFlowPolicy_tenant_default_key" ON "StoreFlowPolicy"("tenantId") WHERE "locationId" IS NULL',
+    );
+  });
+
+  it('refuses to store anything but a SHA-256 digest for an entry credential', () => {
+    expect(flat).toContain(
+      `ADD CONSTRAINT "StoreEntryToken_token_hash_is_sha256" CHECK ("tokenHash" ~ '^[0-9a-f]{64}$')`,
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "StoreEntryToken_expiry_after_issue" CHECK ("expiresAt" > "createdAt")`,
+    );
+  });
+
+  it('keeps a credential status and its evidence together', () => {
+    expect(flat).toContain('"StoreEntryToken_status_evidence"');
+    for (const clause of [
+      `"status" = 'ISSUED' AND "redeemedAt" IS NULL AND "redeemedJourneyId" IS NULL AND "revokedAt" IS NULL`,
+      `"status" = 'REDEEMED' AND "redeemedAt" IS NOT NULL AND "redeemedJourneyId" IS NOT NULL AND "revokedAt" IS NULL`,
+      `"status" = 'REVOKED' AND "revokedAt" IS NOT NULL AND "redeemedAt" IS NULL AND "redeemedJourneyId" IS NULL`,
+    ]) {
+      expect(flat).toContain(clause);
+    }
+    // One credential can only ever open one journey.
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "StoreEntryToken_redeemedJourneyId_key" ON "StoreEntryToken"("redeemedJourneyId")',
+    );
+  });
+
+  it('makes a replayed projection impossible and its audit trail honest', () => {
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "StoreFlowProjection_tenantId_journeyEventId_key" ON "StoreFlowProjection"("tenantId", "journeyEventId")',
+    );
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "StoreFlowProjection_visionEventId_key" ON "StoreFlowProjection"("visionEventId")',
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "StoreFlowProjection_outcome_evidence" CHECK ( ( "outcome" IN ('PROPOSED', 'AUTO_APPLIED', 'REJECTED') AND "visionEventId" IS NOT NULL )`,
+    );
+  });
+
+  it('bounds the autonomy threshold and every recorded score to [0, 1]', () => {
+    expect(flat).toContain(
+      `ADD CONSTRAINT "StoreFlowPolicyVersion_confidence_in_range" CHECK ("autoApplyMinConfidence" >= 0 AND "autoApplyMinConfidence" <= 1)`,
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "StoreFlowPolicyVersion_version_number_positive" CHECK ("versionNumber" >= 1)`,
+    );
+    expect(flat).toContain('"StoreFlowProjection_confidence_in_range"');
+  });
+
+  it('never lets a settled journey lose the order it became', () => {
+    expect(flat).toContain(
+      `ADD CONSTRAINT "CustomerJourney_settlement_evidence" CHECK ( "settlementStatus" NOT IN ('ORDER_CREATED', 'PAID') OR "orderId" IS NOT NULL )`,
+    );
+  });
+});
+
+describe('store flow module backfill migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260916100001_store_flow_module_backfill',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('activates a pre-existing store-flow module row instead of leaving it inactive', () => {
+    expect(sql).toContain('ON CONFLICT ("code") DO UPDATE SET');
+    expect(sql).toContain('"isActive" = true');
+    expect(sql).not.toMatch(/DO UPDATE SET[^;]*"id"\s*=/);
+  });
+
+  it('is idempotent and never overwrites a tenant admin choice', () => {
+    expect(sql).toContain('ON CONFLICT ("tenantId", "moduleId") DO NOTHING');
+    expect(sql).not.toMatch(/ON CONFLICT \("tenantId", "moduleId"\) DO UPDATE/);
+  });
+
+  it('enables store-flow for every pre-existing tenant with deterministic ids', () => {
+    expect(sql).toContain(`'tm-' || md5(t."id" || ':store-flow')`);
+    expect(sql).toContain(`WHERE pm."code" = 'store-flow'`);
+  });
+
+  it('grants no autonomy on its own', () => {
+    // The backfill must not publish a policy: a store keeps observing until
+    // an operator opts it in, which is the whole safety story of the phase.
+    expect(sql).not.toContain('StoreFlowPolicy');
+    expect(sql).not.toContain('AUTO_APPLY');
+    expect(sql).not.toContain('PROPOSE');
+  });
+});
+
+describe('returns & reconciliation migration hardening', () => {
+  const migrationsDir = join(__dirname, '..', '..', 'prisma', 'migrations');
+  const sql = readFileSync(
+    join(
+      migrationsDir,
+      '20260916110000_phase27_returns_reconciliation',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+  // The hand-written statements are wrapped across lines for readability;
+  // compare against a whitespace-normalized copy so formatting is never
+  // load-bearing.
+  const flat = sql.replace(/\s+/g, ' ');
+
+  it('adds the two reverse-flow ledger movement types', () => {
+    // A return, a cancellation reversal and a shrink are ORDINARY movements —
+    // the enum is extended rather than a parallel stock table invented.
+    expect(sql).toContain(
+      `ALTER TYPE "InventoryMovementType" ADD VALUE 'RETURN_IN'`,
+    );
+    expect(sql).toContain(
+      `ALTER TYPE "InventoryMovementType" ADD VALUE 'SHRINK'`,
+    );
+  });
+
+  it('makes a restocked return line impossible without its ledger movement', () => {
+    // THE stock invariant, at the database level: there is no way to record
+    // goods going back on the shelf without the append-only movement that put
+    // them there.
+    expect(flat).toContain(
+      `ADD CONSTRAINT "OrderReturnLine_restock_has_movement" CHECK ("restocked" = false OR "movementId" IS NOT NULL)`,
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "OrderReturnLine_quantity_positive" CHECK ("quantity" > 0)`,
+    );
+  });
+
+  it('makes a cycle count incapable of becoming a second source of truth', () => {
+    // The variance must be DERIVED from the counted figure and the projection
+    // (never an arbitrary number), and a non-zero variance must cite the
+    // movement it became. Together: a count can only change stock by
+    // appending to the ledger.
+    expect(flat).toContain(
+      `ADD CONSTRAINT "CycleCountLine_variance_is_derived" CHECK ( "varianceQuantity" IS NULL OR "systemQuantity" IS NULL OR "varianceQuantity" = "countedQuantity" - "systemQuantity" )`,
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "CycleCountLine_variance_has_movement" CHECK ( "varianceQuantity" IS NULL OR "varianceQuantity" = 0 OR "movementId" IS NOT NULL )`,
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "CycleCountLine_counted_quantity_nonnegative" CHECK ("countedQuantity" >= 0)`,
+    );
+  });
+
+  it('never lets a count claim a status its evidence does not support', () => {
+    expect(flat).toContain('"CycleCount_status_evidence"');
+    for (const clause of [
+      `"status" = 'OPEN' AND "reconciledAt" IS NULL AND "cancelledAt" IS NULL`,
+      `"status" = 'RECONCILED' AND "reconciledAt" IS NOT NULL AND "cancelledAt" IS NULL`,
+      `"status" = 'CANCELLED' AND "cancelledAt" IS NOT NULL AND "reconciledAt" IS NULL`,
+    ]) {
+      expect(flat).toContain(clause);
+    }
+  });
+
+  it('bounds every refund by what was actually captured', () => {
+    // THE money invariant, at the database level: an intent can never report
+    // more refunded than it captured, and no refund is for nothing.
+    expect(flat).toContain(
+      `ADD CONSTRAINT "PaymentIntent_refund_within_capture" CHECK ("refundedAmountMinor" >= 0 AND "refundedAmountMinor" <= "capturedAmountMinor")`,
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "PaymentRefund_amount_positive" CHECK ("amountMinor" > 0)`,
+    );
+  });
+
+  it('makes a replayed refund impossible at the database level', () => {
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "PaymentRefund_tenantId_idempotencyKey_key" ON "PaymentRefund"("tenantId", "idempotencyKey")',
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "PaymentRefund_settlement_evidence" CHECK ( ("status" = 'PENDING' AND "settledAt" IS NULL) OR ("status" IN ('SUCCEEDED', 'FAILED') AND "settledAt" IS NOT NULL) )`,
+    );
+  });
+
+  it('makes a replayed return and a replayed write-off impossible too', () => {
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "OrderReturn_tenantId_reference_key" ON "OrderReturn"("tenantId", "reference")',
+    );
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "CycleCount_tenantId_reference_key" ON "CycleCount"("tenantId", "reference")',
+    );
+    // One observation can be written off exactly once.
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "ShrinkEvent_visionEventId_key" ON "ShrinkEvent"("visionEventId")',
+    );
+  });
+
+  it('keeps a return status and its money together', () => {
+    expect(flat).toContain(
+      `ADD CONSTRAINT "OrderReturn_refund_evidence" CHECK ( ("status" = 'RECORDED' AND "refundId" IS NULL) OR ("status" <> 'RECORDED' AND "refundId" IS NOT NULL) )`,
+    );
+  });
+
+  it('requires a CV-detected write-off to name the observation behind it', () => {
+    expect(flat).toContain(
+      `ADD CONSTRAINT "ShrinkEvent_cv_detected_has_observation" CHECK ("source" <> 'CV_DETECTED' OR "visionEventId" IS NOT NULL)`,
+    );
+    expect(flat).toContain(
+      `ADD CONSTRAINT "ShrinkEvent_quantity_positive" CHECK ("quantity" > 0)`,
+    );
+    // movementId is NOT NULL on the table itself: a shrink record can never
+    // exist without the ledger entry it claims to have produced.
+    expect(flat).toContain('"movementId" TEXT NOT NULL');
+  });
+
+  it('enforces same-tenant references with composite foreign keys', () => {
+    for (const [constraint, columns, parent] of [
+      ['PaymentRefund_intent_same_tenant_fkey', '"intentId", "tenantId"', 'PaymentIntent'],
+      ['PaymentRefund_capture_same_tenant_fkey', '"captureId", "tenantId"', 'PaymentCapture'],
+      ['OrderReturn_order_same_tenant_fkey', '"orderId", "tenantId"', 'Order'],
+      ['OrderReturn_refund_same_tenant_fkey', '"refundId", "tenantId"', 'PaymentRefund'],
+      ['OrderReturnLine_return_same_tenant_fkey', '"returnId", "tenantId"', 'OrderReturn'],
+      ['OrderReturnLine_order_line_same_tenant_fkey', '"orderLineId", "tenantId"', 'OrderLine'],
+      ['OrderReturnLine_product_same_tenant_fkey', '"productId", "tenantId"', 'Product'],
+      ['OrderReturnLine_movement_same_tenant_fkey', '"movementId", "tenantId"', 'InventoryMovement'],
+      ['CycleCount_location_same_tenant_fkey', '"locationId", "tenantId"', 'Location'],
+      ['CycleCountLine_count_same_tenant_fkey', '"cycleCountId", "tenantId"', 'CycleCount'],
+      ['CycleCountLine_product_same_tenant_fkey', '"productId", "tenantId"', 'Product'],
+      ['CycleCountLine_movement_same_tenant_fkey', '"movementId", "tenantId"', 'InventoryMovement'],
+      ['ShrinkEvent_location_same_tenant_fkey', '"locationId", "tenantId"', 'Location'],
+      ['ShrinkEvent_product_same_tenant_fkey', '"productId", "tenantId"', 'Product'],
+      ['ShrinkEvent_vision_event_same_tenant_fkey', '"visionEventId", "tenantId"', 'VisionEvent'],
+      ['ShrinkEvent_movement_same_tenant_fkey', '"movementId", "tenantId"', 'InventoryMovement'],
+    ] as const) {
+      expect(flat).toContain(
+        `ADD CONSTRAINT "${constraint}" FOREIGN KEY (${columns}) REFERENCES "${parent}"("id", "tenantId")`,
+      );
+    }
+  });
+
+  it('anchors the ledger composite FK with a (id, tenantId) unique index', () => {
+    // Without this, a decision record could cite another tenant's movement.
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "InventoryMovement_id_tenantId_key" ON "InventoryMovement"("id", "tenantId")',
+    );
+  });
+
+  it('never covers User references with composite FKs (platform-sandbox exception)', () => {
+    // A platform admin acting in the sandbox tenant is a (platform user,
+    // sandbox tenant) pair that User(id, tenantId) can never hold.
+    expect(flat).not.toMatch(
+      /same_tenant_fkey" FOREIGN KEY \("(createdById|recordedById|reconciledById)"/,
+    );
+  });
+
+  it('creates exactly the columns schema.prisma declares, for every new table', () => {
+    // This repo hand-writes migration SQL, so nothing else catches a column
+    // that exists in the Prisma model and not in the database. `\r?\n`
+    // throughout: the repo is checked out with core.autocrlf on Windows.
+    const schema = readFileSync(
+      join(__dirname, '..', '..', 'prisma', 'schema.prisma'),
+      'utf8',
+    );
+    const schemaColumns = (model: string): string[] => {
+      const body = schema.match(
+        new RegExp(
+          `\\r?\\nmodel ${model} \\{\\r?\\n([\\s\\S]*?)\\r?\\n\\}`,
+        ),
+      );
+      expect(body).not.toBeNull();
+      return body![1]
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(
+          (line) =>
+            line.length > 0 &&
+            !line.startsWith('//') &&
+            !line.startsWith('///') &&
+            !line.startsWith('@@') &&
+            !/^\w+\s+\w+(\[\])?\??\s+@relation/.test(line) &&
+            !/^\w+\s+\w+\[\]/.test(line),
+        )
+        .map((line) => line.split(/\s+/)[0])
+        .filter((name) => /^[a-z]/.test(name));
+    };
+    const migrationColumns = (table: string): string[] => {
+      const body = sql.match(
+        new RegExp(
+          `CREATE TABLE "${table}" \\(\\r?\\n([\\s\\S]*?)\\r?\\n\\);`,
+        ),
+      );
+      expect(body).not.toBeNull();
+      return [...body![1].matchAll(/^ {4}"([A-Za-z0-9_]+)"/gm)].map(
+        (match) => match[1],
+      );
+    };
+    for (const model of [
+      'PaymentRefund',
+      'OrderReturn',
+      'OrderReturnLine',
+      'CycleCount',
+      'CycleCountLine',
+      'ShrinkEvent',
+    ]) {
+      expect([model, migrationColumns(model).sort()]).toEqual([
+        model,
+        schemaColumns(model).sort(),
+      ]);
+    }
+  });
+
+  it('never cascades deletes into the reverse-flow tables', () => {
+    // A return, a count and a write-off are financial/stock history: removing
+    // a parent must FAIL, never silently erase the record of what happened.
+    expect(sql).not.toMatch(/ON DELETE (CASCADE|SET NULL)/);
+  });
+});
+
+describe('returns module backfill migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260916110001_returns_module_backfill',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('activates a pre-existing returns module row instead of leaving it inactive', () => {
+    expect(sql).toContain('ON CONFLICT ("code") DO UPDATE SET');
+    expect(sql).toContain('"isActive" = true');
+    expect(sql).not.toMatch(/DO UPDATE SET[^;]*"id"\s*=/);
+  });
+
+  it('is idempotent and never overwrites a tenant admin choice', () => {
+    expect(sql).toContain('ON CONFLICT ("tenantId", "moduleId") DO NOTHING');
+    expect(sql).not.toMatch(/ON CONFLICT \("tenantId", "moduleId"\) DO UPDATE/);
+  });
+
+  it('enables returns for every pre-existing tenant with deterministic ids', () => {
+    expect(sql).toContain(`'tm-' || md5(t."id" || ':returns')`);
+    expect(sql).toContain(`WHERE pm."code" = 'returns'`);
+  });
+
+  it('moves no stock and no money on its own', () => {
+    // A backfill enables routes. It must never write a movement, a refund or
+    // a return — the reverse flow only ever runs when an operator asks.
+    for (const table of [
+      'InventoryMovement',
+      'InventoryLevel',
+      'PaymentRefund',
+      'OrderReturn',
+      'CycleCount',
+      'ShrinkEvent',
+    ]) {
+      expect(sql).not.toContain(table);
+    }
+  });
+});
+
+describe('loyalty & promotions migration hardening', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260916130000_phase29_loyalty_promotions',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('makes the points ledger append-only at the database level', () => {
+    expect(sql).toContain(
+      'CREATE FUNCTION prevent_loyalty_point_movement_mutation()',
+    );
+    expect(sql).toContain('BEFORE UPDATE OR DELETE ON "LoyaltyPointMovement"');
+    expect(sql).toContain('BEFORE TRUNCATE ON "LoyaltyPointMovement"');
+  });
+
+  it('puts the balance floor on the row being written', () => {
+    expect(sql).toContain('CHECK ("balanceAfter" >= 0)');
+    expect(sql).toContain('CHECK ("points" <> 0)');
+    // Two concurrent redemptions that read the same tail collide here rather
+    // than both committing.
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "LoyaltyPointMovement_accountId_sequenceNumber_key"',
+    );
+  });
+
+  it('makes a points movement replayable exactly once per tenant', () => {
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "LoyaltyPointMovement_tenantId_idempotencyKey_key"',
+    );
+  });
+
+  it('keeps at most one ACTIVE version per promotion', () => {
+    expect(sql).toContain('CREATE UNIQUE INDEX "PromotionVersion_active_promotion_key"');
+    expect(sql).toContain("WHERE \"status\" = 'ACTIVE'");
+  });
+
+  it('keeps one rule per product and one catalog-wide rule per version', () => {
+    expect(sql).toContain('CREATE UNIQUE INDEX "PromotionRule_version_product_key"');
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "PromotionRule_version_catalog_wide_key"',
+    );
+  });
+
+  it('reserves one loyalty account per shopper, ready for the Shopper model', () => {
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "LoyaltyAccount_tenantId_shopperId_key"',
+    );
+    // Phase 29 landed the forward link as a bare column, because Shopper did
+    // not exist on its line of development. The reservation is the index; the
+    // foreign key arrives in its own migration, asserted below.
+    expect(sql).toMatch(/"shopperId" TEXT/);
+  });
+
+  it('MAKES A PROMOTION STRICTLY SUBTRACTIVE, at the database level', () => {
+    for (const table of ['CheckoutSessionLine', 'OrderLine']) {
+      expect(sql).toContain(`"${table}_promotion_subtractive"`);
+      expect(sql).toContain(`"${table}_promotion_needs_price_version"`);
+    }
+    expect(sql).toContain(
+      '"unitPriceMinor" = "basePriceMinor" - "promotionDiscountMinor"',
+    );
+    expect(sql).toContain('"promotionDiscountMinor" <= "basePriceMinor"');
+  });
+
+  it('NEVER TOUCHES A PRICE TABLE — promotions do not bypass price versioning', () => {
+    // A promotion composes on top of a price version. This migration may
+    // REFERENCE PriceBookVersion (a basket line names the version its base
+    // price came from) but must never alter, drop, or write one.
+    expect(sql).not.toMatch(/ALTER TABLE "PriceBook(Version|Entry)?"/);
+    expect(sql).not.toMatch(/DROP TABLE "PriceBook/);
+    expect(sql).not.toMatch(/UPDATE "PriceBook/);
+    expect(sql).not.toMatch(/INSERT INTO "PriceBook/);
+    expect(sql).not.toMatch(/DELETE FROM "PriceBook/);
+    // The only permitted mention outside a comment is as a foreign-key
+    // target: a basket/order line NAMES the version its base price came from.
+    for (const line of sql.split('\n')) {
+      if (!line.includes('"PriceBookVersion"')) continue;
+      if (line.trimStart().startsWith('--')) continue;
+      expect(line).toMatch(/REFERENCES "PriceBookVersion"/);
+    }
+  });
+
+  it('enforces same-tenant references with composite foreign keys', () => {
+    for (const constraint of [
+      'LoyaltyAccount_createdBy_same_tenant_fkey',
+      'LoyaltyPointMovement_account_same_tenant_fkey',
+      'LoyaltyPointMovement_order_same_tenant_fkey',
+      'LoyaltyPointMovement_promotionVersion_same_tenant_fkey',
+      'Promotion_location_same_tenant_fkey',
+      'Promotion_createdBy_same_tenant_fkey',
+      'PromotionVersion_promotion_same_tenant_fkey',
+      'PromotionVersion_superseded_same_tenant_fkey',
+      'PromotionVersion_rollback_same_tenant_fkey',
+      'PromotionRule_version_same_tenant_fkey',
+      'PromotionRule_product_same_tenant_fkey',
+      'CheckoutSession_loyaltyAccount_same_tenant_fkey',
+      'CheckoutSessionLine_priceVersion_same_tenant_fkey',
+      'CheckoutSessionLine_promotionVersion_same_tenant_fkey',
+      'OrderLine_priceVersion_same_tenant_fkey',
+      'OrderLine_promotionVersion_same_tenant_fkey',
+    ]) {
+      expect(sql).toContain(constraint);
+    }
+  });
+
+  it('cascades only from a promotion version into its own rules', () => {
+    // A rule has no meaning apart from its version, so it cascades. Nothing
+    // else does: no loyalty account, points movement, promotion, basket line
+    // or order line is ever removed by a delete somewhere else.
+    for (const line of sql.split('\n')) {
+      if (!line.includes('ON DELETE CASCADE')) continue;
+      expect(line).toMatch(/REFERENCES "PromotionVersion"/);
+    }
+  });
+
+  it('keeps promotion windows and rule values sane', () => {
+    expect(sql).toContain('"PromotionVersion_effective_window_ordered"');
+    expect(sql).toContain('"PromotionVersion_no_self_supersession"');
+    expect(sql).toContain('"PromotionVersion_no_self_rollback"');
+    expect(sql).toContain('"PromotionRule_value_positive"');
+    expect(sql).toContain('"PromotionRule_percent_off_basis_points"');
+  });
+});
+
+describe('loyalty module backfill migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260916130001_loyalty_module_backfill',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('force-activates the module row a pre-Phase-29 database already has', () => {
+    // `loyalty` shipped for many releases as an INACTIVE catalog name. A
+    // DO NOTHING upsert would leave isActive false and every /loyalty route
+    // would 403 behind ModuleEnabledGuard.
+    expect(sql).toContain('ON CONFLICT ("code") DO UPDATE SET');
+    expect(sql).toMatch(/"isActive" = true/);
+  });
+
+  it('enables it for existing tenants without overwriting an admin choice', () => {
+    expect(sql).toContain('INSERT INTO "TenantModule"');
+    expect(sql).toContain('ON CONFLICT ("tenantId", "moduleId") DO NOTHING');
+  });
+
+  it('uses deterministic ids so a re-run cannot race', () => {
+    expect(sql).toContain("md5(t.\"id\" || ':loyalty')");
+  });
+});
+
+describe('loyalty account -> shopper foreign key migration', () => {
+  // Phase 26 (Shopper) and Phase 29 (LoyaltyAccount) were built on separate
+  // branches, so the forward link could only be closed once both were in one
+  // tree. This is that one migration.
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260916140000_loyalty_account_shopper_fk',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+  const flat = sql.replace(/\s+/g, ' ');
+  // The prose above the statement explains what this migration deliberately
+  // does NOT do, so the "does nothing else" assertions below read the SQL
+  // with `--` comment lines stripped.
+  const statements = sql
+    .split(/\r?\n/)
+    .filter((line) => !line.trim().startsWith('--'))
+    .join('\n');
+
+  it('closes the forward link with a real foreign key to Shopper', () => {
+    // The inverse of what the Phase 29 migration could assert: the reference
+    // now exists.
+    expect(flat).toMatch(/REFERENCES "Shopper"/);
+  });
+
+  it('proves same-tenant membership, not mere existence', () => {
+    // A single-column FK would let a loyalty account cite another tenant's
+    // shopper. The composite form makes that unrepresentable.
+    expect(flat).toContain(
+      'ADD CONSTRAINT "LoyaltyAccount_shopper_same_tenant_fkey" FOREIGN KEY ("shopperId", "tenantId") REFERENCES "Shopper"("id", "tenantId")',
+    );
+    expect(flat).toContain('ON DELETE RESTRICT ON UPDATE CASCADE');
+  });
+
+  it('renames nothing, backfills nothing, and moves no data', () => {
+    // The Phase 29 author designed the column so that wiring it would be one
+    // ALTER TABLE. Anything else here would be a redesign in a merge.
+    expect(statements).not.toMatch(/RENAME/i);
+    expect(statements).not.toMatch(/\bUPDATE\s+"/i);
+    expect(statements).not.toMatch(/\bINSERT\s+INTO\b/i);
+    expect(statements).not.toMatch(/\bDROP\b/i);
+    // One statement: the constraint.
+    expect(
+      statements.split(';').filter((part) => part.trim().length > 0),
+    ).toHaveLength(1);
+  });
+});
+
+describe('procurement reference sequence migration', () => {
+  const sql = readFileSync(
+    join(
+      __dirname,
+      '..',
+      '..',
+      'prisma',
+      'migrations',
+      '20260917090000_procurement_reference_sequence',
+      'migration.sql',
+    ),
+    'utf8',
+  );
+
+  it('backfills both tables from the references that already exist', () => {
+    // Without the backfill an upgraded tenant's existing references would be
+    // invisible to the allocator (sequence NULL, or 0 everywhere), and the
+    // next order created would restart at 0001 straight into the
+    // (tenantId, reference) unique. The parser must match the canonical
+    // PREFIX-YYYY-NNNN shape exactly and read the capture group.
+    expect(sql).toContain('UPDATE "PurchaseOrder" SET');
+    expect(sql).toContain('UPDATE "GoodsReceipt" SET');
+    expect(sql).toContain(`'^PO-[0-9]{4}-([0-9]+)$'`);
+    expect(sql).toContain(`'^GR-[0-9]{4}-([0-9]+)$'`);
+    expect(sql).toContain(`'^PO-([0-9]{4})-[0-9]+$'`);
+    expect(sql).toContain(`'^GR-([0-9]{4})-[0-9]+$'`);
+  });
+
+  it('makes both columns mandatory only AFTER the backfill has run', () => {
+    // Adding them NOT NULL up front would fail on any table with rows; adding
+    // them with a default would silently give every historical order sequence
+    // 0. The order of these statements is the whole guarantee.
+    for (const table of ['PurchaseOrder', 'GoodsReceipt']) {
+      for (const column of ['referenceYear', 'referenceSequence']) {
+        const added = sql.indexOf(
+          `ALTER TABLE "${table}" ADD COLUMN "${column}" INTEGER;`,
+        );
+        const backfilled = sql.indexOf(`UPDATE "${table}" SET`);
+        const required = sql.indexOf(
+          `ALTER TABLE "${table}" ALTER COLUMN "${column}" SET NOT NULL;`,
+        );
+        expect(added).toBeGreaterThan(-1);
+        expect(backfilled).toBeGreaterThan(added);
+        expect(required).toBeGreaterThan(backfilled);
+      }
+    }
+  });
+
+  it('indexes the allocator lookup and never touches the reference column', () => {
+    expect(sql).toContain(
+      'CREATE INDEX "PurchaseOrder_tenantId_referenceYear_referenceSequence_idx" ON "PurchaseOrder"("tenantId", "referenceYear", "referenceSequence" DESC);',
+    );
+    expect(sql).toContain(
+      'CREATE INDEX "GoodsReceipt_tenantId_referenceYear_referenceSequence_idx" ON "GoodsReceipt"("tenantId", "referenceYear", "referenceSequence" DESC);',
+    );
+    // The human-facing reference is left exactly as issued: this migration
+    // adds an ordering, it does not renumber anybody's paperwork.
+    expect(sql).not.toMatch(/SET\s+"reference"\s*=/);
+    expect(sql).not.toMatch(/DROP COLUMN "reference"/);
+  });
+
+  it('keeps a sequence non-negative and a year plausible', () => {
+    expect(sql).toContain('PurchaseOrder_referenceSequence_nonneg_check');
+    expect(sql).toContain('GoodsReceipt_referenceSequence_nonneg_check');
+    expect(sql).toContain('PurchaseOrder_referenceYear_range_check');
+    expect(sql).toContain('GoodsReceipt_referenceYear_range_check');
+  });
+});
+
+describe('migration directory naming', () => {
+  const migrationsDir = join(__dirname, '..', '..', 'prisma', 'migrations');
+  const migrationNames = readdirSync(migrationsDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+
+  it('names every migration directory <14-digit timestamp>_<label>', () => {
+    const malformed = migrationNames.filter(
+      (name) => !/^\d{14}_[a-z0-9_]+$/.test(name),
+    );
+    expect(malformed).toEqual([]);
+  });
+
+  it('gives every migration a UNIQUE timestamp prefix', () => {
+    // Two migrations sharing a timestamp leaves Prisma to break the tie
+    // lexicographically on the label. That ordering is invisible, accidental,
+    // and unfixable once the names are recorded in `_prisma_migrations` —
+    // renaming a directory afterwards makes Prisma treat it as brand new.
+    // Phases 27/28 collided on 20260916110000/20260916110001 exactly this
+    // way; the ESL pair was renumbered to 20260916111000/20260916111001.
+    const byPrefix = new Map<string, string[]>();
+    for (const name of migrationNames) {
+      const prefix = name.slice(0, 14);
+      byPrefix.set(prefix, [...(byPrefix.get(prefix) ?? []), name]);
+    }
+
+    const collisions = [...byPrefix.entries()]
+      .filter(([, names]) => names.length > 1)
+      .map(([prefix, names]) => `${prefix} -> ${names.join(', ')}`);
+
+    expect(collisions).toEqual([]);
+  });
+
+  it('keeps every module backfill after the migration that creates its tables', () => {
+    // The ordering guarantee the timestamp collision was quietly relying on:
+    // a `*_module_backfill` INSERTs into tables an earlier migration created,
+    // so it must sort strictly later than every non-backfill migration that
+    // shares its phase.
+    const applied = [...migrationNames];
+    for (const backfill of applied.filter((name) =>
+      name.endsWith('_module_backfill'),
+    )) {
+      const sql = readFileSync(
+        join(migrationsDir, backfill, 'migration.sql'),
+        'utf8',
+      );
+      // Every backfill writes into PlatformModule/TenantModule, which the
+      // init migration created — so the only real requirement is that a
+      // backfill is never the first migration in the chain.
+      expect(sql).toMatch(/PlatformModule|TenantModule/);
+      expect(applied.indexOf(backfill)).toBeGreaterThan(0);
+    }
   });
 });

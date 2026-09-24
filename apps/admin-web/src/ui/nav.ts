@@ -4,35 +4,19 @@
  * absorbed pages (pickup validation → CV Evaluation tab) keep their old
  * routes as redirects (see App.tsx and nav.spec.ts).
  */
-export type NavIcon =
-  | 'overview'
-  | 'store'
-  | 'commerce'
-  | 'review'
-  | 'lab'
-  | 'camera'
-  | 'evaluation';
+import type { NavGroup, NavItem } from '@byond/ui';
 
-export interface NavItem {
-  to: string;
-  label: string;
-  /** `end` matching for the index route only. */
-  end?: boolean;
-}
-
-export interface NavGroup {
-  id: string;
-  label: string;
-  icon: NavIcon;
-  items: NavItem[];
-}
+export type { NavGroup, NavIcon, NavItem } from '@byond/ui';
 
 export const NAV_GROUPS: NavGroup[] = [
   {
     id: 'overview',
     label: 'Overview',
     icon: 'overview',
-    items: [{ to: '/', label: 'Dashboard', end: true }],
+    items: [
+      { to: '/', label: 'Dashboard', end: true },
+      { to: '/reports', label: 'Reports' },
+    ],
   },
   {
     id: 'store-operations',
@@ -44,6 +28,8 @@ export const NAV_GROUPS: NavGroup[] = [
       { to: '/devices', label: 'Devices' },
       { to: '/catalog', label: 'Catalog' },
       { to: '/inventory', label: 'Inventory' },
+      { to: '/esl', label: 'Shelf labels' },
+      { to: '/procurement', label: 'Procurement' },
     ],
   },
   {
@@ -51,11 +37,14 @@ export const NAV_GROUPS: NavGroup[] = [
     label: 'Commerce',
     icon: 'commerce',
     items: [
+      { to: '/pricing', label: 'Pricing' },
+      { to: '/loyalty', label: 'Loyalty & promotions' },
       { to: '/checkout-sessions', label: 'Checkout sessions' },
       { to: '/orders', label: 'Orders' },
       { to: '/payments', label: 'Payments' },
       { to: '/payment-events', label: 'Payment events' },
       { to: '/reconciliation', label: 'Reconciliation' },
+      { to: '/returns', label: 'Returns & reconciliation' },
     ],
   },
   {
@@ -63,6 +52,7 @@ export const NAV_GROUPS: NavGroup[] = [
     label: 'Vision review',
     icon: 'review',
     items: [
+      { to: '/store-flow', label: 'Store flow' },
       { to: '/review-queue', label: 'Review queue' },
       { to: '/journeys', label: 'Journeys' },
       { to: '/vision-events', label: 'CV events' },

@@ -4,17 +4,21 @@ import { AccessControlModule } from './access-control/access-control.module';
 import { AuthModule } from './auth/auth.module';
 import { CameraModule } from './camera/camera.module';
 import { CatalogModule } from './catalog/catalog.module';
+import { PricingModule } from './pricing/pricing.module';
+import { StoreFlowModule } from './store-flow/store-flow.module';
 import { CheckoutModule } from './checkout/checkout.module';
 import { RequestIdMiddleware } from './common/request-id.middleware';
 import { CvDatasetModule } from './cv-dataset/cv-dataset.module';
 import { CvEvaluationModule } from './cv-evaluation/cv-evaluation.module';
 import { validateEnv } from './config/env.validation';
 import { DevicesModule } from './devices/devices.module';
+import { EslModule } from './esl/esl.module';
 import { HealthModule } from './health/health.module';
 import { InferenceModule } from './inference/inference.module';
 import { InventoryModule } from './inventory/inventory.module';
 import { JourneyModule } from './journey/journey.module';
 import { LocationsModule } from './locations/locations.module';
+import { LoyaltyModule } from './loyalty/loyalty.module';
 import { OneSkuBootstrapModule } from './one-sku-bootstrap/one-sku-bootstrap.module';
 import { PlanogramModule } from './planogram/planogram.module';
 import { PretrainedVisionModule } from './pretrained-vision/pretrained-vision.module';
@@ -26,6 +30,10 @@ import { PlatformModulesModule } from './platform-modules/platform-modules.modul
 import { PickupDetectionModule } from './pickup-detection/pickup-detection.module';
 import { PickupFusionModule } from './pickup-fusion/pickup-fusion.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { ReportingModule } from './reporting/reporting.module';
+import { ReturnsModule } from './returns/returns.module';
+import { ProcurementModule } from './procurement/procurement.module';
+import { ShopperModule } from './shopper/shopper.module';
 import { TenantsModule } from './tenants/tenants.module';
 import { UnitsModule } from './units/units.module';
 import { UsersModule } from './users/users.module';
@@ -47,6 +55,7 @@ import { VisionModule } from './vision/vision.module';
     InventoryModule,
     UnitsModule,
     DevicesModule,
+    PricingModule,
     CheckoutModule,
     OrdersModule,
     PaymentsModule,
@@ -64,6 +73,13 @@ import { VisionModule } from './vision/vision.module';
     PlanogramModule,
     PretrainedVisionModule,
     ClipLabModule,
+    StoreFlowModule,
+    ReturnsModule,
+    EslModule,
+    LoyaltyModule,
+    ProcurementModule,
+    ReportingModule,
+    ShopperModule,
   ],
 })
 export class AppModule implements NestModule {

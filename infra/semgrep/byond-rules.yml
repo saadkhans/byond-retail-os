@@ -1,0 +1,68 @@
+# Semgrep rules for the hard rules in AGENTS.md and SECURITY.md.
+#
+# Only ERROR-severity rules gate CI (`semgrep scan --severity ERROR --error`).
+# WARNING rules are advisory: run `pnpm run security:scan -- --all-severities`
+# to see them. Keep ERROR rules high-precision — a rule that cries wolf gets
+# disabled, and then it protects nothing.
+rules:
+  - id: byond-no-raw-card-data-fields
+    languages: [typescript, javascript, json]
+    severity: ERROR
+    message: >-
+      Raw card data must never be stored or passed through this codebase.
+      SECURITY.md allows tokens and last-4 metadata only. If this is a
+      provider-token field, rename it so it cannot be mistaken for a PAN.
+    paths:
+      exclude:
+        # Tests that PROVE card data is rejected necessarily contain a
+        # sample PAN. Both naming conventions here end in "spec.ts".
+        - "**/*spec.ts"
+        - "services/api/test/**"
+        - "infra/semgrep/**"
+    pattern-regex: >-
+      \b(cardNumber|card_number|primaryAccountNumber|primary_account_number|fullPan|full_pan|cardCvv|cvv2|cvc2|track1Data|track2Data|trackData)\s*[:=]
+
+  - id: byond-no-card-data-in-logs
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: >-
+      Never write card-shaped values to a log sink. Logs are replicated,
+      shipped and retained; a PAN in a log is a PAN in a breach.
+    paths:
+      exclude:
+        - "**/*spec.ts"
+        - "services/api/test/**"
+    pattern-regex: >-
+      (console\.(log|info|warn|error|debug)|logger\.(log|info|warn|error|debug))\s*\([^)]*\b(cardNumber|cvv|cvc|pan|track2)\b
+
+  - id: byond-no-inline-secret-assignment
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: >-
+      Secrets come from the environment or a secrets manager, never from a
+      string literal in source — including in tests and fixtures.
+    paths:
+      exclude:
+        - "**/*.example*"
+        - "**/*spec.ts"
+        - "services/api/test/**"
+        - "infra/semgrep/**"
+    pattern-regex: >-
+      \b(JWT_SECRET|API_KEY|apiKey|privateKey|clientSecret|client_secret)\s*[:=]\s*['"][A-Za-z0-9+/_\-]{16,}['"]
+
+  - id: byond-tenant-scoped-query
+    languages: [typescript]
+    severity: WARNING
+    message: >-
+      Tenant-scoped reads must filter by tenantId at the data-access layer.
+      If this model is genuinely global (permissions, platform modules),
+      annotate the call so the intent is explicit.
+    paths:
+      include:
+        - "services/api/src/**/*.repository.ts"
+      exclude:
+        - "**/*spec.ts"
+    patterns:
+      - pattern: "$CLIENT.$MODEL.findMany({ where: { ... } })"
+      - pattern-not: "$CLIENT.$MODEL.findMany({ where: { ..., tenantId: ... } })"
+      - pattern-not: "$CLIENT.$MODEL.findMany({ where: { ..., tenant: ... } })"

@@ -1,0 +1,54 @@
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    # One pull request per ecosystem group keeps the review queue readable; a
+    # security update still arrives on its own, immediately.
+    groups:
+      nest:
+        patterns:
+          - "@nestjs/*"
+      prisma:
+        patterns:
+          - "prisma"
+          - "@prisma/*"
+      typescript-toolchain:
+        patterns:
+          - "typescript"
+          - "typescript-eslint"
+          - "eslint"
+          - "@eslint/*"
+          - "@types/*"
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "react-router-dom"
+          - "@vitejs/*"
+          - "vite"
+          - "vitest"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - ci
+
+  - package-ecosystem: docker
+    directory: /infra/docker
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - infra

@@ -52,11 +52,18 @@ import {
   PaymentsPage,
 } from './pages/PaymentsPage';
 import { PilotRunDetailPage } from './pages/PilotRunsPage';
+import { EslPage } from './pages/EslPage';
+import { LoyaltyPage } from './pages/LoyaltyPage';
+import { PricingPage } from './pages/PricingPage';
+import { StoreFlowPage } from './pages/StoreFlowPage';
+import { ProcurementPage } from './pages/ProcurementPage';
+import { ReportsPage } from './pages/ReportsPage';
 import {
   ReconciliationDetailPage,
   ReconciliationPage,
 } from './pages/ReconciliationPage';
 import { ReferenceLibraryPage } from './pages/ReferenceLibraryPage';
+import { ReturnsPage } from './pages/ReturnsPage';
 import { ReviewQueuePage } from './pages/ReviewQueuePage';
 import { StoreDetailPage, StoresPage } from './pages/StoresPage';
 import { UnitDetailPage, UnitsPage } from './pages/UnitsPage';
@@ -110,6 +117,13 @@ export function App() {
                       path="checkout-sessions/:id"
                       element={<CheckoutSessionDetailPage />}
                     />
+                    <Route path="pricing" element={<PricingPage />} />
+                    <Route path="store-flow" element={<StoreFlowPage />} />
+                    <Route path="returns" element={<ReturnsPage />} />
+                    <Route path="esl" element={<EslPage />} />
+                    <Route path="loyalty" element={<LoyaltyPage />} />
+                    <Route path="procurement" element={<ProcurementPage />} />
+                    <Route path="reports" element={<ReportsPage />} />
                     <Route path="orders" element={<OrdersPage />} />
                     <Route path="orders/:id" element={<OrderDetailPage />} />
                     <Route path="payments" element={<PaymentsPage />} />

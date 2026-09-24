@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import {
   CheckoutSession,
   CheckoutSessionLine,
@@ -34,6 +34,40 @@ import {
 } from '../inventory/inventory.repository';
 import { PrismaService } from '../prisma/prisma.service';
 import { TenantScopedRepository } from '../prisma/tenant-scoped.repository';
+import { computeBasketTotals } from '../pricing/pricing.logic';
+import {
+  LINE_PRICING_PORT,
+  LinePricingPort,
+  ResolvedLinePrice,
+} from './line-pricing.port';
+import {
+  LINE_PROMOTION_PORT,
+  LinePromotionPort,
+  PromotedLinePrice,
+} from './line-promotion.port';
+
+/**
+ * What a basket line records about money: the price version that produced the
+ * base, the promotion version (if any) that reduced it, and the final unit
+ * price the shopper pays. All null when the tenant has no pricing.
+ */
+interface LineMoney {
+  unitPriceMinor: number | null;
+  currencyCode: string | null;
+  priceBookVersionId: string | null;
+  basePriceMinor: number | null;
+  promotionVersionId: string | null;
+  promotionDiscountMinor: number | null;
+}
+
+const UNPRICED_LINE: LineMoney = {
+  unitPriceMinor: null,
+  currencyCode: null,
+  priceBookVersionId: null,
+  basePriceMinor: null,
+  promotionVersionId: null,
+  promotionDiscountMinor: null,
+};
 
 /** Read shape for session list responses (no lines — keep pages light). */
 export const SESSION_INCLUDE = {
@@ -151,6 +185,7 @@ export type CreateSessionRejection =
   | 'unit-location-mismatch'
   | 'device-not-found'
   | 'device-unit-mismatch'
+  | 'loyalty-account-not-found'
   | EvidenceRefRejection;
 
 export type StatusUpdateRejection = 'terminal-blocked' | 'transition-blocked';
@@ -170,7 +205,12 @@ export type CompletionRejection =
   | 'already-completed'
   | 'empty-session'
   | 'idempotency-key-conflict'
-  | 'total-quantity-overflow';
+  | 'total-quantity-overflow'
+  // The summed line totals exceed the INTEGER backing Order.subtotalMinor.
+  // Rejected BEFORE any write, like the quantity overflow above, so an
+  // implausibly large basket is a controlled 409 rather than a raw Prisma
+  // out-of-range 500.
+  | 'total-amount-overflow';
 
 /** A per-line inventory decrement failure that aborted the whole completion. */
 export interface CompletionStockFailure {
@@ -230,8 +270,95 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
     prisma: PrismaService,
     private readonly auditLog: AuditLogService,
     private readonly inventoryRepository: InventoryRepository,
+    /**
+     * Optional on purpose. A deployment without the pricing module — and
+     * every unit test written before Phase 25 — constructs this repository
+     * with three arguments and gets exactly the old behaviour: lines carry
+     * no price and orders carry no total. Pricing adds money to the basket;
+     * it never becomes a precondition for having one.
+     */
+    @Optional()
+    @Inject(LINE_PRICING_PORT)
+    private readonly linePricing?: LinePricingPort,
+    /**
+     * Also optional, and for the same reason. A deployment without the
+     * loyalty module — and every unit test written before Phase 29 —
+     * constructs this repository without it and gets exactly the Phase 28
+     * basket: base prices, and null promotion columns.
+     */
+    @Optional()
+    @Inject(LINE_PROMOTION_PORT)
+    private readonly linePromotion?: LinePromotionPort,
   ) {
     super(prisma);
+  }
+
+  /**
+   * Snapshots what a product costs onto a basket line, inside the caller's
+   * transaction.
+   *
+   * TWO STEPS, IN THIS ORDER, AND NEVER MERGED. Pricing resolves the price
+   * book version in force and returns an immutable answer; only THEN are
+   * promotions asked whether they reduce it. That ordering is what keeps the
+   * Phase 25 invariant intact: a promotion composes ON TOP of a price
+   * version, it takes no part in choosing one, and it never writes one.
+   *
+   * Snapshot, not reference: what the shopper was shown is what they pay,
+   * even if a new price version activates — or a promotion ends — while the
+   * basket is open. A null price (pricing absent, disabled, or no book
+   * covering the product) means UNPRICED, never free, and a promotion can
+   * never turn "unpriced" into a number: with no base there is nothing to
+   * subtract from. Completion then leaves the order total null, which is the
+   * pre-Phase-25 behaviour.
+   */
+  private async resolveLineMoney(
+    tx: Prisma.TransactionClient,
+    tenantId: string,
+    productId: string,
+    locationId: string,
+    loyaltyAccountId: string | null,
+  ): Promise<LineMoney> {
+    if (!this.linePricing) {
+      return UNPRICED_LINE;
+    }
+    const base: ResolvedLinePrice | null =
+      await this.linePricing.resolveForLine(tx, {
+        tenantId,
+        productId,
+        locationId,
+        at: new Date(),
+      });
+    if (!base) {
+      return UNPRICED_LINE;
+    }
+    const promoted: PromotedLinePrice | null = this.linePromotion
+      ? await this.linePromotion.resolveForLine(tx, {
+          tenantId,
+          productId,
+          locationId,
+          at: new Date(),
+          base,
+          loyaltyAccountId,
+        })
+      : null;
+    if (!promoted) {
+      return {
+        unitPriceMinor: base.unitPriceMinor,
+        currencyCode: base.currencyCode,
+        priceBookVersionId: base.priceBookVersionId,
+        basePriceMinor: base.unitPriceMinor,
+        promotionVersionId: null,
+        promotionDiscountMinor: null,
+      };
+    }
+    return {
+      unitPriceMinor: promoted.unitPriceMinor,
+      currencyCode: promoted.currencyCode,
+      priceBookVersionId: base.priceBookVersionId,
+      basePriceMinor: promoted.basePriceMinor,
+      promotionVersionId: promoted.promotionVersionId,
+      promotionDiscountMinor: promoted.discountMinor,
+    };
   }
 
   /**
@@ -246,6 +373,7 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
       locationId: string;
       unitId: string;
       deviceId?: string;
+      loyaltyAccountId?: string;
       idempotencyKey?: string;
       createdById?: string;
     },
@@ -327,6 +455,24 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
           return 'device-unit-mismatch' as const;
         }
       }
+      if (data.loyaltyAccountId) {
+        // Tenant-scoped, and ACTIVE: a suspended or closed member must not be
+        // bound to a basket, because binding one would imply member-only
+        // promotions that the resolver then correctly refuses to apply — a
+        // confusing half-state. The same-tenant composite FK in migration SQL
+        // is the backstop if this check were ever bypassed.
+        const account = await tx.loyaltyAccount.findFirst({
+          where: {
+            id: data.loyaltyAccountId,
+            tenantId: scopedTenantId,
+            status: 'ACTIVE',
+          },
+          select: { id: true },
+        });
+        if (!account) {
+          return 'loyalty-account-not-found' as const;
+        }
+      }
       const refRejection = await this.validateEvidenceRefs(
         tx,
         scopedTenantId,
@@ -343,6 +489,7 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
           locationId: data.locationId,
           unitId: data.unitId,
           deviceId: data.deviceId,
+          loyaltyAccountId: data.loyaltyAccountId,
           sourceType: data.sourceType,
           sourceId: data.sourceId,
           evidenceBundleId: data.evidenceBundleId,
@@ -488,7 +635,11 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
         return 'transition-blocked' as const;
       }
       const after = await tx.checkoutSession.update({
-        where: { id: before.id },
+        // Tenant IN the write predicate, not merely in the lookup above
+        // (AGENTS.md tenancy invariant; pinned by
+        // locations.repository.spec.ts and by the guard below in this file's
+        // spec).
+        where: { id_tenantId: { id: before.id, tenantId: scopedTenantId } },
         data: {
           status: target,
           endedAt: TERMINAL_ENDED_STATUSES.includes(target)
@@ -526,7 +677,16 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
       await this.lockSession(tx, scopedTenantId, sessionId);
       const session = await tx.checkoutSession.findFirst({
         where: { id: sessionId, tenantId: scopedTenantId },
-        select: { id: true, status: true, unitId: true, locationId: true },
+        select: {
+          id: true,
+          status: true,
+          unitId: true,
+          locationId: true,
+          // Membership is fixed when the session opens, so a promotion
+          // decision taken on a line can never be changed by identifying
+          // later. Null means "no member".
+          loyaltyAccountId: true,
+        },
       });
       if (!session) {
         return 'session-not-found' as const;
@@ -609,6 +769,15 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
           return claimRejection;
         }
       }
+      // Resolved under the product lock taken above, so neither the price nor
+      // the promotion can move between the read and the insert.
+      const money = await this.resolveLineMoney(
+        tx,
+        scopedTenantId,
+        product.id,
+        session.locationId,
+        session.loyaltyAccountId ?? null,
+      );
       const line = await tx.checkoutSessionLine.create({
         data: {
           tenantId: scopedTenantId,
@@ -620,6 +789,20 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
           productName: product.name,
           unitOfMeasure: product.unitOfMeasure,
           quantity: data.quantity,
+          // Money snapshot — all null when the tenant has no pricing, which
+          // is exactly the pre-Phase-25 shape. `unitPriceMinor` is what the
+          // shopper pays; the provenance columns say which price version and
+          // which promotion version produced it.
+          unitPriceMinor: money.unitPriceMinor,
+          lineTotalMinor:
+            money.unitPriceMinor === null
+              ? null
+              : money.unitPriceMinor * data.quantity,
+          currencyCode: money.currencyCode,
+          priceBookVersionId: money.priceBookVersionId,
+          basePriceMinor: money.basePriceMinor,
+          promotionVersionId: money.promotionVersionId,
+          promotionDiscountMinor: money.promotionDiscountMinor,
           sourceType: data.sourceType,
           sourceId: data.sourceId,
           evidenceBundleId: data.evidenceBundleId,
@@ -714,10 +897,19 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
           return claimRejection;
         }
       }
+      // A quantity change re-multiplies the SNAPSHOTTED unit price; it never
+      // re-resolves. Re-pricing an open basket because a new version
+      // activated mid-shop is exactly what the snapshot exists to prevent.
+      const quantityAfter = data.quantity ?? before.quantity;
+      const lineTotalMinor =
+        before.unitPriceMinor === null
+          ? null
+          : before.unitPriceMinor * quantityAfter;
       const after = await tx.checkoutSessionLine.update({
-        where: { id: before.id },
+        where: { id_tenantId: { id: before.id, tenantId: scopedTenantId } },
         data: {
           quantity: data.quantity,
+          lineTotalMinor,
           sourceType: data.sourceType,
           sourceId: data.sourceId,
           evidenceBundleId: data.evidenceBundleId,
@@ -768,7 +960,7 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
       // never resurrect an intentionally removed item. REMOVED lines are
       // excluded from the active basket and from completion.
       const removed = await tx.checkoutSessionLine.update({
-        where: { id: existing.id },
+        where: { id_tenantId: { id: existing.id, tenantId: scopedTenantId } },
         data: {
           status: CheckoutSessionLineStatus.REMOVED,
           removedAt: new Date(),
@@ -924,6 +1116,16 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
           return 'total-quantity-overflow' as const;
         }
 
+        // Money totals are derived from the price each line SNAPSHOTTED when
+        // it was added, never re-resolved at completion. All-or-nothing: a
+        // basket with any unpriced line, or with mixed currencies, completes
+        // with null totals exactly as it did before pricing existed, rather
+        // than with a total that quietly omits lines.
+        const totals = computeBasketTotals(session.lines);
+        if (totals && totals.subtotalMinor > PG_INT_MAX) {
+          return 'total-amount-overflow' as const;
+        }
+
         // The order row is created first so SALE movements can carry its id
         // as their referenceType/referenceId cause. CONFIRMED means
         // "inventory consumed" — it carries NO paid/captured semantics
@@ -939,6 +1141,9 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
             confirmedAt: now,
             placedAt: now,
             totalQuantity,
+            subtotalMinor: totals?.subtotalMinor ?? null,
+            totalMinor: totals?.totalMinor ?? null,
+            currencyCode: totals?.currencyCode ?? null,
             sourceType: session.sourceType,
             sourceId: session.sourceId,
             evidenceBundleId: session.evidenceBundleId,
@@ -1012,6 +1217,18 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
               productName: line.productName,
               unitOfMeasure: line.unitOfMeasure,
               quantity: line.quantity,
+              // Copied from the basket line, not re-resolved: an order line
+              // must always explain the amount the shopper was charged. The
+              // provenance columns travel with it, so an order placed today
+              // still names its price version and its promotion version years
+              // later — even after both have been superseded.
+              unitPriceMinor: line.unitPriceMinor,
+              lineTotalMinor: line.lineTotalMinor,
+              currencyCode: line.currencyCode,
+              priceBookVersionId: line.priceBookVersionId,
+              basePriceMinor: line.basePriceMinor,
+              promotionVersionId: line.promotionVersionId,
+              promotionDiscountMinor: line.promotionDiscountMinor,
               sourceType: line.sourceType,
               sourceId: line.sourceId,
               evidenceBundleId: line.evidenceBundleId,
@@ -1029,10 +1246,15 @@ export class CheckoutSessionsRepository extends TenantScopedRepository {
         }
 
         const after = await tx.checkoutSession.update({
-          where: { id: session.id },
+          where: {
+            id_tenantId: { id: session.id, tenantId: scopedTenantId },
+          },
           data: { status: CheckoutSessionStatus.COMPLETED, endedAt: now },
         });
 
+        // A read, and of a row created moments ago in this very transaction
+        // with `tenantId: scopedTenantId` — so the id alone is safe here in a
+        // way it is not for the writes above.
         const fullOrder = await tx.order.findUniqueOrThrow({
           where: { id: order.id },
           include: COMPLETION_ORDER_INCLUDE,

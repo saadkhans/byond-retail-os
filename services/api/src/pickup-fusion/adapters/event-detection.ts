@@ -354,6 +354,12 @@ export class ClassicalMotionEventDetector implements PickupEventDetector {
         events: [],
         tracks: await this.buildTracks(frames, preBackground, geometry),
         warnings: [...warnings, 'CAMERA_MOTION_SUSPECTED'],
+        motionWindow: {
+          startMs: Math.round(window.eventStartMs),
+          peakMs: Math.round(window.eventPeakMs),
+          endMs: Math.round(window.eventEndMs),
+        },
+        localizedArea,
       };
     }
     let regions = connectedRegions(mask, geometry, MIN_REGION_PIXELS);
@@ -370,29 +376,58 @@ export class ClassicalMotionEventDetector implements PickupEventDetector {
         warnings.push('LOCALIZED_REGION_FILTERED');
       }
     }
-    if (regions.length === 0 && localizedArea !== null) {
-      // The fallback knows WHERE the hand moved: look for a subtler
-      // durable change confined to that cell neighbourhood (a transparent
-      // bottle on a bright shelf leaves a low-contrast footprint).
-      regions = connectedRegions(
-        changedMask(
-          preBackground,
-          postBackground,
+    const motionWindow = {
+      startMs: Math.round(window.eventStartMs),
+      peakMs: Math.round(window.eventPeakMs),
+      endMs: Math.round(window.eventEndMs),
+    };
+    // The cell neighbourhood the relaxed search (and any caller-side
+    // before/after check) is confined to. In fallback mode it is where the
+    // fallback located the hand; in the STRICT path it is derived the same
+    // way from the strict window's motion peak — previously the strict
+    // path had no relaxed pass at all, so a clear bottle on a bright
+    // shelf whose removal changed fewer than PIXEL_THRESHOLD levels was
+    // reported as NO_DURABLE_CHANGE even though the hand motion was
+    // plainly seen (batch-1 water pickups a1_02/a1_04).
+    let searchArea: BoundingBox | null = localizedArea;
+    if (regions.length === 0) {
+      if (searchArea === null) {
+        const localized = localizedMotionTimeline(frames, geometry);
+        const peakCell = localized.peakCells[window.peakIndex];
+        searchArea = peakCell ? cellBox(peakCell, geometry) : null;
+      }
+      if (searchArea !== null) {
+        // Look for a subtler durable change confined to that cell
+        // neighbourhood (a transparent bottle on a bright shelf leaves a
+        // low-contrast footprint).
+        regions = connectedRegions(
+          changedMask(
+            preBackground,
+            postBackground,
+            geometry,
+            LOCALIZED_PIXEL_THRESHOLD,
+            searchArea,
+          ),
           geometry,
-          LOCALIZED_PIXEL_THRESHOLD,
-          localizedArea,
-        ),
-        geometry,
-        MIN_REGION_PIXELS,
-      );
-      if (regions.length > 0) {
-        warnings.push('LOCALIZED_REGION_RELAXED');
+          MIN_REGION_PIXELS,
+        );
+        if (regions.length > 0) {
+          warnings.push('LOCALIZED_REGION_RELAXED');
+        }
       }
     }
     if (regions.length === 0) {
       // Motion happened, nothing changed durably — a sweep over an empty
-      // shelf (or a pickup immediately returned).
-      return { events: [], tracks, warnings: [...warnings, 'NO_DURABLE_CHANGE'] };
+      // shelf, a touch, or a pickup immediately returned. The window and
+      // the searched cell are still reported so a caller can ask a
+      // before/after question about that cell.
+      return {
+        events: [],
+        tracks,
+        warnings: [...warnings, 'NO_DURABLE_CHANGE'],
+        motionWindow,
+        localizedArea: searchArea,
+      };
     }
     if (regions.length > 1 && localizedArea !== null) {
       // Fallback mode only: the primary event (crop, VLM, kind) must be the
@@ -425,7 +460,7 @@ export class ClassicalMotionEventDetector implements PickupEventDetector {
         box,
       } as PickupEventProposal;
     });
-    return { events, tracks, warnings };
+    return { events, tracks, warnings, motionWindow, localizedArea: searchArea };
   }
 
   private async buildTracks(

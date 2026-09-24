@@ -559,3 +559,66 @@ describe('fusion-v2 scenarios', () => {
     expect(different).toBeLessThan(same - 0.2);
   });
 });
+
+// Phase 25 — what the detector REPORTS when motion leaves no durable
+// change, and the relaxed pass in the STRICT-window branch.
+describe('event detection: motion window exposure and strict-window relaxed pass (Phase 25)', () => {
+  function faintClip(): AnalysisFrame[] {
+    // Product A painted FLAT gray 122 over the 95/150 stripe texture: every
+    // pixel differs from the background by 27..28 levels — under the strict
+    // threshold of 40, over the relaxed 20. The hand still produces a clear
+    // frame-wide motion window.
+    const buffers: Buffer[] = [];
+    const scene = (present: boolean, handX: number | null) => {
+      const frame = texturedScene();
+      if (present) paint(frame, BOX_A, [122, 122, 122]);
+      if (handX !== null) paint(frame, { x: handX, y: 8, width: 7, height: 14 }, [250, 240, 230]);
+      return frame;
+    };
+    for (let i = 0; i < 6; i += 1) buffers.push(scene(true, null));
+    buffers.push(scene(true, 38));
+    buffers.push(scene(true, 20));
+    buffers.push(scene(false, 8));
+    buffers.push(scene(false, 30));
+    for (let i = 0; i < 6; i += 1) buffers.push(scene(false, null));
+    return toFrames(buffers);
+  }
+
+  it('a hand sweep with no durable change still reports the motion window and the searched cell', async () => {
+    const detection = await buildDetector().detect(clip({ handSweepOnly: true }), GEOMETRY, SOURCE);
+    expect(detection.events).toHaveLength(0);
+    expect(detection.warnings).toContain('NO_DURABLE_CHANGE');
+    expect(detection.motionWindow).not.toBeNull();
+    expect(detection.motionWindow!.startMs).toBeLessThanOrEqual(detection.motionWindow!.peakMs);
+    expect(detection.motionWindow!.peakMs).toBeLessThanOrEqual(detection.motionWindow!.endMs);
+    expect(detection.localizedArea).not.toBeNull();
+    expect(detection.localizedArea!.width).toBeGreaterThan(0);
+    expect(detection.localizedArea!.height).toBeGreaterThan(0);
+  });
+
+  it('a low-contrast removal (below the strict threshold) becomes an event through the relaxed pass in the strict-window branch', async () => {
+    const detection = await buildDetector().detect(faintClip(), GEOMETRY, SOURCE);
+    expect(detection.warnings).not.toContain('LOCALIZED_MOTION_FALLBACK');
+    expect(detection.warnings).toContain('LOCALIZED_REGION_RELAXED');
+    expect(detection.events.length).toBeGreaterThanOrEqual(1);
+    // The event box sits where the faint product stood. (Its PICKUP/RETURN
+    // kind is the surround-contrast discriminator's call, which a flat
+    // gray patch on a striped texture does not exercise — the Phase 25
+    // count check is what settles the kind for such low-contrast events.)
+    expect(detection.events[0].box.x).toBeLessThanOrEqual(BOX_A.x + BOX_A.width);
+    expect(detection.events[0].box.x + detection.events[0].box.width).toBeGreaterThanOrEqual(BOX_A.x);
+    expect(detection.motionWindow).not.toBeNull();
+    expect(detection.localizedArea).not.toBeNull();
+  });
+
+  it('a clean pickup keeps its window and reports no relaxed pass', async () => {
+    const detection = await buildDetector().detect(clip({ removeA: true }), GEOMETRY, SOURCE);
+    expect(detection.events).toHaveLength(1);
+    expect(detection.warnings).not.toContain('LOCALIZED_REGION_RELAXED');
+    expect(detection.motionWindow).toMatchObject({
+      startMs: detection.events[0].startMs,
+      peakMs: detection.events[0].peakMs,
+      endMs: detection.events[0].endMs,
+    });
+  });
+});

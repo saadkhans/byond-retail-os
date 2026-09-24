@@ -180,19 +180,19 @@ describe('fusion-weighting — planogram signal', () => {
     { productId: 'CHIPS', sku: 'CHIPS' },
   ];
 
-  it('scores the event cell 1.0, the rest of the rack 0.6, off-rack 0', () => {
+  it('scores the event cell 1.0, the rest of the rack 0.8, off-rack 0', () => {
     const { signals, cellCode } = planogramSignalsFor(candidates, rack, { x: 0.25, y: 0.75 });
     expect(cellCode).toBe('B1');
     const bySku = new Map(signals.map((row) => [row.sku, row]));
     expect(bySku.get('WATER')).toMatchObject({ score: 1, detail: 'planogram:cell(B1)' });
-    expect(bySku.get('CAN')).toMatchObject({ score: 0.6, detail: 'planogram:rack' });
+    expect(bySku.get('CAN')).toMatchObject({ score: 0.8, detail: 'planogram:rack' });
     expect(bySku.get('CHIPS')).toMatchObject({ score: 0, detail: 'planogram:off-rack' });
   });
 
   it('without a rack point every rack SKU scores at rack level', () => {
     const { signals, cellCode } = planogramSignalsFor(candidates, rack, null);
     expect(cellCode).toBeNull();
-    expect(signals.map((row) => row.score)).toEqual([0.6, 0.6, 0]);
+    expect(signals.map((row) => row.score)).toEqual([0.8, 0.8, 0]);
   });
 
   it('maps the analysis-frame point through the rack frame region and rejects off-rack points', () => {

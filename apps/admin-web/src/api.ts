@@ -5,6 +5,63 @@
  * - The access token is a Bearer header, kept in localStorage. It is never
  *   embedded in URLs and never logged.
  */
+
+/**
+ * The domain contract lives in `@byond/shared`: the wire vocabularies
+ * (status/type unions plus their value lists), the paginated list
+ * envelope, the normalized rack rectangle and the Clip Lab report are
+ * declared ONCE there and spoken by `services/api` too, so this client
+ * cannot drift from the API. Re-exported so pages keep importing every
+ * contract type from '../api'.
+ */
+export * from '@byond/shared';
+import type {
+  CalibrationReadinessLevel,
+  CameraCalibrationMount,
+  CameraCalibrationOrientation,
+  CameraCalibrationProfileStatus,
+  CameraCalibrationZoneType,
+  CameraSourceStatus,
+  CameraSourceType,
+  CheckoutSessionStatus,
+  CvDatasetCandidateSourceType,
+  CvDatasetEligibility,
+  CvDatasetPurpose,
+  CvDatasetReadiness,
+  CvDatasetRunStatus,
+  CvDatasetSplit,
+  CvTestProtocolStatus,
+  CvTestScenario,
+  CvTestScenarioResult,
+  CvTestScenarioType,
+  GroundTruthEventKind,
+  InferenceJobStatus,
+  InferenceJobType,
+  JourneyDecision,
+  JourneyEventType,
+  JourneyReviewDecision,
+  LiveSessionStatus,
+  OneSkuCropWarning,
+  OrderPaymentStatus,
+  OrderStatus,
+  PaymentCaptureStatus,
+  PaymentEventStatus,
+  PaymentEventType,
+  PaymentProvider,
+  PaymentStatus,
+  PilotEvaluationStatus,
+  PilotExpectedAction,
+  PilotRunStatus,
+  PilotVerdict,
+  RackFrameRegion,
+  ReconciliationStatus,
+  VideoArtifactType,
+  VideoAssetStatus,
+  VideoCropReason,
+  VisionEventStatus,
+  VisionEventType,
+} from '@byond/shared';
+
 const API_BASE_URL = (
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000'
 ).replace(/\/+$/, '');
@@ -147,14 +204,6 @@ export async function apiObjectUrl(path: string): Promise<string | null> {
   return URL.createObjectURL(await response.blob());
 }
 
-/** Standard paginated list envelope used by the search endpoints. */
-export interface Paginated<T> {
-  items: T[];
-  total: number;
-  skip: number;
-  take: number;
-}
-
 export interface Store {
   id: string;
   name: string;
@@ -215,6 +264,287 @@ export interface Product {
   barcodes?: { value: string }[];
 }
 
+/* ---------------------------------------------------------------- */
+/* Pricing (Phase 25)                                                 */
+/* ---------------------------------------------------------------- */
+
+export type PriceBookStatus = 'ACTIVE' | 'ARCHIVED';
+
+export type PriceBookVersionStatus =
+  | 'DRAFT'
+  | 'ACTIVE'
+  | 'SUPERSEDED'
+  | 'ARCHIVED';
+
+export type PriceChangeReason =
+  | 'INITIAL'
+  | 'PRICE_CHANGE'
+  | 'PROMOTION_BASE'
+  | 'CORRECTION'
+  | 'ROLLBACK';
+
+export interface PriceBookVersion {
+  id: string;
+  priceBookId: string;
+  versionNumber: number;
+  status: PriceBookVersionStatus;
+  effectiveFrom: string;
+  effectiveTo: string | null;
+  reason: PriceChangeReason;
+  note: string | null;
+  activatedAt: string | null;
+  supersededByVersionId: string | null;
+  rolledBackFromVersionId: string | null;
+  createdAt: string;
+}
+
+export interface PriceBook {
+  id: string;
+  code: string;
+  name: string;
+  currencyCode: string;
+  locationId: string | null;
+  status: PriceBookStatus;
+  createdAt: string;
+  location?: { id: string; code: string; name: string } | null;
+  versions?: PriceBookVersion[];
+}
+
+export interface PriceBookEntry {
+  id: string;
+  productId: string;
+  unitPriceMinor: number;
+  currencyCode: string;
+  product: { id: string; sku: string; name: string };
+}
+
+export interface ResolvedPrice {
+  unitPriceMinor: number;
+  currencyCode: string;
+  priceBookId: string;
+  priceBookVersionId: string;
+}
+
+/* ---------------------------------------------------------------- */
+/* Loyalty & promotions (Phase 29)                                    */
+/*                                                                    */
+/* A promotion NEVER rewrites a price version. It composes on top of  */
+/* one, and a quote reports both halves so any price a shopper pays   */
+/* names exactly one price version and at most one promotion version. */
+/* ---------------------------------------------------------------- */
+
+export type LoyaltyAccountStatus = 'ACTIVE' | 'SUSPENDED' | 'CLOSED';
+
+export type LoyaltyPointMovementType =
+  | 'ACCRUAL'
+  | 'REDEMPTION'
+  | 'ADJUSTMENT'
+  | 'EXPIRY'
+  | 'REVERSAL';
+
+export interface LoyaltyAccount {
+  id: string;
+  memberCode: string;
+  displayName: string | null;
+  status: LoyaltyAccountStatus;
+  enrolledAt: string;
+  createdAt: string;
+}
+
+/** An account plus its DERIVED balance — there is no balance column. */
+export interface LoyaltyAccountWithBalance {
+  account: LoyaltyAccount;
+  pointsBalance: number;
+  movementCount: number;
+}
+
+export interface LoyaltyPointMovement {
+  id: string;
+  accountId: string;
+  sequenceNumber: number;
+  type: LoyaltyPointMovementType;
+  /** Signed: accruals positive, redemptions negative. */
+  points: number;
+  balanceAfter: number;
+  reasonCode: string;
+  note: string | null;
+  orderId: string | null;
+  createdAt: string;
+}
+
+export interface PointMovementResult {
+  movement: LoyaltyPointMovement;
+  pointsBalance: number;
+  /** True when the idempotency key replayed an earlier append. */
+  replayed: boolean;
+}
+
+export type PromotionStatus = 'ACTIVE' | 'ARCHIVED';
+
+export type PromotionVersionStatus =
+  | 'DRAFT'
+  | 'ACTIVE'
+  | 'SUPERSEDED'
+  | 'ARCHIVED';
+
+export type PromotionAudience = 'ALL_SHOPPERS' | 'LOYALTY_MEMBERS';
+
+export type PromotionRuleKind =
+  | 'PERCENT_OFF'
+  | 'AMOUNT_OFF'
+  | 'FIXED_UNIT_PRICE';
+
+export type PromotionChangeReason =
+  | 'INITIAL'
+  | 'RULE_CHANGE'
+  | 'CORRECTION'
+  | 'ROLLBACK';
+
+export interface PromotionVersion {
+  id: string;
+  promotionId: string;
+  versionNumber: number;
+  status: PromotionVersionStatus;
+  effectiveFrom: string;
+  effectiveTo: string | null;
+  reason: PromotionChangeReason;
+  note: string | null;
+  activatedAt: string | null;
+  supersededByVersionId: string | null;
+  rolledBackFromVersionId: string | null;
+  createdAt: string;
+}
+
+export interface Promotion {
+  id: string;
+  code: string;
+  name: string;
+  status: PromotionStatus;
+  audience: PromotionAudience;
+  locationId: string | null;
+  priority: number;
+  createdAt: string;
+  location?: { id: string; code: string; name: string } | null;
+  versions?: PromotionVersion[];
+}
+
+export interface PromotionRule {
+  id: string;
+  versionId: string;
+  productId: string | null;
+  kind: PromotionRuleKind;
+  value: number;
+  maxDiscountMinor: number | null;
+  product?: { id: string; sku: string; name: string } | null;
+}
+
+export interface PromotionOutcome {
+  promotionId: string;
+  promotionVersionId: string;
+  ruleId: string;
+  kind: PromotionRuleKind;
+  discountMinor: number;
+  finalUnitPriceMinor: number;
+}
+
+/** The explained price: which version, which promotion, what is paid. */
+export interface PriceQuote {
+  productId: string;
+  currencyCode: string;
+  basePriceMinor: number;
+  priceBookId: string;
+  priceBookVersionId: string;
+  promotion: PromotionOutcome | null;
+  unitPriceMinor: number;
+}
+
+/* ---------------------------------------------------------------- */
+/* Electronic shelf labels (Phase 28)                                 */
+/* ---------------------------------------------------------------- */
+
+export type EslGatewayStatus =
+  | 'PENDING'
+  | 'ACTIVE'
+  | 'DISABLED'
+  | 'UNREACHABLE';
+
+export type EslLabelStatus = 'UNBOUND' | 'BOUND' | 'RETIRED';
+
+export type EslUpdateJobStatus =
+  | 'QUEUED'
+  | 'RUNNING'
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'CANCELLED';
+
+export type EslUpdateTrigger =
+  | 'PRICE_ACTIVATION'
+  | 'MANUAL_RERENDER'
+  | 'LABEL_BOUND'
+  | 'RECONCILIATION';
+
+export interface EslGateway {
+  id: string;
+  code: string;
+  name: string;
+  vendorCode: string;
+  locationId: string;
+  status: EslGatewayStatus;
+  /** Never the credential itself — only whether one is configured. */
+  credentialRef: string | null;
+  lastSeenAt: string | null;
+  createdAt: string;
+  location?: { id: string; code: string; name: string } | null;
+  _count?: { labels: number };
+}
+
+export interface EslLabel {
+  id: string;
+  gatewayId: string;
+  vendorLabelId: string;
+  productId: string | null;
+  cellAssignmentId: string | null;
+  status: EslLabelStatus;
+  batteryPercent: number | null;
+  signalPercent: number | null;
+  lastRenderedAt: string | null;
+  renderedVersionId: string | null;
+  renderedContentHash: string | null;
+  gateway?: {
+    id: string;
+    code: string;
+    vendorCode: string;
+    status: EslGatewayStatus;
+  } | null;
+  product?: { id: string; sku: string; name: string } | null;
+  cellAssignment?: { id: string; cellCode: string; rackId: string } | null;
+}
+
+export interface EslUpdateJob {
+  id: string;
+  labelId: string;
+  gatewayId: string;
+  trigger: EslUpdateTrigger;
+  priceBookVersionId: string | null;
+  status: EslUpdateJobStatus;
+  attempts: number;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  requestedAt: string;
+  finishedAt: string | null;
+  label?: { id: string; vendorLabelId: string; productId: string | null } | null;
+  gateway?: { id: string; code: string; vendorCode: string } | null;
+}
+
+export interface EslProcessSummary {
+  claimed: number;
+  succeeded: number;
+  failed: number;
+  requeued: number;
+  leaseReclaimed: number;
+  leaseFailed: number;
+}
+
 export interface StockLevel {
   id: string;
   quantity: number;
@@ -232,61 +562,9 @@ export interface SafeUser {
   tenantId: string | null;
 }
 
-export type CheckoutSessionStatus =
-  | 'OPEN'
-  | 'ACTIVE'
-  | 'PENDING_REVIEW'
-  | 'COMPLETED'
-  | 'CANCELLED'
-  | 'EXPIRED';
-
-export type OrderStatus = 'DRAFT' | 'CONFIRMED' | 'CANCELLED';
-
-export type OrderPaymentStatus =
-  | 'UNPAID'
-  | 'AUTHORIZED'
-  | 'PAID'
-  | 'PAYMENT_FAILED'
-  | 'VOIDED'
-  | 'REFUND_PENDING'
-  | 'REFUNDED';
-
 // Phase 6 — provider-neutral payment abstraction. NO live gateway: authorize
 // and capture are SIMULATED. Provider references are opaque; only SAFE card
 // metadata (brand, last4, expiry, wallet) is ever stored.
-export type PaymentProvider = 'SIMULATED' | 'MANUAL';
-
-export type PaymentStatus =
-  | 'CREATED'
-  | 'REQUIRES_AUTHORIZATION'
-  | 'AUTHORIZED'
-  | 'CAPTURE_PENDING'
-  | 'CAPTURED'
-  | 'FAILED'
-  | 'CANCELLED'
-  | 'VOIDED'
-  | 'EXPIRED';
-
-export type PaymentCaptureStatus = 'PENDING' | 'SUCCEEDED' | 'FAILED';
-
-export type PaymentEventStatus = 'RECEIVED' | 'PROCESSED' | 'IGNORED' | 'FAILED';
-
-export type PaymentEventType =
-  | 'AUTHORIZATION_SUCCEEDED'
-  | 'AUTHORIZATION_FAILED'
-  | 'CAPTURE_SUCCEEDED'
-  | 'CAPTURE_FAILED'
-  | 'PAYMENT_CANCELLED'
-  | 'PAYMENT_VOIDED'
-  | 'PAYMENT_EXPIRED'
-  | 'UNKNOWN';
-
-export type ReconciliationStatus =
-  | 'PENDING'
-  | 'MATCHED'
-  | 'MISMATCH'
-  | 'RECONCILED'
-  | 'FAILED';
 
 export interface PaymentAuthorization {
   id: string;
@@ -449,19 +727,6 @@ export interface OrderLine extends EvidenceRefs {
   createdAt: string;
 }
 
-export type VisionEventType =
-  | 'PRODUCT_PICKUP'
-  | 'PRODUCT_RETURN'
-  | 'PRODUCT_TRANSFER'
-  | 'CART_INSERTION'
-  | 'EXIT_RECONCILIATION';
-
-export type VisionEventStatus =
-  | 'PENDING_REVIEW'
-  | 'APPROVED'
-  | 'REJECTED'
-  | 'OVERRIDDEN';
-
 export interface VisionEventCandidate {
   id: string;
   eventId: string;
@@ -542,20 +807,6 @@ export interface VisionEvent {
 // Phase 9 — provider-neutral CV inference jobs. No real ML runs here: jobs
 // are simulated via the admin UI, and successful results convert into
 // Phase 7 vision events. Only safe descriptors — never raw media.
-export type InferenceJobType =
-  | 'TRACKING_EVENT'
-  | 'SHELF_AUDIT'
-  | 'PRODUCT_RECOGNITION'
-  | 'OCR_REVIEW'
-  | 'VLM_REVIEW'
-  | 'EXIT_RECONCILIATION';
-
-export type InferenceJobStatus =
-  | 'QUEUED'
-  | 'RUNNING'
-  | 'SUCCEEDED'
-  | 'FAILED'
-  | 'CANCELLED';
 
 export interface InferenceCandidate {
   id: string;
@@ -635,25 +886,6 @@ export interface Order extends EvidenceRefs {
 // download URL, or media byte field anywhere in these shapes — the API
 // never exposes storage locations, and crops feed Phase 9 inference jobs
 // by opaque id.
-export type VideoAssetStatus =
-  | 'PENDING_MEDIA'
-  | 'QUARANTINED'
-  | 'UPLOADED'
-  | 'VALIDATED'
-  | 'REJECTED'
-  | 'PROCESSING'
-  | 'READY'
-  | 'FAILED';
-
-export type VideoArtifactType = 'FRAME' | 'CROP';
-
-export type VideoCropReason =
-  | 'PRODUCT_PICKUP'
-  | 'PRODUCT_RETURN'
-  | 'SHELF_AUDIT'
-  | 'CART_INSERTION'
-  | 'OCR_REVIEW'
-  | 'VLM_REVIEW';
 
 export interface VideoAsset {
   id: string;
@@ -685,60 +917,6 @@ export interface VideoAsset {
   // Phase 22 — planogram binding captured at upload (or set afterwards).
   planogramRackCode?: string | null;
   rackFrameRegion?: { x: number; y: number; width: number; height: number } | null;
-}
-
-// Phase 22 — Clip Lab: ONE consolidated, shadow-only report for a clip
-// (classified codes, SKUs, normalized numbers; never media or paths).
-export interface ClipLabStepResult {
-  step: 'SCREENING' | 'VALIDATE' | 'DETECTION' | 'FUSION' | 'PRETRAINED';
-  status: 'OK' | 'SKIPPED' | 'FAILED' | 'BLOCKED' | 'NOT_RUN';
-  reasonCode: string | null;
-  ms: number | null;
-}
-
-export interface ClipLabReport {
-  asset: {
-    id: string;
-    name: string;
-    status: string;
-    store: { id: string; name: string; code: string } | null;
-    unit: { id: string; name: string } | null;
-    rackCode: string | null;
-    rackFrameRegion: { x: number; y: number; width: number; height: number } | null;
-    groundTruth: { eventKind: string; sku: string | null; actualTimestampMs: number | null } | null;
-  };
-  steps: ClipLabStepResult[];
-  suggestion: { sku: string | null; action: string; reviewRequired: boolean; notes: string[] } | null;
-  planogram: {
-    configured: boolean;
-    rackCode: string | null;
-    bindingSource: string;
-    cell: string | null;
-    coordinateSource: string;
-    matchStatus: string;
-    expectedSkus: string[];
-    flags: string[];
-  } | null;
-  candidates: { scoped: boolean; excludedProductCount: number; items: { sku: string; score: number }[] };
-  providers: { provider: string; availability: string; reasonCode: string | null; modelId: string | null }[];
-  /** Uncalibrated 0..1 signals per stage (never probabilities); overall is the review gate. */
-  confidence: ClipLabConfidence;
-  why: string[];
-  links: { videoAssetPage: string; pretrainedPage: string };
-}
-
-export interface ClipLabConfidence {
-  detection: { status: 'OK' | 'FAILED' | 'SKIPPED' | 'NOT_RUN'; score: number | null };
-  detector: {
-    provider: string | null;
-    topDetection: number | null;
-    productFrames: number | null;
-    sampledFrames: number | null;
-  };
-  fusionTop: { sku: string; score: number; margin: number } | null;
-  planogramCell: { cell: string; confidence: number } | null;
-  vlm: { status: string | null; verdict: string | null; sku: string | null; support: string | null } | null;
-  overall: { reviewRequired: true; gate: 'REVIEW_REQUIRED' };
 }
 
 // Quarantine screening preview — the ONE deliberate exception to the
@@ -856,18 +1034,8 @@ export interface ImportReport {
   }[];
 }
 
-export type GroundTruthEventKind = 'PICKUP' | 'RETURN' | 'NONE';
-
 // Phase 11 — which controlled test scenario a ground-truthed clip
 // exercises (the evaluation dashboard breaks accuracy down per scenario).
-export type CvTestScenario =
-  | 'PICKUP_SINGLE'
-  | 'RETURN_SINGLE'
-  | 'FALSE_TOUCH'
-  | 'TWO_SIMILAR_PICK_ONE'
-  | 'TWO_VISIBLE_PICK_ONE'
-  | 'VLM_UNAVAILABLE'
-  | 'VLM_INVALID_SKU';
 
 export interface GroundTruthView {
   videoAssetId: string;
@@ -1021,23 +1189,6 @@ export interface VlmReadiness {
 }
 
 // Customer journey skeleton (shadow mode).
-export type JourneyEventType =
-  | 'ENTRY'
-  | 'EXIT'
-  | 'SHELF_INTERACTION'
-  | 'PRODUCT_PICKUP'
-  | 'PRODUCT_RETURN'
-  | 'REVIEW_REQUIRED';
-
-// Phase 11 — final SHADOW decision of an exited journey (recorded
-// conclusion only; never triggers checkout/order/payment writes).
-export type JourneyDecision =
-  | 'READY_TO_SETTLE_SHADOW'
-  | 'NEEDS_EVENT_REVIEW'
-  | 'NEEDS_JOURNEY_REVIEW'
-  | 'FAILED';
-
-export type JourneyReviewDecision = 'APPROVE' | 'REJECT' | 'CORRECT';
 
 /** One append-only reviewer decision over one journey observation. */
 export interface JourneyEventReview {
@@ -1208,13 +1359,6 @@ export interface EvaluationTestRuns {
 // Camera-source responses NEVER carry a URL or a credential — only
 // whether a secret slot NAME is configured; RTSP stream URLs live in
 // server-side runtime configuration only.
-export type CameraSourceType =
-  | 'FILE_REPLAY'
-  | 'RTSP_PLACEHOLDER'
-  | 'LOCAL_WEBCAM_PLACEHOLDER'
-  | 'RTSP_SHADOW';
-
-export type CameraSourceStatus = 'ACTIVE' | 'DISABLED' | 'ERROR';
 
 export interface CameraSourceView {
   id: string;
@@ -1232,8 +1376,6 @@ export interface CameraSourceView {
   createdAt: string;
   updatedAt: string;
 }
-
-export type PilotRunStatus = 'RUNNING' | 'SUCCEEDED' | 'FAILED';
 
 export interface PilotRunView {
   runId: string;
@@ -1281,12 +1423,6 @@ export interface PilotRunDetail extends PilotRunView {
 // Phase 13 — live RTSP shadow sessions. One row per live camera start;
 // the session owns one shadow journey and its LIVE_WINDOW fusion runs.
 // Responses never carry a URL, credential, or slot value.
-export type LiveSessionStatus =
-  | 'STARTING'
-  | 'RUNNING'
-  | 'STOPPING'
-  | 'STOPPED'
-  | 'ERROR';
 
 export interface LiveSessionView {
   sessionId: string;
@@ -1400,16 +1536,6 @@ export interface ReviewQueueItem {
 }
 
 /** Phase 15 — pilot evaluation loop (shadow only). */
-export type PilotEvaluationStatus = 'OPEN' | 'COMPLETED' | 'CANCELLED';
-export type PilotVerdict =
-  | 'CORRECT'
-  | 'INCORRECT'
-  | 'UNCERTAIN'
-  | 'FALSE_TOUCH'
-  | 'WRONG_SKU'
-  | 'WRONG_ACTION'
-  | 'MISSED_EVENT';
-export type PilotExpectedAction = 'PICKUP' | 'RETURN' | 'NO_OP' | 'UNKNOWN';
 
 export interface PilotEvaluationRunView {
   evaluationRunId: string;
@@ -1541,24 +1667,6 @@ export interface PilotDatasetExport {
 }
 
 /** Phase 16 — CV test protocols (shadow only). */
-export type CvTestProtocolStatus = 'DRAFT' | 'ACTIVE' | 'COMPLETED' | 'CANCELLED';
-export type CvTestScenarioResult = 'PASS' | 'FAIL' | 'INCONCLUSIVE';
-export type CvTestScenarioType =
-  | 'SINGLE_PICKUP'
-  | 'SINGLE_RETURN'
-  | 'FALSE_TOUCH_NO_PRODUCT_MOVED'
-  | 'MISSED_PICKUP'
-  | 'MISSED_RETURN'
-  | 'TWO_PRODUCTS_VISIBLE_ONE_PICKED'
-  | 'SIMILAR_SKU_CONFUSION'
-  | 'MULTI_QUANTITY_PICKUP'
-  | 'HAND_OCCLUSION'
-  | 'FAST_PICKUP'
-  | 'SLOW_PICKUP'
-  | 'LOW_LIGHT'
-  | 'BAD_ANGLE'
-  | 'EMPTY_SHELF'
-  | 'UNKNOWN_PRODUCT';
 
 export interface CvTestProtocolView {
   protocolId: string;
@@ -1673,23 +1781,6 @@ export interface LiveTestPreflight {
 }
 
 /** Phase 17 — camera calibration & pilot hardening (shadow only). */
-export type CameraCalibrationProfileStatus = 'DRAFT' | 'ACTIVE' | 'ARCHIVED';
-export type CameraCalibrationOrientation = 'LANDSCAPE' | 'PORTRAIT' | 'UNKNOWN';
-export type CameraCalibrationMount =
-  | 'OVERHEAD'
-  | 'FRONT_SHELF'
-  | 'ANGLED_SHELF'
-  | 'UNKNOWN';
-export type CameraCalibrationZoneType =
-  | 'SHELF_ZONE'
-  | 'INTERACTION_ZONE'
-  | 'IGNORE_ZONE'
-  | 'ENTRY_EXIT_ZONE';
-export type CalibrationReadinessLevel =
-  | 'READY'
-  | 'WARNING'
-  | 'NOT_READY'
-  | 'NOT_APPLICABLE';
 
 export interface CalibrationPolygonPoint {
   x: number;
@@ -1804,22 +1895,6 @@ export interface PilotHardeningReport {
 /** Phase 18 — dataset improvement & model tuning (advisory, shadow only).
  *  Runs organize reviewed/corrected examples into training-ready metadata;
  *  they never carry raw media, source URLs, paths, or credentials. */
-export type CvDatasetRunStatus = 'DRAFT' | 'READY' | 'EXPORTED' | 'ARCHIVED';
-export type CvDatasetPurpose =
-  | 'SKU_CLASSIFICATION'
-  | 'ACTION_RECOGNITION'
-  | 'FALSE_TOUCH_FILTERING'
-  | 'MISSED_EVENT_RECOVERY'
-  | 'CALIBRATION_VALIDATION'
-  | 'MIXED';
-export type CvDatasetCandidateSourceType =
-  | 'LIVE_REVIEW'
-  | 'MISSED_EVENT'
-  | 'PROTOCOL_SCENARIO'
-  | 'DATASET_EXPORT_ITEM';
-export type CvDatasetSplit = 'TRAIN' | 'VALIDATION' | 'TEST' | 'HOLDOUT';
-export type CvDatasetEligibility = 'ELIGIBLE' | 'EXCLUDED';
-export type CvDatasetReadiness = 'READY' | 'WARNING' | 'NOT_READY';
 
 export interface CvDatasetRunView {
   id: string;
@@ -2020,14 +2095,6 @@ export interface OneSkuCropSummary {
   qualityKnown: boolean;
 }
 
-export type OneSkuCropWarning =
-  | 'PRODUCT_TOO_SMALL'
-  | 'HIGH_OCCLUSION'
-  | 'LOW_SHARPNESS'
-  | 'CROP_MISALIGNED'
-  | 'NO_CLEAR_PRODUCT_FRAME'
-  | 'UNKNOWN_GEOMETRY';
-
 export interface OneSkuFusionSummary {
   createdAt: string;
   policy: string;
@@ -2215,14 +2282,6 @@ export interface PretrainedProviderEvidence {
   notes: string[];
 }
 
-/** Normalized rectangle of the analysis frame the rack occupies. */
-export interface RackFrameRegion {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
 export interface PlanogramReportSection {
   /** SCORED_AT_EVALUATION = immutable stored snapshot; CURRENT_ACTIVE =
    *  live lookup (no stored snapshot); NOT_CONFIGURED = no planogram. */
@@ -2313,4 +2372,646 @@ export function pretrainedEvaluatePath(videoAssetId: string): string {
 
 export function pretrainedReportPath(videoAssetId: string): string {
   return `/pretrained-vision/videos/${encodeURIComponent(videoAssetId)}/report`;
+}
+
+// --- Phase 26: the store flow ------------------------------------------------
+
+export type StoreFlowAutonomyLevel = 'SHADOW' | 'PROPOSE' | 'AUTO_APPLY';
+
+export type StoreFlowProjectionOutcome =
+  | 'SKIPPED'
+  | 'PROPOSED'
+  | 'AUTO_APPLIED'
+  | 'REVIEW_REQUIRED'
+  | 'REJECTED';
+
+export type StoreFlowSettlementStatus =
+  | 'NOT_STARTED'
+  | 'BLOCKED_ON_REVIEW'
+  | 'ORDER_CREATED'
+  | 'PAID'
+  | 'FAILED';
+
+export interface StoreFlowPolicyVersion {
+  id: string;
+  versionNumber: number;
+  autonomyLevel: StoreFlowAutonomyLevel;
+  autoApplyMinConfidence: number;
+  requireInventoryValidation: boolean;
+  settleOnExit: boolean;
+  note: string | null;
+  createdAt: string;
+}
+
+export interface StoreFlowPolicy {
+  id: string;
+  locationId: string | null;
+  activeVersionId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  versions: StoreFlowPolicyVersion[];
+}
+
+export interface EffectiveStoreFlowPolicy {
+  autonomyLevel: StoreFlowAutonomyLevel;
+  autoApplyMinConfidence: number;
+  requireInventoryValidation: boolean;
+  settleOnExit: boolean;
+  policyVersionId: string | null;
+  policyLocationId: string | null;
+}
+
+export interface StoreEntryToken {
+  id: string;
+  locationId: string;
+  unitId: string;
+  shopperId: string | null;
+  status: 'ISSUED' | 'REDEEMED' | 'REVOKED';
+  expiresAt: string;
+  redeemedAt: string | null;
+  redeemedJourneyId: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+}
+
+/** The redemption response carries the secret exactly once. */
+export interface StoreEntryIssued {
+  token: StoreEntryToken;
+  secret: string;
+  expiresAt: string;
+}
+
+export interface StoreFlowEntry {
+  journeyId: string;
+  shopperId: string;
+  checkoutSessionId: string;
+  locationId: string;
+  unitId: string;
+}
+
+export interface StoreFlowBasketLine {
+  id: string;
+  productId: string;
+  sku: string;
+  productName: string;
+  quantity: number;
+  unitPriceMinor: number | null;
+  lineTotalMinor: number | null;
+  currencyCode: string | null;
+}
+
+export interface StoreFlowJourney {
+  id: string;
+  locationId: string;
+  unitId: string | null;
+  status: string;
+  shopperId: string | null;
+  checkoutSessionId: string | null;
+  orderId: string | null;
+  settlementStatus: StoreFlowSettlementStatus;
+  startedAt: string;
+  endedAt: string | null;
+  lines: StoreFlowBasketLine[];
+}
+
+export interface StoreFlowProjection {
+  id: string;
+  journeyId: string;
+  journeyEventId: string;
+  outcome: StoreFlowProjectionOutcome;
+  reasonCode: string;
+  visionEventId: string | null;
+  autonomyLevel: StoreFlowAutonomyLevel;
+  confidence: number | null;
+  createdAt: string;
+}
+
+export interface StoreFlowQueueItem {
+  journeyId: string;
+  eventId: string;
+  eventType: string;
+  occurredAt: string;
+  candidateSku: string | null;
+  fusedTopScore: number | null;
+  reason: string;
+  storeFlow: {
+    projectionId: string;
+    outcome: StoreFlowProjectionOutcome;
+    reasonCode: string;
+    autonomyLevel: StoreFlowAutonomyLevel;
+    visionEventId: string | null;
+    visionEventStatus: string | null;
+    checkoutSessionId: string | null;
+  } | null;
+}
+
+export interface StoreFlowSettlement {
+  status: StoreFlowSettlementStatus;
+  blockedBy: string | null;
+  order: { id: string; orderNumber: string } | null;
+  payment: { id: string; status: string } | null;
+}
+
+export interface StoreFlowExitResult {
+  settlement: StoreFlowSettlement;
+}
+
+export interface StoreFlowSyncResult {
+  journeyId: string;
+  autonomyLevel: StoreFlowAutonomyLevel;
+  projected: StoreFlowProjection[];
+  skippedShadow: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 27 — returns, refunds and inventory reconciliation (the reverse flow).
+//
+// Every shape below is a DECISION RECORD that cites the append-only ledger
+// movement it produced (`movementId`). None of them carries a stock level: the
+// admin UI reads stock from the inventory projection as it always has, and the
+// reverse flow explains how it got there.
+// ---------------------------------------------------------------------------
+
+export type OrderReturnKind = 'CUSTOMER_RETURN' | 'ORDER_CANCELLATION';
+
+export type OrderReturnStatus =
+  | 'RECORDED'
+  | 'REFUND_PENDING'
+  | 'REFUNDED'
+  | 'REFUND_FAILED';
+
+/** Closed vocabulary for WHY a return recorded no refund. Never free text. */
+export type RefundSkipReason =
+  | 'NOT_REQUESTED'
+  | 'NO_CAPTURED_PAYMENT'
+  | 'NO_PRICEABLE_LINES'
+  | 'ALREADY_FULLY_REFUNDED';
+
+export type PaymentRefundStatus = 'PENDING' | 'SUCCEEDED' | 'FAILED';
+
+export interface PaymentRefund {
+  id: string;
+  intentId: string;
+  captureId: string | null;
+  status: PaymentRefundStatus;
+  amountMinor: number;
+  currencyCode: string;
+  reason: string | null;
+  providerRefundRef: string | null;
+  failureReason: string | null;
+  requestedAt: string;
+  settledAt: string | null;
+}
+
+export interface OrderReturnLine {
+  id: string;
+  returnId: string;
+  orderLineId: string;
+  productId: string;
+  sku: string;
+  productName: string;
+  quantity: number;
+  /** False for damaged goods: no ledger movement, and `movementId` is null. */
+  restocked: boolean;
+  /** The RETURN_IN movement this line produced. */
+  movementId: string | null;
+  refundAmountMinor: number | null;
+  note: string | null;
+  createdAt: string;
+}
+
+export interface OrderReturn {
+  id: string;
+  orderId: string;
+  kind: OrderReturnKind;
+  status: OrderReturnStatus;
+  reference: string;
+  reason: string;
+  restockedQuantity: number;
+  refundAmountMinor: number | null;
+  currencyCode: string | null;
+  refundId: string | null;
+  refundSkipReason: RefundSkipReason | null;
+  createdAt: string;
+  lines?: OrderReturnLine[];
+  order?: {
+    id: string;
+    orderNumber: string;
+    status: OrderStatus;
+    paymentStatus: OrderPaymentStatus;
+  };
+  refund?: PaymentRefund | null;
+}
+
+export type CycleCountStatus = 'OPEN' | 'RECONCILED' | 'CANCELLED';
+
+export interface CycleCountLine {
+  id: string;
+  cycleCountId: string;
+  productId: string;
+  /** What the operator found on the shelf. */
+  countedQuantity: number;
+  /** What the stock projection said at reconcile time. */
+  systemQuantity: number | null;
+  /** What the append-only ledger replays to. */
+  ledgerQuantity: number | null;
+  /** counted - projection: what became a correction movement. */
+  varianceQuantity: number | null;
+  /** projection - ledger. MUST be zero; anything else is a platform bug. */
+  ledgerDriftQuantity: number | null;
+  movementId: string | null;
+  note: string | null;
+}
+
+export interface CycleCount {
+  id: string;
+  locationId: string;
+  reference: string;
+  status: CycleCountStatus;
+  isFullStocktake: boolean;
+  note: string | null;
+  reconciledAt: string | null;
+  cancelledAt: string | null;
+  createdAt: string;
+  lines?: CycleCountLine[];
+  location?: { id: string; name: string; code: string };
+}
+
+export interface ShrinkEvent {
+  id: string;
+  locationId: string;
+  productId: string;
+  visionEventId: string | null;
+  source: 'CV_DETECTED' | 'OPERATOR';
+  quantity: number;
+  reason: string;
+  /** The SHRINK movement. Never null: a write-off always has its ledger row. */
+  movementId: string;
+  createdAt: string;
+}
+
+/* ---------------------------------------------------------------- */
+/* Procurement (Phase 31)                                             */
+/* ---------------------------------------------------------------- */
+
+export type SupplierStatus = 'ACTIVE' | 'ARCHIVED';
+
+export type PurchaseOrderStatus =
+  | 'DRAFT'
+  | 'SUBMITTED'
+  | 'PARTIALLY_RECEIVED'
+  | 'RECEIVED'
+  | 'CANCELLED';
+
+export type GoodsReceiptDiscrepancy =
+  | 'NONE'
+  | 'SHORT_DELIVERY'
+  | 'OVER_DELIVERY'
+  | 'DAMAGED'
+  | 'SUBSTITUTED';
+
+export interface Supplier {
+  id: string;
+  code: string;
+  name: string;
+  status: SupplierStatus;
+  contactName: string | null;
+  contactEmail: string | null;
+  contactPhone: string | null;
+  leadTimeDays: number | null;
+  notes: string | null;
+  createdAt: string;
+}
+
+export interface SupplierProduct {
+  id: string;
+  supplierId: string;
+  productId: string;
+  supplierSku: string;
+  packSize: number;
+  unitCostMinor: number;
+  currencyCode: string;
+  isPreferred: boolean;
+  product?: { id: string; sku: string; name: string } | null;
+  supplier?: { id: string; code: string; name: string } | null;
+}
+
+/**
+ * Received and outstanding quantities are computed by the API from the goods
+ * receipts posted against the line. There is no stored counter, which is why
+ * they can never disagree with the inventory ledger.
+ */
+export interface PurchaseOrderLine {
+  id: string;
+  productId: string;
+  sku: string;
+  productName: string;
+  quantityOrdered: number;
+  packSize: number;
+  unitCostMinor: number;
+  currencyCode: string;
+  quantityReceived: number;
+  quantityOutstanding: number;
+  unitsReceived: number;
+}
+
+export interface GoodsReceiptLine {
+  id: string;
+  purchaseOrderLineId: string;
+  productId: string;
+  quantityReceived: number;
+  packSize: number;
+  unitsReceived: number;
+  discrepancy: GoodsReceiptDiscrepancy;
+  discrepancyNote: string | null;
+  inventoryMovementId: string | null;
+  product?: { id: string; sku: string; name: string } | null;
+}
+
+export interface GoodsReceipt {
+  id: string;
+  purchaseOrderId: string;
+  reference: string;
+  deliveryNote: string | null;
+  notes: string | null;
+  receivedAt: string;
+  lines: GoodsReceiptLine[];
+}
+
+export interface PurchaseOrder {
+  id: string;
+  reference: string;
+  supplierId: string;
+  locationId: string;
+  status: PurchaseOrderStatus;
+  currencyCode: string;
+  expectedAt: string | null;
+  submittedAt: string | null;
+  closedAt: string | null;
+  cancelledReason: string | null;
+  totalCostMinor: number | null;
+  computedTotalMinor: number;
+  externalReference: string | null;
+  notes: string | null;
+  createdAt: string;
+  supplier?: { id: string; code: string; name: string } | null;
+  location?: { id: string; code: string; name: string } | null;
+  lines: PurchaseOrderLine[];
+  receipts: GoodsReceipt[];
+}
+
+export interface ReceiptMovement {
+  id: string;
+  productId: string;
+  quantityDelta: number;
+  quantityAfter: number;
+  createdAt: string;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 30 — reporting & analytics.
+//
+// Every shape below is READ-ONLY. There is no request body anywhere in the
+// reporting surface: the page never saves a report definition, a filter preset
+// or a note, so no operator prose from this page can ever reach a persisted
+// column.
+// ---------------------------------------------------------------------------
+
+/** Says when a number was computed, and from what. Never cached. */
+export interface ReportProvenance {
+  generatedAt: string;
+  derivation: 'DERIVED_ON_READ';
+  sourceOfTruth: string[];
+  stale: false;
+}
+
+export interface ReportWindow {
+  from: string;
+  to: string;
+}
+
+export interface SalesMoney {
+  grossSalesMinor: number;
+  promotionDiscountMinor: number;
+  netSalesMinor: number;
+  unitsSold: number;
+  lines: number;
+}
+
+export interface SalesCurrencyTotals extends SalesMoney {
+  currencyCode: string;
+  reconciled: boolean;
+}
+
+export interface SalesProductRow extends SalesMoney {
+  key: string;
+  currencyCode: string;
+  productId: string;
+  sku: string;
+  productName: string;
+}
+
+export interface SalesPromotionRow extends SalesMoney {
+  key: string;
+  currencyCode: string;
+  promotionVersionId: string | null;
+}
+
+export interface SalesPriceVersionRow extends SalesMoney {
+  key: string;
+  currencyCode: string;
+  priceBookVersionId: string | null;
+}
+
+export interface SalesReport {
+  window: ReportWindow;
+  filters: { locationId: string | null; productId: string | null };
+  scope: string;
+  totals: {
+    byCurrency: SalesCurrencyTotals[];
+    byProduct: SalesProductRow[];
+    byPromotionVersion: SalesPromotionRow[];
+    byPriceBookVersion: SalesPriceVersionRow[];
+    unpricedLines: number;
+    unpricedUnits: number;
+    inconsistentPricePoints: number;
+  };
+  crossCheck: {
+    netSalesMinorFromOrderLines: number;
+    unitsFromOrderLines: number;
+    lines: number;
+    reconciled: boolean;
+  };
+  provenance: ReportProvenance;
+}
+
+export interface SalesExplainLine {
+  orderLineId: string;
+  productId: string;
+  sku: string;
+  productName: string;
+  quantity: number;
+  currencyCode: string | null;
+  basePriceMinor: number | null;
+  promotionDiscountMinor: number | null;
+  unitPriceMinor: number | null;
+  lineTotalMinor: number | null;
+  priceBookVersion: {
+    id: string;
+    versionNumber: number;
+    status: string;
+    reason: string;
+    effectiveFrom: string;
+    effectiveTo: string | null;
+    activatedAt: string | null;
+    priceBookId: string;
+    priceBookCode: string;
+    priceBookName: string;
+  } | null;
+  promotionVersion: {
+    id: string;
+    versionNumber: number;
+    status: string;
+    reason: string;
+    effectiveFrom: string;
+    effectiveTo: string | null;
+    activatedAt: string | null;
+    promotionId: string;
+    promotionCode: string;
+    promotionName: string;
+    audience: string;
+  } | null;
+  checks: {
+    unitPriceMatchesBaseMinusDiscount: boolean;
+    lineTotalMatchesUnitTimesQuantity: boolean;
+  };
+}
+
+export interface SalesExplainReport {
+  orderId: string;
+  orderNumber: string;
+  status: string;
+  paymentStatus: string;
+  placedAt: string;
+  locationId: string;
+  lines: SalesExplainLine[];
+  totals: SalesCurrencyTotals[];
+  orderSnapshot: {
+    totalQuantity: number;
+    subtotalMinor: number | null;
+    totalMinor: number | null;
+    currencyCode: string | null;
+  };
+  reconciled: boolean | null;
+  provenance: ReportProvenance;
+}
+
+export interface MovementReport {
+  window: ReportWindow;
+  filters: { locationId: string | null; productId: string | null };
+  movements: {
+    byType: {
+      movementType: string;
+      quantityDelta: number;
+      unitsIn: number;
+      unitsOut: number;
+      movements: number;
+    }[];
+    totals: {
+      quantityDelta: number;
+      unitsIn: number;
+      unitsOut: number;
+      movements: number;
+    };
+  };
+  provenance: ReportProvenance;
+}
+
+export interface BalanceReport {
+  rows: {
+    locationId: string;
+    productId: string;
+    ledgerQuantity: number;
+    movements: number;
+    projectedQuantity: number | null;
+    projectionDriftQuantity: number | null;
+  }[];
+  summary: {
+    pairs: number;
+    ledgerQuantity: number;
+    driftingPairs: number;
+    totalAbsoluteDrift: number;
+    projectionHealthy: boolean;
+  };
+  filters: { locationId: string | null; productId: string | null };
+  page: { skip: number; take: number };
+  balanceSource: string;
+  provenance: ReportProvenance;
+}
+
+export interface CountReconciliationReport {
+  lines: number;
+  variance: { totalQuantity: number; lines: number; meaning: string };
+  projectionDefect: {
+    totalDriftQuantity: number;
+    lines: number;
+    healthy: boolean;
+    meaning: string;
+    severity: 'NONE' | 'PLATFORM_DEFECT';
+  };
+  varianceIncludesDrift: false;
+  window: ReportWindow;
+  filters: { locationId: string | null; productId: string | null };
+  provenance: ReportProvenance;
+}
+
+export interface ShrinkReport {
+  shrink: {
+    units: number;
+    events: number;
+    bySource: { source: string; units: number; events: number }[];
+    byProduct: { productId: string; units: number; events: number }[];
+  };
+  ledgerCheck: {
+    shrinkMovementUnits: number;
+    movements: number;
+    reconciled: boolean;
+  };
+  damagedReturns: {
+    units: number;
+    lines: number;
+    byProduct: { productId: string; units: number; lines: number }[];
+    ledgerMovementsWritten: 0;
+    meaning: string;
+  };
+  window: ReportWindow;
+  filters: { locationId: string | null };
+  provenance: ReportProvenance;
+}
+
+export interface CvAccuracyReport {
+  totals: {
+    reviewedObservations: number;
+    correct: number;
+    incorrect: number;
+    uncertain: number;
+    falseTouch: number;
+    wrongSku: number;
+    wrongAction: number;
+    missedEvents: number;
+    decided: number;
+  };
+  accuracy: {
+    action: number | null;
+    sku: number | null;
+    combined: number | null;
+  };
+  confusion: {
+    action: { predicted: string; expected: string; count: number }[];
+    sku: { predicted: string; expected: string; count: number }[];
+  };
+  definitions: Record<string, string>;
+  evaluationRunId: string;
+  scope: { videoBackedObservationsIncluded: boolean; excluded: string };
+  provenance: ReportProvenance;
 }

@@ -1,7 +1,9 @@
 /**
  * Platform module catalog — the single source of truth the seed reads from.
- * These are CATALOG NAMES ONLY: no module logic beyond `core` exists in
- * Phase 1. Inventory, pricing, checkout, CV, etc. are later phases.
+ * An entry with `isActive: false` is a NAME ONLY: the module has no logic yet
+ * and can never be enabled for a tenant. Flip it to true in the phase that
+ * actually ships the module, and add a backfill migration for the tenants
+ * that already exist.
  */
 export interface PlatformModuleDefinition {
   readonly code: string;
@@ -59,9 +61,18 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
   {
     code: 'pricing',
     name: 'Pricing',
-    description: 'Versioned, auditable pricing (later phase).',
-    defaultEnabled: false,
-    isActive: false,
+    description:
+      'Versioned, auditable, reversible price books: effective-dated ' +
+      'versions, immutable entries, activation and rollback, and the ' +
+      'resolved prices checkout snapshots onto basket lines.',
+    // Shipped in Phase 25 and DEFAULT-ENABLED for the same reason as
+    // inventory/devices/checkout (see above): the only enable endpoint is
+    // @TenantOnly(), so leaving this false would strand new tenants behind
+    // 403s. RBAC still gates every route independently. Tenants that existed
+    // BEFORE Phase 25 are covered by the 20260916090001_pricing_module_backfill
+    // migration — defaultEnabled only applies at tenant creation time.
+    defaultEnabled: true,
+    isActive: true,
   },
   {
     code: 'checkout',
@@ -148,32 +159,113 @@ export const PLATFORM_MODULE_CATALOG: readonly PlatformModuleDefinition[] = [
     isActive: true,
   },
   {
+    code: 'store-flow',
+    name: 'Store Flow',
+    description:
+      'Shopper entry and identity, the governed bridge from observed ' +
+      'pickups to basket lines, one review queue over both streams, and ' +
+      'exit settlement into an order and a payment.',
+    // Shipped in Phase 26 and DEFAULT-ENABLED for the same reason as
+    // inventory/devices/checkout/pricing (see above): the only enable
+    // endpoint is @TenantOnly(), so leaving this false would strand new
+    // tenants behind 403s. RBAC still gates every route independently, and
+    // enabling the module changes NOTHING on its own — the autonomy policy
+    // defaults to SHADOW, so a store keeps observing until an operator opts
+    // in. Tenants that existed BEFORE Phase 26 are covered by the
+    // 20260916100001_store_flow_module_backfill migration.
+    defaultEnabled: true,
+    isActive: true,
+  },
+  {
+    code: 'returns',
+    name: 'Returns & Reconciliation',
+    description:
+      'Refunds against captured payments, stock reversal on returned and ' +
+      'cancelled orders, cycle counts and stocktakes that reconcile the ' +
+      'stock projection against the ledger, and the shrink path for ' +
+      'CV-detected loss.',
+    // Shipped in Phase 27 and DEFAULT-ENABLED for the same reason as
+    // inventory/checkout/payments/pricing/store-flow (see above): the only
+    // enable endpoint is @TenantOnly(), so leaving this false would strand
+    // new tenants behind 403s. RBAC still gates every route independently,
+    // and enabling the module changes NOTHING on its own — there are no
+    // background jobs here; every return, count and write-off is an operator
+    // action. Tenants that existed BEFORE Phase 27 are covered by the
+    // 20260916110001_returns_module_backfill migration.
+    defaultEnabled: true,
+    isActive: true,
+  },
+  {
     code: 'esl',
     name: 'Electronic Shelf Labels',
-    description: 'ESL vendor integration (later phase).',
-    defaultEnabled: false,
-    isActive: false,
+    description:
+      'Vendor-neutral electronic shelf labels: gateways and labels behind ' +
+      'an adapter port, price-activation propagation, and a leased retry ' +
+      'queue.',
+    // Shipped in Phase 28 and DEFAULT-ENABLED for the same reason as
+    // inventory/devices/checkout/pricing (see above): the only enable
+    // endpoint is @TenantOnly(), so leaving this false would strand new
+    // tenants behind 403s. RBAC still gates every route independently.
+    // Tenants that existed BEFORE Phase 28 are covered by the
+    // 20260916111001_esl_module_backfill migration — defaultEnabled only
+    // applies at tenant creation time.
+    defaultEnabled: true,
+    isActive: true,
   },
   {
     code: 'loyalty',
-    name: 'Loyalty',
-    description: 'Loyalty and promotions (later phase).',
-    defaultEnabled: false,
-    isActive: false,
+    name: 'Loyalty & Promotions',
+    description:
+      'Loyalty accounts with an append-only points ledger, and versioned, ' +
+      'reversible promotions that compose on top of the price version in ' +
+      'force without ever rewriting price history.',
+    // Shipped in Phase 29 and DEFAULT-ENABLED for the same reason as
+    // inventory/devices/checkout/pricing/esl (see above): the only enable
+    // endpoint is @TenantOnly(), so leaving this false would strand new
+    // tenants behind 403s. RBAC still gates every route independently.
+    // Tenants that existed BEFORE Phase 29 are covered by the
+    // 20260916130001_loyalty_module_backfill migration — defaultEnabled only
+    // applies at tenant creation time.
+    defaultEnabled: true,
+    isActive: true,
   },
   {
     code: 'reporting',
-    name: 'Reporting',
-    description: 'Analytics and reporting (later phase).',
-    defaultEnabled: false,
-    isActive: false,
+    name: 'Reporting & Analytics',
+    description:
+      'Read-only sales, inventory, shrink and CV-accuracy reporting derived ' +
+      'on read from the append-only ledger, the order lines with their ' +
+      'price/promotion provenance, and the evaluation tables.',
+    // Shipped in Phase 30 and DEFAULT-ENABLED for the same reason as
+    // inventory/checkout/pricing (see above): the only enable endpoint is
+    // @TenantOnly(), so leaving this false would strand new tenants behind
+    // 403s on a shipped feature. RBAC still gates every route independently
+    // — each report demands `report:read` AND the permission that already
+    // guards its rows — and enabling this module grants NO new reach: a
+    // report over a module the tenant has disabled is refused. Tenants that
+    // existed BEFORE Phase 30 are covered by the
+    // 20260916150001_reporting_module_backfill migration, which FORCE-upserts
+    // isActive = true: databases seeded earlier already carry an inactive
+    // `reporting` row, and a DO NOTHING there would strand every one of them.
+    defaultEnabled: true,
+    isActive: true,
   },
   {
     code: 'procurement',
     name: 'Procurement',
-    description: 'Supplier ordering and receiving (later phase).',
-    defaultEnabled: false,
-    isActive: false,
+    description:
+      'Suppliers, the supplier catalog and its audited cost history, ' +
+      'purchase orders, and goods receipts that admit stock through the ' +
+      'append-only inventory ledger.',
+    // Shipped in Phase 31 and DEFAULT-ENABLED for the same reason as
+    // inventory/checkout (see above): the only enable endpoint is
+    // @TenantOnly(), so leaving this false would strand new tenants behind
+    // 403s on a shipped feature. RBAC still gates every route independently.
+    // Tenants that existed BEFORE Phase 31 are covered by the
+    // 20260916120001_procurement_module_backfill migration — defaultEnabled
+    // only applies at tenant creation time.
+    defaultEnabled: true,
+    isActive: true,
   },
 ];
 
